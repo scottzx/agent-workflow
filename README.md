@@ -1,10 +1,10 @@
 # agent-workflow — the agent task-flow engine
 
-[agent-workflow 发布页](https://scottzx.github.io/agent-workflow/) · [npm package](https://www.npmjs.com/package/@1agents/acp-service) · [变更日志](CHANGELOG.md)
+[agent-workflow release page](https://scottzx.github.io/agent-workflow/) · [npm package](https://www.npmjs.com/package/@1agents/acp-service) · [changelog](CHANGELOG.md)
 
-agent-workflow is the agent task-flow engine in 一芥天地 (DreamMate World), from 一芥智能. It creates and runs A2A tasks: register a resident role or a one-off host, submit the work, and keep the job, its attempts and its results on the execution ledger. DeepSeek Harness (DSH) hosts the sessions. Codex, Claude Code, Pi and Cursor are built-in ACP agents, together with the other agents this runtime already registers.
+agent-workflow is the agent task-flow engine in DreamMate World. It creates and runs A2A tasks: register a resident role or a one-off host, submit the work, and keep the job, its attempts and its results on the execution ledger. DeepSeek Harness (DSH) hosts the sessions. Codex, Claude Code, Pi and Cursor are built-in ACP agents, together with the other agents this runtime already registers.
 
-agent-workflow dispatches that work and accepts it. In the delivery flows in this repository, a stage's output moves on when that stage's acceptance passes, and a person stays on the loop. 给 Agent 猛猛套上缰绳，库库干活。
+agent-workflow dispatches that work and accepts it. In the delivery flows in this repository, a stage's output moves on when that stage's acceptance passes, and a person stays on the loop. Put a firm harness on your agents and let them get the work done.
 
 Package names and command names are unchanged for compatibility: `@scottzx/1acp`, `@1agents/acp-service`, `@1agents/dsh-acp`, and the `1acp`, `acpx`, and `acp-service` commands. Role and state files stay under [`.1agents/`](.1agents/README.md).
 

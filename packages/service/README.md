@@ -135,7 +135,7 @@ Submit a text task and return after its DSH session has been created or restored
     "message": {
       "messageId": "message-001",
       "role": "ROLE_USER",
-      "parts": [{ "text": "检查这个项目的测试失败原因", "mediaType": "text/plain" }]
+      "parts": [{ "text": "Find out why this project's tests are failing", "mediaType": "text/plain" }]
     },
     "configuration": { "returnImmediately": true },
     "metadata": { "1agents": { "workspace": "demo", "agentPreset": "oneagents-acp-codex" } }
@@ -368,21 +368,21 @@ The public service now targets dreammate-node ^0.15.0 and dreammate-network ^0.5
 Includes the already deployed c055869 branch: structured error provenance, confirmed/unconfirmed cancellation handling, journal ownership, and persisted current-turn diagnostics. This avoids regressing the ERP pilot during the DreamMate 0.15 dependency migration.
 
 
-## 统一任务入口与 PPT 交付角色（本地 P0/P1）
+## Unified task entry and PPT delivery roles (local P0/P1)
 
-A2A 网关增加版本化执行目标目录和任务台账。父任务与子任务都是独立任务；`jobId` 表示工作，`attemptId` 表示一次明确派发、继续或返工。`executionStatus` 展示当前执行轮次，同时列出历史在途/未决轮次。目标探测只读，不调用模型；固定角色拒绝覆盖 cwd/preset，目录范围在执行端用 realpath 复核。
+The A2A gateway adds a versioned catalog of execution targets and a task ledger. Parent tasks and child tasks are both independent tasks. `jobId` names the work. `attemptId` names one explicit dispatch, continuation, or rework. `executionStatus` shows the current attempt and also lists historical in-flight or unresolved attempts. Target probes are read-only and do not call a model. A fixed role rejects cwd/preset overrides. The executor rechecks directory scope with realpath.
 
-- `execution_connection_*` / `execution_target_*` 管理人工登记的连接和三类目标；管理入口只对可信本机开放，DreamMate 报备注明 local-only。
-- `execution_submit` 接收 `originSessionId/targetId/input/clientRequestId?`，远端派发前持久化任务与执行轮次；重复请求返回原轮次，未知受理不能盲目重派。
-- `execution_get/list/events` 查询来源范围内的状态、结果、父子引用和事件；`execution_continue` 显式创建新执行轮次，保留原后端上下文。
-- `remote_agent_*` 保留原参数、Task 和通知/ack，返回附加 jobId/attemptId；旧 Task 各迁移为独立任务，不按 context 合并。
-- 可选 `binding.driver=ppt_delivery` 使用独立领域模块推进项目脚本、制作、确定性校验、独立事实/逐页视觉复核及有限返工。父任务等待时仍为 working；它不把阶段调度加入通用台账。
-- `execution_inbox/ack` 处理领域交付通知，`execution_review` 独立记录绑定具体轮次、结果版本与 digest 的业务接受。角色通知使用独立 `execution-notice:` 标识，不伪造远端 A2A Task。
+- `execution_connection_*` / `execution_target_*` manage manually registered connections and the three target kinds. The admin entry is open only to a trusted local caller. DreamMate registration marks it local-only.
+- `execution_submit` accepts `originSessionId/targetId/input/clientRequestId?` and persists the task and attempt before remote dispatch. A repeated request returns the original attempt. An unknown admission must not be blindly resubmitted.
+- `execution_get/list/events` query status, results, parent/child references, and events within the caller's scope. `execution_continue` explicitly creates a new attempt and keeps the original backend context.
+- `remote_agent_*` keeps its original parameters, Task, and notification/ack behavior, and also returns jobId/attemptId. Each old Task migrates to its own task. Tasks are not merged by context.
+- Optional `binding.driver=ppt_delivery` uses a separate domain module to advance the project script, production, deterministic checks, independent factual and per-slide visual review, and limited rework. A waiting parent task stays working. Stage scheduling is not added to the generic ledger.
+- `execution_inbox/ack` handles domain delivery notices. `execution_review` records business acceptance bound to a specific attempt, result revision, and digest. Role notices use their own `execution-notice:` ids and do not forge a remote A2A Task.
 
-通用 A2A 结果完成后，账本自动生成执行轮次内的 `resultRevision`（`result-1`、`result-2`…）和 `resultDigest`，由 `execution_get` 与 `remote_agent_get` 返回。digest 是规范化 JSON 的 SHA256，覆盖结果正文、结构化回执引用、产物链接和宿主返回的文件大小/SHA256 清单 `resultArtifacts`，不包含查询时间。没有文件清单时只绑定已返回的结果与链接，不能据此声称校验了文件字节。PPT 交付保留其领域生成的版本与 digest。
+After a generic A2A result completes, the ledger creates `resultRevision` (`result-1`, `result-2`, …) and `resultDigest` for that attempt. `execution_get` and `remote_agent_get` return them. The digest is the SHA256 of canonical JSON covering the result body, structured receipt references, artifact links, and the host's file size/SHA256 list `resultArtifacts`. It does not include query time. Without a file list, the digest binds only the returned result and links. That is not a claim that file bytes were checked. PPT delivery keeps the revision and digest its domain module already generated.
 
-相同结果的重复读取与重启不会新增版本；结果变化保存新版本，`execution_get/list` 的 `resultHistory` 展示当前轮次的版本快照，历史轮次在 `attempts[].resultHistory` 中保留，版本变化事件携带版本和 digest。已存在的版本不可覆盖，也不可重新选用已被替代的版本。业务验收只接受当前已完成、结果可用的 `attemptId/resultRevision/resultDigest`；结果或执行轮次变化后不继承旧验收，原结论留在 `acceptanceHistory`。网关升级时从已保存的 A2A 完成回执补齐缺失版本，不重跑任务、不新增通知、不自动写业务接受。
+Reading the same result again, including after a restart, does not create a new revision. A changed result is saved as a new revision. `resultHistory` on `execution_get/list` shows snapshots for the current attempt. Earlier attempts keep theirs on `attempts[].resultHistory`. Revision-change events carry the revision and digest. An existing revision cannot be overwritten or selected again after it has been replaced. Business acceptance accepts only the current completed attempt whose result is available, matched by `attemptId/resultRevision/resultDigest`. When the result or attempt changes, the old acceptance is not inherited. The previous conclusion stays in `acceptanceHistory`. On gateway upgrade, missing revisions are filled from saved A2A completion receipts. That does not rerun tasks, add notices, or write business acceptance automatically.
 
-状态为 gateway.json v2，首次升级前备份。执行端和网关应使用同一冻结完整安装包；角色策略与人工目标配置保存在受保护部署目录，公共样例见 [PPT 交付说明](../../examples/ppt-beautifier/delivery-README.md)。网关周期向 Node 重报备，Node 暂时不可用不影响直接调用。
+State is gateway.json v2. Back up before the first upgrade. The executor and the gateway should use the same frozen full install. Role policy and manually registered targets stay in a protected deployment directory. The public sample is the [PPT delivery guide](../../examples/ppt-beautifier/delivery-README.md). The gateway re-registers with Node on a schedule. A temporary Node outage does not block direct calls.
 
-本阶段不实现 AP 执行 Provider、AP 投影或通用 DAG 引擎；workflow 可登记但执行明确返回 unsupported。未知受理保持待核对；领域父任务 input_required 后本版本不自动恢复，需要明确处理，不能把超时当作远端已停止。目录策略是执行准入检查，不是操作系统沙箱。通知入队不等于主会话已实际唤醒，真实闭环需另存新轮次证据。
+This stage does not implement an Activepieces execution provider, an Activepieces projection, or a general DAG engine. A workflow target can be registered, but execution returns unsupported. An unknown admission stays pending review. After a domain parent task is input_required, this version does not resume it automatically. That needs an explicit action. A timeout is not evidence that the remote side has stopped. Directory policy is an execution admission check, not an operating-system sandbox. Queueing a notice does not mean the parent session was actually woken. A real closed loop needs evidence saved on a new attempt.

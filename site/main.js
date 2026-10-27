@@ -33,8 +33,8 @@ for (const button of document.querySelectorAll("[data-copy]")) {
     try {
       await navigator.clipboard.writeText(code.textContent);
       clearTimeout(reset);
-      button.textContent = "已复制 ✓";
-      status.textContent = "命令已复制到剪贴板。";
+      button.textContent = "Copied ✓";
+      status.textContent = "Command copied to the clipboard.";
       reset = setTimeout(() => {
         button.innerHTML = original;
       }, 2200);
@@ -44,9 +44,9 @@ for (const button of document.querySelectorAll("[data-copy]")) {
       range.selectNodeContents(code);
       selection.removeAllRanges();
       selection.addRange(range);
-      status.textContent = "请使用系统复制命令复制已选中的代码。";
+      status.textContent = "Use your system copy command on the selected code.";
       clearTimeout(reset);
-      button.textContent = "代码已选中，请复制";
+      button.textContent = "Code selected. Copy it.";
       reset = setTimeout(() => {
         button.innerHTML = original;
       }, 4000);

@@ -1,38 +1,38 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#12201d" />
     <meta
       name="description"
-      content="agent-workflow：连接原生 Agent 与你的应用。一个 npm 包，提供持久会话、CLI、运行时 SDK、HTTP/WebSocket 服务与 DeepSeek Harness 插件。"
+      content="agent-workflow connects native Agents to your application. One npm package provides persistent sessions, a CLI, a runtime SDK, an HTTP/WebSocket service, and a DeepSeek Harness plugin."
     />
-    <meta property="og:title" content="agent-workflow · 连接原生 Agent，让会话持续运行" />
+    <meta property="og:title" content="agent-workflow · Connect native Agents and keep sessions running" />
     <meta
       property="og:description"
-      content="保留 Agent 的原生模型、工具与会话。通过 CLI、SDK、服务或 DSH 插件接入你的工作流。"
+      content="Keep the Agent's native models, tools, and session. Connect through the CLI, SDK, service, or DSH plugin."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://scottzx.github.io/agent-workflow/" />
     <link rel="canonical" href="https://scottzx.github.io/agent-workflow/" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="styles.css" />
-    <title>agent-workflow · 原生 Agent 的会话连接层</title>
+    <title>agent-workflow · The session layer for native Agents</title>
     <script src="main.js" defer></script>
   </head>
   <body>
-    <a class="skip-link" href="#main">跳到正文</a>
+    <a class="skip-link" href="#main">Skip to content</a>
     <header class="site-header">
       <div class="container header-inner">
-        <a class="brand" href="#main" aria-label="agent-workflow 首页"
+        <a class="brand" href="#main" aria-label="agent-workflow home"
           ><img src="favicon.svg" width="36" height="36" alt="" /><span
-            >agent-workflow<span class="brand-by">一芥智能</span></span
+            >agent-workflow<span class="brand-by">DREAMMATE WORLD</span></span
           ></a
         >
-        <nav aria-label="主导航">
-          <a href="#features">能力</a><a href="#integrations">接入方式</a
-          ><a href="#install">开始使用</a>
+        <nav aria-label="Primary">
+          <a href="#features">Capabilities</a><a href="#integrations">Integrations</a
+          ><a href="#install">Get started</a>
         </nav>
         <a class="header-source" href="https://github.com/scottzx/agent-workflow"
           >GitHub <span aria-hidden="true">↗</span></a
@@ -44,33 +44,34 @@
         <div class="container hero-grid">
           <div class="hero-copy">
             <a class="release-pill" href="https://www.npmjs.com/package/@1agents/acp-service"
-              ><span class="status-dot"></span> v__VERSION__ 已发布
+              ><span class="status-dot"></span> v__VERSION__ published
               <span aria-hidden="true">↗</span></a
             >
             <p class="eyebrow">AGENT CLIENT PROTOCOL / agent-workflow</p>
-            <h1>连接原生 Agent，<br />让会话<span class="accent">持续运行。</span></h1>
+            <h1>Connect native Agents,<br />and keep sessions <span class="accent">running.</span></h1>
             <p class="hero-description">
-              把 Codex、Claude Code、Grok Build
-              的原生能力带进你的应用。保留模型、工具与会话身份，通过统一的 ACP 接口接入工作流。
+              Bring the native capabilities of Codex, Claude Code, and Grok Build into your
+              application. Keep the model, tools, and session identity, and connect the workflow
+              through one ACP interface.
             </p>
             <div class="hero-actions">
               <a class="button button-lime" href="#install"
-                >开始使用 <span aria-hidden="true">↗</span></a
+                >Get started <span aria-hidden="true">↗</span></a
               ><a class="button button-outline" href="https://github.com/scottzx/agent-workflow"
-                >浏览源码 <span aria-hidden="true">↗</span></a
+                >Browse the source <span aria-hidden="true">↗</span></a
               >
             </div>
-            <p class="hero-footnote">开源 · Node.js 22.13+ · 可独立于 DSH 使用</p>
+            <p class="hero-footnote">Open source · Node.js 22.13+ · Works without DSH</p>
           </div>
           <div class="connection-card">
             <div class="card-topline">
               <span class="mono">ONE CONNECTION. NATIVE CAPABILITIES.</span
-              ><span class="diagram-label">架构示意</span>
+              ><span class="diagram-label">Diagram</span>
             </div>
             <div
               class="connection-map"
               role="img"
-              aria-label="CLI、应用 SDK 和 DeepSeek Harness 通过 agent-workflow 连接 Codex、Claude Code 和 Grok Build"
+              aria-label="The CLI, application SDK, and DeepSeek Harness connect Codex, Claude Code, and Grok Build through agent-workflow"
             >
               <div class="node-row applications">
                 <span><b aria-hidden="true">&gt;_</b> CLI</span
@@ -93,18 +94,18 @@
             <div class="session-preview">
               <div>
                 <span class="status-dot"></span><span class="mono">PERSISTENT SESSION</span
-                ><span class="example-label">调用示例</span>
+                ><span class="example-label">Example</span>
               </div>
-              <pre><code><span class="code-comment"># 创建原生会话</span>
+              <pre><code><span class="code-comment"># Create a native session</span>
 <span class="prompt">$</span> acp-service codex sessions new
 
-<span class="code-comment"># 在同一个会话中继续工作</span>
-<span class="prompt">$</span> acp-service codex <span class="code-string">"梳理项目结构"</span></code></pre>
+<span class="code-comment"># Continue in the same session</span>
+<span class="prompt">$</span> acp-service codex <span class="code-string">"Map the project structure"</span></code></pre>
             </div>
           </div>
         </div>
         <div class="container hero-strip">
-          <span>一个包，四种接入方式</span>
+          <span>One package, four ways in</span>
           <div>
             <span>CLI</span><span>Runtime SDK</span><span>HTTP / WebSocket</span
             ><span>DSH Plugin</span>
@@ -115,38 +116,38 @@
       <section class="section container" id="features">
         <div class="section-heading">
           <p class="eyebrow">01 / BUILT AROUND THE AGENT</p>
-          <h2>接入你的系统，<br />保留 Agent 的原生能力。</h2>
+          <h2>Plug into your system.<br />Keep the Agent's own capabilities.</h2>
           <p>
-            从一次命令调用，到应用中的持续会话，<br class="desktop-break" />让协议负责连接，让 Agent
-            继续负责工作。
+            From one command to a session that stays open inside your app,<br class="desktop-break" />the
+            protocol connects, and the Agent keeps doing the work.
           </p>
         </div>
         <div class="feature-grid">
           <article class="feature">
             <span class="feature-symbol" aria-hidden="true">↻</span
             ><span class="feature-number mono">01 — SESSION</span>
-            <h3>会话可以接着做</h3>
+            <h3>Pick the session back up</h3>
             <p>
-              保留原生 Agent、工作区与会话身份。重连时恢复同一会话，持续处理多轮任务；在 DSH
-              中回放托管回合的更新。
+              Keep the native Agent, workspace, and session identity. Reconnecting restores the same
+              session for more turns, and DSH can replay updates from a hosted turn.
             </p>
           </article>
           <article class="feature">
             <span class="feature-symbol" aria-hidden="true">⌘</span
             ><span class="feature-number mono">02 — CAPABILITIES</span>
-            <h3>原生模型与工具</h3>
+            <h3>Native models and tools</h3>
             <p>
-              使用 Agent 实际提供的模型、推理设置、模式和命令。在 DSH 中处理权限请求，工具仍由原生
-              Agent 执行。
+              Use the models, reasoning settings, modes, and commands the Agent actually exposes.
+              Answer permission requests in DSH. The native Agent still runs the tools.
             </p>
           </article>
           <article class="feature">
             <span class="feature-symbol" aria-hidden="true">⇄</span
             ><span class="feature-number mono">03 — INTEGRATION</span>
-            <h3>从本机接入工作流</h3>
+            <h3>Connect from this machine</h3>
             <p>
-              用 CLI 运行任务，用 SDK 嵌入应用，或通过 HTTP 与 WebSocket 建立连接。需要跨 Agent
-              委派时，再按需开启 A2A。
+              Run work with the CLI, embed the SDK, or connect over HTTP and WebSocket. Turn on A2A
+              only when you need to delegate across Agents.
             </p>
           </article>
         </div>
@@ -157,17 +158,17 @@
           <div class="integration-intro">
             <div>
               <p class="eyebrow">02 / NATIVE IN YOUR WORKSPACE</p>
-              <h2>在熟悉的工作台，<br />继续原生会话。</h2>
+              <h2>Stay in the workspace you know.<br />Continue the native session.</h2>
             </div>
             <div>
               <p>
-                通过 DeepSeek Harness 插件，选择已发现的 ACP Agent
-                与本地工作区，直接使用它的模型选项、原生命令和权限交互。
+                With the DeepSeek Harness plugin, pick a discovered ACP Agent and a local workspace,
+                then use its model options, native commands, and permission prompts directly.
               </p>
               <a
                 class="text-link"
                 href="https://github.com/scottzx/agent-workflow/blob/main/packages/dsh-plugin/README.md"
-                >阅读 DSH 接入指南 <span aria-hidden="true">↗</span></a
+                >Read the DSH guide <span aria-hidden="true">↗</span></a
               >
             </div>
           </div>
@@ -178,22 +179,25 @@
             </div>
             <img
               src="assets/dsh-codex-controls.png"
-              alt="DeepSeek Harness 中的 ACP · Codex 会话，显示原生模型选择和 ACP 设置入口"
+              alt="An ACP Codex session in DeepSeek Harness, showing native model selection and the ACP settings entry"
               width="2924"
               height="1478"
               loading="lazy"
             />
             <figcaption>
-              <span>原生模型选择 · ACP 会话设置 · 本地工作区</span
-              ><span>实际界面 · 本地 DSH 验证构建</span>
+              <span>Native model selection · ACP session settings · Local workspace</span
+              ><span>Real UI · Local DSH verification build</span>
             </figcaption>
           </figure>
           <div class="integration-notes">
             <p>
-              <span class="note-mark" aria-hidden="true">↳</span> 也可以独立运行 CLI、SDK
-              与服务，接入自己的应用。
+              <span class="note-mark" aria-hidden="true">↳</span> You can also run the CLI, SDK, and
+              service on their own and connect your own application.
             </p>
-            <p>具体模型与控制项取决于 Agent、适配器和账号。当前 DSH 插件支持文本提示。</p>
+            <p>
+              The available models and controls depend on the Agent, adapter, and account. The DSH
+              plugin currently accepts text prompts.
+            </p>
           </div>
         </div>
       </section>
@@ -201,28 +205,31 @@
       <section class="section container install-section" id="install">
         <div class="install-copy">
           <p class="eyebrow">03 / GET STARTED</p>
-          <h2>一个安装入口。<br />从你需要的方式开始。</h2>
+          <h2>One install.<br />Start the way you need.</h2>
           <p class="install-description">
-            正式分发包
+            The published package
             <a href="https://www.npmjs.com/package/@1agents/acp-service">@1agents/acp-service</a>
-            包含运行时、CLI、服务与 DSH 插件。
+            includes the runtime, CLI, service, and DSH plugin.
           </p>
           <div class="requirements">
-            <h3>开始前</h3>
+            <h3>Before you start</h3>
             <p>
-              安装 Node.js 22.13 或更新版本，并在运行主机上准备好原生 Agent CLI、登录凭据及对应的
-              ACP 适配器。
+              Install Node.js 22.13 or newer, and have the native Agent CLI, its credentials, and
+              the matching ACP adapter available on the host that will run it.
             </p>
-            <p>安装 DSH 插件后，重启 DSH 并确认插件已启用。插件可自动启动或复用本地 ACP 服务。</p>
+            <p>
+              After installing the DSH plugin, restart DSH and confirm the plugin is enabled. The
+              plugin starts or reuses its local ACP service.
+            </p>
           </div>
           <a
             class="text-link"
             href="https://github.com/scottzx/agent-workflow/blob/main/packages/service/README.md"
-            >完整安装与配置文档 <span aria-hidden="true">↗</span></a
+            >Full install and configuration guide <span aria-hidden="true">↗</span></a
           >
         </div>
         <div class="quickstart">
-          <div class="install-tabs" role="tablist" aria-label="选择接入方式">
+          <div class="install-tabs" role="tablist" aria-label="Choose how to connect">
             <button
               id="tab-dsh"
               type="button"
@@ -232,7 +239,7 @@
               tabindex="0"
               data-tab="dsh"
             >
-              DSH 插件</button
+              DSH plugin</button
             ><button
               id="tab-cli"
               type="button"
@@ -252,7 +259,7 @@
               tabindex="-1"
               data-tab="sdk"
             >
-              SDK / 服务
+              SDK / service
             </button>
           </div>
           <div
@@ -268,16 +275,16 @@
                 class="copy-button"
                 type="button"
                 data-copy="code-dsh"
-                aria-label="复制 DSH 安装命令"
+                aria-label="Copy the DSH install command"
               >
-                复制命令 <span aria-hidden="true">⧉</span>
+                Copy command <span aria-hidden="true">⧉</span>
               </button>
             </div>
-            <pre><code id="code-dsh"><span class="code-comment"># 安装到 DSH 的 web profile</span>
+            <pre><code id="code-dsh"><span class="code-comment"># Install into the DSH web profile</span>
 dsh plugin --profile web add @1agents/acp-service</code></pre>
             <div class="panel-note">
-              <span class="step-tag">接下来</span>
-              <p>重启 DSH → 启用插件 → 新建 <strong>ACP · Agent</strong> 会话 → 选择现有工作区。</p>
+              <span class="step-tag">Next</span>
+              <p>Restart DSH → enable the plugin → create an <strong>ACP · Agent</strong> session → choose an existing workspace.</p>
             </div>
           </div>
           <div
@@ -294,20 +301,20 @@ dsh plugin --profile web add @1agents/acp-service</code></pre>
                 class="copy-button"
                 type="button"
                 data-copy="code-cli"
-                aria-label="复制 CLI 安装与使用命令"
+                aria-label="Copy the CLI install and usage commands"
               >
-                复制命令 <span aria-hidden="true">⧉</span>
+                Copy command <span aria-hidden="true">⧉</span>
               </button>
             </div>
-            <pre><code id="code-cli"><span class="code-comment"># 安装统一 CLI</span>
+            <pre><code id="code-cli"><span class="code-comment"># Install the unified CLI</span>
 npm install -g @1agents/acp-service
 
-<span class="code-comment"># 创建并使用 Codex 会话</span>
+<span class="code-comment"># Create and use a Codex session</span>
 acp-service codex sessions new
-acp-service codex "梳理当前项目结构"</code></pre>
+acp-service codex "Map the current project structure"</code></pre>
             <div class="panel-note">
-              <span class="step-tag">独立使用</span>
-              <p>不依赖 DSH。进入你的项目目录后运行，Agent 使用本机的工具与登录凭据。</p>
+              <span class="step-tag">Standalone</span>
+              <p>DSH is not required. Run it from your project directory. The Agent uses the tools and credentials on this machine.</p>
             </div>
           </div>
           <div
@@ -324,12 +331,12 @@ acp-service codex "梳理当前项目结构"</code></pre>
                 class="copy-button"
                 type="button"
                 data-copy="code-sdk"
-                aria-label="复制 SDK 服务示例"
+                aria-label="Copy the SDK service example"
               >
-                复制代码 <span aria-hidden="true">⧉</span>
+                Copy code <span aria-hidden="true">⧉</span>
               </button>
             </div>
-            <pre><code id="code-sdk"><span class="code-comment">// 先安装：npm install @1agents/acp-service</span>
+            <pre><code id="code-sdk"><span class="code-comment">// Install first: npm install @1agents/acp-service</span>
 import { serveAcpService } from "@1agents/acp-service";
 
 const service = await serveAcpService({
@@ -338,12 +345,12 @@ const service = await serveAcpService({
   report: false,
 });
 
-<span class="code-comment">// 结束时：await service.close();</span></code></pre>
+<span class="code-comment">// When finished: await service.close();</span></code></pre>
             <div class="panel-note">
-              <span class="step-tag">嵌入应用</span>
+              <span class="step-tag">Embed</span>
               <p>
-                通过 HTTP / WebSocket 提供 ACP 服务。另有 <code>/runtime</code> 与
-                <code>/flows</code> 导出供应用集成。
+                Serve ACP over HTTP / WebSocket. <code>/runtime</code> and
+                <code>/flows</code> exports are also available for application integration.
               </p>
             </div>
           </div>
@@ -360,17 +367,17 @@ const service = await serveAcpService({
       <section class="resources container">
         <div>
           <p class="eyebrow">KEEP BUILDING</p>
-          <h2>从接入，走向协作。</h2>
+          <h2>From a connection to a collaboration.</h2>
         </div>
         <div class="resource-links">
           <a href="https://github.com/scottzx/agent-workflow/blob/main/packages/service/README.md"
-            ><span><small>DOCUMENTATION</small>服务与 SDK 文档</span
+            ><span><small>DOCUMENTATION</small>Service and SDK docs</span
             ><span aria-hidden="true">↗</span></a
           ><a href="https://github.com/scottzx/agent-workflow/blob/main/docs/activepieces-automation.md"
-            ><span><small>WORKFLOWS</small>Activepieces 自动化</span
+            ><span><small>WORKFLOWS</small>Activepieces automation</span
             ><span aria-hidden="true">↗</span></a
           ><a href="https://github.com/scottzx/1acp/releases"
-            ><span><small>RELEASES</small>版本与发布记录</span><span aria-hidden="true">↗</span></a
+            ><span><small>RELEASES</small>Versions and releases</span><span aria-hidden="true">↗</span></a
           >
         </div>
       </section>
@@ -379,13 +386,13 @@ const service = await serveAcpService({
       <a class="brand footer-brand" href="#main"
         ><img src="favicon.svg" alt="" width="28" height="28" /><span>agent-workflow</span></a
       >
-      <p>连接原生 Agent 与你的应用。一芥天地（DreamMate World）· 一芥智能。</p>
+      <p>Connect native Agents to your application. Part of DreamMate World.</p>
       <div>
         <a href="https://github.com/scottzx/agent-workflow">GitHub ↗</a
         ><a href="https://www.npmjs.com/package/@1agents/acp-service">npm ↗</a
-        ><a href="llms.txt">面向 Agent 的说明 ↗</a>
+        ><a href="llms.txt">Notes for Agents ↗</a>
       </div>
-      <span class="footer-credit">一芥天地 · DREAMMATE WORLD · 一芥智能</span>
+      <span class="footer-credit">DREAMMATE WORLD</span>
     </footer>
   </body>
 </html>

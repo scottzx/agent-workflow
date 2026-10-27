@@ -6,7 +6,7 @@ Repo: https://github.com/scottzx/agent-workflow
 
 ## Unreleased
 
-- Repository: the product brand is agent-workflow, part of 一芥天地 (DreamMate World) by 一芥智能. GitHub is now https://github.com/scottzx/agent-workflow. The npm package remains `@scottzx/1acp`, and the `1acp` / `acpx` commands are unchanged. Historical release notes below are unchanged.
+- Repository: the product brand is agent-workflow, part of DreamMate World. GitHub is now https://github.com/scottzx/agent-workflow. The npm package remains `@scottzx/1acp`, and the `1acp` / `acpx` commands are unchanged. Historical release notes below are unchanged.
 
 ## 0.20.0 - 2026-10-20
 
