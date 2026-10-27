@@ -136,7 +136,7 @@ that A2A completion and business acknowledgement follow the DSH turn ending.
 
 The temporary dispatch flow uses every-minute Cron. Choose its real business
 task and cadence before enabling it. The demo report is available in the result
-run's “保存智能体报告” step. No Plane writeback is configured by this example.
+run's step that saves the agent report. No Plane writeback is configured by this example.
 
 WSL keeps its original Activepieces sandbox mode and container environment.
 The DSH Agent Card origin was corrected to match the reachable relay; the

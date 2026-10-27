@@ -1,7 +1,7 @@
 {
   "name": "@1agents/acp-workspace",
   "private": true,
-  "description": "agent-workflow workspace: dispatch, acceptance, and human-in-the-loop agent task flow. Part of 一芥天地 (DreamMate World) by 一芥智能.",
+  "description": "agent-workflow workspace: dispatch, acceptance, and human-in-the-loop agent task flow. Part of DreamMate World.",
   "homepage": "https://scottzx.github.io/agent-workflow/",
   "bugs": {
     "url": "https://github.com/scottzx/agent-workflow/issues"

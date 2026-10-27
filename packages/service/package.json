@@ -1,7 +1,7 @@
 {
   "name": "@1agents/acp-service",
   "version": "0.9.0",
-  "description": "agent-workflow ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness ACP/A2A plugins in one package. Part of 一芥天地 (DreamMate World).",
+  "description": "agent-workflow ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness ACP/A2A plugins in one package. Part of DreamMate World.",
   "keywords": [
     "dreammate",
     "acp",
