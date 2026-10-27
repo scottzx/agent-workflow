@@ -11,7 +11,7 @@ export function verifyPackageBuild(root = resolve(import.meta.dirname, '..')) {
     accessSync(join(service, target));
   }
   for (const target of Object.values(manifest.bin)) accessSync(join(service, target));
-  for (const target of ['vendor/runtime/package.json', 'vendor/dsh/service-worker.js']) accessSync(join(service, target));
+  for (const target of ['vendor/runtime/package.json', 'vendor/dsh/service-worker.js', 'dist/workbench-ui/index.html', 'dist/workbench-ui/app.js']) accessSync(join(service, target));
   const patch = readFileSync(join(service, manifest.dsh.bundle.patch), 'utf8');
   assert.ok(patch.includes(`name: '${manifest.name}'`), 'DSH patch must load the package root so its client face is discovered');
   const client = readFileSync(join(service, manifest.exports['./client']), 'utf8');

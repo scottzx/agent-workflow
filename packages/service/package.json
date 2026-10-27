@@ -80,8 +80,8 @@
     "vendor"
   ],
   "scripts": {
-    "build": "node ../../scripts/embed-runtime.mjs && tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node ../../scripts/embed-runtime.mjs && tsc -p tsconfig.build.json && node workbench-ui/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p workbench-ui/tsconfig.json",
     "test": "npm run build && npm run test:only",
     "prepack": "node ../../scripts/verify-package-build.mjs",
     "start": "tsx bin/acp-service.ts",
@@ -98,16 +98,18 @@
     "@agentclientprotocol/sdk": "1.4.0",
     "@openclaw/fs-safe": "^0.26.7",
     "commander": "^15.0.0",
+    "dsh-zod": "npm:zod@4.4.3",
     "skillflag": "^0.2.1",
     "tsx": "^4.23.15",
     "ws": "^8.18.0",
-    "zod": "^4.6.5",
-    "dsh-zod": "npm:zod@4.4.3"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@scottzx/1acp": "workspace:*",
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.14",
+    "esbuild": "0.28.2",
+    "preact": "10.29.2",
     "typescript": "^5.7.2"
   },
   "dsh": {

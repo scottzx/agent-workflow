@@ -16,6 +16,7 @@ import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSc
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
@@ -1500,6 +1501,7 @@ function methodContractViolations(methods: Record<string, { description?: unknow
 
 export async function serveA2AGateway(input: A2AGatewayConfig, options: { report?: boolean } = {}) {
   const gateway = new RemoteAgentGateway(input);
+  const workbenchUi = gateway.config.workbench ? new WorkbenchUi(gateway.config.workbench.token) : undefined;
   const callbackHealth: { state?: 'pending' | 'listening' } = {};
   const server = http.createServer((req, res) => { void (async () => {
     try {
@@ -1513,21 +1515,30 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           ...(callbackHealth.state === 'pending' ? { callback: 'pending' } : {}) });
       }
       const url = new URL(req.url ?? '/', 'http://localhost');
-      if (url.pathname.startsWith('/workbench/')) {
-        if (!gateway.config.workbench) return json(res, 503, { error: 'Workbench is not configured' });
-        if (!authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
-        if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated application workbench' });
-        if (req.method === 'GET' && url.pathname === '/workbench/tasks') {
+      const page = url.pathname === WORKBENCH_UI_PATH || url.pathname.startsWith(`${WORKBENCH_UI_PATH}/`);
+      if (page || url.pathname.startsWith('/workbench/')) {
+        if (!gateway.config.workbench || !workbenchUi) return json(res, 503, { error: 'Workbench is not configured' });
+        // The page reaches the same routes as the bearer API once its own login and origin checks pass.
+        let pathname = url.pathname;
+        if (page) {
+          const routed = await workbenchUi.handle(req, res, url);
+          if (!routed) return;
+          pathname = routed.route;
+        } else {
+          if (!authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
+          if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
+        }
+        if (req.method === 'GET' && pathname === '/workbench/tasks') {
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
         }
-        const agentCreate = req.method === 'POST' && url.pathname === '/workbench/agents';
-        const agentChange = /^\/workbench\/agents\/([^/]+)\/(settings|publish)$/.exec(url.pathname);
-        if (url.pathname === '/workbench/agents' || agentChange) {
+        const agentCreate = req.method === 'POST' && pathname === '/workbench/agents';
+        const agentChange = /^\/workbench\/agents\/([^/]+)\/(settings|publish)$/.exec(pathname);
+        if (pathname === '/workbench/agents' || agentChange) {
           if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
         }
-        if (req.method === 'GET' && url.pathname === '/workbench/agents') return json(res, 200, gateway.workbenchAgents());
+        if (req.method === 'GET' && pathname === '/workbench/agents') return json(res, 200, gateway.workbenchAgents());
         if (agentCreate || agentChange) {
           if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
           try {
@@ -1545,9 +1556,11 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           }
         }
         if (url.search) return json(res, 404, { error: 'No workbench route' });
-        const route = /^\/workbench\/tasks\/([^/]+)(.*)$/.exec(url.pathname);
+        const route = /^\/workbench\/tasks\/([^/]+)(.*)$/.exec(pathname);
         if (!route) return json(res, 404, { error: 'No workbench route' });
         const jobId = decodeURIComponent(route[1]!), rest = route[2] ?? '';
+        // Only the DSH host opens process requests; the page can read and answer them.
+        if (page && rest === '/process-requests') return json(res, 403, { error: 'browser_action_required', message: 'Process requests are opened by the execution host.' });
         const review = /^\/reviews\/([^/]+)\/decisions$/.exec(rest);
         const answer = /^\/process-requests\/([^/]+)\/answers$/.exec(rest);
         const one = /^\/process-requests\/([^/]+)$/.exec(rest);
