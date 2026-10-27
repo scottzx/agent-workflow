@@ -127,6 +127,10 @@ export class AcpAdapter implements LlmAdapter {
   providerInfo(provider: string) { return { id: provider, name: 'ACP Agents' }; }
   providerRetryPolicy() { return { mode: 'normal' as const, maxRetries: 0, retryableCodes: [], initialDelayMs: 1000, maxDelayMs: 1000, jitterRatio: 0 }; }
   imageRequestPricing() { return undefined; }
+  /** DSH 0.2.1 requires this. ACP Agents take text only, so keep the base class's untouched image target. */
+  imageRequestTarget(_provider: string, _model: string, image: { width: number; height: number; bytes: number }) {
+    return { width: image.width, height: image.height, maxBytes: image.bytes };
+  }
   async listModels(provider: string): Promise<LlmModelInfo[]> {
     return [];
   }
