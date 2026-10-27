@@ -57,7 +57,7 @@ class RoleSkillLoadingError extends Error {
   constructor(cause: unknown) { super('Role skills could not be loaded or verified; the model was not started', { cause }); }
 }
 
-const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS']);
+const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS', 'MODEL_UNAVAILABLE', 'MODEL_SELECTION_UNSUPPORTED']);
 
 function sessionFailureCode(error: unknown): string | undefined {
   const seen = new Set<unknown>();
@@ -100,10 +100,11 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   const metadata: unknown = request.metadata?.['1agents'];
   if (metadata !== undefined && (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))) throw new RequestMalformedError('metadata.1agents must be an object');
   const value = (metadata ?? {}) as Record<string, unknown>;
-  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
-  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath']) {
+  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'provider', 'model'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
+  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath', 'provider', 'model']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !(value[key] as string).trim())) throw new RequestMalformedError(`${key} must be a nonempty string`);
   }
+  if ((value.provider === undefined) !== (value.model === undefined)) throw new RequestMalformedError('provider and model must be passed together');
   if (value.roleId !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value.roleId as string)
       || !options.roleSkills || !Object.hasOwn(options.roleSkills.profiles, value.roleId as string))) throw new RequestMalformedError('Unknown host role');
   if (value.roleLockPath !== undefined && (!options.roleSkills || !isAbsolute(value.roleLockPath as string)
@@ -121,7 +122,8 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   return { prompt, input: { cwd, agentPreset: value.agentPreset as string | undefined,
     ...(preflight?.success ? { preflight: preflight.data } : {}),
     ...(value.roleId ? { roleId: value.roleId as string } : {}),
-    ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}) },
+    ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}),
+    ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}) },
     ...(resultContract?.success ? { resultContract: resultContract.data } : {}) };
 }
 
@@ -281,15 +283,22 @@ export class A2ASessionExecutor implements AgentExecutor {
         try { role = await this.roleFor(input, saved, key, controller.signal); }
         catch (error) { throw new RoleSkillLoadingError(error); }
         controller.signal.throwIfAborted();
+        const agentPreset = input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset;
+        // ACP Agents publish their own model options through session/set_config_option.
+        if (input.provider && agentPreset?.startsWith('oneagents-acp-')) throw Object.assign(new Error('provider and model apply only to standard presets'), { code: 'MODEL_SELECTION_UNSUPPORTED' });
         // ACP session preparation can itself wait in the process FIFO.
-        if ((input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset)?.startsWith('oneagents-acp-')) pendingCapacity();
+        if (agentPreset?.startsWith('oneagents-acp-')) pendingCapacity();
         // Acquire only after context/role waits, immediately before session creation.
         capacityLease = await acquireCapacity();
         controller.signal.throwIfAborted();
         target = await this.backend.prepare({ sessionId: saved?.sessionId,
           cwd: input.cwd ?? saved?.cwd ?? this.options.defaultCwd,
-          agentPreset: input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset,
-          ...(input.preflight ? { preflight: input.preflight } : {}) }, { signal: controller.signal });
+          agentPreset,
+          ...(input.preflight ? { preflight: input.preflight } : {}),
+          ...(input.provider ? { provider: input.provider, model: input.model } : {}) }, { signal: controller.signal });
+        if (input.provider && !target.provider) throw Object.assign(new Error('The host did not apply the requested model'), { code: 'MODEL_UNAVAILABLE' });
+        // The DSH session keeps its earlier selection; report it until a new value is passed.
+        if (!target.provider && saved?.provider) { target.provider = saved.provider; target.model = saved.model; }
         if (role) { target.roleId = role.roleId; target.roleSkills = role.summary; promptPrefix = role.promptPrefix; }
         this.store.saveTarget(context.contextId, target, context.context);
       } finally {

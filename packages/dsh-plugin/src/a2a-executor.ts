@@ -18,7 +18,7 @@ export interface SessionControl {
   status(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }>;
 }
 
-function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT', message: string): Error {
+function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT' | 'MODEL_UNAVAILABLE' | 'MODEL_SELECTION_UNSUPPORTED', message: string): Error {
   const error = new Error(message) as Error & { code: string };
   error.code = code;
   return error;
@@ -164,8 +164,12 @@ export class DshA2ABackend implements A2ABackend {
       if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw sessionError('SESSION_CONFLICT', 'Existing session cwd conflicts');
       signal?.throwIfAborted();
       if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw sessionError('SESSION_CONFLICT', 'Existing session preset conflicts');
-      return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight };
+      if (input.provider !== undefined) await this.requireModel(input, agentPreset, signal);
+      const selected = await this.selectModel(input, input.sessionId as SessionId, signal);
+      return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight, ...selected };
     }
+    // Reject an unknown model before a blank session is created for it.
+    if (input.provider !== undefined) await this.requireModel(input, agentPreset, signal);
     const created = await this.ctx.sessionController.create({
       cwd,
       ...(agentPreset === undefined ? {} : { agentPreset }),
@@ -175,12 +179,34 @@ export class DshA2ABackend implements A2ABackend {
     signal?.throwIfAborted();
     const agent = await this.agent(created.sessionId);
     signal?.throwIfAborted();
+    const selected = await this.selectModel(input, created.sessionId, signal);
     return {
       sessionId: created.sessionId,
       cwd: agent.session.header.cwd ?? cwd,
       ...(created.agentPreset === undefined ? {} : { agentPreset: created.agentPreset }),
       preflight,
+      ...selected,
     };
+  }
+
+  /** Standard presets only. The catalog must list the exact model; a miss never falls back to the host default. */
+  private async requireModel(input: A2APrepareInput, agentPreset: string | undefined, signal?: AbortSignal): Promise<void> {
+    if (agentPreset?.startsWith('oneagents-acp-')) throw sessionError('MODEL_SELECTION_UNSUPPORTED', 'provider and model apply only to standard presets');
+    const catalog = await this.ctx.sessionController.modelCatalog();
+    signal?.throwIfAborted();
+    if (!catalog.groups.some(group => group.id === input.provider && group.models.some(model => model.id === input.model))) {
+      throw sessionError('MODEL_UNAVAILABLE', `Model ${input.provider}/${input.model} is not in the DSH model catalog`);
+    }
+  }
+
+  /** Install the requested model before the first prompt and return what DSH resolved. Omitted fields leave the session unchanged. */
+  private async selectModel(input: A2APrepareInput, sessionId: SessionId, signal?: AbortSignal): Promise<{ provider?: string; model?: string }> {
+    if (input.provider === undefined || input.model === undefined) return {};
+    let selected;
+    try { ({ selected } = await this.ctx.sessionController.selectModel({ sessionId, provider: input.provider, model: input.model })); }
+    catch (error) { throw Object.assign(sessionError('MODEL_UNAVAILABLE', `DSH did not select ${input.provider}/${input.model}`), { cause: error }); }
+    signal?.throwIfAborted();
+    return { provider: selected.provider, model: selected.model };
   }
 
   /** Admit one identified queued prompt and wait only for its own turn, independent of the HTTP connection.

@@ -82,10 +82,11 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
   clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
+  provider: string.optional(), model: string.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
 const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
@@ -120,10 +121,10 @@ const EXECUTION_METHODS = {
 export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时保持 persistent；one-shot 在完成、失败或取消后普通关闭进程，runtime 仍是 persistent。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时保持 persistent；one-shot 在完成、失败或取消后普通关闭进程，runtime 仍是 persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
   remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。mode 为 delete 时还删除 ACP 会话记录，之后不能接回；仅在网关配置 sessionLifecycle.allowDelete 时接受，否则返回 DELETE_DISABLED，不删除 DSH 会话历史。', parameters: z.toJSONSchema(closeSchema) },
   remote_agent_sessions: { description: '按 prewarm、job、user-opened 和未标注列出本机进程租约，并给出 taskSlot 与 processSlot。只读，不关闭、不补标已经在跑的进程。', parameters: z.toJSONSchema(sessionsSchema) },
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
@@ -364,6 +365,10 @@ export class RemoteAgentGateway {
         return this.ledgerView(input.originSessionId, job.jobId);
       }
       const fields = resolved.input;
+      const provider = fields.provider === undefined ? undefined : string.parse(fields.provider);
+      const model = fields.model === undefined ? undefined : string.parse(fields.model);
+      if ((provider === undefined) !== (model === undefined)) throw new Error('provider and model must be passed together');
+      if (provider && isAcpAgentPreset(resolved.agentPreset)) throw new Error('provider and model apply only to standard presets; oneagents-acp-* presets switch models through session/set_config_option');
       const preflight = fields.preflight === undefined ? undefined : a2aPreflightRequirementsSchema.parse(fields.preflight);
       const requirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
@@ -385,7 +390,7 @@ export class RemoteAgentGateway {
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
-          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}) } },
+          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}) } },
         configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
           authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
       if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
@@ -744,7 +749,7 @@ export class RemoteAgentGateway {
   }
   private view(job: Job) {
     const task = Task.fromJSON(job.task);
-    const meta = task.metadata?.['1agents'] as { sessionId?: string; preflight?: unknown; result?: unknown; capacity?: unknown; taskSlot?: unknown; processSlot?: unknown; resumed?: unknown; restoreMethod?: unknown } | undefined;
+    const meta = task.metadata?.['1agents'] as { sessionId?: string; preflight?: unknown; result?: unknown; capacity?: unknown; taskSlot?: unknown; processSlot?: unknown; resumed?: unknown; restoreMethod?: unknown; provider?: unknown; model?: unknown } | undefined;
     const result = job.attemptId ? this.ledger.getAttempt(job.attemptId).result : undefined;
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
       ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
@@ -755,6 +760,7 @@ export class RemoteAgentGateway {
       ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
       ...(meta?.resumed === true ? { resumed: true } : {}),
       ...(meta?.restoreMethod === 'session/load' || meta?.restoreMethod === 'session/resume' ? { restoreMethod: meta.restoreMethod } : {}),
+      ...(typeof meta?.provider === 'string' && typeof meta.model === 'string' ? { provider: meta.provider, model: meta.model } : {}),
       ...(job.lifecycle ? { lifecycle: job.lifecycle } : {}),
       ...(job.sessionState ? { sessionState: job.sessionState } : {}),
       ...(job.processReleased !== undefined ? { processReleased: job.processReleased } : {}),
@@ -1030,6 +1036,7 @@ export class RemoteAgentGateway {
           ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
           ...(input.roleId ? { roleId: input.roleId } : {}), ...(input.roleLockPath ? { roleLockPath: input.roleLockPath } : {}),
           ...(input.lifecycle ? { lifecycle: input.lifecycle } : previous.lifecycle ? { lifecycle: previous.lifecycle } : {}),
+          ...(input.provider !== undefined ? { provider: input.provider } : {}), ...(input.model !== undefined ? { model: input.model } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);

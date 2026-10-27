@@ -1,7 +1,7 @@
 # A2A 缺口收口方案
 
 - 日期：2026-10-27（Asia/Shanghai）。
-- 状态：**P0、P1、P1.5 和 P3 的空闲回收、`INPUT_REQUIRED` 告警与计数已写进源码并通过隔离测试。P2 的接回已在测试里覆盖，真机两项只读检查未做。P3 的受控 delete 已实现，默认关闭。G9 未做。未重启服务，未部署。** 进度见 §5.1。
+- 状态：**P0、P1、P1.5 和 P3 的空闲回收、`INPUT_REQUIRED` 告警与计数已写进源码并通过隔离测试。P2 的接回已在测试里覆盖，真机两项只读检查未做。P3 的受控 delete 已实现，默认关闭。G9 已在单独分支实现并通过隔离测试。未重启服务，未部署。** 进度见 §5.1。
 - 依据：文档里仍写着未完成的 A2A 缺口，并在当日源码上核对过仍成立的部分。会话关闭的代码位置见 [2026-10-26 核对记录](a2a-session-lifecycle-close-resume-20261026.md)。该文第九节的待决定项以本文为准。补充结论来自 `packages/runtime` 的 `ensureSession`、`close` 和 `connectAndLoadSession`，以及 ACP 服务与 DSH 适配器的现有调用。
 - 源码基线：仓库 `@1agents/acp-service` **0.9.0**。2026-10-25 的本机发布记录仍是 0.8.3 本地包；本文不把线上进程写成已经升到 0.9.0。
 
@@ -268,6 +268,14 @@ P3 给 `INPUT_REQUIRED` 单独计时，初值 2 小时。到时写一条带 sess
 
 要做时单独开，不并进 P0–P3。候选形状是：只对 `standard` 增加可选的 provider 和 model；创建会话之后、第一条 prompt 之前，对照 `modelCatalog()` 调用 `selectModel`；目录里没有就让任务失败，不静默退回默认模型。不传时保持现在的宿主默认，避免旧派单改行为。同一 `contextId` 沿用已经选中的模型，除非这次明确带了新值。回执里写上实际使用的 provider 和 model。模型名只出现在这两个字段里，不靠 prompt 正文切换。
 
+实现（2026-10-27，分支 `a2a-g9-standard-model-20261027`）按上面的形状：
+
+- spawn、message 的 schema 加可选 `provider`、`model`，两者必须一起传。网关在预设已知为 `oneagents-acp-*` 时直接拒绝。`metadata.1agents` 解析器接受这两个字段并带进 `A2APrepareInput`。宿主执行器按实际生效的预设（请求、已存会话或宿主默认）再查一次，是 ACP 就让任务失败，代码 `MODEL_SELECTION_UNSUPPORTED`，不调用 `prepare`。
+- `DshA2ABackend.prepare` 先查 `modelCatalog()`，provider 分组里没有这个模型 id 就失败（`MODEL_UNAVAILABLE`），不创建空白会话。然后 `create`，再 `selectModel({ sessionId, provider, model })`，第一条 prompt 在这之后。`selectModel` 自身报错也记成 `MODEL_UNAVAILABLE`。宿主没有回写所选模型时执行器同样失败，不静默用默认。
+- 已有会话：不传就不调用目录和 `selectModel`，DSH 会话日志里已有的选择继续生效；执行器把已存 target 里的 provider、model 带到新回合的回执上。传了新值就核对目录后对同一 `sessionId` 再选一次。
+- 回执：target、`resultMetadata` 和 `remote_agent_get` 带 DSH 返回的 `selected.provider`、`selected.model`。不传时这两个字段不出现。
+- 已知副作用：DSH 的 `selectModel` 在选中后还会 `agentDefaultModel.saveSelection`，把这次选择存成宿主默认。派过一次 DeepSeek 之后，不写模型的 `standard` 派单和 DSH 界面里新开的会话都会用 DeepSeek，直到再有人换。已经跑过回合的会话不受影响。这与 DSH 界面换模型的行为一致。本轮不绕开它；若要隔离，需要 DSH 提供只改会话、不改默认的选择接口，或在派单后恢复默认。
+
 ## 5. 实施顺序
 
 每期单独可审查。前一期的测试没过，不开始后一期。全部在新分支上做，不直接改正在跑的 release。
@@ -340,6 +348,7 @@ G8 不排进 P0–P3。
 | P1 | 已实现 | `remote_agent_close`、spawn/message 的 `lifecycle`、one-shot 终态关闭；宿主 `/sessions/close`、`/sessions/status`；DSH 适配器普通 `session/close`；进程名额等待移出 60 秒，任务保持 `CAPACITY_PENDING` |
 | P1.5 | 已实现 | `taskSlot`、`processSlot.headWaitMs`；`remote_agent_sessions` 按来源列租约 |
 | P2 | 测试已覆盖 | 关闭后 message 接回同一会话并返回 `resumed`、`restoreMethod`；`autoResume: false`；删除与冲突不替换；满额时保持 Pending。`classifyColdAttach` 只记卡点。真机的模型记忆检查和闲置数小时检查仍在上线前做 |
+| G9 | 已实现，单独分支 `a2a-g9-standard-model-20261027` | 见 §4.10 末尾。spawn、message 可传 `provider`、`model`，仅限 `standard` 等非 ACP 预设；目录里没有则任务失败；不传保持宿主默认；回执带实际模型。DSH `selectModel` 会顺带改宿主默认模型 |
 | P3 | 已实现 | 网关按 `sessionLifecycle.idleScanIntervalMs`（默认 60 秒）扫描。只处理 `oneagents-acp-*` 且整个 context 都已终态的会话；`status` 必须返回已附着且没有进行中的回合，查不到就不关。空闲从最后一轮的终态时间算起。时限：job 的 `idleTtlSeconds` 优先，否则 `sessionLifecycle.persistentIdleTtlSeconds`（默认 600）。`INPUT_REQUIRED` 超过 `inputRequiredAlertSeconds`（默认 7200）每轮只告警一次。`/health.sessions` 给出 busy、告警、按原因的关闭数、`restoreMethod` 计数、关闭失败数、`processReleasePending`。one-shot 补关沿用每次 reconcile 的重试，没有另设 30 秒。受控 delete：`remote_agent_close` 加 `mode: "delete"`，网关 `sessionLifecycle.allowDelete` 默认 false，未打开时返回 `DELETE_DISABLED` 且不联系远端。宿主 `/sessions/delete` 调 ACP `session/delete`，把 target 标成 `deleted`。进程已关时适配器只建裸连接发 delete，不重新附着、不拉起 agent。DSH 原生会话历史不删。之后 message 返回 `SESSION_DELETED`，网关和宿主两层都拒绝 |
 
 隔离测试：`packages/service` 全部 385 项通过，插件 `adapter`、`a2a-executor` 等通过。插件 `service-process.test.mjs` 的「real Cordis startup failure」在本机失败，原因是正在运行的 DSH 占着默认 A2A 存储目录的租约，与这批改动无关。
@@ -368,7 +377,7 @@ G8 不排进 P0–P3。
 
 - 使用 `oneagents-acp-*` 的口播、报告、单次检查，在 spawn 时传 `lifecycle: { "mode": "one-shot" }`，并使用默认的 `closeAfter: "terminal"`。口播验收看文件，返工在本地重渲染，不依赖模型还记得上文。不改成 `ack`：漏掉 ack 时进程会继续占名额。
 - 这只安排终态后的普通 close，runtime 仍是 `persistent`。
-- `standard` 预设不必传 one-shot。它没有 ACP 子进程，传了也只返回 `acp: false`。它也不能指定模型，新会话用 DSH 当时的默认模型。不要把模型名写进 prompt。训练师核实当前默认是 MiniMax-M3.1-Flash，DeepSeek 在 DSH 目录里但这条派单选不到。
+- `standard` 预设不必传 one-shot。它没有 ACP 子进程，传了也只返回 `acp: false`。G9 部署后可以在 spawn 传 `provider`、`model` 指定模型，回执里看实际使用的模型；不传仍用 DSH 当时的默认模型。不要把模型名写进 prompt。部署前这条派单仍选不到 DeepSeek。
 - 需要多轮追问的用 persistent。回合结束并空闲满 10 分钟后自动关闭；10 分钟内的追问仍在原进程上。用完也可以立刻 `remote_agent_close`。必须常驻的写 `idleTtlSeconds: 0`。P3 源码已实现这 10 分钟回收，但在部署前不会生效，用完仍要自己 close。
 - 追问已关闭会话直接 `remote_agent_message`，看 `resumed`。必须确认模型还记得上文时，先看技能里的实测结论；没有结论就从文件接续。
 - 不用 cancel 释放已完成任务，也不为腾容量重启 DSH。

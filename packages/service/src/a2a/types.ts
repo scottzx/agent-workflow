@@ -46,6 +46,9 @@ export interface A2ATarget {
   state?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale' | 'deleted';
   lastUsedAt?: string;
   lifecycle?: { mode: 'persistent' | 'one-shot'; idleTtlSeconds?: number; closeAfter?: 'terminal' | 'ack' };
+  /** Model the host selected for a standard preset. Absent when the session uses the host default. */
+  provider?: string;
+  model?: string;
 }
 
 export interface A2ACloseResult {
@@ -70,6 +73,9 @@ export interface A2APrepareInput {
   roleId?: string;
   /** Optional existing parent lock under the host cache's locks directory. */
   roleLockPath?: string;
+  /** Standard presets only, passed together. Omitted keeps the session's current or host-default model. */
+  provider?: string;
+  model?: string;
 }
 
 /** A single DSH turn's output, without transport or host dependencies. */

@@ -701,3 +701,82 @@ test('a host store with a deleted target rejects a later message without prepari
   await until(() => fresh.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-host-deleted', taskId: follow.taskId }) as Promise<Record<string, unknown>>, value => value.state === 'TASK_STATE_FAILED');
   assert.equal(backend.runs.length, 1);
 });
+
+class ModelBackend implements A2ABackend {
+  readonly prepares: A2APrepareInput[] = [];
+  readonly runs: string[] = [];
+  async prepare(input: A2APrepareInput): Promise<A2ATarget> {
+    this.prepares.push(input);
+    if (input.agentPreset?.startsWith('oneagents-acp-') && input.provider) throw new Error('backend must not see an ACP model request');
+    if (input.model === 'missing') throw Object.assign(new Error('Model deepseek/missing is not in the DSH model catalog'), { code: 'MODEL_UNAVAILABLE' });
+    return { sessionId: input.sessionId ?? `model-${this.prepares.length}`, cwd: input.cwd!, agentPreset: input.agentPreset,
+      ...(input.provider ? { provider: input.provider, model: input.model } : {}) };
+  }
+  async run(_target: A2ATarget, prompt: string): Promise<A2ARunResult> {
+    this.runs.push(prompt);
+    return { outcome: 'completed', text: 'ok' };
+  }
+}
+const standard = { ...spawn, agentPreset: 'standard' };
+const getTask = (gateway: RemoteAgentGateway, taskId: string) => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-a', taskId }) as Promise<any>;
+const settled = (gateway: RemoteAgentGateway, taskId: string) => until(() => getTask(gateway, taskId), value => value.state === 'TASK_STATE_COMPLETED' || value.state === 'TASK_STATE_FAILED');
+
+test('standard spawn selects the requested model before its prompt and reports it', async t => {
+  const f = await fixture(t, new ModelBackend()), gateway = f.gateway();
+  const task = await gateway.invoke('remote_agent_spawn', { ...standard, provider: 'deepseek', model: 'deepseek-v4' }) as any;
+  const final = await settled(gateway, task.taskId);
+  assert.equal(final.state, 'TASK_STATE_COMPLETED');
+  assert.equal(f.backend.prepares[0]!.provider, 'deepseek');
+  assert.equal(f.backend.prepares[0]!.model, 'deepseek-v4');
+  assert.deepEqual([final.provider, final.model], ['deepseek', 'deepseek-v4']);
+  assert.deepEqual([final.resultMetadata.provider, final.resultMetadata.model], ['deepseek', 'deepseek-v4']);
+  assert.deepEqual(f.backend.runs, ['read pwd'], 'the model name is not added to the prompt');
+});
+
+test('a model missing from the host catalog fails the task without a prompt', async t => {
+  const f = await fixture(t, new ModelBackend()), gateway = f.gateway();
+  const task = await gateway.invoke('remote_agent_spawn', { ...standard, provider: 'deepseek', model: 'missing' }) as any;
+  const final = await settled(gateway, task.taskId);
+  assert.equal(final.state, 'TASK_STATE_FAILED');
+  assert.equal(final.resultMetadata.validation.code, 'MODEL_UNAVAILABLE');
+  assert.equal(final.provider, undefined);
+  assert.deepEqual(f.backend.runs, []);
+});
+
+test('omitted provider and model leave the request and the result unchanged', async t => {
+  const f = await fixture(t, new ModelBackend()), gateway = f.gateway();
+  const task = await gateway.invoke('remote_agent_spawn', standard) as any;
+  const final = await settled(gateway, task.taskId);
+  assert.equal(final.state, 'TASK_STATE_COMPLETED');
+  assert.equal('provider' in f.backend.prepares[0]!, false);
+  assert.equal('model' in f.backend.prepares[0]!, false);
+  assert.equal('provider' in final, false);
+  assert.equal('provider' in final.resultMetadata, false);
+});
+
+test('a follow-up keeps the selected model unless it passes a new one', async t => {
+  const f = await fixture(t, new ModelBackend()), gateway = f.gateway();
+  const first = await gateway.invoke('remote_agent_spawn', { ...standard, provider: 'deepseek', model: 'deepseek-v4' }) as any;
+  await settled(gateway, first.taskId);
+  const kept = await gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId: 'parent-a', taskId: first.taskId, prompt: 'again' }) as any;
+  const keptFinal = await settled(gateway, kept.taskId);
+  assert.equal(f.backend.prepares[1]!.sessionId, keptFinal.sessionId);
+  assert.equal('provider' in f.backend.prepares[1]!, false, 'no new selection is sent');
+  assert.deepEqual([keptFinal.provider, keptFinal.model], ['deepseek', 'deepseek-v4']);
+  const switched = await gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId: 'parent-a', taskId: first.taskId, prompt: 'switch', provider: 'deepseek', model: 'deepseek-v4-pro' }) as any;
+  const switchedFinal = await settled(gateway, switched.taskId);
+  assert.equal(switchedFinal.sessionId, keptFinal.sessionId);
+  assert.equal(f.backend.prepares[2]!.model, 'deepseek-v4-pro');
+  assert.deepEqual([switchedFinal.provider, switchedFinal.model], ['deepseek', 'deepseek-v4-pro']);
+});
+
+test('ACP presets and half-specified models are rejected before dispatch', async t => {
+  const f = await fixture(t, new ModelBackend()), gateway = f.gateway();
+  await assert.rejects(gateway.invoke('remote_agent_spawn', { ...spawn, agentPreset: 'oneagents-acp-grok', provider: 'deepseek', model: 'deepseek-v4' }), /only to standard presets/);
+  await assert.rejects(gateway.invoke('remote_agent_spawn', { ...standard, provider: 'deepseek' }), /passed together/);
+  const acp = await gateway.invoke('remote_agent_spawn', { ...spawn, agentPreset: 'oneagents-acp-grok' }) as any;
+  await settled(gateway, acp.taskId);
+  await assert.rejects(gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId: 'parent-a', taskId: acp.taskId, prompt: 'x', provider: 'deepseek', model: 'deepseek-v4' }), /only to standard presets/);
+  assert.equal(f.backend.prepares.length, 1);
+  assert.equal(f.backend.prepares.some(input => input.provider), false);
+});

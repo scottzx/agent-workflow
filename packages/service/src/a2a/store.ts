@@ -99,6 +99,9 @@ function parseTarget(value: unknown): A2ATarget {
   const preflight = source.preflight === undefined ? undefined : a2aPreflightReportSchema.parse(source.preflight);
   const roleSkills = source.roleSkills === undefined ? undefined : a2aRoleSkillsSchema.parse(source.roleSkills);
   const roleId = source.roleId === undefined ? undefined : text(source.roleId, 'role identity');
+  const provider = source.provider === undefined ? undefined : text(source.provider, 'model provider');
+  const model = source.model === undefined ? undefined : text(source.model, 'model');
+  if ((provider !== undefined) !== (model !== undefined)) throw new Error('A2A model provider and model must be stored together');
   if ((roleId !== undefined) !== (roleSkills !== undefined)) throw new Error('A2A role identity and skill lock must be stored together');
   let state: A2ATarget['state'];
   if (source.state !== undefined) {
@@ -136,7 +139,8 @@ function parseTarget(value: unknown): A2ATarget {
   return { sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), ...(preflight === undefined ? {} : { preflight }),
     ...(roleSkills === undefined ? {} : { roleId, roleSkills }), ...(state === undefined ? {} : { state }),
     ...(resumed === undefined ? {} : { resumed }), ...(restoreMethod === undefined ? {} : { restoreMethod }),
-    ...(lastUsedAt === undefined ? {} : { lastUsedAt }), ...(lifecycle === undefined ? {} : { lifecycle }) };
+    ...(lastUsedAt === undefined ? {} : { lastUsedAt }), ...(lifecycle === undefined ? {} : { lifecycle }),
+    ...(provider === undefined ? {} : { provider, model }) };
 }
 
 function validatePushUrl(value: unknown): string {

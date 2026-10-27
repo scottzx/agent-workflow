@@ -770,3 +770,13 @@ test('callback destinations require an allowed origin and redirects never reach 
   await f.close();
   assert.equal(forbiddenHits, 0, 'Webhook redirect leaked a request outside the allowlist');
 });
+
+test('a host-default ACP preset rejects provider and model before preparing a session', async t => {
+  const f = await fixture(t, { defaultAgentPreset: 'oneagents-acp-grok' });
+  await assert.rejects(f.client.sendMessage(message('half', { metadata: { provider: 'deepseek' } }), authenticated), /passed together/);
+  const task = await submit(f.client, message('work', { metadata: { provider: 'deepseek', model: 'deepseek-v4' } }));
+  const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+  assert.equal((failed.metadata?.['1agents'] as { result: { validation: { code: string } } }).result.validation.code, 'MODEL_SELECTION_UNSUPPORTED');
+  assert.equal(f.backend.preparations.length, 0);
+  assert.equal(f.backend.runs.length, 0);
+});
