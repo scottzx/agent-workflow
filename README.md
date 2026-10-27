@@ -1,10 +1,12 @@
-# 1ACP — the agent task-flow engine
+# agent-workflow — the agent task-flow engine
 
-[1ACP 发布页](https://scottzx.github.io/1acp/) · [npm package](https://www.npmjs.com/package/@1agents/acp-service) · [变更日志](CHANGELOG.md)
+[agent-workflow 发布页](https://scottzx.github.io/agent-workflow/) · [npm package](https://www.npmjs.com/package/@1agents/acp-service) · [变更日志](CHANGELOG.md)
 
-1ACP is the agent task-flow engine in 一芥天地 (DreamMate World), from 一芥智能. It creates and runs A2A tasks: register a resident role or a one-off host, submit the work, and keep the job, its attempts and its results on the execution ledger. DeepSeek Harness (DSH) hosts the sessions. Codex, Claude Code, Pi and Cursor are built-in ACP agents, together with the other agents this runtime already registers.
+agent-workflow is the agent task-flow engine in 一芥天地 (DreamMate World), from 一芥智能. It creates and runs A2A tasks: register a resident role or a one-off host, submit the work, and keep the job, its attempts and its results on the execution ledger. DeepSeek Harness (DSH) hosts the sessions. Codex, Claude Code, Pi and Cursor are built-in ACP agents, together with the other agents this runtime already registers.
 
-1ACP dispatches that work and accepts it. In the delivery flows in this repository, a stage's output moves on when that stage's acceptance passes, and a person stays on the loop. 给 Agent 猛猛套上缰绳，库库干活。
+agent-workflow dispatches that work and accepts it. In the delivery flows in this repository, a stage's output moves on when that stage's acceptance passes, and a person stays on the loop. 给 Agent 猛猛套上缰绳，库库干活。
+
+Package names and command names are unchanged for compatibility: `@scottzx/1acp`, `@1agents/acp-service`, `@1agents/dsh-acp`, and the `1acp`, `acpx`, and `acp-service` commands. Role and state files stay under [`.1agents/`](.1agents/README.md).
 
 A PPT script is structure-checked and, under the default policy, waits for a human decision before production starts. The deck then goes through a deterministic machine check. An independent agent reviewer is dispatched after that check passes, and the deck is delivered after that review passes. A report workflow file-checks the Markdown, then finishes when a person approves that exact file. Code checks, a separate agent reviewer and a human decision are the acceptance steps these deliveries use, each tied to its own stage.
 
@@ -27,10 +29,10 @@ Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, 
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-For a pinned release artifact, install the identical npm tarball attached to [0.6.0](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0):
+For a pinned release artifact, install the identical npm tarball attached to [0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
-dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
 ```
 
 Install `@1agents/session-reader` separately if you want to browse and continue existing Claude, Codex or Grok histories. See the [DSH user guide](packages/dsh-plugin/README.md), [service and A2A guide](packages/service/README.md), and [installation verification](docs/marketplaces/verification-2026-10-09.md).
@@ -89,7 +91,7 @@ Build runtime, then service, then the private DSH source module; `pnpm build` al
 
 ```sh
 # Run from the DSH checkout; the plugin starts or reuses its local service:
-pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service
+pnpm dsh plugin --profile web add /absolute/path/agent-workflow/packages/service
 pnpm dsh web --no-open
 ```
 
@@ -148,6 +150,8 @@ In the shared local workspace, keep `1agents_app/modules/1acp` as the real check
 
 See each package README for its protocol, configuration and usage details.
 
-The embedded runtime preserves its upstream history and attribution from [openclaw/acpx](https://github.com/openclaw/acpx). See the [runtime license](packages/runtime/LICENSE) and [DSH plugin license](packages/dsh-plugin/LICENSE); the unified npm artifact includes its component licenses.
+## Acknowledgements
+
+The embedded runtime is derived from [openclaw/acpx](https://github.com/openclaw/acpx) (MIT, Copyright (c) 2025 OpenClaw Team). Its upstream history stays in this repository, and the full MIT text stays in the [runtime license](packages/runtime/LICENSE). See [NOTICE](NOTICE) and [Syncing upstream](docs/upstream-sync.md). The [DSH plugin license](packages/dsh-plugin/LICENSE) is unchanged. The unified npm artifact includes its component licenses.
 
 The source-maintained [ACP Service skill](packages/service/skills/acp-service/SKILL.md) ships in the unified npm package, including ACP, DSH and A2A references. Use `acp-service --skill list`, `--skill show acp-service`, or `--skill export acp-service` to discover, read or export it; the existing `acpx` runtime skill remains available.

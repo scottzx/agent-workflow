@@ -23,7 +23,7 @@ flowchart LR
   Observe --> Rule[CODE：纯规则]
   Rule --> Apply[Piece apply_stock_advice]
   Apply --> Claim[原子保存动作与冻结输入]
-  Claim --> ACP[1ACP execution_submit]
+  Claim --> ACP[agent-workflow execution_submit]
   ACP --> Editor[已有公众号系列编辑]
   Editor --> Result[下次观察核对交付与版本]
   Result --> Asset[幂等登记成品待审]
@@ -41,7 +41,7 @@ flowchart LR
 | `piece/` | 私有组件 `@1agents/piece-wechat-stock`，凭据不进入流程 JSON 或动作输出 |
 | `flow.mjs`、`scenarios.mjs` | 保留的明确模拟规则演练，不能作为生产接入证据 |
 
-桥接只向本机现有网关 `/invoke` 发送内部构造的固定业务请求，不对网络开放通用 `/invoke` 或目标管理。1ACP 核心 API、原有宿主、模型策略、任务锁及既有 AP 验证流程均无需修改。
+桥接只向本机现有网关 `/invoke` 发送内部构造的固定业务请求，不对网络开放通用 `/invoke` 或目标管理。agent-workflow 核心 API、原有宿主、模型策略、任务锁及既有 AP 验证流程均无需修改。
 
 ## 状态和防重复
 

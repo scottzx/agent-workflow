@@ -1,7 +1,7 @@
 {
   "name": "@1agents/dsh-acp",
   "type": "module",
-  "description": "External ACP Agent sessions for DeepSeek Harness",
+  "description": "agent-workflow DeepSeek Harness integration: external ACP Agent sessions for DeepSeek Harness.",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -61,9 +61,13 @@
     "esbuild": "^0.28.2",
     "typescript": "^5.7.2"
   },
+  "homepage": "https://scottzx.github.io/agent-workflow/",
+  "bugs": {
+    "url": "https://github.com/scottzx/agent-workflow/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/scottzx/1acp.git",
+    "url": "git+https://github.com/scottzx/agent-workflow.git",
     "directory": "packages/dsh-plugin"
   },
   "license": "MIT",

@@ -1,0 +1,46 @@
+NOTICE
+
+agent-workflow
+==============
+
+This repository is agent-workflow, part of 一芥天地 (DreamMate World) by 一芥智能.
+
+The GitHub project was previously published as scottzx/1acp under the brand
+name 1ACP. npm package names (@scottzx/1acp, @1agents/acp-service,
+@1agents/dsh-acp) and the 1acp, acpx, and acp-service commands are unchanged.
+
+Upstream attribution
+--------------------
+
+packages/runtime is derived from openclaw/acpx:
+
+  https://github.com/openclaw/acpx
+
+That work is licensed under the MIT License:
+
+  Copyright (c) 2025 OpenClaw Team
+
+The full MIT license text is kept, unmodified, in:
+
+  packages/runtime/LICENSE
+
+Keep that copyright notice and permission notice with any redistribution of
+the runtime. Last synced upstream release in this history: acpx v0.20.0
+(afc076b501774c6139c9732f5487dc721d5bd757). See docs/upstream-sync.md.
+
+packages/dsh-plugin/LICENSE is an unmodified copy of that same MIT text and
+the same OpenClaw copyright line. The plugin sources are this repository's
+DeepSeek Harness integration. They are not a path-renamed copy of acpx, so
+this NOTICE does not claim the plugin as an acpx derivative. The license file
+is left untouched on purpose.
+
+Original work
+-------------
+
+This NOTICE does not choose a license for code written for agent-workflow
+itself, including packages/service, scripts, site, examples, and docs.
+
+There is no root LICENSE file. packages/service/package.json and
+packages/dsh-plugin/package.json already declare "license": "MIT" from earlier
+commits; those fields were not changed here, and they are not a new grant.
+Scott still needs to decide the license and copyright line for original work.

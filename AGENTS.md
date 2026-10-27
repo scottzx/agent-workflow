@@ -1,4 +1,6 @@
-# 1ACP Agent 工作约定
+# agent-workflow Agent 工作约定
+
+本仓库产品名为 agent-workflow，属于一芥天地（DreamMate World），由一芥智能开发。npm 包名、命令名、环境变量和 `.1agents/` 目录名保持不变。
 
 适用于本项目及其子目录。模块内更具体的开发和验证要求继续适用；本工作区的新增变更日志统一遵循下列日期分文件规则。
 

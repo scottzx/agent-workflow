@@ -5,6 +5,8 @@ description: Use acpx as a headless ACP CLI for agent-to-agent communication, in
 
 # acpx
 
+This skill is the agent-workflow runtime CLI, based on [acpx](https://github.com/openclaw/acpx). The npm package name remains `@scottzx/1acp`. The `acpx` and `1acp` commands are unchanged.
+
 ## When to use this skill
 
 Use this skill when you need to run coding agents through `acpx`, manage persistent ACP sessions, queue prompts, override the Claude system prompt, prune stale sessions, consume structured agent output from scripts, or compose multi-agent workflows declaratively with `acpx/flows`.

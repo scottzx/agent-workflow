@@ -14,21 +14,21 @@ Restart DSH and check that **`@1agents/acp-service`** is enabled on the Plugins 
 
 If pnpm reports an ignored transitive `esbuild` build script, follow the package manager's prompt or set that individual package's approval in the profile, then repeat the install. Approve or deny the script according to your policy, and check the bundle's enabled state after a partial install.
 
-The pinned [GitHub Release tarball](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0) contains the same published npm artifact:
+The pinned [GitHub Release tarball](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0) contains the same published npm artifact:
 
 ```sh
-dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
 ```
 
-`@1agents/session-reader` is optional: install it separately to browse and continue existing Claude, Codex and Grok histories. For presets, native controls, configuration and migration, see the [DSH user guide](https://github.com/scottzx/1acp/blob/main/packages/dsh-plugin/README.md).
+`@1agents/session-reader` is optional: install it separately to browse and continue existing Claude, Codex and Grok histories. For presets, native controls, configuration and migration, see the [DSH user guide](https://github.com/scottzx/agent-workflow/blob/main/packages/dsh-plugin/README.md).
 
-The CI baseline is **DSH 0.1.7-rc.2**, commit `21638c56315ae6a2b552d6091945d3144c9af32e`. Additional isolated-profile verification used a locally modified DSH tree labeled `0.2.0-rc.1`. The [verification record](https://github.com/scottzx/1acp/blob/main/docs/marketplaces/verification-2026-10-09.md) describes the installed-package, Loader, browser and lifecycle checks and their limits.
+The CI baseline is **DSH 0.1.7-rc.2**, commit `21638c56315ae6a2b552d6091945d3144c9af32e`. Additional isolated-profile verification used a locally modified DSH tree labeled `0.2.0-rc.1`. The [verification record](https://github.com/scottzx/agent-workflow/blob/main/docs/marketplaces/verification-2026-10-09.md) describes the installed-package, Loader, browser and lifecycle checks and their limits.
 
 ### Screenshots
 
-![Discovered ACP Agent presets in DSH](https://raw.githubusercontent.com/scottzx/1acp/main/packages/service/assets/dsh-agent-presets.png)
+![Discovered ACP Agent presets in DSH](https://raw.githubusercontent.com/scottzx/agent-workflow/main/packages/service/assets/dsh-agent-presets.png)
 
-![Native Codex model and ACP controls](https://raw.githubusercontent.com/scottzx/1acp/main/packages/service/assets/dsh-codex-controls.png)
+![Native Codex model and ACP controls](https://raw.githubusercontent.com/scottzx/agent-workflow/main/packages/service/assets/dsh-codex-controls.png)
 
 These unmodified screenshots show discovery and native capability loading in that fresh isolated local profile. No model prompt was sent for the UI check. Controls depend on the selected Agent, adapter and account.
 
@@ -58,7 +58,7 @@ The existing embedded `acpx` runtime skill remains available. The skill and its 
 
 ## Service development and API
 
-Version 0.6.0 includes the 1ACP runtime, CLI, service, DSH plugin, browser controls, skills and licenses. The runtime and service retain their respective ACP SDK versions.
+Version 0.6.0 includes the agent-workflow runtime, CLI, service, DSH plugin, browser controls, skills and licenses. The runtime and service retain their respective ACP SDK versions.
 
 The runtime's per-session launch argv and transient credentials APIs support Provider Profiles. Public runtime APIs and flow authoring are available as `@1agents/acp-service/runtime` and `@1agents/acp-service/flows`. The `acp-service` command forwards runtime commands alongside its `serve` command.
 
@@ -97,7 +97,7 @@ HTTP endpoints:
 
 DSH reads the package's bundle patch and browser metadata; the CLI uses its `bin` entry. There is no installation-time mode switch, and both uses can coexist. The package root retains the service API and exposes Cordis metadata plus a lazy `apply`; merely importing it starts no plugin or process. `/service` is the service API, while `/dsh`, `/dsh/preset` and `/dsh/imports` provide the typed plugin interfaces. DSH host dependencies are supplied by DSH rather than installed with the CLI.
 
-The plugin starts or reuses a local service when activated. See [DSH plugin usage](https://github.com/scottzx/1acp/blob/main/packages/dsh-plugin/README.md) for presets, browser controls, configuration and lifecycle. Before migrating, stop DSH and remove `@1agents/dsh-acp`, then add the unified package; keep session bindings and preserve custom row configuration. Plugin and preset IDs are unchanged.
+The plugin starts or reuses a local service when activated. See [DSH plugin usage](https://github.com/scottzx/agent-workflow/blob/main/packages/dsh-plugin/README.md) for presets, browser controls, configuration and lifecycle. Before migrating, stop DSH and remove `@1agents/dsh-acp`, then add the unified package; keep session bindings and preserve custom row configuration. Plugin and preset IDs are unchanged.
 
 ## DSH A2A
 
@@ -280,7 +280,7 @@ npm run typecheck
 npm test
 ```
 
-Tests use the official ACP SDK over real WebSockets, cover session lifecycle and permission reconnects, and drive the installed 1acp runtime through a deterministic external stdio Agent. They require no model API key. Existing real-provider smoke tests in the 1agents backend remain opt-in.
+Tests use the official ACP SDK over real WebSockets, cover session lifecycle and permission reconnects, and drive the installed agent-workflow runtime (`@scottzx/1acp`) through a deterministic external stdio Agent. They require no model API key. Existing real-provider smoke tests in the 1agents backend remain opt-in.
 
 ## Local harness discovery
 
@@ -295,8 +295,8 @@ The service launcher uses the same local command resolution, including absolute 
 The optional automation listener supports Activepieces scheduled tasks:
 authenticated occurrence submission, overlap prevention, durable task
 correlation and completion-processing claims. See the repository's
-[integration guide](https://github.com/scottzx/1acp/blob/main/docs/activepieces-automation.md) and
-[configuration examples](https://github.com/scottzx/1acp/tree/main/examples/activepieces).
+[integration guide](https://github.com/scottzx/agent-workflow/blob/main/docs/activepieces-automation.md) and
+[configuration examples](https://github.com/scottzx/agent-workflow/tree/main/examples/activepieces).
 
 The same package includes `acp-service a2a gateway --config /absolute/gateway.json` and exports `RemoteAgentGateway` / `serveA2AGateway` from `@1agents/acp-service/a2a`. The gateway calls the standard A2A 1.0 SendMessage, GetTask and CancelTask APIs. Its seven `remote_agent_*` methods register with the local DreamMate node; an existing `dreammate_invoke` client can use them without another MCP server. This source change also adds four optional `session_*` delivery methods described below; installed older versions must be updated before using them.
 
@@ -355,7 +355,7 @@ Host transport IDs are derived deterministically as `sha256([originSessionId, me
 
 New A2A notices snapshot their delivery route. An already bound origin uses session delivery, ahead of the legacy webhook, with message ID `a2a-notice:<noticeId>`. The queued notice identifies the task and tells the parent to retrieve its full result through `remote_agent_get` or `remote_agent_inbox`. Unbound origins keep the existing webhook/inbox path; adding a binding later does not migrate old notices. `accepted` means accepted into the host queue, not model execution or business completion. Notices stay in the inbox until `remote_agent_ack`; acknowledgement records `processedAt` on the corresponding delivery and prevents a pending notice from being sent later. There is no automatic business acknowledgement.
 
-Codex hosts support `executable`, `remote`, `cwd`, `timeoutMs`, and `remoteAuthTokenEnv`; DSH hosts support an origin `url`, protected `headers`, and `timeoutMs`. Keep real DSH Cookie/Authorization values and remote credentials in the private gateway configuration or designated environment, never tool arguments, message text, receipts, or logs. Host authentication is distinct from the remote A2A bearer token. Ordinary MCP access alone still does not supply a binding or configure the host. See the [session delivery guide](https://github.com/scottzx/1acp/blob/main/docs/session-delivery.md) for configuration and recovery.
+Codex hosts support `executable`, `remote`, `cwd`, `timeoutMs`, and `remoteAuthTokenEnv`; DSH hosts support an origin `url`, protected `headers`, and `timeoutMs`. Keep real DSH Cookie/Authorization values and remote credentials in the private gateway configuration or designated environment, never tool arguments, message text, receipts, or logs. Host authentication is distinct from the remote A2A bearer token. Ordinary MCP access alone still does not supply a binding or configure the host. See the [session delivery guide](https://github.com/scottzx/agent-workflow/blob/main/docs/session-delivery.md) for configuration and recovery.
 
 
 ## 0.8.0 — DreamMate dependency transition
