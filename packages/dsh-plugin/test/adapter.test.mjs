@@ -22,6 +22,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise(r => wss.once('listening', r));
   let creations = 0, executions = 0, permissions = 0, dropped = false;
+  const attaches = [];
   const records = new Map();
   const replay = new Map();
   const waiting = Promise.withResolvers();
@@ -38,6 +39,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     const app = acpAgent()
       .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true, _meta: { '1agents': { version: 1 } } } }))
       .onRequest('session/new', async ({ params }) => {
+        attaches.push({ method: 'session/new' });
         creationsInput.push(params);
         await beforeNew();
         const sessionId = 'remote-' + (++creations);
@@ -66,7 +68,17 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         if (streamConfig.closeError) throw new RequestError(streamConfig.closeError.code, streamConfig.closeError.message, streamConfig.closeError.data);
         return {};
       })
-      .onRequest('session/load', async ({ params }) => { for (const update of replay.get(params.sessionId) ?? []) await connection.client.notify('session/update', { sessionId: params.sessionId, update }); return {}; })
+      .onRequest('session/load', async ({ params }) => {
+        attaches.push({ method: 'session/load', sessionId: params.sessionId });
+        if (streamConfig.loadError) throw new RequestError(streamConfig.loadError.code, streamConfig.loadError.message, streamConfig.loadError.data);
+        for (const update of replay.get(params.sessionId) ?? []) await connection.client.notify('session/update', { sessionId: params.sessionId, update });
+        return {};
+      })
+      .onRequest('session/resume', async ({ params }) => {
+        attaches.push({ method: 'session/resume', sessionId: params.sessionId });
+        if (streamConfig.loadError) throw new RequestError(streamConfig.loadError.code, streamConfig.loadError.message, streamConfig.loadError.data);
+        return {};
+      })
       .onNotification('session/cancel', () => cancelled.resolve())
       .onRequest('session/prompt', async ({ params }) => {
         prompts.push(params.prompt);
@@ -132,7 +144,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
-  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
+  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, commands, attaches, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
 
@@ -861,4 +873,39 @@ test('diagnostics bind only messages admitted in the current official turn, excl
   await assert.rejects(collect(f.adapter, { ...f.options('unused'), messages: [old, current] }));
   assert.equal(diagnostics.find(f.local.id, 'old-request'), undefined);
   assert.equal(diagnostics.find(f.local.id, 'current-request').category, 'quota');
+});
+
+test('a saved binding reattaches with its restore method and the same ACP session', async t => {
+  for (const method of ['session/load', 'session/resume']) {
+    const f = await fixture(t);
+    const endpoint = new URL('/agents/codex', f.config.serviceUrl);
+    endpoint.protocol = 'ws:';
+    new State(f.config.stateDirectory).save(f.local.id, {
+      agent: 'codex', cwd: f.local.session.header.cwd, endpoint: endpoint.href,
+      sessionId: 'remote-kept', restoreMethod: method,
+    });
+    await collect(f.adapter, f.options('again'));
+    assert.equal(f.counts().creations, 0);
+    assert.deepEqual(f.attaches, [{ method, sessionId: 'remote-kept' }]);
+    assert.equal(new State(f.config.stateDirectory).get(f.local.id).sessionId, 'remote-kept');
+  }
+});
+
+test('a deleted ACP session is not replaced with session/new', async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    loadError: { code: -32003, message: 'Session was deleted' },
+  });
+  const endpoint = new URL('/agents/codex', f.config.serviceUrl);
+  endpoint.protocol = 'ws:';
+  new State(f.config.stateDirectory).save(f.local.id, {
+    agent: 'codex', cwd: f.local.session.header.cwd, endpoint: endpoint.href,
+    sessionId: 'remote-kept', restoreMethod: 'session/load',
+  });
+  await assert.rejects(collect(f.adapter, f.options('again')), error => {
+    assert.equal(error.code, 'SESSION_DELETED');
+    assert.match(error.message, /Session was deleted/);
+    return true;
+  });
+  assert.equal(f.counts().creations, 0);
+  assert.deepEqual(f.attaches.map(item => item.method), ['session/load']);
 });

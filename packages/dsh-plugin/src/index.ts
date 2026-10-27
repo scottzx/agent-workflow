@@ -74,5 +74,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     });
     ctx.effect(() => dispose);
   }
-  if (input.a2a) closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics);
+  if (input.a2a) closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics, {
+    release: sessionId => adapter.releaseSession(sessionId),
+    status: sessionId => adapter.sessionStatus(sessionId),
+  });
 }

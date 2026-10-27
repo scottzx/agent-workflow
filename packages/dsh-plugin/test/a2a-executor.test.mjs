@@ -212,8 +212,8 @@ test('prepare creates a real DSH Session and adopts its original directory and p
   assert.equal(f.createCount, 1);
   assert.equal(f.creates.length, 1, 'even a blank saved Session is resumed without calling create again');
   assert.equal(f.resolveCount, 2);
-  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, agentPreset: 'other' }), /preset conflicts/);
-  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, cwd: tmpdir() }), /cwd conflicts/);
+  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, agentPreset: 'other' }), error => error.code === 'SESSION_CONFLICT' && /preset conflicts/.test(error.message));
+  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, cwd: tmpdir() }), error => error.code === 'SESSION_CONFLICT' && /cwd conflicts/.test(error.message));
 });
 
 test('prepare rejects missing sessions and invalid remote directories before creating a session', async t => {
@@ -222,7 +222,7 @@ test('prepare rejects missing sessions and invalid remote directories before cre
   await assert.rejects(f.backend.prepare({ cwd: 'relative' }), /absolute directory/);
   await assert.rejects(f.backend.prepare({ cwd: file }), /point to a directory/);
   await assert.rejects(f.backend.prepare({ cwd: join(f.cwd, 'missing') }), /ENOENT/);
-  await assert.rejects(f.backend.prepare({ sessionId: 'missing-session' }), /not found/);
+  await assert.rejects(f.backend.prepare({ sessionId: 'missing-session' }), error => error.code === 'SESSION_NOT_FOUND' && /not found/.test(error.message));
   assert.equal(f.createCount, 0);
 });
 

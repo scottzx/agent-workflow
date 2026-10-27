@@ -105,19 +105,41 @@ let capacityLaunchAbort = new AbortController();
 const sessionLaunchControllers = new Map();
 const initializingSessionControllers = new Map();
 const capacityLaunchSignals = new Map();
+// A probed process lease is held before ensureSession. onBeforeSpawn must
+// consume that lease instead of acquiring a second slot. launchId !== capacityId.
+const preparedProcessLeases = new Map();
+const preparedByLaunch = new Map();
+const preparedLaunches = new Set();
+const handshakeTimers = new Map();
+function handshakeMs() {
+  const value = Number(process.env.ACP_HANDSHAKE_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 60_000;
+}
+function clearHandshake(launchId) {
+  const timer = handshakeTimers.get(launchId);
+  if (timer) clearTimeout(timer);
+  handshakeTimers.delete(launchId);
+  preparedLaunches.delete(launchId);
+  preparedByLaunch.delete(launchId);
+}
+const launchOrigins = new Map();
 const capacityLifecycle = createCapacityLifecycle({
-  acquire: request => processCapacity.acquire(request, {
-    signal: capacityLaunchSignals.get(request.id) || capacityLaunchAbort.signal,
-  }),
+  acquire: request => {
+    const prepared = preparedByLaunch.get(request.id);
+    if (prepared) return prepared;
+    const origin = launchOrigins.get(request.id);
+    return processCapacity.acquire(origin ? { ...request, origin } : request, {
+      signal: capacityLaunchSignals.get(request.id) || capacityLaunchAbort.signal,
+    });
+  },
 });
 const runtime = createAcpRuntime({
   // Includes compatibility checks, probes and pre-warm launches. Native user
   // processes outside this service are not admitted through this governor.
   processLifecycle: {
     async onBeforeSpawn(launch) {
-      const session = launch.scope.kind === "runtime-session"
-        ? sessionLaunchControllers.get(launch.scope.sessionKey)
-        : undefined;
+      const sessionKey = launch.scope.kind === "runtime-session" ? launch.scope.sessionKey : undefined;
+      const session = sessionKey ? sessionLaunchControllers.get(sessionKey) : undefined;
       // Capture the generation before the lifecycle's deferred acquire runs.
       const signal = AbortSignal.any([
         capacityLaunchAbort.signal,
@@ -125,19 +147,45 @@ const runtime = createAcpRuntime({
       ]);
       capacityLaunchSignals.set(launch.launchId, signal);
       signal.throwIfAborted();
+      if (sessionKey && preparedProcessLeases.has(sessionKey)) {
+        const lease = preparedProcessLeases.get(sessionKey);
+        preparedProcessLeases.delete(sessionKey);
+        preparedByLaunch.set(launch.launchId, Promise.resolve(lease));
+        preparedLaunches.add(launch.launchId);
+      }
+      const origin = typeof sessionKey === "string" && sessionKey.startsWith("prewarm_grok_")
+        ? "prewarm"
+        : typeof sessionKey === "string" && sessionKey ? "user-opened" : undefined;
+      if (origin) launchOrigins.set(launch.launchId, origin);
       await capacityLifecycle.onBeforeSpawn(launch);
       signal.throwIfAborted();
+      // The 60s budget starts only after the process slot is held.
+      if (preparedLaunches.has(launch.launchId)) {
+        const timer = setTimeout(() => {
+          if (!preparedLaunches.has(launch.launchId)) return;
+          const current = sessionKey ? sessionLaunchControllers.get(sessionKey) : undefined;
+          current?.controller.abort(new Error("ACP handshake timed out"));
+        }, handshakeMs());
+        timer.unref?.();
+        handshakeTimers.set(launch.launchId, timer);
+      }
     },
     async onSpawned(started) {
+      clearHandshake(started.launchId);
       await capacityLifecycle.onSpawned(started);
       capacityLaunchSignals.delete(started.launchId);
+      launchOrigins.delete(started.launchId);
     },
     onSpawnFailed(failure) {
+      clearHandshake(failure.launchId);
       capacityLaunchSignals.delete(failure.launchId);
+      launchOrigins.delete(failure.launchId);
       return capacityLifecycle.onSpawnFailed(failure);
     },
     onExit(exit) {
+      clearHandshake(exit.launchId);
       capacityLaunchSignals.delete(exit.launchId);
+      launchOrigins.delete(exit.launchId);
       return capacityLifecycle.onExit(exit);
     },
   },
@@ -1625,6 +1673,29 @@ export async function dispatchCommand(ws, payload) {
             }
           }
 
+          if (typeof payload.capacityId === "string" && payload.capacityId.trim()) {
+            const capacityId = payload.capacityId.trim();
+            if (capacityId.length > 4096) {
+              sendError(ws, sessionId, "INVALID_PARAMS", "capacityId is invalid");
+              console.timeEnd(`ensure_session_${sessionId}`);
+              break;
+            }
+            const admission = await processCapacity.tryAdmit(
+              { kind: "process", source: "automatic", id: capacityId, origin: capacityId.startsWith("a2a-") ? "job" : "user-opened" },
+              { signal: initializationSignal },
+            );
+            if (admission?.pending === true) {
+              sendCapacityPending(ws, sessionId, admission);
+              console.timeEnd(`ensure_session_${sessionId}`);
+              break;
+            }
+            const previousLease = preparedProcessLeases.get(runtimeSessionKey);
+            if (previousLease && previousLease !== admission) {
+              try { await previousLease.release(); } catch { /* A later exit observation retries release. */ }
+            }
+            preparedProcessLeases.set(runtimeSessionKey, admission);
+          }
+
           console.log(
             `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
@@ -1729,6 +1800,11 @@ export async function dispatchCommand(ws, payload) {
               );
             }
           } catch (error) {
+            const leftover = preparedProcessLeases.get(runtimeSessionKey);
+            if (leftover) {
+              preparedProcessLeases.delete(runtimeSessionKey);
+              try { await leftover.release(); } catch { /* A later exit observation retries release. */ }
+            }
             if (initialization.controller.signal.aborted && initializedHandle) {
               const current = activeSessions.get(sessionId);
               if (current?.handle === initializedHandle) {
@@ -2626,6 +2702,16 @@ export async function dispatchCommand(ws, payload) {
           break;
         }
 
+        case "capacity_cancel": {
+          const capacityId = typeof payload.capacityId === "string" ? payload.capacityId.trim() : "";
+          if (!capacityId || capacityId.length > 4096) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "capacityId is required");
+            return;
+          }
+          await processCapacity.cancel({ id: capacityId, kind: "process" });
+          break;
+        }
+
         default:
           sendError(ws, sessionId, "UNKNOWN_ACTION", `Action ${action} is not supported`);
       }
@@ -2781,6 +2867,18 @@ function notifySessionTakenOver(previousWs, nextWs, sessionId) {
   } catch (err) {
     console.warn(`[acpx-server] Failed to notify taken-over ws for ${sessionId}:`, err.message);
   }
+}
+
+function sendCapacityPending(ws, sessionId, pending) {
+  ws.send(JSON.stringify({
+    event: "error",
+    sessionId,
+    code: "CAPACITY_PENDING",
+    message: "CAPACITY_PENDING",
+    scope: "control",
+    terminal: false,
+    data: { position: pending.position, waitedMs: pending.waitedMs },
+  }));
 }
 
 // Helper for sending error events

@@ -4,6 +4,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, wr
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { CancelTaskRequest, GetTaskRequest, SendMessageRequest, Task } from '@a2a-js/sdk';
 import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, type Client } from '@a2a-js/sdk/client';
 import { reportAndHoldRegistration, reportToAgent } from '@1agents/dreammate-node/client';
@@ -15,6 +16,9 @@ import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSc
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
+import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
+import { CapacityQueue } from '../capacity-queue.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
@@ -45,6 +49,14 @@ const configSchema = z.object({
   reportReview: reportReviewPolicySchema.optional(),
   workbench: z.object({ token: string, reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
     allowedOrigins: z.array(string).optional() }).strict().optional(),
+  /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
+  capacityDirectory: z.string().min(1).optional(),
+  /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
+  sessionLifecycle: z.object({
+    persistentIdleTtlSeconds: z.number().int().min(0).max(30 * 24 * 60 * 60).default(600),
+    idleScanIntervalMs: z.number().int().min(50).max(10 * 60_000).default(60_000),
+    inputRequiredAlertSeconds: z.number().int().min(1).max(30 * 24 * 60 * 60).default(2 * 60 * 60),
+  }).strict().default({ persistentIdleTtlSeconds: 600, idleScanIntervalMs: 60_000, inputRequiredAlertSeconds: 2 * 60 * 60 }),
 }).strict().superRefine((config, ctx) => {
   const machineTokens = [...Object.values(config.remotes).map(remote => remote.token), config.callback?.token,
     ...Object.values(config.notificationTargets).map(target => target.token), config.automation?.token];
@@ -67,11 +79,13 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
   roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
-  clientRequestId: string.optional(),
+  clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional() }).strict();
+const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
+const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
@@ -104,10 +118,12 @@ const EXECUTION_METHODS = {
 export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。', parameters: z.toJSONSchema(spawnSchema) },
-  remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时保持 persistent；one-shot 在完成、失败或取消后普通关闭进程，runtime 仍是 persistent。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
+  remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
+  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。', parameters: z.toJSONSchema(closeSchema) },
+  remote_agent_sessions: { description: '按 prewarm、job、user-opened 和未标注列出本机进程租约，并给出 taskSlot 与 processSlot。只读，不关闭、不补标已经在跑的进程。', parameters: z.toJSONSchema(sessionsSchema) },
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_inbox: { description: '读取当前主会话未确认的完成或需要输入通知。读取不删除；处理后调用 remote_agent_ack。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_ack: { description: '确认主会话已处理指定通知。noticeId 稳定，重复确认安全。', parameters: z.toJSONSchema(ackSchema) },
@@ -132,6 +148,19 @@ interface Job {
   stale?: boolean;
   ledgerJobId?: string;
   attemptId?: string;
+  sessionId?: string;
+  lifecycle?: SessionLifecycle;
+  sessionState?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale';
+  closedAt?: string;
+  closeReason?: CloseReason;
+  processReleased?: true | 'pending';
+}
+
+export class RemoteAgentError extends Error {
+  constructor(readonly code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CLOSED' | 'SESSION_BUSY' | 'SESSION_CONFLICT' | 'SESSION_ATTACH_IN_PROGRESS' | 'UNSUPPORTED' | 'REMOTE_UNAVAILABLE', message: string) {
+    super(message);
+    this.name = 'RemoteAgentError';
+  }
 }
 interface NoticeRecord { notice: RemoteAgentNotice; target?: string; acknowledged?: boolean; delivered?: boolean; sessionDeliveryId?: string }
 interface ExecutionNotice { noticeId: string; messageId: string; originSessionId: string; jobId: string; attemptId: string;
@@ -176,13 +205,21 @@ export class RemoteAgentGateway {
   private readonly operations = new Set<Promise<unknown>>();
   private readonly advancingDeliveries = new Map<string, Promise<void>>();
   private readonly canceling = new Map<string, Promise<void>>();
+  private readonly closingSessions = new Map<string, Promise<void>>();
+  private readonly automaticCloseStopped = new Set<string>();
+  private readonly now: () => number;
+  private idleScannedAt = Number.NEGATIVE_INFINITY;
+  /** taskId and status timestamp of INPUT_REQUIRED turns already warned about. */
+  private readonly inputRequiredAlerts = new Map<string, { sessionId?: string; contextId: string; since: string }>();
+  private closeFailures = 0;
   private reconciling?: Promise<void>;
   private workbenchQueue: Promise<void> = Promise.resolve();
   private readonly timer: NodeJS.Timeout;
   private closed = false;
 
-  constructor(input: A2AGatewayConfig) {
+  constructor(input: A2AGatewayConfig, options: { now?: () => number } = {}) {
     this.config = configSchema.parse(input);
+    this.now = options.now ?? Date.now;
     if (!path.isAbsolute(this.config.stateDirectory)) throw new Error('stateDirectory must be absolute');
     mkdirSync(this.config.stateDirectory, { recursive: true, mode: 0o700 });
     // Reuse the A2A store's tested single-owner lease, in a separate empty
@@ -290,7 +327,7 @@ export class RemoteAgentGateway {
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
     const resolved = this.targets.resolve(input.targetId, input.input);
     if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
-      throw new Error('Continue must preserve the original remote, cwd and preset');
+      throw new RemoteAgentError('SESSION_CONFLICT', 'Continue must preserve the original remote, cwd and preset');
     }
     const reportRequest = input.input.reportReview;
     if (reportRequest !== undefined && (options.jobId || resolved.target.kind !== 'agent_host' || !this.config.reportReview || !this.config.workbench)) throw new Error('Report review requires a new temporary agent_host task and configured report/workbench policy');
@@ -341,6 +378,7 @@ export class RemoteAgentGateway {
       if (fresh.configVersion !== resolved.configVersion || fresh.connectionVersion !== resolved.connectionVersion) throw new Error('Execution target changed before dispatch');
       this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
       this.ledger.markDispatching(attempt.attemptId); sent = true;
+      const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
@@ -352,7 +390,7 @@ export class RemoteAgentGateway {
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
-        ledgerJobId: job.jobId, attemptId: attempt.attemptId });
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}) });
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
@@ -704,11 +742,20 @@ export class RemoteAgentGateway {
   }
   private view(job: Job) {
     const task = Task.fromJSON(job.task);
+    const meta = task.metadata?.['1agents'] as { sessionId?: string; preflight?: unknown; result?: unknown; capacity?: unknown; taskSlot?: unknown; processSlot?: unknown; resumed?: unknown; restoreMethod?: unknown } | undefined;
     const result = job.attemptId ? this.ledger.getAttempt(job.attemptId).result : undefined;
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
       ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
-      cwd: job.cwd, agentPreset: job.agentPreset, sessionId: task.metadata?.['1agents']?.sessionId,
-      preflight: task.metadata?.['1agents']?.preflight, resultMetadata: task.metadata?.['1agents']?.result,
+      cwd: job.cwd, agentPreset: job.agentPreset, sessionId: meta?.sessionId ?? job.sessionId,
+      preflight: meta?.preflight, resultMetadata: meta?.result,
+      ...(meta?.capacity ? { capacity: meta.capacity } : {}),
+      ...(meta?.taskSlot ? { taskSlot: meta.taskSlot } : {}),
+      ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
+      ...(meta?.resumed === true ? { resumed: true } : {}),
+      ...(meta?.restoreMethod === 'session/load' || meta?.restoreMethod === 'session/resume' ? { restoreMethod: meta.restoreMethod } : {}),
+      ...(job.lifecycle ? { lifecycle: job.lifecycle } : {}),
+      ...(job.sessionState ? { sessionState: job.sessionState } : {}),
+      ...(job.processReleased !== undefined ? { processReleased: job.processReleased } : {}),
       resultRevision: result?.resultRevision, resultDigest: result?.resultDigest,
       state: taskState(job), result: resultText(task), artifactLinks: artifactLinks(task), checkedAt: job.checkedAt, stale: Boolean(job.stale) };
   }
@@ -733,6 +780,8 @@ export class RemoteAgentGateway {
     if ((terminal.has(taskState(job)) && !terminal.has(wire(task).status?.state)) ||
       Date.parse(previous.status?.timestamp ?? '') > Date.parse(task.status?.timestamp ?? '')) return;
     job.task = wire(task); job.checkedAt = new Date().toISOString(); job.stale = false;
+    const meta = task.metadata?.['1agents'] as { sessionId?: unknown } | undefined;
+    if (typeof meta?.sessionId === 'string' && meta.sessionId) job.sessionId = meta.sessionId;
     const state = taskState(job);
     if (actionable.has(state)) {
       const noticeId = createHash('sha256').update(JSON.stringify([job.remote, job.taskId, state, task.status?.timestamp])).digest('hex');
@@ -748,6 +797,7 @@ export class RemoteAgentGateway {
         { provider: 'a2a', remote: job.remote, endpoint: job.remoteEndpoint, taskId: task.id, contextId: task.contextId, sessionId: task.metadata?.['1agents']?.sessionId }, observed);
       else this.ledger.observe(job.attemptId, observed);
     } else this.save();
+    if (oneShotShouldClose(job.lifecycle, state, this.taskAcknowledged(job, state))) this.releaseOneShot(job);
   }
   private async refresh(job: Job): Promise<void> {
     const key = `${job.remote}:${job.taskId}`;
@@ -810,6 +860,11 @@ export class RemoteAgentGateway {
         await this.sessions.reconcile();
       }
       await Promise.allSettled(this.state.notices.filter(record => record.target && !record.delivered && !record.acknowledged).map(record => this.deliver(record)));
+      for (const job of this.state.jobs) {
+        if (this.closed) break;
+        if (oneShotShouldClose(job.lifecycle, taskState(job), this.taskAcknowledged(job, taskState(job)))) this.releaseOneShot(job);
+      }
+      await this.reconcileIdleSessions();
       await this.automation?.reconcileAcknowledgements();
     })();
     this.reconciling = pending;
@@ -960,6 +1015,9 @@ export class RemoteAgentGateway {
     }
     if (method === 'remote_agent_message') {
       const input = messageSchema.parse(params), previous = this.job(input);
+      if (input.autoResume === false && (previous.sessionState === 'closed' || previous.sessionState === 'closing')) {
+        throw new RemoteAgentError('SESSION_CLOSED', 'Session is closed');
+      }
       if (!previous.ledgerJobId) throw new Error('Task has no unified job association');
       const record = this.ledger.get(input.originSessionId, previous.ledgerJobId);
       const target = this.targets.getTarget(record.targetId);
@@ -968,6 +1026,7 @@ export class RemoteAgentGateway {
         input: { ...(target.kind === 'agent_host' ? { cwd: previous.cwd, ...(previous.agentPreset ? { agentPreset: previous.agentPreset } : {}) } : {}), prompt: input.prompt,
           ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
           ...(input.roleId ? { roleId: input.roleId } : {}), ...(input.roleLockPath ? { roleLockPath: input.roleLockPath } : {}),
+          ...(input.lifecycle ? { lifecycle: input.lifecycle } : previous.lifecycle ? { lifecycle: previous.lifecycle } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
@@ -985,7 +1044,19 @@ export class RemoteAgentGateway {
       if (!notice) throw new Error('Notice not found for this origin session');
       notice.acknowledged = true; this.save();
       this.sessions.acknowledgeNotice(input.originSessionId, input.noticeId);
+      const acked = this.state.jobs.find(item => item.originSessionId === input.originSessionId && item.taskId === notice.notice.taskId);
+      if (acked && oneShotShouldClose(acked.lifecycle, notice.notice.state, true)) this.releaseOneShot(acked);
       return { acknowledged: true, noticeId: input.noticeId };
+    }
+    if (method === 'remote_agent_close') {
+      const input = closeSchema.parse(params);
+      const present = [input.taskId, input.contextId, input.sessionId].filter(value => value !== undefined);
+      if (present.length !== 1) throw new RemoteAgentError('SESSION_CONFLICT', 'Provide exactly one of taskId, contextId, or sessionId');
+      return this.performClose(input, 'explicit');
+    }
+    if (method === 'remote_agent_sessions') {
+      sessionsSchema.parse(params ?? {});
+      return this.capacityReport(true);
     }
     throw new Error(`Unknown method: ${method}`);
   }
@@ -1044,6 +1115,208 @@ export class RemoteAgentGateway {
     this.workbenchQueue = operation.then(() => {}, () => {});
     return operation;
   }
+  private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle | undefined {
+    if (value === undefined) return previous;
+    return normalizeLifecycle(value, this.config.sessionLifecycle.persistentIdleTtlSeconds);
+  }
+  /**
+   * P3. A persistent ACP session closes once the host confirms it is attached and idle and its
+   * last turn ended more than idleTtlSeconds ago. Busy, INPUT_REQUIRED and unknown status stay open.
+   */
+  private async reconcileIdleSessions(): Promise<void> {
+    const policy = this.config.sessionLifecycle;
+    const now = this.now();
+    if (now - this.idleScannedAt < policy.idleScanIntervalMs) return;
+    this.idleScannedAt = now;
+    const contexts = new Map<string, Job[]>();
+    for (const job of this.state.jobs) {
+      const key = `${job.originSessionId}\0${job.remote}\0${job.contextId}`;
+      contexts.set(key, [...(contexts.get(key) ?? []), job]);
+    }
+    for (const jobs of contexts.values()) {
+      if (this.closed) return;
+      for (const job of jobs) if (taskState(job) === 'TASK_STATE_INPUT_REQUIRED') this.alertInputRequired(job, now);
+      if (jobs.some(job => !terminal.has(taskState(job)))) continue;
+      const job = jobs.at(-1)!;
+      if (!isAcpAgentPreset(job.agentPreset) || !job.sessionId || job.sessionState === 'closed' || job.sessionState === 'closing') continue;
+      const lifecycle = job.lifecycle ?? normalizeLifecycle(undefined, policy.persistentIdleTtlSeconds);
+      if (lifecycle.mode !== 'persistent' || lifecycle.idleTtlSeconds === 0) continue;
+      const ttlMs = lifecycle.idleTtlSeconds * 1000;
+      const endedAt = Date.parse(Task.fromJSON(job.task).status?.timestamp ?? '');
+      if (!Number.isFinite(endedAt) || now - endedAt < ttlMs) continue;
+      let status: { attached?: unknown; activeTurn?: unknown; lastUsedAt?: unknown };
+      try { status = await this.postSession(job.remote, 'status', { sessionId: job.sessionId, contextId: job.contextId }, job.remoteEndpoint); }
+      catch { continue; }
+      if (status.attached !== true || status.activeTurn !== false) continue;
+      const lastUsedAt = typeof status.lastUsedAt === 'string' ? Date.parse(status.lastUsedAt) : Number.NaN;
+      if (Number.isFinite(lastUsedAt) && now - lastUsedAt < ttlMs) continue;
+      try { await this.performClose({ originSessionId: job.originSessionId, remote: job.remote, contextId: job.contextId }, 'idle-ttl'); }
+      catch (error) {
+        if (error instanceof RemoteAgentError && error.code === 'SESSION_BUSY') continue;
+        this.closeFailures += 1;
+        console.warn(`A2A idle close failed session=${job.sessionId} context=${job.contextId} code=${error instanceof RemoteAgentError ? error.code : 'REMOTE_UNAVAILABLE'}`);
+      }
+    }
+  }
+  /** Warns once per INPUT_REQUIRED turn after the alert window. The process is never closed for this. */
+  private alertInputRequired(job: Job, now: number): void {
+    const since = Task.fromJSON(job.task).status?.timestamp ?? '';
+    const sinceMs = Date.parse(since);
+    if (!Number.isFinite(sinceMs) || now - sinceMs < this.config.sessionLifecycle.inputRequiredAlertSeconds * 1000) return;
+    const key = `${job.taskId}\0${since}`;
+    if (this.inputRequiredAlerts.has(key)) return;
+    this.inputRequiredAlerts.set(key, { ...(job.sessionId ? { sessionId: job.sessionId } : {}), contextId: job.contextId, since });
+    console.warn(`A2A input required for too long session=${job.sessionId ?? ''} context=${job.contextId} task=${job.taskId} since=${since}`);
+  }
+  /** Read-only lifecycle counts for /health. Close reasons and resumes are counted per context from saved jobs. */
+  lifecycleReport() {
+    const contexts = new Map<string, Job[]>();
+    for (const job of this.state.jobs) {
+      const key = `${job.originSessionId}\0${job.remote}\0${job.contextId}`;
+      contexts.set(key, [...(contexts.get(key) ?? []), job]);
+    }
+    const closeReasons: Record<CloseReason, number> = { explicit: 0, 'one-shot': 0, 'idle-ttl': 0 };
+    const restoreMethods = { 'session/load': 0, 'session/resume': 0 };
+    let busy = 0, processReleasePending = 0;
+    for (const jobs of contexts.values()) {
+      if (jobs.some(job => !terminal.has(taskState(job)))) busy += 1;
+      const last = jobs.at(-1)!;
+      if (last.closeReason) closeReasons[last.closeReason] += 1;
+      if (last.processReleased === 'pending') processReleasePending += 1;
+      for (const job of jobs) {
+        const method: unknown = Task.fromJSON(job.task).metadata?.['1agents']?.restoreMethod;
+        if (method === 'session/load' || method === 'session/resume') restoreMethods[method] += 1;
+      }
+    }
+    const current = [...this.inputRequiredAlerts.entries()].filter(([key]) => {
+      const job = this.state.jobs.find(item => item.taskId === key.split('\0')[0]);
+      return job !== undefined && taskState(job) === 'TASK_STATE_INPUT_REQUIRED' && Task.fromJSON(job.task).status?.timestamp === key.split('\0')[1];
+    }).map(([, alert]) => alert);
+    return { busy, inputRequiredAlerts: current, closeReasons, restoreMethods, closeFailures: this.closeFailures, processReleasePending };
+  }
+  private taskAcknowledged(job: Job, state: string): boolean {
+    return this.state.notices.some(record => record.acknowledged === true && record.notice.taskId === job.taskId
+      && record.notice.originSessionId === job.originSessionId && record.notice.state === state);
+  }
+  private releaseOneShot(job: Job): void {
+    if (this.automaticCloseStopped.has(job.remote)) return;
+    if (job.closeReason || job.sessionState === 'closed' || job.sessionState === 'closing') return;
+    const key = `${job.remote}\0${job.contextId}\0one-shot`;
+    if (this.closingSessions.has(key)) return;
+    const operation = this.finishClose(job).finally(() => {
+      if (this.closingSessions.get(key) === operation) this.closingSessions.delete(key);
+    });
+    this.closingSessions.set(key, operation);
+  }
+  private async finishClose(job: Job): Promise<void> {
+    try {
+      await this.performClose({ originSessionId: job.originSessionId, remote: job.remote, contextId: job.contextId }, 'one-shot');
+    } catch (error) {
+      if (error instanceof RemoteAgentError && error.code === 'UNSUPPORTED') this.automaticCloseStopped.add(job.remote);
+      else this.closeFailures += 1;
+      console.warn(`A2A session close failed session=${job.sessionId ?? ''} context=${job.contextId} task=${job.taskId} code=${error instanceof RemoteAgentError ? error.code : 'REMOTE_UNAVAILABLE'}`);
+    }
+  }
+  private jobsForClose(input: { originSessionId: string; remote: string; taskId?: string; contextId?: string; sessionId?: string }): Job[] {
+    const owned = this.state.jobs.filter(job => job.originSessionId === input.originSessionId && job.remote === input.remote);
+    const sessionOf = (job: Job): string | undefined => job.sessionId ?? (Task.fromJSON(job.task).metadata?.['1agents']?.sessionId as string | undefined);
+    if (input.taskId) {
+      const job = owned.find(item => item.taskId === input.taskId);
+      return job ? owned.filter(item => item.contextId === job.contextId) : [];
+    }
+    if (input.contextId) return owned.filter(item => item.contextId === input.contextId);
+    return owned.filter(item => sessionOf(item) === input.sessionId);
+  }
+  private markClosed(jobs: Job[], reason: CloseReason, processReleased: true | 'pending'): void {
+    const closedAt = new Date().toISOString();
+    const sessionState = processReleased === true ? 'closed' : 'closing';
+    for (const job of jobs) {
+      job.sessionState = sessionState;
+      job.closedAt = closedAt;
+      job.closeReason = reason;
+      job.processReleased = processReleased;
+    }
+    this.save();
+  }
+  private async performClose(input: { originSessionId: string; remote: string; taskId?: string; contextId?: string; sessionId?: string; force?: boolean }, reason: CloseReason) {
+    const jobs = this.jobsForClose(input);
+    if (!jobs.length) throw new RemoteAgentError('SESSION_NOT_FOUND', 'Session not found for this origin session');
+    const contexts = new Set(jobs.map(job => job.contextId));
+    if (contexts.size !== 1) throw new RemoteAgentError('SESSION_CONFLICT', 'Session identifier matches more than one context');
+    const contextId = jobs[0]!.contextId;
+    if (jobs.every(job => job.sessionState === 'closed' || job.sessionState === 'closing')) {
+      const sample = jobs[0]!;
+      return { remote: input.remote, contextId, sessionId: sample.sessionId, state: 'closed' as const, alreadyClosed: true,
+        processReleased: sample.processReleased ?? 'pending', canceledTaskIds: [] as string[], ...(sample.agentPreset?.startsWith('oneagents-acp-') ? { acp: true } : sample.agentPreset ? { acp: false } : {}) };
+    }
+    const busy = jobs.filter(job => !terminal.has(taskState(job)));
+    const canceledTaskIds: string[] = [];
+    if (busy.length && !input.force) throw new RemoteAgentError('SESSION_BUSY', 'Session is busy');
+    if (busy.length && input.force) {
+      for (const job of busy) {
+        if (job.attemptId) this.ledger.requestCancellation(job.attemptId);
+        try {
+          const client = await this.client(job.remote, job.remoteEndpoint);
+          this.update(job, await client.cancelTask(CancelTaskRequest.fromJSON({ id: job.taskId }), this.auth(job.remote)));
+          canceledTaskIds.push(job.taskId);
+        } catch (error) {
+          if (error instanceof RemoteAgentError) throw error;
+          if (!terminal.has(taskState(job))) throw new RemoteAgentError('SESSION_BUSY', 'Session is busy');
+        }
+      }
+    }
+    const sessionId = jobs.map(job => job.sessionId).find((value): value is string => typeof value === 'string' && value.length > 0);
+    if (!sessionId) {
+      this.markClosed(jobs, reason, true);
+      return { remote: input.remote, contextId, state: 'closed' as const, alreadyClosed: false, processReleased: true as const, canceledTaskIds, acp: false };
+    }
+    const result = await this.postSession(input.remote, 'close', { sessionId, contextId }, jobs[0]!.remoteEndpoint) as { processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
+    const processReleased = result.processReleased === true ? true : 'pending';
+    this.markClosed(jobs, reason, processReleased);
+    return { remote: input.remote, contextId, sessionId, state: 'closed' as const, alreadyClosed: result.alreadyClosed === true,
+      processReleased, canceledTaskIds, ...(typeof result.acp === 'boolean' ? { acp: result.acp } : {}) };
+  }
+  private async postSession(remote: string, action: 'close' | 'status', body: unknown, pinnedEndpoint?: string): Promise<Record<string, unknown>> {
+    const configured = this.config.remotes[remote];
+    const config = configured ? { ...configured, url: pinnedEndpoint ?? configured.url } : undefined;
+    if (!config) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Unknown remote');
+    const client = await this.client(remote, config.url), card = await client.getAgentCard(this.auth(remote));
+    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
+    if (!endpoint) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Remote does not advertise a JSONRPC endpoint');
+    const url = new URL(endpoint);
+    if (url.origin !== new URL(config.url).origin || url.username || url.password) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Session endpoint must use the configured remote origin');
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/sessions/${action}`; url.search = ''; url.hash = '';
+    const controller = new AbortController(); this.controllers.add(controller);
+    try {
+      const response = await fetch(url, { method: 'POST', redirect: 'error',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
+        body: JSON.stringify(body), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
+      const payload = await response.json().catch(() => ({})) as { error?: unknown; processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
+      if (response.status === 501 || payload.error === 'UNSUPPORTED') throw new RemoteAgentError('UNSUPPORTED', 'Remote host does not support session close');
+      if (!response.ok) {
+        const code = payload.error === 'SESSION_NOT_FOUND' || payload.error === 'SESSION_BUSY' || payload.error === 'SESSION_CONFLICT' || payload.error === 'REMOTE_UNAVAILABLE'
+          ? payload.error : 'REMOTE_UNAVAILABLE';
+        throw new RemoteAgentError(code, code === 'SESSION_NOT_FOUND' ? 'Session not found for this origin session' : 'Remote session close failed');
+      }
+      return payload;
+    } finally { this.controllers.delete(controller); }
+  }
+  /** Read-only ledger view. strict requests fail when the directory is unset or the ledger cannot be read. */
+  async capacityReport(strict = false): Promise<(CapacityInspection & { processSlot: CapacityInspection['processSlot'] & { headWaitMs: number } }) | undefined> {
+    if (!this.config.capacityDirectory) {
+      if (strict) throw new Error('ACP capacity directory is not configured');
+      return;
+    }
+    try {
+      const governor = new CapacityGovernor({ directory: this.config.capacityDirectory });
+      const queue = new CapacityQueue({ directory: this.config.capacityDirectory });
+      const report = await governor.inspect();
+      return { ...report, processSlot: { ...report.processSlot, headWaitMs: await queue.headWaitMs('process') } };
+    } catch (error) {
+      if (!strict) return;
+      throw new Error(error instanceof Error && error.message.startsWith('ACP capacity') ? error.message : 'ACP capacity state is unavailable');
+    }
+  }
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true; clearInterval(this.timer);
@@ -1078,6 +1351,35 @@ async function listen(server: http.Server, port: number, host: string): Promise<
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
   return (server.address() as AddressInfo).port;
 }
+/** Only a missing bind address is retried. A busy port or a permission error is a bad configuration. */
+export function isRetryableCallbackBindError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'EADDRNOTAVAIL';
+}
+/** Keeps trying `bind` after EADDRNOTAVAIL. Any other error rejects without another sleep. */
+export async function retryCallbackBind(options: {
+  bind: () => Promise<void>;
+  signal: AbortSignal;
+  onPending: (error: unknown, at: string) => void;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+}): Promise<void> {
+  const sleep = options.sleep ?? ((ms, signal) => delay(ms, undefined, { signal }));
+  let waitMs = options.initialDelayMs ?? 1000;
+  const maxDelayMs = options.maxDelayMs ?? 30_000;
+  for (;;) {
+    options.signal.throwIfAborted();
+    try {
+      await options.bind();
+      return;
+    } catch (error) {
+      if (!isRetryableCallbackBindError(error)) throw error;
+      options.onPending(error, new Date().toISOString());
+      await sleep(waitMs, options.signal);
+      waitMs = Math.min(waitMs * 2, maxDelayMs);
+    }
+  }
+}
 async function stop(server: http.Server): Promise<void> {
   server.closeIdleConnections();
   await new Promise<void>(resolve => server.close(() => resolve()));
@@ -1099,9 +1401,18 @@ function methodContractViolations(methods: Record<string, { description?: unknow
 
 export async function serveA2AGateway(input: A2AGatewayConfig, options: { report?: boolean } = {}) {
   const gateway = new RemoteAgentGateway(input);
+  const callbackHealth: { state?: 'pending' | 'listening' } = {};
   const server = http.createServer((req, res) => { void (async () => {
     try {
-      if (req.method === 'GET' && req.url === '/health') return json(res, gateway.sessions.healthy ? 200 : 503, { status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes), sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable' });
+      if (req.method === 'GET' && req.url === '/health') {
+        const slots = await gateway.capacityReport();
+        return json(res, gateway.sessions.healthy ? 200 : 503, {
+          status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes),
+          sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable',
+          ...(slots ? { taskSlot: slots.taskSlot, processSlot: slots.processSlot } : {}),
+          sessions: gateway.lifecycleReport(),
+          ...(callbackHealth.state === 'pending' ? { callback: 'pending' } : {}) });
+      }
       const url = new URL(req.url ?? '/', 'http://localhost');
       if (url.pathname.startsWith('/workbench/')) {
         if (!gateway.config.workbench) return json(res, 503, { error: 'Workbench is not configured' });
@@ -1132,21 +1443,55 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
       return json(res, 200, await gateway.invoke(request.method ?? request.capability ?? '', request.params));
     } catch (error) { json(res, 400, { error: error instanceof z.ZodError ? 'Invalid method parameters' : error instanceof Error ? error.message : 'Invocation failed' }); }
   })(); });
-  let receiver: http.Server | undefined;
+  const callbackServers = new Set<http.Server>();
+  const callbackAbort = new AbortController();
   let callbackPort: number | undefined;
   let automationServer: http.Server | undefined;
   let automationPort: number | undefined;
+  const callbackHandler = gateway.config.callback ? (req: IncomingMessage, res: ServerResponse) => { void (async () => {
+    const callback = gateway.config.callback!;
+    if (!authenticated(req, callback.token)) return json(res, 401, { error: 'Unauthorized' });
+    if (req.method !== 'POST' || req.url !== new URL(callback.url).pathname) return json(res, 404, { error: 'No route' });
+    try { const event = await body(req); json(res, 202, { accepted: true }); void gateway.receivePush(event).catch(() => {}); }
+    catch { json(res, 400, { error: 'Invalid A2A event' }); }
+  })(); } : undefined;
+  const bindCallback = async (): Promise<void> => {
+    if (!gateway.config.callback || !callbackHandler) return;
+    if (callbackAbort.signal.aborted) throw callbackAbort.signal.reason ?? new Error('callback stopped');
+    const receiver = http.createServer(callbackHandler);
+    callbackServers.add(receiver);
+    try {
+      callbackPort = await listen(receiver, gateway.config.callback.port, gateway.config.callback.host);
+      if (callbackAbort.signal.aborted) {
+        await stop(receiver);
+        throw callbackAbort.signal.reason ?? new Error('callback stopped');
+      }
+      callbackHealth.state = 'listening';
+    } catch (error) {
+      callbackServers.delete(receiver);
+      receiver.close(() => {});
+      throw error;
+    }
+  };
   try {
     const port = await listen(server, gateway.config.port, '127.0.0.1');
     if (gateway.config.callback) {
       const callback = gateway.config.callback;
-      receiver = http.createServer((req, res) => { void (async () => {
-        if (!authenticated(req, callback.token)) return json(res, 401, { error: 'Unauthorized' });
-        if (req.method !== 'POST' || req.url !== new URL(callback.url).pathname) return json(res, 404, { error: 'No route' });
-        try { const event = await body(req); json(res, 202, { accepted: true }); void gateway.receivePush(event).catch(() => {}); }
-        catch { json(res, 400, { error: 'Invalid A2A event' }); }
-      })(); });
-      callbackPort = await listen(receiver, callback.port, callback.host);
+      try {
+        await bindCallback();
+      } catch (error) {
+        if (!isRetryableCallbackBindError(error)) throw error;
+        callbackHealth.state = 'pending';
+        console.error(`[a2a-gateway] ${new Date().toISOString()} callback listen pending: ${callback.host}:${callback.port} ${error instanceof Error ? error.message : String(error)}`);
+        void retryCallbackBind({
+          bind: bindCallback,
+          signal: callbackAbort.signal,
+          onPending: (cause, at) => console.error(`[a2a-gateway] ${at} callback listen pending: ${callback.host}:${callback.port} ${cause instanceof Error ? cause.message : String(cause)}`),
+        }).catch(cause => {
+          if (callbackAbort.signal.aborted) return;
+          console.error(`[a2a-gateway] ${new Date().toISOString()} callback listen failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        });
+      }
     }
     if (gateway.config.automation && gateway.automation) {
       automationServer = createAutomationServer(gateway.automation);
@@ -1172,18 +1517,20 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     return { gateway, port, callbackPort, automationPort, registration, close: async () => {
       closing ??= (async () => {
         if (reporting) clearInterval(reporting);
+        callbackAbort.abort();
         // Stop the Reader before draining HTTP requests that may be awaiting a scan.
         await gateway.projectDiscovery?.close();
         // Stop accepting requests and drain their ledger writes while this instance
         // still owns the storage lease. Automation continuations and its admission
         // queue can outlive the gateway operation they awaited.
-        await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : []), ...(automationServer ? [stop(automationServer)] : [])]);
+        await Promise.all([stop(server), ...[...callbackServers].map(item => stop(item)), ...(automationServer ? [stop(automationServer)] : [])]);
         await gateway.close();
       })();
       await closing;
     } };
   } catch (error) {
-    await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : []), ...(automationServer ? [stop(automationServer)] : [])]);
+    callbackAbort.abort();
+    await Promise.all([stop(server), ...[...callbackServers].map(item => stop(item)), ...(automationServer ? [stop(automationServer)] : [])]);
     await gateway.close(); throw error;
   }
 }

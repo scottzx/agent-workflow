@@ -10,6 +10,27 @@ import { A2APreflightError, runA2APreflight, type A2ABackend, type A2APreflightI
 import { toSafeError } from '@1agents/acp-service/runtime';
 
 import type { Diagnostics } from './diagnostics.js';
+import { consumeProcessReady, readProcessCapacity, readSessionRestore } from './process-admission.js';
+
+export interface SessionControl {
+  release(sessionId: string): Promise<{ processReleased: true | 'pending'; acp?: boolean }>;
+  status(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }>;
+}
+
+function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT', message: string): Error {
+  const error = new Error(message) as Error & { code: string };
+  error.code = code;
+  return error;
+}
+
+/** Host inspect either returns null or throws its own not-found error. Other failures stay unchanged. */
+function isMissingSession(error: unknown, sessionId: string): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { name?: unknown; message?: unknown };
+  return value.name === 'ApiSessionNotFound'
+    || value.message === `Session ${sessionId} not found`
+    || value.message === `session "${sessionId}" not found`;
+}
 
 function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string, diagnostic?: ReturnType<typeof toSafeError>): A2ARunResult {
   switch (reason.kind) {
@@ -64,7 +85,23 @@ async function waitForIdle(agent: Agent, signal: AbortSignal): Promise<void> {
 export class DshA2ABackend implements A2ABackend {
   private readonly executions = new Map<string, Promise<void>>();
   /** @param ctx DSH plugin context that owns session-controller and execution event registrations. */
-  constructor(private readonly ctx: Context, private readonly diagnostics?: Diagnostics) {}
+  constructor(private readonly ctx: Context, private readonly diagnostics?: Diagnostics, private readonly sessions?: SessionControl) {}
+
+  async close(target: A2ATarget): Promise<{ processReleased: true | 'pending'; acp?: boolean }> {
+    if (!target.agentPreset?.startsWith('oneagents-acp-')) return { processReleased: true, acp: false };
+    if (!this.sessions) {
+      const error = new Error('Host close is not supported') as Error & { code: string };
+      error.code = 'UNSUPPORTED';
+      throw error;
+    }
+    return this.sessions.release(target.sessionId);
+  }
+
+  async status(target: A2ATarget): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }> {
+    if (target.agentPreset?.startsWith('oneagents-acp-') && this.sessions) return this.sessions.status(target.sessionId);
+    const found = await this.ctx.sessionController.inspect(target.sessionId as SessionId).catch(() => null);
+    return { attached: found != null, activeTurn: false };
+  }
 
   /** Restart reconciliation reads the plugin domain and never dispatches another prompt. */
   async recover(target: A2ATarget, options: { requestId: string }) {
@@ -82,12 +119,18 @@ export class DshA2ABackend implements A2ABackend {
   async prepare(input: A2APrepareInput, options?: { signal: AbortSignal }): Promise<A2ATarget> {
     const signal = options?.signal;
     signal?.throwIfAborted();
-    const previous = input.sessionId === undefined
-      ? undefined
-      : await this.ctx.sessionController.inspect(input.sessionId as SessionId);
-    signal?.throwIfAborted();
-    if (input.sessionId !== undefined && previous == null) throw new Error(`Session ${input.sessionId} not found`);
-    if (previous !== undefined && previous.meta.id !== input.sessionId) throw new Error('Existing session identity conflicts');
+    let previous: Awaited<ReturnType<Context['sessionController']['inspect']>> | undefined;
+    if (input.sessionId !== undefined) {
+      try {
+        previous = await this.ctx.sessionController.inspect(input.sessionId as SessionId);
+      } catch (error) {
+        if (isMissingSession(error, input.sessionId)) throw sessionError('SESSION_NOT_FOUND', `Session ${input.sessionId} not found`);
+        throw error;
+      }
+      signal?.throwIfAborted();
+      if (previous == null) throw sessionError('SESSION_NOT_FOUND', `Session ${input.sessionId} not found`);
+    }
+    if (previous !== undefined && previous.meta.id !== input.sessionId) throw sessionError('SESSION_CONFLICT', 'Existing session identity conflicts');
     const requestedCwd = input.cwd ?? previous?.meta.cwd ?? process.cwd();
     if (!isAbsolute(requestedCwd)) throw new Error('A2A cwd must be an absolute directory on the DSH host');
     const cwd = await realpath(requestedCwd);
@@ -99,16 +142,16 @@ export class DshA2ABackend implements A2ABackend {
     if (!preflight.ok) throw new A2APreflightError(preflight);
     const agentPreset = input.agentPreset ?? previous?.meta.agentPreset;
     if (input.sessionId !== undefined && previous !== undefined) {
-      if (previous.meta.cwd === undefined || await realpath(previous.meta.cwd) !== cwd) throw new Error('Existing session cwd conflicts');
-      if (input.agentPreset !== undefined && input.agentPreset !== previous.meta.agentPreset) throw new Error('Existing session preset conflicts');
+      if (previous.meta.cwd === undefined || await realpath(previous.meta.cwd) !== cwd) throw sessionError('SESSION_CONFLICT', 'Existing session cwd conflicts');
+      if (input.agentPreset !== undefined && input.agentPreset !== previous.meta.agentPreset) throw sessionError('SESSION_CONFLICT', 'Existing session preset conflicts');
       // create() only reuses blank Sessions on current DSH; resolve the saved
       // identity directly so an active or completed context keeps its queue.
       const agent = await this.agent(input.sessionId as SessionId);
       signal?.throwIfAborted();
-      if (agent.id !== input.sessionId || agent.session.id !== input.sessionId) throw new Error('Existing session identity conflicts');
-      if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw new Error('Existing session cwd conflicts');
+      if (agent.id !== input.sessionId || agent.session.id !== input.sessionId) throw sessionError('SESSION_CONFLICT', 'Existing session identity conflicts');
+      if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw sessionError('SESSION_CONFLICT', 'Existing session cwd conflicts');
       signal?.throwIfAborted();
-      if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw new Error('Existing session preset conflicts');
+      if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw sessionError('SESSION_CONFLICT', 'Existing session preset conflicts');
       return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight };
     }
     const created = await this.ctx.sessionController.create({
@@ -134,7 +177,7 @@ export class DshA2ABackend implements A2ABackend {
    * @param options Task-owned request identity and cancellation signal.
    * @returns The exact turn's ending and its final assistant text.
    */
-  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void> }): Promise<A2ARunResult> {
+  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void>; onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void }): Promise<A2ARunResult> {
     options.signal.throwIfAborted();
     const queuedAbort = Promise.withResolvers<A2ARunResult>();
     const abort = (): void => { queuedAbort.reject(options.signal.reason); };
@@ -151,7 +194,7 @@ export class DshA2ABackend implements A2ABackend {
     finally { options.signal.removeEventListener('abort', abort); }
   }
 
-  private async execute(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void> }): Promise<A2ARunResult> {
+  private async execute(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void>; onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void }): Promise<A2ARunResult> {
     const agent = await this.agent(target.sessionId as SessionId);
     options.signal.throwIfAborted();
     const completion = Promise.withResolvers<A2ARunResult>();
@@ -173,6 +216,8 @@ export class DshA2ABackend implements A2ABackend {
       completion.resolve(result);
     };
     const finishTurn = (reason: TurnEndReason): void => {
+      const restoreMethod = readSessionRestore(agent.id);
+      if (restoreMethod) Object.assign(target, { resumed: true, restoreMethod });
       const start = agent.session.snapshotEvents().findLast(event => event.type === 'turn/start' && event.data.turn === turn);
       let diagnostic;
       try { diagnostic = this.diagnostics?.find(agent.id, options.requestId, turn, start?.seq); }
@@ -240,6 +285,17 @@ export class DshA2ABackend implements A2ABackend {
       }
     }));
     options.signal.addEventListener('abort', cancel, { once: true });
+    let capacityTimer: ReturnType<typeof setTimeout> | undefined;
+    if (options.onCapacity && target.agentPreset?.startsWith('oneagents-acp-')) {
+      const tick = (): void => {
+        const pending = readProcessCapacity(target.sessionId);
+        if (pending) options.onCapacity?.({ code: 'CAPACITY_PENDING', position: pending.position, waitedMs: pending.waitedMs });
+        else if (consumeProcessReady(target.sessionId)) options.onCapacity?.(undefined);
+        capacityTimer = setTimeout(tick, 50);
+        capacityTimer.unref?.();
+      };
+      tick();
+    }
     try {
       // Recheck after event registration; cancellation can arrive during Agent restoration.
       options.signal.throwIfAborted();
@@ -262,6 +318,7 @@ export class DshA2ABackend implements A2ABackend {
       if (options.signal.aborted) cancel();
       return await completion.promise;
     } finally {
+      if (capacityTimer) clearTimeout(capacityTimer);
       options.signal.removeEventListener('abort', cancel);
       for (const dispose of listeners.reverse()) dispose();
     }

@@ -12,6 +12,33 @@ import { FileA2AStore } from './store.js';
 import type { A2ABackend } from './types.js';
 import { a2aPreflightInputSchema } from './preflight.js';
 
+async function readBoundedJson(req: IncomingMessage, limit: number): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > limit) throw new Error('body too large');
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function sessionRouteError(error: unknown): { status: number; code: string } {
+  const code = error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : '';
+  switch (code) {
+    case 'SESSION_NOT_FOUND': return { status: 404, code };
+    case 'SESSION_DELETED': return { status: 404, code };
+    case 'SESSION_CLOSED': return { status: 409, code };
+    case 'SESSION_BUSY': return { status: 409, code };
+    case 'SESSION_CONFLICT': return { status: 400, code };
+    case 'SESSION_ATTACH_IN_PROGRESS': return { status: 409, code };
+    case 'UNSUPPORTED': return { status: 501, code };
+    case 'REMOTE_UNAVAILABLE': return { status: 503, code };
+    default: return { status: 503, code: 'REMOTE_UNAVAILABLE' };
+  }
+}
+
 /** Remote execution is explicitly enabled with a host-owned bearer credential. */
 export interface A2AServerOptions extends A2AExecutionOptions {
   backend: A2ABackend;
@@ -222,6 +249,45 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(report));
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Invalid preflight request' }));
+      }
+      return;
+    }
+    if (req.url === `${path}/sessions/close` || req.url === `${path}/sessions/status`) {
+      const action = req.url.endsWith('/status') ? 'status' : 'close';
+      if (action === 'close' ? !options.backend.close : !options.backend.status) {
+        res.writeHead(501, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'UNSUPPORTED' })); return;
+      }
+      try {
+        const body = await readBoundedJson(req, 65536) as { sessionId?: unknown; contextId?: unknown };
+        if (!body || typeof body !== 'object' || typeof body.sessionId !== 'string' || !body.sessionId.trim()
+          || typeof body.contextId !== 'string' || !body.contextId.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'SESSION_CONFLICT' })); return;
+        }
+        const context = new ServerCallContext({ requestedVersion: '1.0', user: { isAuthenticated: true, userName: 'dsh-a2a' } });
+        const target = store.loadTarget(body.contextId, context);
+        if (!target || target.sessionId !== body.sessionId) {
+          res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'SESSION_NOT_FOUND' })); return;
+        }
+        if (action === 'status') {
+          const report = await options.backend.status!(target);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(report)); return;
+        }
+        if (target.state === 'closed' || target.state === 'closing') {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ processReleased: target.state === 'closed' ? true : 'pending', alreadyClosed: true,
+            acp: target.agentPreset?.startsWith('oneagents-acp-') === true, sessionId: target.sessionId, contextId: body.contextId }));
+          return;
+        }
+        const result = await options.backend.close!(target);
+        store.saveTarget(body.contextId, { ...target, state: result.processReleased === true ? 'closed' : 'closing', lastUsedAt: new Date().toISOString() }, context);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ...result, alreadyClosed: false, sessionId: target.sessionId, contextId: body.contextId }));
+      } catch (error) {
+        if (error instanceof SyntaxError || (error instanceof Error && error.message === 'body too large')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'SESSION_CONFLICT' })); return;
+        }
+        const mapped = sessionRouteError(error);
+        res.writeHead(mapped.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: mapped.code }));
       }
       return;
     }

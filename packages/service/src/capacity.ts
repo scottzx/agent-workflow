@@ -10,6 +10,8 @@ import { DirectoryLease } from './a2a/lease.js';
 
 export type CapacityKind = 'process' | 'task';
 export type CapacitySource = 'automatic' | 'interactive';
+/** Process leases only. Missing on a record means the lease stays unlabeled. */
+export type ProcessLeaseOrigin = 'prewarm' | 'job' | 'user-opened';
 export interface CapacityMemoryReading {
   totalBytes: number;
   availableBytes: number;
@@ -24,7 +26,7 @@ export interface CapacityOptions {
   /** Host-owned memory reader, useful for deterministic admission tests. Never populate from a task payload. */
   memoryProvider?: () => CapacityMemoryReading;
 }
-export interface CapacityRequest { kind: CapacityKind; source: CapacitySource; id: string }
+export interface CapacityRequest { kind: CapacityKind; source: CapacitySource; id: string; origin?: ProcessLeaseOrigin }
 export interface CapacityLimits { soft: number; hard: number; basis: 'hardware-estimate' | 'configured' }
 export interface CapacitySnapshot {
   limits: CapacityLimits;
@@ -43,6 +45,12 @@ export interface CapacitySnapshot {
   };
 }
 export interface CapacityLease { spawned(pid: number): Promise<void>; recheck(): Promise<void>; release(): Promise<void> }
+export interface CapacityProcessSession { id: string; ownerPid: number; childPid?: number }
+export interface CapacityInspection {
+  taskSlot: { limit: number; used: number };
+  processSlot: { limit: number; used: number };
+  sessions: Record<ProcessLeaseOrigin | 'unlabeled', CapacityProcessSession[]>;
+}
 export type CapacityErrorCode = 'ACP_CAPACITY_SOFT_LIMIT' | 'ACP_CAPACITY_HARD_LIMIT' | 'ACP_CAPACITY_MEMORY_LIMIT';
 export class CapacityError extends Error {
   constructor(readonly code: CapacityErrorCode) {
@@ -62,6 +70,7 @@ interface Reservation extends CapacityRequest {
   childPid?: number;
   startupUntil: number;
 }
+const processOrigins = new Set<ProcessLeaseOrigin>(['prewarm', 'job', 'user-opened']);
 const MiB = 1024 ** 2;
 const startupWindowMs = 30_000;
 const tokenPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -173,9 +182,12 @@ export class CapacityGovernor {
 
   async acquire(request: CapacityRequest): Promise<CapacityLease> {
     if (!request || !validKind(request.kind) || !validSource(request.source) || typeof request.id !== 'string' ||
-        !request.id.trim() || request.id.length > 4096) throw new Error('Invalid ACP capacity request');
+        !request.id.trim() || request.id.length > 4096 ||
+        (request.origin !== undefined && (request.kind !== 'process' || !processOrigins.has(request.origin)))) {
+      throw new Error('Invalid ACP capacity request');
+    }
     const reservation: Reservation = { version: 1, token: randomUUID(), ownerPid: process.pid, startupUntil: Date.now() + startupWindowMs,
-      kind: request.kind, source: request.source, id: request.id };
+      kind: request.kind, source: request.source, id: request.id, ...(request.origin ? { origin: request.origin } : {}) };
     await this.transaction(() => {
       const records = this.readReservations();
       this.ensurePolicy(records);
@@ -237,6 +249,26 @@ export class CapacityGovernor {
     });
   }
 
+  /**
+   * Read both ledgers and process-lease origins. Does not acquire, release, or relabel.
+   * A missing origin stays unlabeled. Dead owners stay on disk for the next admission pass.
+   */
+  async inspect(): Promise<CapacityInspection> {
+    return this.transaction(() => {
+      const records = this.readReservations(false);
+      const limit = this.recordedLimit() ?? this.limits.soft;
+      const sessions: CapacityInspection['sessions'] = { prewarm: [], job: [], 'user-opened': [], unlabeled: [] };
+      for (const record of records) {
+        if (record.kind !== 'process') continue;
+        const row = { id: record.id, ownerPid: record.ownerPid, ...(record.childPid !== undefined ? { childPid: record.childPid } : {}) };
+        if (record.origin && processOrigins.has(record.origin)) sessions[record.origin].push(row);
+        else sessions.unlabeled.push(row);
+      }
+      const used = (kind: CapacityKind) => records.filter(record => record.kind === kind).length;
+      return { taskSlot: { limit, used: used('task') }, processSlot: { limit, used: used('process') }, sessions };
+    });
+  }
+
   private count(kind: CapacityKind, reservations: Reservation[], excludeStartupToken?: string): CapacitySnapshot {
     const matching = reservations.filter(item => item.kind === kind);
     const automatic = matching.filter(item => item.source === 'automatic').length;
@@ -262,7 +294,18 @@ export class CapacityGovernor {
         startupReservedBytes, availableForStartupBytes, availableSlots, startupWindowMs } };
   }
 
-  private readReservations(): Reservation[] {
+  private recordedLimit(): number | undefined {
+    try {
+      const value = this.readJson(join(this.directory, 'policy.json')) as { version?: unknown; softLimit?: unknown };
+      if (!value || value.version !== 1 || !Number.isSafeInteger(value.softLimit) || (value.softLimit as number) < 1) throw new Error(stateMessage);
+      return value.softLimit as number;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  }
+
+  private readReservations(reclaim = true): Reservation[] {
     const records: Reservation[] = [];
     for (const name of readdirSync(this.directory)) {
       if (name === '.lock' || name === 'policy.json') continue;
@@ -280,7 +323,7 @@ export class CapacityGovernor {
       // An unregistered process may have spawned just before its owner crashed. Never guess it dead.
       const reclaimable = isDead(record.ownerPid) &&
         (record.kind === 'task' || (record.childPid !== undefined && isDead(record.childPid)));
-      if (reclaimable) unlinkSync(path);
+      if (reclaim && reclaimable) unlinkSync(path);
       else records.push(record);
     }
     return records;
@@ -326,7 +369,8 @@ export class CapacityGovernor {
         !pidIsValid(value.ownerPid) || !validKind(value.kind) || !validSource(value.source) ||
         typeof value.id !== 'string' || !value.id.trim() || value.id.length > 4096 ||
         !Number.isSafeInteger(value.startupUntil) || value.startupUntil < 0 ||
-        (value.childPid !== undefined && (!pidIsValid(value.childPid) || value.kind !== 'process'))) throw new Error(stateMessage);
+        (value.childPid !== undefined && (!pidIsValid(value.childPid) || value.kind !== 'process')) ||
+        (value.origin !== undefined && (value.kind !== 'process' || !processOrigins.has(value.origin)))) throw new Error(stateMessage);
     return value;
   }
 

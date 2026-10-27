@@ -39,6 +39,25 @@ export interface A2ATarget {
   /** Logical host binding; several bindings may use one canonical skill profile. */
   roleId?: string;
   roleSkills?: A2ARoleSkills;
+  /** Set when this target was attached again through session/load or session/resume. */
+  resumed?: boolean;
+  restoreMethod?: 'session/load' | 'session/resume';
+  /** Absent on records written before session close. Callers treat that as attached. */
+  state?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale';
+  lastUsedAt?: string;
+  lifecycle?: { mode: 'persistent' | 'one-shot'; idleTtlSeconds?: number; closeAfter?: 'terminal' | 'ack' };
+}
+
+export interface A2ACloseResult {
+  processReleased: true | 'pending';
+  /** False when the preset has no ACP child process. */
+  acp?: boolean;
+}
+
+export interface A2ASessionStatus {
+  attached: boolean;
+  activeTurn: boolean;
+  lastUsedAt?: string;
 }
 
 /** Omitted location and preset reuse a saved context or the host defaults. */
@@ -75,5 +94,10 @@ export interface A2ABackend {
   prepare(input: A2APrepareInput, options?: { signal: AbortSignal }): Promise<A2ATarget>;
   run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal;
     /** Hosts with a session queue call this again immediately before submitting the prompt. */
-    beforeStart?: (signal?: AbortSignal) => Promise<void> }): Promise<A2ARunResult>;
+    beforeStart?: (signal?: AbortSignal) => Promise<void>;
+    /** Process-slot wait stays submitted. Undefined means the handshake has started. */
+    onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void }): Promise<A2ARunResult>;
+  /** Ordinary session release. Hosts that cannot close omit this and the gateway reports UNSUPPORTED. */
+  close?(target: A2ATarget, options?: { signal?: AbortSignal }): Promise<A2ACloseResult>;
+  status?(target: A2ATarget): Promise<A2ASessionStatus>;
 }

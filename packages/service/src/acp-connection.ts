@@ -19,6 +19,12 @@ const EXT = '_1agents/';
 
 /** Error envelopes have a closed projection; provider data never becomes metadata. */
 function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): RecordValue {
+  // Process-slot admission is not a turn failure. Keep the queue position for the caller.
+  if (event.code === 'CAPACITY_PENDING' || event.message === 'CAPACITY_PENDING') {
+    const data = event.data && typeof event.data === 'object' ? event.data as RecordValue : {};
+    return { event: event.event ?? 'error', sessionId: event.sessionId, code: 'CAPACITY_PENDING',
+      message: 'CAPACITY_PENDING', scope: 'control', terminal: false, data: { position: data.position, waitedMs: data.waitedMs } };
+  }
   if (['tool_call', 'tool_call_update', 'tool_result'].includes(event.event)) {
     if (event.error === undefined && event.errorCode === undefined && event.errorText === undefined) return event;
     const error = toSafeError(event.error ?? (trustedRuntimeErrors ? { code: event.errorCode, message: event.errorText } : undefined), { origin: 'service' });
@@ -130,6 +136,9 @@ export class RuntimePeer {
     finally { call.active = false; }
     const failureEvent = events.find(e => (e.event === 'error' || e.type === 'error' || e.event === 'protocol_error') && e.scope !== 'turn');
     if (failureEvent) {
+      if (failureEvent.code === 'CAPACITY_PENDING' || failureEvent.message === 'CAPACITY_PENDING') {
+        throw new RequestError(-32010, 'CAPACITY_PENDING', failureEvent.data);
+      }
       const safe: SafeError = toSafeError(failureEvent.error ?? failureEvent, { origin: 'service', operationId: payload.requestId });
       throw new RequestError(-32000, safe.message, safe);
     }
@@ -501,7 +510,17 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
   }, async ({ params, signal }) => {
     requireInitialized();
     if (!extensions || typeof params.sessionId !== 'string' || !params.sessionId) throw RequestError.invalidParams('Native session ID required');
-    return ensure({ ...params, _meta: { [NS]: { ...metadata(params), resumeSessionId: params.sessionId } } }, true, false, signal);
+    return ensure({ ...params, _meta: { [NS]: { ...metadata(params), resumeSessionId: params.sessionId, capacityId: `import:${params.sessionId}` } } }, true, false, signal);
+  });
+  app.onRequest(`${EXT}capacity/cancel`, (value: unknown): RecordValue => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw RequestError.invalidParams('Expected object');
+    return value as RecordValue;
+  }, async ({ params }) => {
+    requireInitialized();
+    if (!extensions) throw RequestError.methodNotFound(`${EXT}capacity/cancel`);
+    if (typeof params.capacityId !== 'string' || !params.capacityId.trim() || params.capacityId.length > 4096) throw RequestError.invalidParams('capacityId is required');
+    await peer.command(backend, { action: 'capacity_cancel', capacityId: params.capacityId });
+    return {};
   });
   const controls: Record<string, string> = { 'session/history': 'get_history', 'session/permission_mode': 'set_permission_mode', 'session/cancel_queued': 'cancel_queued', 'session/fork': 'fork_session', 'session/authenticate': 'authenticate', 'session/logout': 'logout' };
   for (const [method, action] of Object.entries(controls)) {

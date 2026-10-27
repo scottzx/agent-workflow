@@ -19,6 +19,7 @@ import { connect, object, type JsonObject } from './transport.js';
 import { State, hasActiveWriter, type Binding } from './state.js';
 import { mergeTool, type RemoteTool } from './tool-events.js';
 import { toSafeError } from '@1agents/acp-service/runtime';
+import { capacityPendingOf, noteProcessCapacity, noteProcessReady, noteSessionRestore, requestWhenAdmitted } from './process-admission.js';
 export interface SessionPolicy {
   /** Exact workspace and ACP registry name; no global or wildcard policy. */
   cwd: string;
@@ -69,6 +70,12 @@ function serviceProjection(error: unknown): JsonObject | undefined {
 }
 
 /** Only actual cancellation rejections may replace a racing provider failure. */
+function isDeletedAcpSession(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { code?: unknown; message?: unknown };
+  return value.code === -32003 || value.message === 'Session was deleted';
+}
+
 function isCancellationRejection(error: unknown, signal: AbortSignal): boolean {
   if (!signal.aborted) return false;
   if (error === signal.reason) return true;
@@ -190,10 +197,16 @@ export class AcpAdapter implements LlmAdapter {
         plan: async () => ({ outcome: 'abandoned' }),
       }, this.lifetime.signal);
       try {
-        const result = object(await link.rpc.request('_1agents/session/import', {
-          sessionId: nativeSessionId, cwd, mcpServers: [],
-          _meta: { '1agents': { permissionMode: 'approve-reads' } },
-        }, { cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]) }));
+        const capacityId = `import:${nativeSessionId}`;
+        const result = object(await requestWhenAdmitted({
+          signal: this.lifetime.signal,
+          isPending: capacityPendingOf,
+          cancel: async () => { await link.rpc.request('_1agents/capacity/cancel', { capacityId }).catch(() => undefined); },
+          request: () => link.rpc.request('_1agents/session/import', {
+            sessionId: nativeSessionId, cwd, mcpServers: [],
+            _meta: { '1agents': { permissionMode: 'approve-reads', capacityId } },
+          }, { cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]) }),
+        }));
         if (typeof result.sessionId !== 'string' || !result.sessionId) throw new Error('ACP import returned no service session ID');
         return { agent: name, cwd, endpoint: endpoint.href, sessionId: result.sessionId, restoreMethod: 'session/resume' as const };
       } finally { link.close(); await link.closed; }
@@ -221,14 +234,14 @@ export class AcpAdapter implements LlmAdapter {
       }));
     }
   }
-  private async connection(agent: Agent): Promise<Link> {
+  private async connection(agent: Agent, capacityId?: string, callerSignal?: AbortSignal): Promise<Link> {
     const operation = (this.connections.get(agent.id) ?? Promise.resolve())
-      .catch(() => undefined).then(() => this.openConnection(agent));
+      .catch(() => undefined).then(() => this.openConnection(agent, capacityId, callerSignal));
     this.connections.set(agent.id, operation);
     try { return await operation; }
     finally { if (this.connections.get(agent.id) === operation) this.connections.delete(agent.id); }
   }
-  private async openConnection(agent: Agent): Promise<Link> {
+  private async openConnection(agent: Agent, capacityId?: string, callerSignal?: AbortSignal): Promise<Link> {
     const name = this.agentName(agent);
     if (!name) throw new Error('ACP is available only in an ACP Agent preset; start a new ACP session');
     const cwd = agent.session.header.cwd;
@@ -305,11 +318,25 @@ export class AcpAdapter implements LlmAdapter {
       let createdBinding: Binding | undefined;
       try {
         const policy = this.config.sessionPolicies?.find(p => p.cwd === resolve(cwd) && p.agent === name);
-        const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': { permissionMode: policy?.permissionMode ?? 'approve-reads' } } };
-        const cancellationSignal = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]);
+        const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': {
+          permissionMode: policy?.permissionMode ?? 'approve-reads', ...(capacityId ? { capacityId } : {}),
+        } } };
+        const admit = <T>(request: () => Promise<T>): Promise<T> => capacityId
+          ? requestWhenAdmitted({
+            request,
+            signal: callerSignal ? AbortSignal.any([this.lifetime.signal, callerSignal]) : this.lifetime.signal,
+            isPending: capacityPendingOf,
+            onPending: pending => noteProcessCapacity(agent.id, pending),
+            cancel: async () => { await link.rpc.request('_1agents/capacity/cancel', { capacityId }).catch(() => undefined); },
+          })
+          : request();
+        // Queue waits return immediately. This 60s bound covers only the attempt that holds the slot.
+        const handshake = () => AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000), ...(callerSignal ? [callerSignal] : [])]);
+        const restoreMethod = binding ? binding.restoreMethod ?? 'session/load' : undefined;
         const result = binding
-          ? await link.rpc.request(binding.restoreMethod ?? 'session/load', { ...params, sessionId: binding.sessionId! }, { cancellationSignal })
-          : await link.rpc.request('session/new', params, { cancellationSignal });
+          ? await admit(() => link.rpc.request(restoreMethod!, { ...params, sessionId: binding.sessionId! }, { cancellationSignal: handshake() }))
+          : await admit(() => link.rpc.request('session/new', params, { cancellationSignal: handshake() }));
+        if (binding && restoreMethod) noteSessionRestore(agent.id, restoreMethod);
         if (!binding) createdBinding = { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId };
         capabilities.configOptions = result.configOptions ?? capabilities.configOptions;
         capabilities.modes = result.modes ?? undefined;
@@ -317,13 +344,20 @@ export class AcpAdapter implements LlmAdapter {
         // existing session must retain its native mode and user selections.
         if (!binding && policy?.initialModeId) {
           if (!capabilities.modes?.availableModes.some(m => m.id === policy.initialModeId)) throw new Error('Configured initial ACP mode is not advertised by the Agent');
-          await link.rpc.request('session/set_mode', { sessionId: (result as { sessionId: string }).sessionId, modeId: policy.initialModeId }, { cancellationSignal });
+          await link.rpc.request('session/set_mode', { sessionId: (result as { sessionId: string }).sessionId, modeId: policy.initialModeId }, { cancellationSignal: handshake() });
           capabilities.modes.currentModeId = policy.initialModeId;
         }
         if (createdBinding) this.state.save(agent.id, createdBinding);
         void link.closed.then(() => { if (this.links.get(agent.id) === operation) this.links.delete(agent.id); });
         return link;
       } catch (error) {
+        if (binding && isDeletedAcpSession(error)) {
+          link.close();
+          const deleted = new LlmError('Session was deleted', 'SESSION_DELETED');
+          // The stream catch replaces unowned errors with ACP_TURN_FAILED. Keep this code.
+          ownedFailures.set(deleted, toSafeError(deleted, { origin: 'acp', outcomeUnknown: false }));
+          throw deleted;
+        }
         let failure = error;
         if (createdBinding) {
           const cleanup = new AbortController();
@@ -350,6 +384,41 @@ export class AcpAdapter implements LlmAdapter {
     this.links.set(agent.id, operation);
     try { return await operation; }
     catch (error) { if (this.links.get(agent.id) === operation) this.links.delete(agent.id); throw error; }
+  }
+  /** Ordinary ACP release. The binding, session id, and restore method stay. No session/delete. */
+  async releaseSession(sessionId: string): Promise<{ processReleased: true | 'pending'; acp: boolean }> {
+    const agent = this.ctx.agents.get(sessionId as never);
+    if (!agent) {
+      const error = new Error('Session not found') as Error & { code: string };
+      error.code = 'SESSION_NOT_FOUND';
+      throw error;
+    }
+    if (!this.agentName(agent)) return { processReleased: true, acp: false };
+    const binding = this.state.get(agent.id);
+    const pending = this.links.get(agent.id);
+    const link = pending ? await pending.catch(() => undefined) : undefined;
+    if (link && binding?.sessionId) {
+      try {
+        await link.rpc.request('session/close', { sessionId: binding.sessionId }, {
+          cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '';
+        if (!/not found|Session not found|-32001/i.test(message)) {
+          const wrapped = new Error('Remote session close failed') as Error & { code: string };
+          wrapped.code = 'REMOTE_UNAVAILABLE';
+          throw wrapped;
+        }
+      }
+      link.close();
+      if (this.links.get(agent.id) === pending) this.links.delete(agent.id);
+    }
+    return { processReleased: 'pending', acp: true };
+  }
+  async sessionStatus(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean }> {
+    const agent = this.ctx.agents.get(sessionId as never);
+    if (!agent) return { attached: false, activeTurn: false };
+    return { attached: this.links.has(agent.id), activeTurn: this.controllers.has(agent.id) };
   }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const agent = options.sessionId ? this.ctx.agents.get(options.sessionId) : undefined;
@@ -493,7 +562,15 @@ export class AcpAdapter implements LlmAdapter {
         signal.throwIfAborted();
         try {
           this.output.set(agent.id, update);
-          active = await this.connection(agent);
+          const capacityId = input.flatMap(message => message.role === 'user' && message.source?.kind === 'user' && 'rpcId' in message.source
+            && typeof message.source.rpcId === 'string' && message.source.rpcId.startsWith('a2a-') ? [message.source.rpcId] : [])[0];
+          try {
+            active = await this.connection(agent, capacityId, signal);
+            noteProcessReady(agent.id);
+          } catch (error) {
+            noteProcessCapacity(agent.id, undefined);
+            throw error;
+          }
           binding = this.state.get(agent.id)!;
           signal.throwIfAborted();
           if (diagnosticId) await save(() => this.diagnostics!.submitted(diagnosticId!));
