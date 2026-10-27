@@ -1,6 +1,6 @@
 # Activepieces scheduled agent tasks
 
-Activepieces owns schedules and business steps. The existing 1acp A2A gateway
+Activepieces owns schedules and business steps. The existing agent-workflow A2A gateway
 owns remote task monitoring, durable completion notices and delivery retries.
 The optional automation listener adds occurrence admission and processing claims.
 DSH remains the execution host for the existing A2A backend.

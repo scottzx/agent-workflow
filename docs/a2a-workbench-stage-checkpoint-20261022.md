@@ -2,7 +2,7 @@
 
 - 日期：2026-10-22（Asia/Shanghai）。
 - 本次范围：保存现阶段源码、设计、实施记录和后续计划，提交到独立 Git 分支；合并另行讨论。
-- 保存分支：`codex/a2a-workbench-checkpoint-20261022`，`1acp` 与父项目分别提交。
+- 保存分支：`codex/a2a-workbench-checkpoint-20261022`，`agent-workflow` 与父项目分别提交。
 - 保存前基线：本模块 `e792802`，父项目 `68c5054d4a0053b414cdc5d5151a891e4da5d6eb`。
 - 本次不实施下一阶段扩展，不部署服务、不发布 npm、不重制业务 PPT。
 

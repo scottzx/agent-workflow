@@ -116,8 +116,8 @@ button[hidden],
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  font-size: 23px;
-  letter-spacing: -0.8px;
+  font-size: 16px;
+  letter-spacing: -0.4px;
   font-weight: 750;
   line-height: 1;
 }
@@ -386,8 +386,8 @@ h1 {
   position: relative;
 }
 .protocol-node strong {
-  font-size: 24px;
-  letter-spacing: -0.5px;
+  font-size: 15px;
+  letter-spacing: -0.4px;
   display: block;
   font-weight: 650;
 }
@@ -949,7 +949,7 @@ code {
     font-size: 12px;
   }
   .brand {
-    font-size: 21px;
+    font-size: 15px;
   }
   .brand > img {
     width: 32px;
@@ -1114,7 +1114,7 @@ code {
   }
   .brand {
     gap: 7px;
-    font-size: 20px;
+    font-size: 14px;
   }
   .hero-copy h1 {
     font-size: 33px;
@@ -1158,7 +1158,7 @@ code {
     letter-spacing: 0.5px;
   }
   .protocol-node strong {
-    font-size: 22px;
+    font-size: 14px;
   }
   .protocol-node img {
     width: 32px;

@@ -1,7 +1,7 @@
 # Private ERPNext daily report piece
 
 This package is installed only in the existing Activepieces environment. Do not
-publish it to npm. It uses framework 0.32.0, matching the sibling 1acp piece, and
+publish it to npm. It uses framework 0.32.0, matching the sibling agent-workflow piece, and
 requires Activepieces 0.92.1 or later. Build and package it with:
 
     npm ci

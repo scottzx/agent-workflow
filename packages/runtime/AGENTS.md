@@ -183,7 +183,7 @@ Harness documentation synchronization policy:
   runtime logic.
 - Changelog entries should cover user-facing changes only. Do not add internal
   release-process or meta-only notes.
-- In this 1acp workspace, follow the root [Agent changelog policy](../../AGENTS.md#变更日志维护):
+- In this agent-workflow workspace, follow the root [Agent changelog policy](../../AGENTS.md#变更日志维护):
   add local changes to `../../changelog/YYYY-MM-DD.md` using the actual date in
   `Asia/Shanghai`. Append to the existing daily file or create the next day's file.
   Keep [`CHANGELOG.md`](CHANGELOG.md) as upstream/version history; do not append

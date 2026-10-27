@@ -36,4 +36,4 @@ for (const [, value] of html.matchAll(/\b(?:href|src)="([^"]+)"/g)) {
 }
 assert.doesNotMatch(html, /__[A-Z_]+__/, "Unresolved release metadata");
 fs.writeFileSync(path.join(output, ".nojekyll"), "");
-console.log(`Built 1ACP v${version}: dist/release-site (links, assets and branding verified)`);
+console.log(`Built agent-workflow v${version}: dist/release-site (links, assets and branding verified)`);

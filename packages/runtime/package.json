@@ -2,14 +2,16 @@
   "name": "@scottzx/1acp",
   "version": "0.16.0",
   "private": true,
-  "description": "Headless CLI client for the Agent Client Protocol (ACP) — talk to coding agents from the command line",
-  "homepage": null,
-  "bugs": null,
+  "description": "agent-workflow runtime based on acpx: headless CLI client for the Agent Client Protocol (ACP).",
+  "homepage": "https://scottzx.github.io/agent-workflow/",
+  "bugs": {
+    "url": "https://github.com/scottzx/agent-workflow/issues"
+  },
   "license": "MIT",
   "author": "scottzx",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/scottzx/1acp.git",
+    "url": "git+https://github.com/scottzx/agent-workflow.git",
     "directory": "packages/runtime"
   },
   "bin": {

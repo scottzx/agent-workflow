@@ -1,6 +1,6 @@
 # Historical daily-report test
 
-This recipe verifies Activepieces → GitHub collection → 1acp A2A → ERPNext
+This recipe verifies Activepieces → GitHub collection → agent-workflow A2A → ERPNext
 with the existing gateway and a new agent session in a dedicated working
 directory. It supplements Git facts with a small, timestamp-filtered 1session
 summary prepared on the machine that owns the sessions.
@@ -12,7 +12,7 @@ enable the draft as a production daily schedule.
 
 ## Prerequisites
 
-- Existing encrypted GitHub and 1acp automation connections in Activepieces.
+- Existing encrypted GitHub and agent-workflow automation connections in Activepieces. The connection externalId remains `oneacp-automation`.
 - Install the private [ERPNext piece](../erpnext-piece/README.md) and create its
   encrypted CustomAuth connection; never place API credentials in flow inputs.
 - A private ERPNext report user with create/read/write permissions on its own
