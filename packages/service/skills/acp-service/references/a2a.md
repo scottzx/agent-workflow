@@ -123,7 +123,7 @@ acp-service a2a invoke remote_agent_ack <<'JSON'
 JSON
 ```
 
-每次 spawn 都创建新会话，即使 cwd 相同。message 复用原 context/cwd/preset，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。未传 `lifecycle` 时 message 沿用原会话策略。`remote_agent_*` 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。
+每次 spawn 都创建新会话，即使 cwd 相同。这次新会话会回放该工作区、该 Agent 在 ACP 设置里已经接受的模式和配置；Grok Build 与 Codex 的记录各自保存。message 复用原 context/cwd/preset 和原会话上的设置，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。未传 `lifecycle` 时 message 沿用原会话策略。`remote_agent_*` 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。
 
 **standard 选模型。** `provider` 和 `model` 只用于 `standard` 等 DSH 原生预设，必须一起传，例如 `"provider": "deepseek", "model": "<目录里的模型 id>"`。DSH 新建会话后、第一条 prompt 前，按 `modelCatalog()` 核对，再调用 `selectModel`。目录里没有时任务失败，`resultMetadata.validation.code` 为 `MODEL_UNAVAILABLE`，不退回默认模型，也不发 prompt。省略时用 DSH 当时的默认模型，get 不带这两个字段。message 不传时沿用该会话已选的模型，传了就在本轮前切换。`oneagents-acp-*` 预设传这两个字段会被拒绝（宿主侧为 `MODEL_SELECTION_UNSUPPORTED`），它们的模型由 Agent 自己公布，经 `session/set_config_option` 切换。get 与 `resultMetadata` 写出实际使用的 `provider`、`model`。不要把模型名写进 prompt，那不会改会话模型。注意：DSH 的 `selectModel` 同时把这次选择存成 DSH 的默认模型，之后不指定模型的新会话（包括 DSH 界面里新开的）会用它。投递到已存在的主会话使用下面新增的 `session_*` 工具，两类 API 的任务 ID 和会话 ID 不可混用。
 

@@ -3629,11 +3629,12 @@ async function handlePermissionRequestCallback(req, ctx) {
     return { outcome: "allow_once" };
   }
 
-  // Per-session mode shortcut — gates the prompt without round-tripping
-  // through the UI. approve-reads falls through to the normal flow
-  // (1acp internally auto-allows read/search; everything else prompts).
-  // approve-all and deny-all are blanket decisions for the entire
-  // session until the user toggles the mode again.
+  // Bridge permissionMode (approve-reads / approve-all / deny-all) is not
+  // applied. Tool posture follows ACP settings the user can select or import:
+  // native mode (session/set_mode; Grok handled above) and config options such
+  // as reasoning effort (session/set_config_option). Other agents fall through
+  // to project allow-rules and a prompt.
+  /*
   if (!grokMode && session.permissionMode === "approve-all") {
     console.log(
       `[acpx-server] permission mode=approve-all → auto allow_once for ${req.raw.toolCall.title}`,
@@ -3646,6 +3647,7 @@ async function handlePermissionRequestCallback(req, ctx) {
     );
     return { outcome: "reject_once" };
   }
+  */
 
   // Project-level "总是允许" allowlist: a prior allow_always for this
   // tool+prefix auto-approves without prompting again. Read fresh from the

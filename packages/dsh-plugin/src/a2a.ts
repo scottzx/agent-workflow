@@ -14,6 +14,8 @@ export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token
   stateDirectory?: string;
   /** Public DSH origin, for example its Tailscale URL. */
   publicUrl?: string;
+  /** Gateway workbench that records questions and plan approvals for this host's A2A turns. */
+  workbench?: { url: string; token: string };
 }
 
 /** Routes and in-flight turns are released with the owning Cordis plugin. */
@@ -23,7 +25,8 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
   if (!token) throw new Error('Set DSH_A2A_TOKEN or a2a.token before enabling DSH A2A');
   let close = async () => {};
   await ctx.effect(async () => {
-    const server = await createA2AServer({ ...options, token, backend: new DshA2ABackend(ctx, diagnostics, sessions),
+    const { workbench: _workbench, ...serverOptions } = options;
+    const server = await createA2AServer({ ...serverOptions, token, backend: new DshA2ABackend(ctx, diagnostics, sessions),
       stateDirectory: options.stateDirectory ?? stateDirectory,
       publicUrl: options.publicUrl ?? `http://127.0.0.1:${ctx.webServer.port}` });
     const routes: (() => void)[] = [];

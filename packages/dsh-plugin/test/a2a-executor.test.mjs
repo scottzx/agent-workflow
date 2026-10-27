@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
 import SessionStore from '@deepseek-ai/dsh-session';
+import { currentA2AExecution } from '@1agents/acp-service/a2a';
 import { DshA2ABackend } from '../dist/a2a-executor.js';
 import { diagnosticsFixture, identity } from './helpers/diagnostics.mjs';
 import { toSafeError } from '@1agents/acp-service/runtime';
@@ -35,6 +36,26 @@ test('A2A checks startup admission after session serialization and before submit
   f.claim(agent, 'second', 2); f.output(agent, 2, 'second done'); f.finish(agent, 2, { kind: 'completed' });
   assert.equal((await second).outcome, 'completed');
   assert.equal(checks, 1);
+});
+
+test('an A2A execution binding lasts for the prompt and clears when the turn ends', async t => {
+  const f = await fixture(t);
+  const target = await f.backend.prepare({ cwd: f.cwd });
+  let during;
+  const prompt = f.controller.prompt.bind(f.controller);
+  f.controller.prompt = async (request, signal) => {
+    during = currentA2AExecution(target.sessionId);
+    return prompt(request, signal);
+  };
+  const execution = { jobId: 'job-1', attemptId: 'attempt-1' };
+  const run = f.backend.run(target, 'bound', { requestId: 'bound', signal: new AbortController().signal, execution });
+  await f.admitted.promise;
+  assert.deepEqual(during, execution);
+  assert.deepEqual(currentA2AExecution(target.sessionId), execution);
+  const agent = f.agents.get(target.sessionId);
+  f.claim(agent, 'bound', 1); f.output(agent, 1, 'done'); f.finish(agent, 1, { kind: 'completed' });
+  assert.equal((await run).outcome, 'completed');
+  assert.equal(currentA2AExecution(target.sessionId), undefined);
 });
 
 test('A2A samples memory after an existing native turn drains and cancellation does not wait for that turn', async t => {

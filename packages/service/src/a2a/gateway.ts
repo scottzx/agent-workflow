@@ -24,7 +24,9 @@ import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema }
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
-import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
+import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
+import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
+import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
@@ -171,7 +173,7 @@ interface ExecutionNotice { noticeId: string; messageId: string; originSessionId
 interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean;
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
-interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun> }
+interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[] }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
 const actionable = new Set([...terminal, 'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED']);
 const wire = (task: Task): Record<string, any> => Task.toJSON(task) as Record<string, any>;
@@ -194,6 +196,7 @@ export class RemoteAgentGateway {
   readonly automation?: A2AAutomation;
   readonly sessions: SessionDelivery;
   readonly targets: TargetDirectory;
+  readonly agents: AgentRegistry;
   readonly projectDiscovery?: ProjectRoleDiscovery;
   readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
@@ -244,6 +247,7 @@ export class RemoteAgentGateway {
       this.sessions = new SessionDelivery(this.config.stateDirectory, this.config.sessionHosts);
       this.targets = new TargetDirectory(this.config.stateDirectory, this.config.remotes);
       this.targets.ensureLegacyRemotes();
+      this.agents = new AgentRegistry(this.config.stateDirectory);
       this.ledger = new JobLedger(this.state.ledger, next => {
         atomicJson(this.stateFile, { ...this.state, version: 2, ledger: next });
         this.state.ledger = next; this.state.version = 2;
@@ -269,6 +273,8 @@ export class RemoteAgentGateway {
       this.state.reportReviews ??= {};
       this.state.executionCancellations ??= {};
       this.state.pptDeliveries ??= { version: 1, runs: {} };
+      if (this.state.processRequests !== undefined && !Array.isArray(this.state.processRequests)) throw new Error('Invalid gateway state');
+      this.state.processRequests = z.array(processRequestSchema).parse(this.state.processRequests ?? []);
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         const attempt = this.ledger.getAttempt(run.attemptId);
         if (attempt.submissionStatus === 'prepared') this.ledger.markDispatching(attempt.attemptId);
@@ -300,6 +306,13 @@ export class RemoteAgentGateway {
   private legacySnapshot(job: Job) {
     try { return this.targetSnapshot(this.targets.resolve(`legacy:${job.remote}`, { cwd: job.cwd, prompt: 'Legacy task migration', ...(job.agentPreset ? { agentPreset: job.agentPreset } : {}) })); }
     catch { return { targetId: `legacy:${job.remote}`, provider: 'a2a', remote: job.remote, cwd: job.cwd, agentPreset: job.agentPreset, historicalConfigUnknown: true }; }
+  }
+  /** A continuation keeps the channel frozen on its current attempt. A new task is admitted from the registry. */
+  private developmentFor(target: { targetId: string; kind: string; name: string }, jobId?: string) {
+    if (!jobId) return this.agents.admit(target);
+    const job = this.ledger.snapshot().jobs[jobId];
+    const attempt = job ? this.ledger.snapshot().attempts[job.currentAttemptId] : undefined;
+    return readDevelopment(attempt?.targetSnapshot?.development);
   }
   private targetSnapshot(resolved: ExecutionTargetSnapshot) {
     return { targetId: resolved.target.targetId, targetKind: resolved.target.kind, targetName: resolved.target.name,
@@ -335,7 +348,8 @@ export class RemoteAgentGateway {
     const reportRequest = input.input.reportReview;
     if (reportRequest !== undefined && (options.jobId || resolved.target.kind !== 'agent_host' || !this.config.reportReview || !this.config.workbench)) throw new Error('Report review requires a new temporary agent_host task and configured report/workbench policy');
     if (reportRequest !== undefined) reportReviewInputSchema.parse(reportRequest);
-    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
+    const development = this.developmentFor(resolved.target, options.jobId);
+    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(development ? { development } : {}), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
     if (prepared.idempotent) return this.ledgerView(input.originSessionId, prepared.job.jobId);
     const { job, attempt } = prepared;
@@ -390,7 +404,8 @@ export class RemoteAgentGateway {
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
-          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}) } },
+          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
+          execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
         configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
           authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
       if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
@@ -1085,13 +1100,35 @@ export class RemoteAgentGateway {
     const runs = Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[];
     const reportRuns = Object.values(this.state.reportReviews ?? {});
     return workbenchSnapshot({ ledger: this.ledger.snapshot(), runs, reportRuns, reviews: [...runs.flatMap(run => run.humanReviews ?? []), ...reportRuns.flatMap(run => run.humanReviews)],
-      actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
+      processRequests: this.state.processRequests ?? [], actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
+  }
+  private workbench<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.workbenchQueue.then(operation);
+    this.workbenchQueue = run.then(() => {}, () => {});
+    return run;
+  }
+  private writeProcessRequest(request: ProcessRequest): void {
+    const items = this.state.processRequests ?? [];
+    const index = items.findIndex(item => item.requestId === request.requestId);
+    const next = items.slice();
+    if (index < 0) next.push(request); else next[index] = request;
+    this.state.processRequests = next;
+    this.save();
   }
   workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
+  workbenchAgents() {
+    const residents = this.targets.listTargets().filter(target => target.kind === 'resident_agent').map(target => ({
+      targetId: target.targetId, name: target.name, ...(target.binding.roleId ? { roleId: target.binding.roleId } : {}),
+      ...(target.binding.agentPreset ? { agentPreset: target.binding.agentPreset } : {}) }));
+    return listWorkbenchAgents(this.workbenchProjection(), this.agents.snapshot(), residents);
+  }
+  createWorkbenchAgent(input: unknown) { return this.workbench(async () => ({ draft: this.agents.create(input), ...this.workbenchAgents() })); }
+  updateWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ draft: this.agents.update(agentId, input), ...this.workbenchAgents() })); }
+  publishWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() })); }
   workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
   /** Only the dedicated HTTP workbench calls this; it is deliberately absent from the agent tool catalogue. */
   async decideWorkbenchReview(jobId: string, reviewId: string, input: unknown) {
-    const operation = this.workbenchQueue.then(async () => {
+    return this.workbench(async () => {
       if (this.closed) throw new Error('Gateway is closed');
       const scope = this.workbenchTask(jobId), config = this.config.workbench!;
       await this.advancingDeliveries.get(scope.currentAttemptId);
@@ -1123,8 +1160,57 @@ export class RemoteAgentGateway {
       if (current.humanReviews?.some(item => item.resume?.status === 'pending')) void this.advanceDelivery(current).catch(() => {});
       return this.workbenchTask(jobId);
     });
-    this.workbenchQueue = operation.then(() => {}, () => {});
-    return operation;
+  }
+  /** Records a question or plan approval against the running attempt. The workbench token never travels in A2A metadata. */
+  async openProcessRequest(jobId: string, input: unknown) {
+    return this.workbench(async () => {
+      if (this.closed) throw new Error('Gateway is closed');
+      const scope = this.workbenchTask(jobId);
+      const parsed = processRequestCreateSchema.parse(input);
+      if (parsed.jobId !== jobId) throw new ProcessRequestError('invalid', 'Process request job does not match the task');
+      let attempt;
+      try { attempt = this.ledger.getAttempt(parsed.attemptId); }
+      catch { throw new ProcessRequestError('invalid', 'Process request attempt was not found'); }
+      if (attempt.jobId !== jobId || attempt.attemptId !== scope.currentAttemptId) throw new ProcessRequestError('invalid', 'Process request attempt is not current');
+      if (['completed', 'failed', 'canceled', 'rejected'].includes(scope.executionStatus)) throw new ProcessRequestError('already_decided', 'Task is no longer running');
+      if (parsed.requestId) {
+        const existing = this.state.processRequests?.find(item => item.requestId === parsed.requestId);
+        if (existing) {
+          if (!sameProcessRequest(existing, parsed)) throw new ProcessRequestError('idempotency_conflict', 'requestId conflicts with a recorded process request');
+          return projectProcessRequest(existing);
+        }
+      }
+      const created = createProcessRequest(parsed);
+      this.writeProcessRequest(created);
+      return created;
+    });
+  }
+  processRequest(jobId: string, requestId: string) {
+    const request = this.workbenchTask(jobId).processRequests.find(item => item.requestId === requestId);
+    if (!request) throw new ProcessRequestError('not_found', 'Process request not found in authorized task');
+    return request;
+  }
+  /** Completes the stored request. The caller must still finish the original userQuestions wait; this does not send another prompt. */
+  async answerProcessRequest(jobId: string, requestId: string, input: unknown) {
+    return this.workbench(async () => {
+      if (this.closed) throw new Error('Gateway is closed');
+      this.workbenchTask(jobId);
+      const stored = this.state.processRequests?.find(item => item.requestId === requestId && item.jobId === jobId);
+      if (!stored) throw new ProcessRequestError('not_found', 'Process request not found in authorized task');
+      const parsed = processRequestAnswerSchema.parse(input);
+      if (stored.status === 'pending' && Date.parse(stored.deadlineAt) <= Date.now() && stored.answer?.clientRequestId !== parsed.clientRequestId) {
+        this.writeProcessRequest(expireProcessRequest(stored));
+        throw new ProcessRequestError('expired', 'This process request has expired');
+      }
+      let result;
+      try { result = answerProcessRequest(stored, parsed); }
+      catch (error) {
+        if (error instanceof ProcessRequestError && error.code === 'expired' && stored.status === 'pending') this.writeProcessRequest(expireProcessRequest(stored));
+        throw error;
+      }
+      if (!result.idempotent) this.writeProcessRequest(result.request);
+      return this.workbenchTask(jobId);
+    });
   }
   private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle | undefined {
     if (value === undefined) return previous;
@@ -1436,15 +1522,49 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
         }
-        const route = /^\/workbench\/tasks\/([^/]+)(?:\/reviews\/([^/]+)\/decisions)?$/.exec(url.pathname);
-        if (!route || url.search) return json(res, 404, { error: 'No workbench route' });
-        const jobId = decodeURIComponent(route[1]!);
+        const agentCreate = req.method === 'POST' && url.pathname === '/workbench/agents';
+        const agentChange = /^\/workbench\/agents\/([^/]+)\/(settings|publish)$/.exec(url.pathname);
+        if (url.pathname === '/workbench/agents' || agentChange) {
+          if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+        }
+        if (req.method === 'GET' && url.pathname === '/workbench/agents') return json(res, 200, gateway.workbenchAgents());
+        if (agentCreate || agentChange) {
+          if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
+          try {
+            const payload = await body(req);
+            if (agentCreate) return json(res, 200, await gateway.createWorkbenchAgent(payload));
+            const agentId = decodeURIComponent(agentChange![1]!), action = agentChange![2];
+            return json(res, 200, await (action === 'publish' ? gateway.publishWorkbenchAgent(agentId, payload) : gateway.updateWorkbenchAgent(agentId, payload)));
+          } catch (error) {
+            if (error instanceof AgentRegistryError) {
+              const status = error.code === 'not_found' ? 404 : error.code === 'conflict' ? 409 : 400;
+              return json(res, status, { error: error.code, message: error.message });
+            }
+            if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
+            throw error;
+          }
+        }
+        if (url.search) return json(res, 404, { error: 'No workbench route' });
+        const route = /^\/workbench\/tasks\/([^/]+)(.*)$/.exec(url.pathname);
+        if (!route) return json(res, 404, { error: 'No workbench route' });
+        const jobId = decodeURIComponent(route[1]!), rest = route[2] ?? '';
+        const review = /^\/reviews\/([^/]+)\/decisions$/.exec(rest);
+        const answer = /^\/process-requests\/([^/]+)\/answers$/.exec(rest);
+        const one = /^\/process-requests\/([^/]+)$/.exec(rest);
         try {
-          if (req.method === 'GET' && !route[2]) return json(res, 200, gateway.workbenchTask(jobId));
-          if (req.method === 'POST' && route[2]) return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(route[2]), await body(req)));
-          return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
+          if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
+          if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
+          if (answer && req.method === 'POST') return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), await body(req)));
+          if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
+          if (rest === '' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });
+          if (error instanceof ProcessRequestError) {
+            const status = error.code === 'forbidden' ? 403 : error.code === 'not_found' ? 404 : error.code === 'invalid' ? 400 : 409;
+            return json(res, status, { error: error.code, message: error.message });
+          }
           if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
           return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
         }

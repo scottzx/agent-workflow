@@ -11,6 +11,7 @@ import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
 import { mountDshA2A, type DshA2AOptions } from './a2a.js';
+import { createWorkbenchProcessClient } from './process-requests.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
@@ -33,7 +34,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   const diagnosticOwner = await openDiagnostics(resolve(input.diagnosticsDirectory ?? join(config.stateDirectory, 'diagnostics')));
   const { diagnostics } = diagnosticOwner;
   let closeA2A: (() => Promise<void>) | undefined;
-  const adapter = new AcpAdapter(ctx, config, diagnostics);
+  const processRequests = input.a2a?.workbench ? createWorkbenchProcessClient(input.a2a.workbench) : undefined;
+  const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
   const nativeSessions = new NativeSessions(ctx, adapter, config);
   ctx.provide('oneagentsAcpSessions', nativeSessions);

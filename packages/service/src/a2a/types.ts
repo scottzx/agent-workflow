@@ -2,6 +2,7 @@
 import type { SafeError } from '@1agents/acp-service/runtime';
 import { isAbsolute } from 'node:path';
 import { z } from 'zod';
+import type { A2AExecutionRef } from './execution-binding.js';
 
 const roleText = z.string().min(1).max(4096).refine(value => !value.includes('\0'));
 const rolePath = roleText.refine(isAbsolute, 'Expected an absolute role cache path');
@@ -102,7 +103,9 @@ export interface A2ABackend {
     /** Hosts with a session queue call this again immediately before submitting the prompt. */
     beforeStart?: (signal?: AbortSignal) => Promise<void>;
     /** Process-slot wait stays submitted. Undefined means the handshake has started. */
-    onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void }): Promise<A2ARunResult>;
+    onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void;
+    /** Set by the gateway. The DSH host binds it for the prompt and never puts the workbench credential here. */
+    execution?: A2AExecutionRef }): Promise<A2ARunResult>;
   /** Ordinary session release. Hosts that cannot close omit this and the gateway reports UNSUPPORTED. */
   close?(target: A2ATarget, options?: { signal?: AbortSignal }): Promise<A2ACloseResult>;
   status?(target: A2ATarget): Promise<A2ASessionStatus>;

@@ -6,7 +6,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
-import { A2APreflightError, runA2APreflight, type A2ABackend, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
+import { A2APreflightError, bindA2AExecution, runA2APreflight, unbindA2AExecution, type A2ABackend, type A2AExecutionRef, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
 
 import type { Diagnostics } from './diagnostics.js';
@@ -215,7 +215,7 @@ export class DshA2ABackend implements A2ABackend {
    * @param options Task-owned request identity and cancellation signal.
    * @returns The exact turn's ending and its final assistant text.
    */
-  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void>; onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void }): Promise<A2ARunResult> {
+  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void>; onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void; execution?: A2AExecutionRef }): Promise<A2ARunResult> {
     options.signal.throwIfAborted();
     const queuedAbort = Promise.withResolvers<A2ARunResult>();
     const abort = (): void => { queuedAbort.reject(options.signal.reason); };
@@ -232,7 +232,7 @@ export class DshA2ABackend implements A2ABackend {
     finally { options.signal.removeEventListener('abort', abort); }
   }
 
-  private async execute(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void>; onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void }): Promise<A2ARunResult> {
+  private async execute(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void>; onCapacity?: (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined) => void; execution?: A2AExecutionRef }): Promise<A2ARunResult> {
     const agent = await this.agent(target.sessionId as SessionId);
     options.signal.throwIfAborted();
     const completion = Promise.withResolvers<A2ARunResult>();
@@ -335,6 +335,7 @@ export class DshA2ABackend implements A2ABackend {
       tick();
     }
     try {
+      if (options.execution) bindA2AExecution(target.sessionId, options.execution);
       // Recheck after event registration; cancellation can arrive during Agent restoration.
       options.signal.throwIfAborted();
       // Native user turns do not share this backend's execution map.
@@ -357,6 +358,7 @@ export class DshA2ABackend implements A2ABackend {
       return await completion.promise;
     } finally {
       if (capacityTimer) clearTimeout(capacityTimer);
+      if (options.execution) unbindA2AExecution(target.sessionId, options.execution);
       options.signal.removeEventListener('abort', cancel);
       for (const dispose of listeners.reverse()) dispose();
     }

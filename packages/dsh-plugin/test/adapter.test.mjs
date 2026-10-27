@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { agent as acpAgent, RequestError } from '@agentclientprotocol/sdk';
 import { WebSocketServer } from 'ws';
 import { LlmError } from '@deepseek-ai/dsh-llm';
+import { bindA2AExecution, currentA2AExecution, unbindA2AExecution } from '@1agents/acp-service/a2a';
 import { AcpAdapter, validateSessionPolicies } from '../dist/adapter.js';
 import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
@@ -35,7 +36,8 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const commands = new Map();
   let model = 'native-a';
   const configOptions = () => [{ id: 'native-model', name: 'Native model', category: 'model', type: 'select', currentValue: model, options: [{ value: 'native-a', name: 'Native A' }, { value: 'native-b', name: 'Native B' }] }];
-  wss.on('connection', ws => {
+  wss.on('connection', (ws, request) => {
+    const agentName = decodeURIComponent(new URL(request.url ?? '/', 'http://127.0.0.1').pathname.split('/').filter(Boolean).pop() ?? '');
     let connection;
     const app = acpAgent()
       .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true, _meta: { '1agents': { version: 1 } } } }))
@@ -45,6 +47,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         await beforeNew();
         const sessionId = 'remote-' + (++creations);
         await connection.client.notify('session/update', { sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'review', description: 'Native review', input: { hint: 'Scope' } }, { name: 'model', description: 'Native model' }] } });
+        if (streamConfig.onNew) return streamConfig.onNew({ params, sessionId, agentName });
         return { sessionId, configOptions: configOptions(), modes: { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] } };
       })
       .onRequest('_1agents/session/import', object, () => {
@@ -52,6 +55,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         return { sessionId: 'synthetic-imported-session' };
       })
       .onRequest('session/set_config_option', async ({ params }) => {
+        if (streamConfig.onConfig) { changes.push(params); return streamConfig.onConfig({ params, agentName }); }
         assert.equal(params.configId, 'native-model');
         assert.ok(['native-a', 'native-b'].includes(params.value));
         changes.push(params); model = params.value;
@@ -134,6 +138,13 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     return 'allowed-once';
   } }, userQuestions: { ask: async request => {
     assert.equal(request.agent, local);
+    if (streamConfig.questionHold) {
+      (streamConfig.asks ??= []).push(request);
+      if (!request.signal.aborted) await new Promise(resolve => request.signal.addEventListener('abort', resolve, { once: true }));
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      throw error;
+    }
     const q = request.questions[0];
     if (q.id === 'plan') {
       assert.equal(q.detail, 'Read the project');
@@ -143,19 +154,19 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     return { answers: [{ id: q.id, selected: ['A', 'B'] }] };
   } } };
   const config = { serviceUrl: `http://127.0.0.1:${wss.address().port}`, agents: ['codex', 'grok-build'], stateDirectory: directory, reconnectAttempts: 2, reconnectDelayMs: 1 };
-  const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics);
+  const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics, streamConfig.processRequests);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
   return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, deletedSessions, commands, attaches, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
 
-test('workspace policy sets permission and advertised native mode before any prompt', { timeout: 5000 }, async t => {
+test('workspace policy sets advertised native mode and does not send bridge permissionMode', { timeout: 5000 }, async t => {
   const f = await fixture(t);
   f.config.sessionPolicies = validateSessionPolicies([{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'write' }]);
   const capabilities = await f.adapter.describe(f.local);
   assert.equal(capabilities.modes.currentModeId, 'write');
-  assert.equal(f.creationsInput[0]._meta['1agents'].permissionMode, 'approve-all');
+  assert.equal(f.creationsInput[0]._meta, undefined);
   assert.deepEqual(f.changes, [{ sessionId: 'remote-1', modeId: 'write' }]);
   assert.equal(f.prompts.length, 0);
   await f.adapter.describe(f.local);
@@ -169,10 +180,62 @@ for (const mismatch of ['workspace', 'agent']) {
     f.config.sessionPolicies = validateSessionPolicies([{ cwd: mismatch === 'workspace' ? join(f.local.session.header.cwd, 'other') : f.local.session.header.cwd, agent: mismatch === 'agent' ? 'grok-build' : 'codex', permissionMode: 'approve-all', initialModeId: 'write' }]);
     const capabilities = await f.adapter.describe(f.local);
     assert.equal(capabilities.modes.currentModeId, 'read');
-    assert.equal(f.creationsInput[0]._meta['1agents'].permissionMode, 'approve-reads');
+    assert.equal(f.creationsInput[0]._meta, undefined);
     assert.deepEqual(f.changes, []);
   });
 }
+
+test('workbench answers complete the live question and plan, and DSH answers close the card', { timeout: 10000 }, async t => {
+  const execution = { jobId: 'job-1', attemptId: 'attempt-1' };
+  t.after(() => unbindA2AExecution('dsh-session', execution));
+  const workbenchCalls = [];
+  const workbench = {
+    async open(input) { workbenchCalls.push({ op: 'open', input }); return { requestId: input.requestId, deadlineAt: new Date(Date.now() + 60_000).toISOString(), status: 'pending' }; },
+    async wait(input) {
+      const opened = workbenchCalls.find(call => call.op === 'open' && call.input.requestId === input.requestId);
+      if (opened.input.kind === 'plan') return { requestId: input.requestId, jobId: opened.input.jobId, kind: 'plan', status: 'answered', deadlineAt: opened.deadlineAt ?? '', answer: { clientRequestId: 'wb-plan', outcome: 'approved' } };
+      return { requestId: input.requestId, jobId: 'job-1', kind: 'question', status: 'answered', deadlineAt: '', answer: { clientRequestId: 'wb-q', outcome: 'accepted', answers: { 'Choose targets': ['A', 'B'] } } };
+    },
+    async report(input) { workbenchCalls.push({ op: 'report', input }); },
+  };
+  const held = { processRequests: workbench, questionHold: true, asks: [] };
+  const workbenchWins = await fixture(t, false, 'question', async () => {}, [], held);
+  bindA2AExecution(workbenchWins.local.id, execution);
+  await collect(workbenchWins.adapter, workbenchWins.options('workbench-wins'));
+  assert.equal(held.asks.length, 2);
+  assert.equal(held.asks.every(request => request.signal.aborted), true);
+  assert.equal(workbenchCalls.some(call => call.op === 'report'), false);
+  assert.equal(workbenchCalls.filter(call => call.op === 'open').map(call => call.input.kind).join(','), 'question,plan');
+  unbindA2AExecution(workbenchWins.local.id, execution);
+
+  const dshCalls = [];
+  const dsh = {
+    async open(input) { dshCalls.push({ op: 'open', input }); return { requestId: input.requestId, deadlineAt: new Date(Date.now() + 60_000).toISOString(), status: 'pending' }; },
+    async wait(input) { await new Promise((_, reject) => input.signal.addEventListener('abort', () => reject(input.signal.reason), { once: true })); },
+    async report(input) { dshCalls.push({ op: 'report', input }); },
+  };
+  const dshWins = await fixture(t, false, 'question', async () => {}, [], { processRequests: dsh });
+  bindA2AExecution(dshWins.local.id, execution);
+  await collect(dshWins.adapter, dshWins.options('dsh-wins'));
+  const reports = dshCalls.filter(call => call.op === 'report').map(call => call.input);
+  assert.deepEqual(reports.map(item => item.outcome), ['accepted', 'approved']);
+  assert.deepEqual(reports[0].answers, { 'Choose targets': ['A', 'B'] });
+  assert.equal(reports[1].answers, undefined);
+  unbindA2AExecution(dshWins.local.id, execution);
+
+  let opened = false;
+  const unbound = await fixture(t, false, 'question', async () => {}, [], { processRequests: { async open() { opened = true; throw new Error('unused'); }, async wait() { throw new Error('unused'); }, async report() {} } });
+  await collect(unbound.adapter, unbound.options('no-binding'));
+  assert.equal(opened, false);
+  assert.equal(currentA2AExecution(unbound.local.id), undefined);
+
+  let failedOpen = false;
+  const failed = await fixture(t, false, 'question', async () => {}, [], { processRequests: { async open() { failedOpen = true; throw new Error('gateway down'); }, async wait() { throw new Error('unused'); }, async report() {} } });
+  bindA2AExecution(failed.local.id, execution);
+  await collect(failed.adapter, failed.options('open-failed'));
+  assert.equal(failedOpen, true);
+  unbindA2AExecution(failed.local.id, execution);
+});
 
 test('unadvertised initial mode fails before prompting', { timeout: 5000 }, async t => {
   const f = await fixture(t);
@@ -803,6 +866,59 @@ test('native commands, models and modes are discovered before prompting and stay
   await collect(f.adapter, f.options('message-1'));
   assert.equal(f.counts().creations, 1);
   assert.deepEqual(f.changes.map(c => c.sessionId), ['remote-1', 'remote-1']);
+});
+
+test('pinned settings stay with their own agent and a changed catalog fails before prompting', async t => {
+  const grokModes = { currentModeId: 'acceptEdits', availableModes: [{ id: 'acceptEdits', name: 'Accept Edits' }, { id: 'bypassPermissions', name: 'Always Approve' }] };
+  const codexModes = { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] };
+  const grokModel = { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'grok-2', options: [{ group: 'Grok', name: 'Grok', options: [{ value: 'grok-2', name: 'Grok 2' }, { value: 'grok-2-mini', name: 'Mini' }] }] };
+  const grokEffort = { id: 'reasoningEffort', name: 'Reasoning', type: 'select', currentValue: 'low', options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }] };
+  const codexModel = { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'codex-mini', options: [{ value: 'codex-mini', name: 'Mini' }, { value: 'codex-max', name: 'Max' }] };
+  const codexVerbosity = { id: 'verbosity', name: 'Verbosity', type: 'select', currentValue: 'low', options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }] };
+  let dropGrokEffort = false;
+  const catalog = agentName => agentName === 'codex'
+    ? [structuredClone(codexModel), structuredClone(codexVerbosity)]
+    : [structuredClone(grokModel), structuredClone(dropGrokEffort ? { ...grokEffort, options: [{ value: 'low', name: 'Low' }] } : grokEffort)];
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    onNew: ({ sessionId, agentName }) => ({ sessionId, configOptions: catalog(agentName), modes: agentName === 'codex' ? codexModes : grokModes }),
+    onConfig: ({ params, agentName }) => ({ configOptions: catalog(agentName).map(option => option.id === params.configId ? { ...option, currentValue: params.value } : option) }),
+  });
+  const agents = new Map([[f.local.id, f.local]]);
+  f.ctx.agents.get = id => agents.get(id);
+  const spawn = (id, preset) => {
+    const agent = { id, session: { header: { cwd: f.local.session.header.cwd, agentPreset: preset }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: f.local.ctx, followup: f.local.followup };
+    agents.set(id, agent);
+    return agent;
+  };
+  const grok = spawn('dsh-grok', 'oneagents-acp-grok-build');
+  await f.adapter.describe(grok);
+  await f.adapter.configure(grok, 'reasoningEffort', 'high');
+  await f.adapter.configure(grok, 'model', 'grok-2-mini');
+  await f.adapter.configure(grok, '$mode', 'bypassPermissions');
+  const codex = spawn('dsh-codex', 'oneagents-acp-codex');
+  await f.adapter.describe(codex);
+  await f.adapter.configure(codex, 'verbosity', 'high');
+  await f.adapter.configure(codex, 'model', 'codex-max');
+  await f.adapter.configure(codex, '$mode', 'write');
+  f.changes.length = 0;
+  f.config.sessionPolicies = validateSessionPolicies([{ cwd: f.local.session.header.cwd, agent: 'grok-build', initialModeId: 'acceptEdits' }]);
+  const replayGrok = spawn('dsh-grok-next', 'oneagents-acp-grok-build');
+  await f.adapter.describe(replayGrok);
+  assert.deepEqual(f.changes.map(change => [change.configId ?? change.modeId, change.value ?? change.modeId]), [
+    ['model', 'grok-2-mini'], ['reasoningEffort', 'high'], ['bypassPermissions', 'bypassPermissions'],
+  ]);
+  await f.adapter.describe(replayGrok);
+  assert.equal(f.changes.length, 3);
+  const replayCodex = spawn('dsh-codex-next', 'oneagents-acp-codex');
+  await f.adapter.describe(replayCodex);
+  assert.deepEqual(f.changes.slice(3).map(change => change.configId ?? change.modeId), ['model', 'verbosity', 'write']);
+  assert.equal(f.prompts.length, 0);
+  dropGrokEffort = true;
+  const mismatched = spawn('dsh-grok-mismatch', 'oneagents-acp-grok-build');
+  await assert.rejects(f.adapter.describe(mismatched), /Pinned ACP option "reasoningEffort" value "high" is not advertised by grok-build/);
+  assert.equal(f.prompts.length, 0);
+  assert.equal(new State(f.config.stateDirectory).get(mismatched.id), undefined);
+  assert.ok(f.closedSessions.includes('remote-' + f.counts().creations));
 });
 
 test('unstarted sessions switch ACP agents and replace native commands', async t => {

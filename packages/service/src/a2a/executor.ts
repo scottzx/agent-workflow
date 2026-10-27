@@ -89,6 +89,7 @@ async function waitForPreparation(previous: Promise<void>, signal: AbortSignal):
 /** Validate application metadata before the SDK starts an execution. */
 export function parseA2AInput(request: SendMessageRequest, options: A2AExecutionOptions): {
   prompt: string; input: A2APrepareInput; resultContract?: A2AResultContract;
+  execution?: { jobId: string; attemptId: string };
 } {
   const message = request.message;
   if (!message?.messageId.trim() || message.role !== Role.ROLE_USER) throw new RequestMalformedError('A user message with messageId is required');
@@ -100,7 +101,7 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   const metadata: unknown = request.metadata?.['1agents'];
   if (metadata !== undefined && (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))) throw new RequestMalformedError('metadata.1agents must be an object');
   const value = (metadata ?? {}) as Record<string, unknown>;
-  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'provider', 'model'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
+  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
   for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath', 'provider', 'model']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !(value[key] as string).trim())) throw new RequestMalformedError(`${key} must be a nonempty string`);
   }
@@ -119,12 +120,26 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   if (preflight && !preflight.success) throw new RequestMalformedError('Invalid preflight requirements');
   const resultContract = value.resultContract === undefined ? undefined : a2aResultContractSchema.safeParse(value.resultContract);
   if (resultContract && !resultContract.success) throw new RequestMalformedError('Invalid result contract');
+  const execution = executionOf(value.execution);
   return { prompt, input: { cwd, agentPreset: value.agentPreset as string | undefined,
     ...(preflight?.success ? { preflight: preflight.data } : {}),
     ...(value.roleId ? { roleId: value.roleId as string } : {}),
     ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}),
     ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}) },
-    ...(resultContract?.success ? { resultContract: resultContract.data } : {}) };
+    ...(resultContract?.success ? { resultContract: resultContract.data } : {}),
+    ...(execution ? { execution } : {}) };
+}
+
+function executionOf(value: unknown): { jobId: string; attemptId: string } | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestMalformedError('execution must be an object');
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) if (key !== 'jobId' && key !== 'attemptId') throw new RequestMalformedError(`Unknown metadata.1agents.execution field: ${key}`);
+  for (const key of ['jobId', 'attemptId'] as const) {
+    const item = record[key];
+    if (typeof item !== 'string' || !item.trim() || item.length > 512 || item.includes('\0')) throw new RequestMalformedError(`execution.${key} must be a nonempty string`);
+  }
+  return { jobId: (record.jobId as string).trim(), attemptId: (record.attemptId as string).trim() };
 }
 
 /** SDK owns the execution lifetime; an HTTP disconnect never aborts this signal. */
@@ -323,7 +338,8 @@ export class A2ASessionExecutor implements AgentExecutor {
           } else status(TaskState.TASK_STATE_WORKING);
         });
       };
-      const result = await this.backend.run(target, promptPrefix + prompt, { requestId, signal: controller.signal, beforeStart, onCapacity });
+      const result = await this.backend.run(target, promptPrefix + prompt, { requestId, signal: controller.signal, beforeStart, onCapacity,
+        ...(parsed.execution ? { execution: parsed.execution } : {}) });
       returnedError = result.outcome === 'failed' && result.error !== undefined
         ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
       returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)

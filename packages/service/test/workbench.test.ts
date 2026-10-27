@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JobLedger, type LedgerTargetSnapshot } from '../src/execution/ledger.js';
 import { createHumanReview, decideHumanReview } from '../src/execution/human-review.js';
+import { createProcessRequest, PROCESS_REQUEST_TTL_MS } from '../src/execution/process-request.js';
 import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask } from '../src/execution/workbench.js';
 import type { PptDeliveryRun } from '../src/execution/ppt-delivery.js';
 
@@ -319,4 +320,46 @@ test('historical service hosts stay frozen when a later execution uses another e
   assert.equal(detail.execution.serviceInfo?.host, 'new.example');
   assert.equal(detail.attempts.find(a => a.attemptId === first.attempt.attemptId)?.execution.serviceInfo?.host, 'old.example');
   assert.equal(detail.attempts.find(a => a.attemptId === next.attempt.attemptId)?.execution.serviceInfo?.host, 'new.example');
+});
+
+test('a live process request waits in the confirmation queue and an expired one does not', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const parent = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'host' }, input: { prompt: 'secret-prompt' }, title: 'Distribution' });
+  ledger.markDispatching(parent.attempt.attemptId);
+  ledger.accept(parent.attempt.attemptId, { taskId: 'parent-task', sessionId: 'parent-session' }, { executionStatus: 'working' });
+  const child = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'author' }, input: {}, title: 'Author',
+    parentJobRef: { sourceId: ledger.sourceId, jobId: parent.job.jobId }, parentAttemptId: parent.attempt.attemptId });
+  ledger.markDispatching(child.attempt.attemptId);
+  ledger.accept(child.attempt.attemptId, { taskId: 'child-task', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const at = new Date('2026-10-27T02:00:00.000Z');
+  const request = createProcessRequest({ requestId: 'prc-1', jobId: child.job.jobId, attemptId: child.attempt.attemptId, sessionId: 'dsh-1', kind: 'question',
+    questions: [{ id: '0', question: 'Choose targets', options: [{ label: 'A' }], multiSelect: true }] }, at);
+  const source = { ledger: ledger.snapshot(), runs: [], reviews: [], processRequests: [request], actorId: 'owner', now: at.getTime() + 60_000 };
+  const before = structuredClone(source);
+  const snapshot = workbenchSnapshot(source);
+  assert.deepEqual(source, before);
+  const detail = getWorkbenchTask(snapshot, child.job.jobId);
+  assert.equal(detail.executionStatus, 'working');
+  assert.equal(detail.displayStatus, 'awaiting_human');
+  assert.equal(detail.pendingProcessRequestId, 'prc-1');
+  assert.equal(detail.processRequests[0]?.canAnswer, true);
+  assert.equal(detail.processRequests[0]?.questions?.[0]?.question, 'Choose targets');
+  const parentDetail = getWorkbenchTask(snapshot, parent.job.jobId);
+  assert.equal(parentDetail.executionStatus, 'working');
+  assert.equal(parentDetail.pendingProcessRequestId, 'prc-1');
+  assert.equal(parentDetail.processRequests[0]?.requestId, 'prc-1');
+  assert.equal(JSON.stringify(snapshot).includes('secret-prompt'), false);
+  const pending = listWorkbenchTasks(snapshot, { filter: 'pending' });
+  assert.equal(pending.counts.pending, 1);
+  assert.equal(pending.items.some(item => item.jobId === parent.job.jobId), true);
+  assert.equal(pending.items.some(item => item.jobId === child.job.jobId), true);
+  assert.equal(listWorkbenchTasks(snapshot, { filter: 'working' }).items.some(item => item.jobId === child.job.jobId || item.jobId === parent.job.jobId), false);
+  const expired = workbenchSnapshot({ ...source, now: at.getTime() + PROCESS_REQUEST_TTL_MS + 1 });
+  const expiredDetail = getWorkbenchTask(expired, child.job.jobId);
+  assert.equal(expiredDetail.pendingProcessRequestId, undefined);
+  assert.equal(expiredDetail.displayStatus, 'working');
+  assert.equal(expiredDetail.processRequests[0]?.status, 'expired');
+  assert.equal(expiredDetail.processRequests[0]?.canAnswer, false);
+  assert.equal(listWorkbenchTasks(expired, { filter: 'pending' }).total, 0);
+  assert.equal(request.status, 'pending');
 });

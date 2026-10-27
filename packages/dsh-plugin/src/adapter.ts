@@ -18,13 +18,20 @@ import { RequestError } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
 import { State, hasActiveWriter, type Binding } from './state.js';
 import { mergeTool, type RemoteTool } from './tool-events.js';
+import { currentA2AExecution } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
 import { capacityPendingOf, noteProcessCapacity, noteProcessReady, noteSessionRestore, requestWhenAdmitted } from './process-admission.js';
+import type { ProcessQuestionInput, ProcessRequestClient, ProcessRequestView } from './process-requests.js';
+import { AgentSessionSettings, pinnedModeError, pinnedOptionError, replayPinnedOptions } from './session-settings.js';
 export interface SessionPolicy {
   /** Exact workspace and ACP registry name; no global or wildcard policy. */
   cwd: string;
   agent: string;
-  permissionMode: 'approve-reads' | 'approve-all' | 'deny-all';
+  /**
+   * Accepted so older host configs still load. Not sent and not applied.
+   * Tool posture comes from ACP settings: native mode and config options.
+   */
+  permissionMode?: 'approve-reads' | 'approve-all' | 'deny-all';
   initialModeId?: string;
 }
 export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number; sessionPolicies?: SessionPolicy[] }
@@ -34,7 +41,7 @@ export function validateSessionPolicies(policies: SessionPolicy[] = []): Session
   return policies.map(policy => {
     if (!policy || typeof policy.cwd !== 'string' || !isAbsolute(policy.cwd)
       || typeof policy.agent !== 'string' || !/^[a-z0-9_-]+$/i.test(policy.agent)
-      || !['approve-reads', 'approve-all', 'deny-all'].includes(policy.permissionMode)
+      || (policy.permissionMode !== undefined && !['approve-reads', 'approve-all', 'deny-all'].includes(policy.permissionMode))
       || (policy.initialModeId !== undefined && (typeof policy.initialModeId !== 'string' || !policy.initialModeId))) {
       throw new Error('Invalid workspace-scoped ACP session policy');
     }
@@ -110,6 +117,14 @@ class Queue<T> {
   }
 }
 
+function acpFromProcessView(kind: 'question' | 'plan', view: ProcessRequestView): JsonObject {
+  const outcome = view.answer?.outcome;
+  const closed = view.status === 'expired' || view.status === 'cancelled' || outcome === 'cancelled' || outcome === 'abandoned';
+  if (kind === 'plan') return { outcome: !closed && (outcome === 'approved' || outcome === 'rejected') ? outcome : 'abandoned' };
+  if (!closed && outcome === 'accepted' && view.answer?.answers) return { outcome: 'accepted', answers: view.answer.answers };
+  return { outcome: 'cancelled' };
+}
+
 export class AcpAdapter implements LlmAdapter {
   private state: State;
   private initializationFailures = new Map<string, Error>();
@@ -123,7 +138,11 @@ export class AcpAdapter implements LlmAdapter {
   private commandDisposers = new Map<string, (() => void)[]>();
   private output = new Map<string, (update: SessionUpdate) => void>();
   private lifetime = new AbortController();
-  constructor(private ctx: Context, private config: Config, private readonly diagnostics?: Diagnostics) { this.state = new State(config.stateDirectory); }
+  private readonly sessionSettings: AgentSessionSettings;
+  constructor(private ctx: Context, private config: Config, private readonly diagnostics?: Diagnostics, private readonly processRequests?: ProcessRequestClient) {
+    this.state = new State(config.stateDirectory);
+    this.sessionSettings = new AgentSessionSettings(config.stateDirectory);
+  }
   providerInfo(provider: string) { return { id: provider, name: 'ACP Agents' }; }
   providerRetryPolicy() { return { mode: 'normal' as const, maxRetries: 0, retryableCodes: [], initialDelayMs: 1000, maxDelayMs: 1000, jitterRatio: 0 }; }
   imageRequestPricing() { return undefined; }
@@ -171,15 +190,19 @@ export class AcpAdapter implements LlmAdapter {
     const link = await this.connection(agent);
     const sessionId = this.state.get(agent.id)!.sessionId!;
     const capabilities = this.capabilities.get(agent.id)!;
+    const name = this.agentName(agent);
+    const cwd = agent.session.header.cwd;
     if (configId === '$mode') {
       if (!capabilities.modes?.availableModes.some(m => m.id === value)) throw new Error('Unknown ACP mode');
       await link.rpc.request('session/set_mode', { sessionId, modeId: value });
       capabilities.modes.currentModeId = value;
+      if (name && cwd) this.sessionSettings.remember(cwd, name, { modeId: value });
     } else {
       const option = capabilities.configOptions.find(o => o.id === configId);
       if (!option) throw new Error('Unknown ACP configuration');
       const result = await link.rpc.request('session/set_config_option', { sessionId, configId, value });
       capabilities.configOptions = result.configOptions;
+      if (name && cwd) this.sessionSettings.remember(cwd, name, { option: { id: configId, value, ...(option.category === 'model' || option.id === 'model' ? { model: true } : {}) } });
     }
     return capabilities;
   }
@@ -208,7 +231,9 @@ export class AcpAdapter implements LlmAdapter {
           cancel: async () => { await link.rpc.request('_1agents/capacity/cancel', { capacityId }).catch(() => undefined); },
           request: () => link.rpc.request('_1agents/session/import', {
             sessionId: nativeSessionId, cwd, mcpServers: [],
-            _meta: { '1agents': { permissionMode: 'approve-reads', capacityId } },
+            // Bridge permissionMode is not sent. The imported session keeps the
+            // Agent's own mode and config options (ACP 设置).
+            _meta: { '1agents': { capacityId } },
           }, { cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]) }),
         }));
         if (typeof result.sessionId !== 'string' || !result.sessionId) throw new Error('ACP import returned no service session ID');
@@ -237,6 +262,26 @@ export class AcpAdapter implements LlmAdapter {
         },
       }));
     }
+  }
+  /** Replay this Agent's own accepted values. Another Agent's catalog is never consulted. */
+  private async applyPinnedSettings(name: string, cwd: string, link: Link, sessionId: string, capabilities: Capabilities, policy: SessionPolicy | undefined, cancellationSignal: AbortSignal): Promise<void> {
+    const pinned = this.sessionSettings.get(cwd, name);
+    let advertised = capabilities.configOptions;
+    for (const option of replayPinnedOptions(pinned?.options ?? [])) {
+      const mismatch = pinnedOptionError(name, option, advertised);
+      if (mismatch) throw new Error(mismatch);
+      const next = await link.rpc.request('session/set_config_option', { sessionId, configId: option.id, value: option.value }, { cancellationSignal });
+      advertised = next.configOptions ?? [];
+      capabilities.configOptions = advertised;
+    }
+    const modeId = pinned?.modeId ?? policy?.initialModeId;
+    if (!modeId) return;
+    const mismatch = pinned?.modeId
+      ? pinnedModeError(name, modeId, capabilities.modes?.availableModes)
+      : capabilities.modes?.availableModes.some(mode => mode.id === modeId) ? undefined : 'Configured initial ACP mode is not advertised by the Agent';
+    if (mismatch) throw new Error(mismatch);
+    await link.rpc.request('session/set_mode', { sessionId, modeId }, { cancellationSignal });
+    if (capabilities.modes) capabilities.modes.currentModeId = modeId;
   }
   private async connection(agent: Agent, capacityId?: string, callerSignal?: AbortSignal): Promise<Link> {
     const operation = (this.connections.get(agent.id) ?? Promise.resolve())
@@ -322,9 +367,11 @@ export class AcpAdapter implements LlmAdapter {
       let createdBinding: Binding | undefined;
       try {
         const policy = this.config.sessionPolicies?.find(p => p.cwd === resolve(cwd) && p.agent === name);
-        const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': {
-          permissionMode: policy?.permissionMode ?? 'approve-reads', ...(capacityId ? { capacityId } : {}),
-        } } };
+        // Bridge permissionMode (approve-reads / approve-all / deny-all) is not
+        // sent. Mode and reasoning effort come from ACP 设置: session/set_mode,
+        // session/set_config_option, or the settings kept by a native import.
+        // initialModeId below still selects an advertised native mode.
+        const params: NewSessionRequest = { cwd, mcpServers: [], ...(capacityId ? { _meta: { '1agents': { capacityId } } } : {}) };
         const admit = <T>(request: () => Promise<T>): Promise<T> => capacityId
           ? requestWhenAdmitted({
             request,
@@ -344,13 +391,9 @@ export class AcpAdapter implements LlmAdapter {
         if (!binding) createdBinding = { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId };
         capabilities.configOptions = result.configOptions ?? capabilities.configOptions;
         capabilities.modes = result.modes ?? undefined;
-        // Select an advertised native mode before the first prompt. Loading an
-        // existing session must retain its native mode and user selections.
-        if (!binding && policy?.initialModeId) {
-          if (!capabilities.modes?.availableModes.some(m => m.id === policy.initialModeId)) throw new Error('Configured initial ACP mode is not advertised by the Agent');
-          await link.rpc.request('session/set_mode', { sessionId: (result as { sessionId: string }).sessionId, modeId: policy.initialModeId }, { cancellationSignal: handshake() });
-          capabilities.modes.currentModeId = policy.initialModeId;
-        }
+        // A new session replays only this Agent's accepted settings. Loading an
+        // existing session keeps the mode and options already on that session.
+        if (!binding) await this.applyPinnedSettings(name, resolve(cwd), link, (result as { sessionId: string }).sessionId, capabilities, policy, handshake());
         if (createdBinding) this.state.save(agent.id, createdBinding);
         void link.closed.then(() => { if (this.links.get(agent.id) === operation) this.links.delete(agent.id); });
         return link;
@@ -486,23 +529,84 @@ export class AcpAdapter implements LlmAdapter {
     const selected = decision === 'allowed-once' ? allow : decision === 'rejected' ? deny : undefined;
     return { outcome: selected ? { outcome: 'selected', optionId: selected.optionId } : { outcome: 'cancelled' } };
   }
-  private async question(agent: Agent, p: JsonObject, signal: AbortSignal): Promise<JsonObject> {
-    const questions = (Array.isArray(p.questions) ? p.questions : []).map((value, i) => {
+  private questionsOf(p: JsonObject): ProcessQuestionInput[] {
+    return (Array.isArray(p.questions) ? p.questions : []).map((value, i) => {
       const q = object(value);
       return { id: String(i), question: String(q.question ?? ''), header: typeof q.header === 'string' ? q.header : undefined,
-        options: Array.isArray(q.options) ? q.options.map(value => { const o = object(value); return { label: String(o.label), description: typeof o.description === 'string' ? o.description : undefined }; }) : undefined,
+        options: Array.isArray(q.options) ? q.options.map(item => { const o = object(item); return { label: String(o.label), description: typeof o.description === 'string' ? o.description : undefined }; }) : undefined,
         multiSelect: q.multiSelect === true };
     });
+  }
+  private async askQuestions(agent: Agent, questions: ProcessQuestionInput[], signal: AbortSignal): Promise<JsonObject> {
     try {
       const result = await this.ctx.userQuestions.ask({ agent, questions, signal });
       return { outcome: 'accepted', answers: Object.fromEntries(result.answers.map(a => [questions[Number(a.id)].question, a.custom || (a.selected.length === 1 ? a.selected[0] : a.selected)])) };
     } catch (error) { if (signal.aborted) return { outcome: 'cancelled' }; throw error; }
   }
-  private async plan(agent: Agent, p: JsonObject, signal: AbortSignal): Promise<JsonObject> {
+  private async askPlan(agent: Agent, content: string, signal: AbortSignal): Promise<JsonObject> {
     try {
-      const result = await this.ctx.userQuestions.ask({ agent, signal, questions: [{ id: 'plan', question: 'ACP Agent 请求执行计划', detail: String(p.planContent ?? ''), options: [{ label: '批准' }, { label: '拒绝' }], intent: { kind: 'plan-review', approve: '批准' } }] });
+      const result = await this.ctx.userQuestions.ask({ agent, signal, questions: [{ id: 'plan', question: 'ACP Agent 请求执行计划', detail: content, options: [{ label: '批准' }, { label: '拒绝' }], intent: { kind: 'plan-review', approve: '批准' } }] });
       return { outcome: result.answers[0]?.selected.includes('批准') ? 'approved' : 'rejected' };
     } catch (error) { if (signal.aborted) return { outcome: 'abandoned' }; throw error; }
+  }
+  private async question(agent: Agent, p: JsonObject, signal: AbortSignal): Promise<JsonObject> {
+    const questions = this.questionsOf(p);
+    return this.withProcessRequest(agent, signal, { kind: 'question', body: questions, questions, local: askSignal => this.askQuestions(agent, questions, askSignal) });
+  }
+  private async plan(agent: Agent, p: JsonObject, signal: AbortSignal): Promise<JsonObject> {
+    const planContent = String(p.planContent ?? '');
+    return this.withProcessRequest(agent, signal, { kind: 'plan', body: planContent, planContent, local: askSignal => this.askPlan(agent, planContent, askSignal) });
+  }
+  /** The workbench answer completes this wait. A later A2A user message does not. */
+  private async withProcessRequest(agent: Agent, signal: AbortSignal, spec: {
+    kind: 'question' | 'plan'; body: unknown; questions?: ProcessQuestionInput[]; planContent?: string;
+    local: (signal: AbortSignal) => Promise<JsonObject>;
+  }): Promise<JsonObject> {
+    const fallback = spec.kind === 'plan' ? 'abandoned' : 'cancelled';
+    if (!this.processRequests) return spec.local(signal);
+    const binding = currentA2AExecution(agent.id);
+    if (!binding) return spec.local(signal);
+    const requestId = `prc-${createHash('sha256').update(JSON.stringify([binding.jobId, binding.attemptId, spec.kind, spec.body])).digest('hex').slice(0, 32)}`;
+    let opened: { requestId: string };
+    try { opened = await this.processRequests.open({ requestId, jobId: binding.jobId, attemptId: binding.attemptId, sessionId: agent.id, kind: spec.kind, questions: spec.questions, planContent: spec.planContent }); }
+    catch { return spec.local(signal); }
+    if (signal.aborted) {
+      void this.reportProcess(binding.jobId, opened.requestId, fallback, undefined, `dsh-cancel:${opened.requestId}`);
+      return { outcome: fallback };
+    }
+    const child = new AbortController(), waitAbort = new AbortController();
+    const stop = () => { child.abort(signal.reason); waitAbort.abort(signal.reason); };
+    signal.addEventListener('abort', stop, { once: true });
+    const localTask = spec.local(child.signal);
+    const remoteTask = this.processRequests.wait({ jobId: binding.jobId, requestId: opened.requestId, signal: AbortSignal.any([signal, waitAbort.signal]) });
+    void localTask.catch(() => {});
+    void remoteTask.catch(() => {});
+    try {
+      const winner = await Promise.race([
+        localTask.then(value => ({ source: 'local' as const, value })),
+        remoteTask.then(value => ({ source: 'workbench' as const, value })),
+      ]);
+      if (winner.source === 'local') {
+        waitAbort.abort();
+        const outcome = typeof winner.value.outcome === 'string' ? winner.value.outcome : fallback;
+        const answers = winner.value.answers as Record<string, string | string[]> | undefined;
+        void this.reportProcess(binding.jobId, opened.requestId, outcome, answers, outcome === 'cancelled' || outcome === 'abandoned' ? `dsh-cancel:${opened.requestId}` : `dsh-ui:${opened.requestId}`);
+        return winner.value;
+      }
+      child.abort();
+      return acpFromProcessView(spec.kind, winner.value);
+    } catch (error) {
+      child.abort(); waitAbort.abort();
+      if (signal.aborted) {
+        void this.reportProcess(binding.jobId, opened.requestId, fallback, undefined, `dsh-cancel:${opened.requestId}`);
+        return { outcome: fallback };
+      }
+      void this.reportProcess(binding.jobId, opened.requestId, fallback, undefined, `dsh-cancel:${opened.requestId}`);
+      throw error;
+    } finally { signal.removeEventListener('abort', stop); }
+  }
+  private reportProcess(jobId: string, requestId: string, outcome: string, answers?: Record<string, string | string[]>, clientRequestId?: string): Promise<void> {
+    return this.processRequests!.report({ jobId, requestId, clientRequestId: clientRequestId ?? `dsh-ui:${requestId}`, outcome, ...(answers ? { answers } : {}) }).catch(() => {});
   }
   private async run(agent: Agent, options: GenerateOptions, signal: AbortSignal, queue: Queue<StreamChunk>): Promise<void> {
     const cwd = agent.session.header.cwd;

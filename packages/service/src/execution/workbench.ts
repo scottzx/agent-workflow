@@ -4,6 +4,8 @@ import type { ReportReviewRun } from './report-review.js';
 import type { PptDeliveryRun } from './ppt-delivery.js';
 import { deliveryProgress } from './delivery-progress.js';
 import type { HumanReviewRequest, HumanReviewStatus } from './human-review.js';
+import { projectProcessRequest, type ProcessRequest } from './process-request.js';
+import { describeTaskDevelopment, projectWorkbenchAgents, type AgentDraft, type AgentRelease, type AgentTaskRef, type ResidentAgentRef, type WorkbenchAgentRow } from './agent-registry.js';
 
 export interface WorkbenchServiceInfo {
   kind: 'a2a' | 'gateway_workflow' | 'activepieces' | 'unknown';
@@ -19,7 +21,8 @@ export interface AcpTaskSummary {
   sourceId: string; jobId: string; title: string; originSessionId: string; parentJobRef?: JobRef;
   parentAttemptId?: string; purpose?: string; targetId: string; currentAttemptId: string;
   executionStatus: string; displayStatus: string; phase: string; createdAt: string | null; updatedAt: string;
-  stale: boolean; reviewStatus?: HumanReviewStatus; pendingReviewId?: string; progressSummary: string;
+  stale: boolean; reviewStatus?: HumanReviewStatus; pendingReviewId?: string; pendingProcessRequestId?: string; progressSummary: string;
+  channel: 'trial' | 'formal' | 'standalone'; agentId?: string; agentName?: string; agentPhase?: 'developing' | 'published';
   inFlightAttemptIds: string[]; unresolvedAttemptIds: string[]; execution: WorkbenchExecution;
 }
 export interface WorkbenchStage { stage: string; name: string; status: string; planned: boolean; jobId?: string; attemptId?: string }
@@ -28,14 +31,16 @@ export interface WorkbenchProgress { stage: string; phase: string; stages: Workb
   availableResults?: ReturnType<typeof deliveryProgress>['availableResults'] }
 export interface WorkbenchDependency { from: string; to: string; kind: 'parent' | 'depends_on' | 'replaces'; label: string; parentAttemptId?: string }
 export type WorkbenchReview = HumanReviewRequest & { canReview: boolean; resumeStatus?: 'pending' | 'applied'; resumeError?: string };
+export type WorkbenchProcessRequest = ProcessRequest & { canAnswer: boolean };
 export type WorkbenchAttempt = Omit<LedgerAttempt, 'input' | 'targetSnapshot' | 'backendRunRef'> & { backendRunRef?: Record<string, string>; execution: WorkbenchExecution };
 export interface AcpTaskDetail extends AcpTaskSummary {
   attempts: WorkbenchAttempt[]; children: AcpTaskSummary[]; ancestors: AcpTaskSummary[];
-  progress: WorkbenchProgress; reviews: WorkbenchReview[]; events: LedgerEvent[]; dependencies: WorkbenchDependency[];
+  progress: WorkbenchProgress; reviews: WorkbenchReview[]; processRequests: WorkbenchProcessRequest[]; events: LedgerEvent[]; dependencies: WorkbenchDependency[];
   artifacts: { revision: string; digest?: string; artifacts: unknown[] }[];
 }
 export interface WorkbenchSource { ledger: LedgerState; runs: readonly PptDeliveryRun[]; reviews: readonly HumanReviewRequest[];
-  reportRuns?: readonly ReportReviewRun[]; actorId: string; allowedOrigins?: readonly string[]; now?: number }
+  reportRuns?: readonly ReportReviewRun[]; processRequests?: readonly ProcessRequest[]; actorId: string; allowedOrigins?: readonly string[]; now?: number }
+export type { AgentDraft, AgentRelease, WorkbenchAgentRow };
 export interface WorkbenchSnapshot { sourceId: string; tasks: AcpTaskSummary[]; details: Record<string, AcpTaskDetail> }
 export interface WorkbenchListQuery { filter?: 'all' | 'pending' | 'working' | 'failed'; limit?: number; offset?: number }
 const stageNames: Record<string, string> = { summary: '文稿生成', human_review: '人工审核', make: '设计制作', validate: '机器校验', review: '独立验收', finished: '交付完成' };
@@ -163,29 +168,60 @@ function progress(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: read
     executionElapsedMs: run.metrics.elapsedMs, humanWaitingMs: (human.humanWaitingMs ?? 0) + (human.humanWaitStartedAt && Number.isFinite(Date.parse(human.humanWaitStartedAt)) ? Math.max(0, now - Date.parse(human.humanWaitStartedAt)) : 0),
     availableResults: deliveryProgress(run).availableResults, updatedAt: run.updatedAt };
 }
-function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: readonly HumanReviewRequest[], ledger: LedgerState, actorId: string): AcpTaskSummary {
+function pendingProcessRequest(requests: readonly ProcessRequest[], job: LedgerJob, now: number): ProcessRequest | undefined {
+  return requests.filter(request => request.jobId === job.jobId && request.attemptId === job.currentAttemptId)
+    .map(request => projectProcessRequest(request, now)).filter(request => request.status === 'pending')
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+}
+function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: readonly HumanReviewRequest[], ledger: LedgerState, actorId: string, requests: readonly ProcessRequest[], now: number): AcpTaskSummary {
   const attempt = ledger.attempts[job.currentAttemptId], review = latestReview(reviews, job), pending = review?.status === 'pending' && !terminal.has(job.executionStatus) && (!run || !terminal.has(run.executionStatus));
+  const pendingRequest = terminal.has(job.executionStatus) ? undefined : pendingProcessRequest(requests, job, now);
   const awaitingResume = review?.resume?.status === 'pending' && !terminal.has(job.executionStatus);
   const resumeError = awaitingResume ? run?.diagnostics?.findLast(item => item.startsWith('Human continuation deferred:')) : undefined;
-  const displayStatus = pending ? 'awaiting_human' : awaitingResume && !resumeError ? 'resuming' : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? 'changes_requested' : job.executionStatus;
-  const phase = pending ? 'human_review' : awaitingResume ? 'human_resume' : run?.phase ?? attempt?.phase ?? job.purpose ?? '';
+  const displayStatus = pending || pendingRequest ? 'awaiting_human' : awaitingResume && !resumeError ? 'resuming' : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? 'changes_requested' : job.executionStatus;
+  const phase = pending ? 'human_review' : pendingRequest ? 'process_request' : awaitingResume ? 'human_resume' : run?.phase ?? attempt?.phase ?? job.purpose ?? '';
   const progressSummary = pending ? `${review.title}已形成，等待确认 ${review.revision}；通过后开始设计制作。`
+    : pendingRequest ? (pendingRequest.kind === 'plan' ? '计划待批准，请在过程请求里提交。' : '有待回答的问题，请在过程请求里提交。')
     : awaitingResume ? resumeError ? `决定已保存，继续执行受阻：${resumeError.slice('Human continuation deferred:'.length).trim()}` : '本版决定已保存，等待系统继续处理。'
     : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? run?.summaryRevisionPending ? '修改意见已保存，正在提交原作者。' : '修改意见已提交原作者，等待新版本。'
     : attempt?.diagnostic || (run ? runDescription(run) : attempt?.result?.resultSummary || stateDescriptions[job.executionStatus] || '等待同步执行进展。');
+  const execution = executionView(attempt, job.targetId, Boolean(run));
+  const development = describeTaskDevelopment(attempt?.targetSnapshot?.development, { targetId: job.targetId, resident: execution.kind === 'resident', residentName: execution.targetName });
   return { sourceId: job.sourceId, jobId: job.jobId, title: job.title ?? `${purposeNames[job.purpose ?? ''] ?? '执行任务'} ${job.jobId.slice(0, 8)}`,
+    channel: development.channel, ...(development.agentId ? { agentId: development.agentId, agentName: development.name, agentPhase: development.phase } : {}),
     originSessionId: job.originSessionId, ...(job.parentJobRef ? { parentJobRef: job.parentJobRef } : {}), ...(job.parentAttemptId ? { parentAttemptId: job.parentAttemptId } : {}),
     ...(job.purpose ? { purpose: job.purpose } : {}), targetId: job.targetId, currentAttemptId: job.currentAttemptId, executionStatus: job.executionStatus, displayStatus, phase,
-    createdAt: job.createdAt, updatedAt: review && review.updatedAt > job.updatedAt ? review.updatedAt : job.updatedAt, stale: attempt?.stale ?? true,
-    inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds], execution: executionView(attempt, job.targetId, Boolean(run)),
-    ...(review ? { reviewStatus: review.status } : {}), ...(pending && review.reviewerId === actorId ? { pendingReviewId: review.reviewId } : {}), progressSummary };
+    createdAt: job.createdAt, updatedAt: [job.updatedAt, review?.updatedAt, pendingRequest?.updatedAt].filter((value): value is string => Boolean(value)).sort().at(-1)!, stale: attempt?.stale ?? true,
+    inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds], execution,
+    ...(review ? { reviewStatus: review.status } : {}), ...(pending && review.reviewerId === actorId ? { pendingReviewId: review.reviewId } : {}),
+    ...(pendingRequest ? { pendingProcessRequestId: pendingRequest.requestId } : {}), progressSummary };
+}
+function bubbleProcessWait(summaries: Map<string, AcpTaskSummary>): void {
+  const tasks = [...summaries.values()];
+  for (let depth = 0; depth < 5; depth++) {
+    let changed = false;
+    for (const task of tasks) {
+      if (task.pendingReviewId || task.pendingProcessRequestId || terminal.has(task.executionStatus)) continue;
+      const child = tasks.filter(item => item.parentJobRef?.jobId === task.jobId && item.pendingProcessRequestId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+      if (!child?.pendingProcessRequestId) continue;
+      task.pendingProcessRequestId = child.pendingProcessRequestId;
+      if (!['awaiting_human', 'resuming', 'changes_requested'].includes(task.displayStatus)) {
+        task.displayStatus = 'awaiting_human'; task.phase = 'process_request'; task.progressSummary = child.progressSummary;
+        if (child.updatedAt > task.updatedAt) task.updatedAt = child.updatedAt;
+      }
+      changed = true;
+    }
+    if (!changed) break;
+  }
 }
 
 export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
   const { ledger, actorId } = source, allowed = source.allowedOrigins ? new Set(source.allowedOrigins) : undefined;
   const jobs = Object.values(ledger.jobs).filter(job => !allowed || allowed.has(job.originSessionId));
   const visible = new Set(jobs.map(job => job.jobId)), runFor = (job: LedgerJob) => source.runs.find(run => run.jobId === job.jobId && run.attemptId === job.currentAttemptId);
-  const summaries = new Map(jobs.map(job => [job.jobId, summary(job, runFor(job), source.reviews, ledger, actorId)]));
+  const now = source.now ?? Date.now();
+  const summaries = new Map(jobs.map(job => [job.jobId, summary(job, runFor(job), source.reviews, ledger, actorId, source.processRequests ?? [], now)]));
+  bubbleProcessWait(summaries);
   const details: Record<string, AcpTaskDetail> = {};
   for (const job of jobs) {
     const run = runFor(job), ownReviews = source.reviews.filter(r => r.jobId === job.jobId || r.authorJobId === job.jobId && visible.has(r.jobId));
@@ -216,6 +252,11 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
       attemptId: review.attemptId, jobVersion: 0, type: `human_review.${decision.action}`, observedAt: decision.at,
       data: { reviewId: review.reviewId, revision: review.revision, actor: decision.actor, ...(decision.note ? { note: decision.note } : {}) } })));
     details[job.jobId] = { ...summaries.get(job.jobId)!, attempts, children, ancestors, progress: progress(job, run, source.reviews, ledger.attempts[job.currentAttemptId], source.now ?? Date.now()),
+      processRequests: (source.processRequests ?? []).filter(request => request.jobId === job.jobId || children.some(child => child.jobId === request.jobId)).map(request => {
+        const projected = projectProcessRequest(request, now);
+        const owner = ledger.jobs[request.jobId];
+        return { ...projected, canAnswer: projected.status === 'pending' && owner?.currentAttemptId === request.attemptId && !terminal.has(owner.executionStatus) };
+      }),
       reviews: ownReviews.map(review => {
         const ownerRun = source.runs.find(item => item.jobId === review.jobId && item.attemptId === review.attemptId);
         const resumeError = review.resume?.status === 'pending' ? ownerRun?.diagnostics?.findLast(item => item.startsWith('Human continuation deferred:')) : undefined;
@@ -236,8 +277,10 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
       { stage: 'file_check', name: '报告文件检查', status: report.fileCheck ? report.fileCheck.passed ? 'completed' : 'failed' : 'not_started', planned: !report.fileCheck },
       { stage: 'human_review', name: '人工最终确认', status: pending?.status ?? 'not_started', planned: !pending, jobId: report.jobId, attemptId: report.attemptId },
     ];
-    task.progressSummary = report.resultSummary ?? '临时智能体正在分析项目，输出报告后进行文件检查与人工最终确认。';
-    detail.progressSummary = task.progressSummary;
+    if (!detail.pendingProcessRequestId) {
+      task.progressSummary = report.resultSummary ?? '临时智能体正在分析项目，输出报告后进行文件检查与人工最终确认。';
+      detail.progressSummary = task.progressSummary;
+    }
     detail.progress = { stage: report.stage, phase: report.phase, stages,
       completedStages: stages.filter(stage => ['completed', 'approved'].includes(stage.status)).map(stage => stage.name),
       remainingStages: stages.filter(stage => !['completed', 'approved'].includes(stage.status)).map(stage => stage.name), updatedAt: report.updatedAt };
@@ -248,12 +291,18 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
 export function listWorkbenchTasks(snapshot: WorkbenchSnapshot, query: WorkbenchListQuery = {}) {
   const filter = query.filter ?? 'all', offset = Math.max(0, Math.trunc(query.offset ?? 0)), limit = Math.min(200, Math.max(1, Math.trunc(query.limit ?? 50)));
   const rootIds = new Set(snapshot.tasks.filter(task => !task.parentJobRef || !Object.hasOwn(snapshot.details, task.parentJobRef.jobId)).map(task => task.jobId));
-  const isWorking = (task: AcpTaskSummary) => task.displayStatus === 'resuming' || !task.pendingReviewId && ['working', 'submitted', 'not_started'].includes(task.executionStatus);
+  const needsPerson = (task: AcpTaskSummary) => Boolean(task.pendingReviewId || task.pendingProcessRequestId);
+  const isWorking = (task: AcpTaskSummary) => task.displayStatus === 'resuming' || !needsPerson(task) && ['working', 'submitted', 'not_started'].includes(task.executionStatus);
   const isFailed = (task: AcpTaskSummary) => task.unresolvedAttemptIds.length > 0 || ['failed', 'rejected', 'unknown', 'auth_required', 'input_required'].includes(task.executionStatus) && !['awaiting_human', 'resuming'].includes(task.displayStatus);
   const roots = snapshot.tasks.filter(task => rootIds.has(task.jobId));
-  const counts = { all: roots.length, pending: roots.filter(task => Boolean(task.pendingReviewId)).length, working: roots.filter(isWorking).length, failed: roots.filter(isFailed).length };
-  const matches = snapshot.tasks.filter(task => filter === 'all' ? true : filter === 'pending' ? Boolean(task.pendingReviewId) : filter === 'working' ? isWorking(task) : isFailed(task));
+  const counts = { all: roots.length, pending: roots.filter(needsPerson).length, working: roots.filter(isWorking).length, failed: roots.filter(isFailed).length };
+  const matches = snapshot.tasks.filter(task => filter === 'all' ? true : filter === 'pending' ? needsPerson(task) : filter === 'working' ? isWorking(task) : isFailed(task));
   return { items: structuredClone(matches.slice(offset, offset + limit)), total: matches.length, counts, offset, limit };
+}
+
+export function listWorkbenchAgents(snapshot: WorkbenchSnapshot, catalog: { drafts: readonly AgentDraft[]; releases: readonly AgentRelease[] }, residents: readonly ResidentAgentRef[] = []): { developing: WorkbenchAgentRow[]; published: WorkbenchAgentRow[] } {
+  const tasks: AgentTaskRef[] = snapshot.tasks.map(task => ({ ...(task.agentId ? { agentId: task.agentId } : {}), ...(task.pendingReviewId ? { pendingReviewId: task.pendingReviewId } : {}), ...(task.pendingProcessRequestId ? { pendingProcessRequestId: task.pendingProcessRequestId } : {}) }));
+  return projectWorkbenchAgents({ ...catalog, residents }, tasks);
 }
 
 export function getWorkbenchTask(snapshot: WorkbenchSnapshot, jobId: string): AcpTaskDetail {

@@ -188,6 +188,63 @@ test('canceling a waiting task removes its actionable review and pending view en
   assert.doesNotMatch(canceledNotice.text, /文字稿待人工确认|打开文字稿审核/);
 });
 
+test('process requests register once, answer once, and expire instead of accepting a late submit', async t => {
+  const f = await fixture(t);
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '分发任务', targetSnapshot: { targetId: 'legacy:host' }, input: { prompt: 'secret-prompt' } });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId;
+  const body = { requestId: 'prc-1', jobId, attemptId: prepared.attempt.attemptId, sessionId: 'dsh-1', kind: 'question',
+    questions: [{ id: '0', question: 'Choose targets', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true }] };
+  const path = `/workbench/tasks/${jobId}/process-requests`;
+  assert.equal((await f.request(path, post(body), null)).status, 401);
+  assert.equal((await f.request(path, { ...post(body), headers: { Origin: 'http://web.example', 'Content-Type': 'application/json' } })).status, 403);
+  const hidden = f.gateway.ledger.prepare({ originSessionId: 'private-root', title: '隐藏', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  f.gateway.ledger.markDispatching(hidden.attempt.attemptId);
+  f.gateway.ledger.accept(hidden.attempt.attemptId, { taskId: 'hidden-task', sessionId: 'hidden' }, { executionStatus: 'working' });
+  assert.equal((await f.request(`/workbench/tasks/${hidden.job.jobId}/process-requests`, post({ ...body, jobId: hidden.job.jobId, attemptId: hidden.attempt.attemptId }))).status, 404);
+  const opened = await f.request(path, post(body));
+  assert.equal(opened.status, 200);
+  const created = await opened.json() as any;
+  assert.equal(created.requestId, 'prc-1'); assert.equal(created.status, 'pending');
+  assert.equal((await (await f.request(path, post(body))).json() as any).deadlineAt, created.deadlineAt);
+  assert.equal((await f.request(path, post({ ...body, questions: [{ id: '0', question: 'Other question' }] }))).status, 409);
+  const pending = await (await f.request('/workbench/tasks?filter=pending')).json() as any;
+  assert.equal(pending.items.some((item: any) => item.jobId === jobId && item.pendingProcessRequestId === 'prc-1'), true);
+  assert.equal(JSON.stringify(pending).includes('secret-prompt'), false);
+  assert.equal(JSON.stringify(pending).includes(token), false);
+  const answer = { clientRequestId: 'wb-1', outcome: 'accepted', answers: { 'Choose targets': ['A', 'B'] } };
+  const answered = await f.request(`${path}/prc-1/answers`, post(answer));
+  assert.equal(answered.status, 200);
+  const detail = await answered.json() as any;
+  assert.equal(detail.executionStatus, 'working');
+  assert.equal(detail.pendingProcessRequestId, undefined);
+  assert.equal(detail.processRequests[0].status, 'answered');
+  assert.equal(detail.processRequests[0].canAnswer, false);
+  assert.deepEqual(detail.processRequests[0].answer.answers, answer.answers);
+  const replay = await (await f.request(`${path}/prc-1/answers`, post(answer))).json() as any;
+  assert.equal(replay.processRequests[0].answer.at, detail.processRequests[0].answer.at);
+  assert.equal((await f.request(`${path}/prc-1/answers`, post({ ...answer, clientRequestId: 'wb-2' }))).status, 409);
+  const second = { ...body, requestId: 'prc-2', kind: 'plan', questions: undefined, planContent: 'Read the project' };
+  assert.equal((await f.request(path, post(second))).status, 200);
+  const internals = f.gateway as any;
+  const stored = internals.state.processRequests.find((item: any) => item.requestId === 'prc-2');
+  stored.deadlineAt = new Date(Date.now() - 1000).toISOString();
+  internals.save();
+  const viewed = await f.request(`${path}/prc-2`);
+  assert.equal(viewed.status, 200);
+  const viewedBody = await viewed.json() as any;
+  assert.equal(viewedBody.status, 'expired');
+  assert.equal(viewedBody.canAnswer, false);
+  const late = await f.request(`${path}/prc-2/answers`, post({ clientRequestId: 'wb-late', outcome: 'approved' }));
+  assert.equal(late.status, 409); assert.equal((await late.json() as any).error, 'expired');
+  assert.equal(internals.state.processRequests.find((item: any) => item.requestId === 'prc-2').status, 'expired');
+  await f.restart();
+  const durable = await (await f.request(`/workbench/tasks/${jobId}`)).json() as any;
+  assert.equal(durable.processRequests.find((item: any) => item.requestId === 'prc-1').answer.clientRequestId, 'wb-1');
+  assert.equal(durable.processRequests.find((item: any) => item.requestId === 'prc-2').status, 'expired');
+});
+
 test('abandoning through human review closes further child dispatch admission', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '人工放弃任务'), internals = f.gateway as any;
   internals.advanceDelivery = Object.getPrototypeOf(f.gateway).advanceDelivery;
@@ -210,4 +267,50 @@ test('abandoning through human review closes further child dispatch admission', 
     parentJobRef: { sourceId: f.gateway.ledger.sourceId, jobId: item.jobId }, parentAttemptId: item.run.attemptId,
   }), /closing or closed/);
   assert.equal(sends, 0);
+});
+
+test('agent drafts publish by name and a review decision does not publish', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.request('/workbench/agents', {}, null)).status, 401);
+  assert.equal((await f.request('/workbench/agents', { headers: { Origin: 'http://web.example' } })).status, 403);
+  assert.equal((await f.request('/workbench/agents?filter=all')).status, 400);
+  assert.ok(!Object.keys(REMOTE_AGENT_METHODS).includes('createWorkbenchAgent'));
+  const invoke = await f.request('/invoke', post({ method: 'createWorkbenchAgent', params: { name: 'x', acpAgent: 'grok-build' } }), null);
+  assert.equal(invoke.status, 400);
+  const created = await f.request('/workbench/agents', post({ name: '公众号草稿', acpAgent: 'grok-build', targetId: 'writer', modeId: 'bypassPermissions',
+    options: [{ id: 'reasoningEffort', value: 'high' }, { id: 'model', value: 'grok-2' }] }));
+  assert.equal(created.status, 200);
+  const draft = await created.json() as any;
+  assert.equal(draft.draft.options[0].id, 'model');
+  assert.equal(draft.developing.length, 1);
+  const codex = await (await f.request('/workbench/agents', post({ name: '审稿草稿', acpAgent: 'codex', modeId: 'write', options: [{ id: 'verbosity', value: 'low' }] }))).json() as any;
+  assert.equal(codex.developing.length, 2);
+  const duplicate = await f.request('/workbench/agents', post({ name: '公众号草稿', acpAgent: 'grok-build' }));
+  assert.equal(duplicate.status, 409);
+  const updated = await f.request(`/workbench/agents/${draft.draft.agentId}/settings`, post({ modeId: 'acceptEdits' }));
+  assert.equal(updated.status, 200);
+  const updatedBody = await updated.json() as any;
+  assert.equal(updatedBody.draft.modeId, 'acceptEdits');
+  assert.equal(updatedBody.developing.find((row: any) => row.acpAgent === 'codex').modeId, 'write');
+  const item = await f.seed('allowed-root', '审核不发布');
+  const decision = await f.request(decisions(item.jobId, item.review.reviewId), post(item.decision));
+  assert.equal(decision.status, 200);
+  const beforePublish = await (await f.request('/workbench/agents')).json() as any;
+  assert.equal(beforePublish.published.length, 0);
+  const published = await f.request(`/workbench/agents/${draft.draft.agentId}/publish`, post({ releaseName: '公众号-grok' }));
+  assert.equal(published.status, 200);
+  const release = await published.json() as any;
+  assert.equal(release.release.releaseName, '公众号-grok');
+  assert.equal(release.release.modeId, 'acceptEdits');
+  assert.equal(release.developing.find((row: any) => row.agentId === draft.draft.agentId).targetId, undefined);
+  assert.equal(release.published[0].agentId, 'release:公众号-grok');
+  assert.equal(release.published[0].counterpartId, draft.draft.agentId);
+  const again = await f.request(`/workbench/agents/${draft.draft.agentId}/publish`, post({ releaseName: '公众号-grok' }));
+  assert.equal(again.status, 409);
+  const missing = await f.request('/workbench/agents/agt-missing1/publish', post({ releaseName: '别的名字' }));
+  assert.equal(missing.status, 404);
+  const saved = JSON.parse(await readFile(join(f.config.stateDirectory, 'agent-registry.json'), 'utf8'));
+  assert.equal(saved.releases.length, 1);
+  assert.equal(JSON.stringify(saved).includes(token), false);
+  assert.equal(JSON.stringify(release).includes(token), false);
 });
