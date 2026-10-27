@@ -20,10 +20,10 @@ If pnpm pauses or fails with an ignored transitive `esbuild` build script, follo
 
 Restart DSH after updating packages, confirm **`@1agents/acp-service`** is enabled on its Plugins page, and choose a discovered **ACP · Agent** preset for a new session. Select an existing workspace, then send a text prompt. Replace `web` with your profile name, such as `desktop`; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
 
-For a pinned fallback, install the identical npm artifact from [GitHub Release 0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+For a pinned fallback, install the identical npm artifact from [GitHub Release 0.6.0](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0). The asset is still published on `scottzx/1acp`.
 
 ```sh
-dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
 ```
 
 The package declares `dsh.bundle.patch` and its browser entry, so installation selects the bundle automatically.

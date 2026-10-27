@@ -29,10 +29,10 @@ Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, 
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-For a pinned release artifact, install the identical npm tarball attached to [0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+For a pinned release artifact, install the identical npm tarball attached to [0.6.0](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0). That GitHub Release asset is still on `scottzx/1acp`; it has not been copied to `scottzx/agent-workflow`.
 
 ```sh
-dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
 ```
 
 Install `@1agents/session-reader` separately if you want to browse and continue existing Claude, Codex or Grok histories. See the [DSH user guide](packages/dsh-plugin/README.md), [service and A2A guide](packages/service/README.md), and [installation verification](docs/marketplaces/verification-2026-10-09.md).

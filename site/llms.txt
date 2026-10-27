@@ -9,7 +9,7 @@ agent-workflow connects native coding Agents to applications through the Agent C
 - Service, CLI and SDK documentation: https://github.com/scottzx/agent-workflow/blob/main/packages/service/README.md
 - DSH plugin guide: https://github.com/scottzx/agent-workflow/blob/main/packages/dsh-plugin/README.md
 - Automation guide: https://github.com/scottzx/agent-workflow/blob/main/docs/activepieces-automation.md
-- GitHub releases: https://github.com/scottzx/agent-workflow/releases
+- GitHub releases: https://github.com/scottzx/1acp/releases (assets not yet copied to scottzx/agent-workflow)
 
 Install: npm install -g @1agents/acp-service
 DSH: dsh plugin --profile web add @1agents/acp-service
