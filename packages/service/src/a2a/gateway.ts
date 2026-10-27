@@ -484,7 +484,7 @@ export class RemoteAgentGateway {
     const artifactLinks = links.map(item => ({ url: item.url, mediaType: item.mediaType, sha256: item.sha256, size: item.size }));
     const reviewUrl = this.config.workbench?.publicBaseUrl ? new URL(this.config.workbench.publicBaseUrl) : undefined;
     if (reviewUrl && pendingReview) reviewUrl.hash = `acp/tasks/${encodeURIComponent(run.jobId)}?review=${encodeURIComponent(pendingReview.reviewId)}`;
-    const reviewEntry = pendingReview ? `\n\n${reviewUrl ? `[打开文字稿审核](${reviewUrl.href})` : '请用户打开 1agents「任务工作台 → 待我确认」。'}\n审核版本：${pendingReview.revision}；审核请求：${pendingReview.reviewId}。\n人工决定必须在审核页记录，execution_review 和通知已读均不能替代。` : '';
+    const reviewEntry = pendingReview ? `\n\n${reviewUrl ? `[打开文字稿审核](${reviewUrl.href})` : '请用户打开本机 A2A 网关的任务工作台页面（/workbench/ui/）→「待我确认」。'}\n审核版本：${pendingReview.revision}；审核请求：${pendingReview.reviewId}。\n人工决定必须在审核页记录，execution_review 和通知已读均不能替代。` : '';
     const text = `[任务交付通知] ${pendingReview ? '文字稿待人工确认' : run.executionStatus === 'completed' ? '任务已完成' : run.executionStatus === 'canceled' ? '任务已取消' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
       artifactLinks.map(item => `[${item.mediaType?.includes('presentation') ? (run.executionStatus === 'completed' ? '最终 PPT' : '已有 PPT（未完成最终验收）') : '预览产物'}](${item.url})`).join('\n') +
       reviewEntry +
