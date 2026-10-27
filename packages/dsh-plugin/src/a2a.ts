@@ -33,6 +33,7 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
       routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/preflight`, handler: server.handler }));
       routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/sessions/close`, handler: server.handler }));
       routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/sessions/status`, handler: server.handler }));
+      routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/sessions/delete`, handler: server.handler }));
     } catch (error) {
       for (const dispose of routes.reverse()) dispose();
       await server.close();

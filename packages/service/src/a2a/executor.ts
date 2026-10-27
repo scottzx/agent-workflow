@@ -275,6 +275,7 @@ export class A2ASessionExecutor implements AgentExecutor {
         await waitForPreparation(previous, controller.signal);
         controller.signal.throwIfAborted();
         const saved = this.store.loadTarget(context.contextId, context.context);
+        if (saved?.state === 'deleted') throw Object.assign(new Error('Session was deleted'), { code: 'SESSION_DELETED' });
         if (saved?.roleSkills) submitted();
         let role;
         try { role = await this.roleFor(input, saved, key, controller.signal); }

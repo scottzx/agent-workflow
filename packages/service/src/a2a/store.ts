@@ -88,7 +88,7 @@ function parseTask(value: unknown): Task {
   return task;
 }
 
-const targetStates = new Set(['attached', 'busy', 'idle', 'closing', 'closed', 'stale']);
+const targetStates = new Set(['attached', 'busy', 'idle', 'closing', 'closed', 'stale', 'deleted']);
 
 function parseTarget(value: unknown): A2ATarget {
   const source = record(value, 'target');

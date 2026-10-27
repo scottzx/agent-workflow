@@ -252,9 +252,9 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
       }
       return;
     }
-    if (req.url === `${path}/sessions/close` || req.url === `${path}/sessions/status`) {
-      const action = req.url.endsWith('/status') ? 'status' : 'close';
-      if (action === 'close' ? !options.backend.close : !options.backend.status) {
+    if (req.url === `${path}/sessions/close` || req.url === `${path}/sessions/status` || req.url === `${path}/sessions/delete`) {
+      const action = req.url.endsWith('/status') ? 'status' : req.url.endsWith('/delete') ? 'delete' : 'close';
+      if (!options.backend[action]) {
         res.writeHead(501, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'UNSUPPORTED' })); return;
       }
       try {
@@ -272,7 +272,19 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
           const report = await options.backend.status!(target);
           res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(report)); return;
         }
-        if (target.state === 'closed' || target.state === 'closing') {
+        if (action === 'delete') {
+          if (target.state === 'deleted') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ processReleased: true, alreadyClosed: true, state: 'deleted', acp: target.agentPreset?.startsWith('oneagents-acp-') === true, sessionId: target.sessionId, contextId: body.contextId }));
+            return;
+          }
+          const result = await options.backend.delete!(target);
+          store.saveTarget(body.contextId, { ...target, state: 'deleted', lastUsedAt: new Date().toISOString() }, context);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ...result, alreadyClosed: false, state: 'deleted', sessionId: target.sessionId, contextId: body.contextId }));
+          return;
+        }
+        if (target.state === 'closed' || target.state === 'closing' || target.state === 'deleted') {
           res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ processReleased: target.state === 'closed' ? true : 'pending', alreadyClosed: true,
             acp: target.agentPreset?.startsWith('oneagents-acp-') === true, sessionId: target.sessionId, contextId: body.contextId }));

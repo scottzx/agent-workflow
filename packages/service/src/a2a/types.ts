@@ -43,7 +43,7 @@ export interface A2ATarget {
   resumed?: boolean;
   restoreMethod?: 'session/load' | 'session/resume';
   /** Absent on records written before session close. Callers treat that as attached. */
-  state?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale';
+  state?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale' | 'deleted';
   lastUsedAt?: string;
   lifecycle?: { mode: 'persistent' | 'one-shot'; idleTtlSeconds?: number; closeAfter?: 'terminal' | 'ack' };
 }
@@ -100,4 +100,6 @@ export interface A2ABackend {
   /** Ordinary session release. Hosts that cannot close omit this and the gateway reports UNSUPPORTED. */
   close?(target: A2ATarget, options?: { signal?: AbortSignal }): Promise<A2ACloseResult>;
   status?(target: A2ATarget): Promise<A2ASessionStatus>;
+  /** Controlled delete: ACP session/delete, never DSH history. The gateway sends it only when allowDelete is set. */
+  delete?(target: A2ATarget): Promise<A2ACloseResult>;
 }

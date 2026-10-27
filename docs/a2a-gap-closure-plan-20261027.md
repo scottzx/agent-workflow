@@ -1,7 +1,7 @@
 # A2A 缺口收口方案
 
 - 日期：2026-10-27（Asia/Shanghai）。
-- 状态：**P0、P1、P1.5 和 P3 的空闲回收、`INPUT_REQUIRED` 告警与计数已写进源码并通过隔离测试。P2 的接回已在测试里覆盖，真机两项只读检查未做。P3 的受控 delete 未做。G9 未做。未重启服务，未部署。** 进度见 §5.1。
+- 状态：**P0、P1、P1.5 和 P3 的空闲回收、`INPUT_REQUIRED` 告警与计数已写进源码并通过隔离测试。P2 的接回已在测试里覆盖，真机两项只读检查未做。P3 的受控 delete 已实现，默认关闭。G9 未做。未重启服务，未部署。** 进度见 §5.1。
 - 依据：文档里仍写着未完成的 A2A 缺口，并在当日源码上核对过仍成立的部分。会话关闭的代码位置见 [2026-10-26 核对记录](a2a-session-lifecycle-close-resume-20261026.md)。该文第九节的待决定项以本文为准。补充结论来自 `packages/runtime` 的 `ensureSession`、`close` 和 `connectAndLoadSession`，以及 ACP 服务与 DSH 适配器的现有调用。
 - 源码基线：仓库 `@1agents/acp-service` **0.9.0**。2026-10-25 的本机发布记录仍是 0.8.3 本地包；本文不把线上进程写成已经升到 0.9.0。
 
@@ -232,6 +232,7 @@ P2 用一次闲置后再 message 的检查把卡点记下来：停在入队、�
 | `CAPACITY_PENDING` | 不是错误。进程名额不足，任务保持 submitted。get 里有队列位置和已等时长 |
 | `REMOTE_UNAVAILABLE` | 稍后重试。重启完成后再次 close 应得到 `alreadyClosed` |
 | `UNSUPPORTED` | 远端宿主未升级。spawn 和 message 保持旧行为 |
+| `DELETE_DISABLED` | 网关没有打开 `sessionLifecycle.allowDelete`。改用普通 close |
 
 错误文本继续走 `toSafeError`。日志只记 sessionId、contextId、taskId，不记 prompt 和 token。
 
@@ -339,9 +340,9 @@ G8 不排进 P0–P3。
 | P1 | 已实现 | `remote_agent_close`、spawn/message 的 `lifecycle`、one-shot 终态关闭；宿主 `/sessions/close`、`/sessions/status`；DSH 适配器普通 `session/close`；进程名额等待移出 60 秒，任务保持 `CAPACITY_PENDING` |
 | P1.5 | 已实现 | `taskSlot`、`processSlot.headWaitMs`；`remote_agent_sessions` 按来源列租约 |
 | P2 | 测试已覆盖 | 关闭后 message 接回同一会话并返回 `resumed`、`restoreMethod`；`autoResume: false`；删除与冲突不替换；满额时保持 Pending。`classifyColdAttach` 只记卡点。真机的模型记忆检查和闲置数小时检查仍在上线前做 |
-| P3 | 部分实现 | 网关按 `sessionLifecycle.idleScanIntervalMs`（默认 60 秒）扫描。只处理 `oneagents-acp-*` 且整个 context 都已终态的会话；`status` 必须返回已附着且没有进行中的回合，查不到就不关。空闲从最后一轮的终态时间算起。时限：job 的 `idleTtlSeconds` 优先，否则 `sessionLifecycle.persistentIdleTtlSeconds`（默认 600）。`INPUT_REQUIRED` 超过 `inputRequiredAlertSeconds`（默认 7200）每轮只告警一次。`/health.sessions` 给出 busy、告警、按原因的关闭数、`restoreMethod` 计数、关闭失败数、`processReleasePending`。one-shot 补关沿用每次 reconcile 的重试，没有另设 30 秒。**受控 delete（`allowDelete`）未做** |
+| P3 | 已实现 | 网关按 `sessionLifecycle.idleScanIntervalMs`（默认 60 秒）扫描。只处理 `oneagents-acp-*` 且整个 context 都已终态的会话；`status` 必须返回已附着且没有进行中的回合，查不到就不关。空闲从最后一轮的终态时间算起。时限：job 的 `idleTtlSeconds` 优先，否则 `sessionLifecycle.persistentIdleTtlSeconds`（默认 600）。`INPUT_REQUIRED` 超过 `inputRequiredAlertSeconds`（默认 7200）每轮只告警一次。`/health.sessions` 给出 busy、告警、按原因的关闭数、`restoreMethod` 计数、关闭失败数、`processReleasePending`。one-shot 补关沿用每次 reconcile 的重试，没有另设 30 秒。受控 delete：`remote_agent_close` 加 `mode: "delete"`，网关 `sessionLifecycle.allowDelete` 默认 false，未打开时返回 `DELETE_DISABLED` 且不联系远端。宿主 `/sessions/delete` 调 ACP `session/delete`，把 target 标成 `deleted`。进程已关时适配器只建裸连接发 delete，不重新附着、不拉起 agent。DSH 原生会话历史不删。之后 message 返回 `SESSION_DELETED`，网关和宿主两层都拒绝 |
 
-隔离测试：`packages/service` 全部 383 项通过，插件 `adapter`、`a2a-executor` 等通过。插件 `service-process.test.mjs` 的「real Cordis startup failure」在本机失败，原因是正在运行的 DSH 占着默认 A2A 存储目录的租约，与这批改动无关。
+隔离测试：`packages/service` 全部 385 项通过，插件 `adapter`、`a2a-executor` 等通过。插件 `service-process.test.mjs` 的「real Cordis startup failure」在本机失败，原因是正在运行的 DSH 占着默认 A2A 存储目录的租约，与这批改动无关。
 
 ## 6. 兼容、发布与回滚
 

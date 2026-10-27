@@ -89,7 +89,7 @@ DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`p
 | `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale。进程名额排队时仍是 submitted，并带 `capacity`、`taskSlot` 和 `processSlot` |
 | `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath, autoResume, lifecycle`；复用远端会话，创建新 taskId；已有角色/锁不能更换。已关闭会话默认接回，get 返回 `resumed: true` 和实际 `restoreMethod`（`session/load` 或绑定里的 `session/resume`）。`autoResume: false` 不向远端发送，返回 `SESSION_CLOSED` |
 | `remote_agent_cancel` | 任务定位字段；只取消这项任务自己的执行，不能释放已经完成的会话进程 |
-| `remote_agent_close` | `remote, originSessionId`，以及 `taskId`、`contextId`、`sessionId` 三选一；可选 `force`。普通关闭 ACP 进程，保留会话记录和绑定，不删除。进行中返回 `SESSION_BUSY`；`force: true` 先取消再关闭。宿主没有关闭能力时返回 `UNSUPPORTED`，且不把任务记成已关闭。`standard` 不发送 `session/close` |
+| `remote_agent_close` | `remote, originSessionId`，以及 `taskId`、`contextId`、`sessionId` 三选一；可选 `force`。普通关闭 ACP 进程，保留会话记录和绑定，不删除。进行中返回 `SESSION_BUSY`；`force: true` 先取消再关闭。宿主没有关闭能力时返回 `UNSUPPORTED`，且不把任务记成已关闭。`standard` 不发送 `session/close`。可选 `mode: "delete"` 还删除 ACP 会话记录，之后 message 返回 `SESSION_DELETED`；仅在网关 `sessionLifecycle.allowDelete: true` 时接受，否则返回 `DELETE_DISABLED`。不删 DSH 会话历史 |
 | `remote_agent_sessions` | 无业务参数。按 `prewarm`、`job`、`user-opened` 和未标注列进程租约，并给出两本账。只读，不关闭，也不给已经在跑且没有来源的进程补标签 |
 | `remote_agent_list` | `originSessionId`；列出该主会话派发的任务 |
 | `remote_agent_inbox` | `originSessionId`；读取未确认的完成/需要输入通知 |

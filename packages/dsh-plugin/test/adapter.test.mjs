@@ -31,6 +31,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const changes = [];
   const creationsInput = [];
   const closedSessions = [];
+  const deletedSessions = [];
   const commands = new Map();
   let model = 'native-a';
   const configOptions = () => [{ id: 'native-model', name: 'Native model', category: 'model', type: 'select', currentValue: model, options: [{ value: 'native-a', name: 'Native A' }, { value: 'native-b', name: 'Native B' }] }];
@@ -68,6 +69,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         if (streamConfig.closeError) throw new RequestError(streamConfig.closeError.code, streamConfig.closeError.message, streamConfig.closeError.data);
         return {};
       })
+      .onRequest('session/delete', ({ params }) => { deletedSessions.push(params.sessionId); return {}; })
       .onRequest('session/load', async ({ params }) => {
         attaches.push({ method: 'session/load', sessionId: params.sessionId });
         if (streamConfig.loadError) throw new RequestError(streamConfig.loadError.code, streamConfig.loadError.message, streamConfig.loadError.data);
@@ -144,7 +146,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
-  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, commands, attaches, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
+  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, deletedSessions, commands, attaches, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
 
@@ -908,4 +910,18 @@ test('a deleted ACP session is not replaced with session/new', async t => {
   });
   assert.equal(f.counts().creations, 0);
   assert.deepEqual(f.attaches.map(item => item.method), ['session/load']);
+});
+
+test('release keeps the binding and delete reaches a detached session without reattaching it', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await collect(f.adapter, f.options('message-1'));
+  assert.deepEqual(await f.adapter.sessionStatus('dsh-session'), { attached: true, activeTurn: false });
+  assert.deepEqual(await f.adapter.releaseSession('dsh-session'), { processReleased: 'pending', acp: true });
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+  assert.deepEqual(await f.adapter.sessionStatus('dsh-session'), { attached: false, activeTurn: false });
+  const attaches = f.attaches.length;
+  assert.deepEqual(await f.adapter.deleteSession('dsh-session'), { processReleased: true, acp: true });
+  assert.deepEqual(f.deletedSessions, ['remote-1']);
+  assert.equal(f.attaches.length, attaches);
+  await assert.rejects(f.adapter.deleteSession('missing'), error => error.code === 'SESSION_NOT_FOUND');
 });

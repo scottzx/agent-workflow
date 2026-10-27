@@ -567,17 +567,18 @@ test('persistent ACP sessions close after a confirmed idle TTL and stay open oth
   const zero = await finish('parent-idle-zero', { lifecycle: { mode: 'persistent', idleTtlSeconds: 0 } });
   const long = await finish('parent-idle-long', { lifecycle: { mode: 'persistent', idleTtlSeconds: 1800 } });
   const asking = await finish('parent-idle-input', {}, { outcome: 'input-required', text: 'need a path' });
-  offsetMs = 599_000;
+  // Real time keeps running under a loaded test run, so stay 10s short of the 600s window.
+  offsetMs = 590_000;
   await pause(300);
   assert.equal(backend.closes.length, 0);
 
   // A follow-up inside the window restarts the clock from its own turn.
+  offsetMs = 0;
   await gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId: 'parent-idle-default', taskId: kept.taskId, prompt: 'again' });
   await until(async () => backend.runs.length, value => value === 5);
   backend.runs[4]!.finish({ outcome: 'completed', text: 'again done' });
-  offsetMs = 0;
   await until(async () => (await gateway.invoke('remote_agent_inbox', { originSessionId: 'parent-idle-default' }) as { notices: unknown[] }).notices.length, value => value === 2);
-  offsetMs = 599_000;
+  offsetMs = 590_000;
   await pause(300);
   assert.equal(backend.closes.length, 0);
 
@@ -628,4 +629,75 @@ test('INPUT_REQUIRED warns only after the alert window', async t => {
   offsetMs = 2 * 60 * 60 * 1000 + 1000;
   await until(async () => gateway.lifecycleReport().inputRequiredAlerts.length, value => value === 1);
   assert.equal(backend.closes.length, 0);
+});
+
+class DeletingBackend extends ClosingBackend {
+  readonly deletes: A2ATarget[] = [];
+  async delete(target: A2ATarget) {
+    this.deletes.push(target);
+    return { processReleased: true as const, acp: target.agentPreset?.startsWith('oneagents-acp-') === true };
+  }
+}
+
+test('delete is refused unless allowDelete is set, and a deleted session is never resumed', { timeout: 20_000 }, async t => {
+  const backend = new DeletingBackend();
+  const f = await fixture(t, backend);
+  const finish = async (gateway: RemoteAgentGateway, originSessionId: string) => {
+    const count = backend.runs.length;
+    const task = await gateway.invoke('remote_agent_spawn', { ...spawn, originSessionId, agentPreset: 'oneagents-acp-codex' }) as Record<string, unknown>;
+    await until(async () => backend.runs.length, value => value === count + 1);
+    backend.runs[count]!.finish({ outcome: 'completed', text: 'done' });
+    await until(() => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId, taskId: task.taskId }) as Promise<Record<string, unknown>>, value => value.state === 'TASK_STATE_COMPLETED');
+    return task;
+  };
+
+  const locked = f.gateway();
+  const kept = await finish(locked, 'parent-delete-off');
+  await assert.rejects(() => locked.invoke('remote_agent_close', { remote: 'wsl', originSessionId: 'parent-delete-off', taskId: kept.taskId, mode: 'delete' }),
+    (error: unknown) => error instanceof RemoteAgentError && error.code === 'DELETE_DISABLED');
+  assert.equal(backend.deletes.length, 0);
+  assert.equal(backend.closes.length, 0);
+  await locked.close();
+
+  const gateway = f.gateway({ ...f.config, sessionLifecycle: { allowDelete: true } });
+  const task = await finish(gateway, 'parent-delete-on');
+  const deleted = await gateway.invoke('remote_agent_close', { remote: 'wsl', originSessionId: 'parent-delete-on', taskId: task.taskId, mode: 'delete' }) as Record<string, unknown>;
+  assert.equal(deleted.state, 'deleted');
+  assert.equal(deleted.alreadyClosed, false);
+  assert.equal(deleted.acp, true);
+  assert.equal(backend.deletes.length, 1);
+  const view = await gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-delete-on', taskId: task.taskId }) as Record<string, unknown>;
+  assert.equal(view.sessionState, 'deleted');
+  const again = await gateway.invoke('remote_agent_close', { remote: 'wsl', originSessionId: 'parent-delete-on', taskId: task.taskId, mode: 'delete' }) as Record<string, unknown>;
+  assert.equal(again.alreadyClosed, true);
+  assert.equal(again.state, 'deleted');
+  const closeAfter = await gateway.invoke('remote_agent_close', { remote: 'wsl', originSessionId: 'parent-delete-on', taskId: task.taskId }) as Record<string, unknown>;
+  assert.equal(closeAfter.alreadyClosed, true);
+  assert.equal(backend.deletes.length, 1);
+  const runs = backend.runs.length;
+  await assert.rejects(() => gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId: 'parent-delete-on', taskId: task.taskId, prompt: 'continue' }),
+    (error: unknown) => error instanceof RemoteAgentError && error.code === 'SESSION_DELETED');
+  await pause(200);
+  assert.equal(backend.runs.length, runs);
+});
+
+test('a host store with a deleted target rejects a later message without preparing a session', async t => {
+  const backend = new DeletingBackend();
+  const f = await fixture(t, backend);
+  const gateway = f.gateway({ ...f.config, sessionLifecycle: { allowDelete: true } });
+  const task = await gateway.invoke('remote_agent_spawn', { ...spawn, originSessionId: 'parent-host-deleted', agentPreset: 'oneagents-acp-codex' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 1);
+  backend.runs[0]!.finish({ outcome: 'completed', text: 'done' });
+  await until(() => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-host-deleted', taskId: task.taskId }) as Promise<Record<string, unknown>>, value => value.state === 'TASK_STATE_COMPLETED');
+  await gateway.invoke('remote_agent_close', { remote: 'wsl', originSessionId: 'parent-host-deleted', taskId: task.taskId, mode: 'delete' });
+  // A second gateway without the local deleted mark still reaches the host, which must refuse.
+  await gateway.close();
+  const state = join(f.config.stateDirectory, 'gateway.json');
+  const saved = JSON.parse(readFileSync(state, 'utf8'));
+  for (const job of saved.jobs) { delete job.sessionState; delete job.closeReason; }
+  writeFileSync(state, JSON.stringify(saved));
+  const fresh = f.gateway();
+  const follow = await fresh.invoke('remote_agent_message', { remote: 'wsl', originSessionId: 'parent-host-deleted', taskId: task.taskId, prompt: 'continue' }) as Record<string, unknown>;
+  await until(() => fresh.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-host-deleted', taskId: follow.taskId }) as Promise<Record<string, unknown>>, value => value.state === 'TASK_STATE_FAILED');
+  assert.equal(backend.runs.length, 1);
 });

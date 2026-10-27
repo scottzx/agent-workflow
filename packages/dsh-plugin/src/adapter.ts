@@ -415,6 +415,45 @@ export class AcpAdapter implements LlmAdapter {
     }
     return { processReleased: 'pending', acp: true };
   }
+  /**
+   * Controlled delete. ACP session/delete closes the process and marks the record deleted.
+   * The DSH session and its history stay. A detached session gets a bare link, so no agent process starts.
+   */
+  async deleteSession(sessionId: string): Promise<{ processReleased: true | 'pending'; acp: boolean }> {
+    const agent = this.ctx.agents.get(sessionId as never);
+    if (!agent) {
+      const error = new Error('Session not found') as Error & { code: string };
+      error.code = 'SESSION_NOT_FOUND';
+      throw error;
+    }
+    if (!this.agentName(agent)) return { processReleased: true, acp: false };
+    const binding = this.state.get(agent.id);
+    if (!binding?.sessionId || 'initializationCleanupPending' in binding) return { processReleased: true, acp: true };
+    const pending = this.links.get(agent.id);
+    const attached = pending ? await pending.catch(() => undefined) : undefined;
+    const link = attached ?? await connect(binding.endpoint, {
+      update: () => {},
+      permission: async () => ({ outcome: { outcome: 'cancelled' } }),
+      question: async () => ({ outcome: 'cancelled' }),
+      plan: async () => ({ outcome: 'abandoned' }),
+    }, this.lifetime.signal);
+    try {
+      await link.rpc.request('session/delete', { sessionId: binding.sessionId }, {
+        cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      if (!/not found|Session not found|-32001/i.test(message)) {
+        const wrapped = new Error('Remote session delete failed') as Error & { code: string };
+        wrapped.code = 'REMOTE_UNAVAILABLE';
+        throw wrapped;
+      }
+    } finally {
+      link.close();
+      if (attached && this.links.get(agent.id) === pending) this.links.delete(agent.id);
+    }
+    return { processReleased: attached ? 'pending' : true, acp: true };
+  }
   async sessionStatus(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean }> {
     const agent = this.ctx.agents.get(sessionId as never);
     if (!agent) return { attached: false, activeTurn: false };

@@ -14,6 +14,7 @@ import { consumeProcessReady, readProcessCapacity, readSessionRestore } from './
 
 export interface SessionControl {
   release(sessionId: string): Promise<{ processReleased: true | 'pending'; acp?: boolean }>;
+  delete?(sessionId: string): Promise<{ processReleased: true | 'pending'; acp?: boolean }>;
   status(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }>;
 }
 
@@ -95,6 +96,17 @@ export class DshA2ABackend implements A2ABackend {
       throw error;
     }
     return this.sessions.release(target.sessionId);
+  }
+
+  /** Non-ACP presets only drop the A2A binding; DSH session history is never deleted. */
+  async delete(target: A2ATarget): Promise<{ processReleased: true | 'pending'; acp?: boolean }> {
+    if (!target.agentPreset?.startsWith('oneagents-acp-')) return { processReleased: true, acp: false };
+    if (!this.sessions?.delete) {
+      const error = new Error('Host delete is not supported') as Error & { code: string };
+      error.code = 'UNSUPPORTED';
+      throw error;
+    }
+    return this.sessions.delete(target.sessionId);
   }
 
   async status(target: A2ATarget): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }> {

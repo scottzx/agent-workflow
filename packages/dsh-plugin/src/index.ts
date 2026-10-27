@@ -76,6 +76,7 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   }
   if (input.a2a) closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics, {
     release: sessionId => adapter.releaseSession(sessionId),
+    delete: sessionId => adapter.deleteSession(sessionId),
     status: sessionId => adapter.sessionStatus(sessionId),
   });
 }

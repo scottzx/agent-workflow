@@ -56,7 +56,9 @@ const configSchema = z.object({
     persistentIdleTtlSeconds: z.number().int().min(0).max(30 * 24 * 60 * 60).default(600),
     idleScanIntervalMs: z.number().int().min(50).max(10 * 60_000).default(60_000),
     inputRequiredAlertSeconds: z.number().int().min(1).max(30 * 24 * 60 * 60).default(2 * 60 * 60),
-  }).strict().default({ persistentIdleTtlSeconds: 600, idleScanIntervalMs: 60_000, inputRequiredAlertSeconds: 2 * 60 * 60 }),
+    /** remote_agent_close mode "delete" is refused unless this is set. Delete cannot be undone. */
+    allowDelete: z.boolean().default(false),
+  }).strict().default({ persistentIdleTtlSeconds: 600, idleScanIntervalMs: 60_000, inputRequiredAlertSeconds: 2 * 60 * 60, allowDelete: false }),
 }).strict().superRefine((config, ctx) => {
   const machineTokens = [...Object.values(config.remotes).map(remote => remote.token), config.callback?.token,
     ...Object.values(config.notificationTargets).map(target => target.token), config.automation?.token];
@@ -84,7 +86,7 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
 const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional() }).strict();
-const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
+const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
@@ -122,7 +124,7 @@ export const REMOTE_AGENT_METHODS = {
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。', parameters: z.toJSONSchema(messageSchema) },
-  remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。', parameters: z.toJSONSchema(closeSchema) },
+  remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。mode 为 delete 时还删除 ACP 会话记录，之后不能接回；仅在网关配置 sessionLifecycle.allowDelete 时接受，否则返回 DELETE_DISABLED，不删除 DSH 会话历史。', parameters: z.toJSONSchema(closeSchema) },
   remote_agent_sessions: { description: '按 prewarm、job、user-opened 和未标注列出本机进程租约，并给出 taskSlot 与 processSlot。只读，不关闭、不补标已经在跑的进程。', parameters: z.toJSONSchema(sessionsSchema) },
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_inbox: { description: '读取当前主会话未确认的完成或需要输入通知。读取不删除；处理后调用 remote_agent_ack。', parameters: z.toJSONSchema(inboxSchema) },
@@ -150,14 +152,14 @@ interface Job {
   attemptId?: string;
   sessionId?: string;
   lifecycle?: SessionLifecycle;
-  sessionState?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale';
+  sessionState?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale' | 'deleted';
   closedAt?: string;
   closeReason?: CloseReason;
   processReleased?: true | 'pending';
 }
 
 export class RemoteAgentError extends Error {
-  constructor(readonly code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CLOSED' | 'SESSION_BUSY' | 'SESSION_CONFLICT' | 'SESSION_ATTACH_IN_PROGRESS' | 'UNSUPPORTED' | 'REMOTE_UNAVAILABLE', message: string) {
+  constructor(readonly code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CLOSED' | 'SESSION_BUSY' | 'SESSION_CONFLICT' | 'SESSION_ATTACH_IN_PROGRESS' | 'UNSUPPORTED' | 'REMOTE_UNAVAILABLE' | 'DELETE_DISABLED', message: string) {
     super(message);
     this.name = 'RemoteAgentError';
   }
@@ -1015,6 +1017,7 @@ export class RemoteAgentGateway {
     }
     if (method === 'remote_agent_message') {
       const input = messageSchema.parse(params), previous = this.job(input);
+      if (previous.sessionState === 'deleted') throw new RemoteAgentError('SESSION_DELETED', 'Session was deleted');
       if (input.autoResume === false && (previous.sessionState === 'closed' || previous.sessionState === 'closing')) {
         throw new RemoteAgentError('SESSION_CLOSED', 'Session is closed');
       }
@@ -1052,6 +1055,7 @@ export class RemoteAgentGateway {
       const input = closeSchema.parse(params);
       const present = [input.taskId, input.contextId, input.sessionId].filter(value => value !== undefined);
       if (present.length !== 1) throw new RemoteAgentError('SESSION_CONFLICT', 'Provide exactly one of taskId, contextId, or sessionId');
+      if (input.mode === 'delete' && !this.config.sessionLifecycle.allowDelete) throw new RemoteAgentError('DELETE_DISABLED', 'Session delete is disabled on this gateway');
       return this.performClose(input, 'explicit');
     }
     if (method === 'remote_agent_sessions') {
@@ -1138,7 +1142,7 @@ export class RemoteAgentGateway {
       for (const job of jobs) if (taskState(job) === 'TASK_STATE_INPUT_REQUIRED') this.alertInputRequired(job, now);
       if (jobs.some(job => !terminal.has(taskState(job)))) continue;
       const job = jobs.at(-1)!;
-      if (!isAcpAgentPreset(job.agentPreset) || !job.sessionId || job.sessionState === 'closed' || job.sessionState === 'closing') continue;
+      if (!isAcpAgentPreset(job.agentPreset) || !job.sessionId || job.sessionState === 'closed' || job.sessionState === 'closing' || job.sessionState === 'deleted') continue;
       const lifecycle = job.lifecycle ?? normalizeLifecycle(undefined, policy.persistentIdleTtlSeconds);
       if (lifecycle.mode !== 'persistent' || lifecycle.idleTtlSeconds === 0) continue;
       const ttlMs = lifecycle.idleTtlSeconds * 1000;
@@ -1200,7 +1204,7 @@ export class RemoteAgentGateway {
   }
   private releaseOneShot(job: Job): void {
     if (this.automaticCloseStopped.has(job.remote)) return;
-    if (job.closeReason || job.sessionState === 'closed' || job.sessionState === 'closing') return;
+    if (job.closeReason || job.sessionState === 'closed' || job.sessionState === 'closing' || job.sessionState === 'deleted') return;
     const key = `${job.remote}\0${job.contextId}\0one-shot`;
     if (this.closingSessions.has(key)) return;
     const operation = this.finishClose(job).finally(() => {
@@ -1227,9 +1231,9 @@ export class RemoteAgentGateway {
     if (input.contextId) return owned.filter(item => item.contextId === input.contextId);
     return owned.filter(item => sessionOf(item) === input.sessionId);
   }
-  private markClosed(jobs: Job[], reason: CloseReason, processReleased: true | 'pending'): void {
+  private markClosed(jobs: Job[], reason: CloseReason, processReleased: true | 'pending', deleted = false): void {
     const closedAt = new Date().toISOString();
-    const sessionState = processReleased === true ? 'closed' : 'closing';
+    const sessionState = deleted ? 'deleted' : processReleased === true ? 'closed' : 'closing';
     for (const job of jobs) {
       job.sessionState = sessionState;
       job.closedAt = closedAt;
@@ -1238,15 +1242,16 @@ export class RemoteAgentGateway {
     }
     this.save();
   }
-  private async performClose(input: { originSessionId: string; remote: string; taskId?: string; contextId?: string; sessionId?: string; force?: boolean }, reason: CloseReason) {
+  private async performClose(input: { originSessionId: string; remote: string; taskId?: string; contextId?: string; sessionId?: string; mode?: 'close' | 'delete'; force?: boolean }, reason: CloseReason) {
+    const deleting = input.mode === 'delete';
     const jobs = this.jobsForClose(input);
     if (!jobs.length) throw new RemoteAgentError('SESSION_NOT_FOUND', 'Session not found for this origin session');
     const contexts = new Set(jobs.map(job => job.contextId));
     if (contexts.size !== 1) throw new RemoteAgentError('SESSION_CONFLICT', 'Session identifier matches more than one context');
     const contextId = jobs[0]!.contextId;
-    if (jobs.every(job => job.sessionState === 'closed' || job.sessionState === 'closing')) {
+    if (jobs.every(job => job.sessionState === 'deleted' || (!deleting && (job.sessionState === 'closed' || job.sessionState === 'closing')))) {
       const sample = jobs[0]!;
-      return { remote: input.remote, contextId, sessionId: sample.sessionId, state: 'closed' as const, alreadyClosed: true,
+      return { remote: input.remote, contextId, sessionId: sample.sessionId, state: sample.sessionState === 'deleted' ? 'deleted' as const : 'closed' as const, alreadyClosed: true,
         processReleased: sample.processReleased ?? 'pending', canceledTaskIds: [] as string[], ...(sample.agentPreset?.startsWith('oneagents-acp-') ? { acp: true } : sample.agentPreset ? { acp: false } : {}) };
     }
     const busy = jobs.filter(job => !terminal.has(taskState(job)));
@@ -1266,17 +1271,18 @@ export class RemoteAgentGateway {
       }
     }
     const sessionId = jobs.map(job => job.sessionId).find((value): value is string => typeof value === 'string' && value.length > 0);
+    const state = deleting ? 'deleted' as const : 'closed' as const;
     if (!sessionId) {
-      this.markClosed(jobs, reason, true);
-      return { remote: input.remote, contextId, state: 'closed' as const, alreadyClosed: false, processReleased: true as const, canceledTaskIds, acp: false };
+      this.markClosed(jobs, reason, true, deleting);
+      return { remote: input.remote, contextId, state, alreadyClosed: false, processReleased: true as const, canceledTaskIds, acp: false };
     }
-    const result = await this.postSession(input.remote, 'close', { sessionId, contextId }, jobs[0]!.remoteEndpoint) as { processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
+    const result = await this.postSession(input.remote, deleting ? 'delete' : 'close', { sessionId, contextId }, jobs[0]!.remoteEndpoint) as { processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
     const processReleased = result.processReleased === true ? true : 'pending';
-    this.markClosed(jobs, reason, processReleased);
-    return { remote: input.remote, contextId, sessionId, state: 'closed' as const, alreadyClosed: result.alreadyClosed === true,
+    this.markClosed(jobs, reason, processReleased, deleting);
+    return { remote: input.remote, contextId, sessionId, state, alreadyClosed: result.alreadyClosed === true,
       processReleased, canceledTaskIds, ...(typeof result.acp === 'boolean' ? { acp: result.acp } : {}) };
   }
-  private async postSession(remote: string, action: 'close' | 'status', body: unknown, pinnedEndpoint?: string): Promise<Record<string, unknown>> {
+  private async postSession(remote: string, action: 'close' | 'status' | 'delete', body: unknown, pinnedEndpoint?: string): Promise<Record<string, unknown>> {
     const configured = this.config.remotes[remote];
     const config = configured ? { ...configured, url: pinnedEndpoint ?? configured.url } : undefined;
     if (!config) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Unknown remote');
@@ -1292,7 +1298,7 @@ export class RemoteAgentGateway {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
         body: JSON.stringify(body), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
       const payload = await response.json().catch(() => ({})) as { error?: unknown; processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
-      if (response.status === 501 || payload.error === 'UNSUPPORTED') throw new RemoteAgentError('UNSUPPORTED', 'Remote host does not support session close');
+      if (response.status === 501 || payload.error === 'UNSUPPORTED') throw new RemoteAgentError('UNSUPPORTED', `Remote host does not support session ${action}`);
       if (!response.ok) {
         const code = payload.error === 'SESSION_NOT_FOUND' || payload.error === 'SESSION_BUSY' || payload.error === 'SESSION_CONFLICT' || payload.error === 'REMOTE_UNAVAILABLE'
           ? payload.error : 'REMOTE_UNAVAILABLE';
