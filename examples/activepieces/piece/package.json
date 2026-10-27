@@ -2,6 +2,7 @@
   "name": "@1agents/piece-acp-automation",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Private Activepieces actions for the 1acp A2A automation gateway.",
   "type": "commonjs",
   "main": "dist/index.js",

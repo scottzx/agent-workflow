@@ -37,10 +37,13 @@ is left untouched on purpose.
 Original work
 -------------
 
-This NOTICE does not choose a license for code written for agent-workflow
-itself, including packages/service, scripts, site, examples, and docs.
+Code written for agent-workflow itself, including packages/service, the DSH
+plugin sources, scripts, site, examples, and docs, is licensed under the MIT
+License in the root LICENSE file:
 
-There is no root LICENSE file. packages/service/package.json and
-packages/dsh-plugin/package.json already declare "license": "MIT" from earlier
-commits; those fields were not changed here, and they are not a new grant.
-Scott still needs to decide the license and copyright line for original work.
+  Copyright (c) 2026 一芥智能
+
+packages/runtime keeps its upstream copyright and MIT text in
+packages/runtime/LICENSE, as described above. packages/dsh-plugin/LICENSE
+remains that same unmodified OpenClaw MIT text; it is not a separate grant
+and does not reclassify the plugin sources as an acpx derivative.
