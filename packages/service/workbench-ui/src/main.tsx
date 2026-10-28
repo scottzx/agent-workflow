@@ -328,12 +328,12 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
 
 function App() {
     const [state, setState] = useState<'checking' | 'login' | 'ready'>('checking');
-    const [loginRequired, setLoginRequired] = useState(true);
+    const [canSignOut, setCanSignOut] = useState(true);
     useEffect(() => {
         session
             .status()
             .then(result => {
-                setLoginRequired(result.loginRequired !== false);
+                setCanSignOut(result.loginRequired !== false);
                 setState(result.authenticated ? 'ready' : 'login');
             })
             .catch(() => setState('login'));
@@ -343,7 +343,7 @@ function App() {
     }, []);
     if (state === 'checking') return <p class="acp-muted acp-boot">{text('正在连接网关…', 'Connecting to the gateway…')}</p>;
     if (state === 'login') return <Login onDone={() => setState('ready')} />;
-    return <Workbench onLogout={loginRequired ? () => void session.logout().finally(() => setState('login')) : undefined} />;
+    return <Workbench onLogout={canSignOut ? () => void session.logout().finally(() => setState('login')) : undefined} />;
 }
 
 render(<App />, document.getElementById('app')!);
