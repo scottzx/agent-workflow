@@ -15,6 +15,8 @@ const COOKIE = 'acp_workbench';
 const SESSION_MS = 12 * 60 * 60 * 1000;
 const MAX_SESSIONS = 64;
 const ASSETS: Record<string, string> = { 'app.js': 'text/javascript; charset=utf-8', 'app.css': 'text/css; charset=utf-8' };
+/** Lazy-loaded renderer chunks (markdown, highlighting) emitted by the page build. */
+const CHUNK = /^chunk-[A-Za-z0-9_-]+\.js$/;
 const SECURITY_HEADERS = {
   'Content-Security-Policy': "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff',
@@ -93,8 +95,10 @@ export class WorkbenchUi {
         return void send(res, 200, 'text/html; charset=utf-8', await readFile(path.join(directory, 'index.html')));
       }
       const asset = pathname.slice(`${WORKBENCH_UI_PATH}/`.length);
-      if (!Object.hasOwn(ASSETS, asset)) return void sendJson(res, 404, { error: 'No workbench page asset' });
-      return void send(res, 200, ASSETS[asset]!, await readFile(path.join(directory, asset)));
+      const type = Object.hasOwn(ASSETS, asset) ? ASSETS[asset] : CHUNK.test(asset) ? ASSETS['app.js'] : undefined;
+      if (!type) return void sendJson(res, 404, { error: 'No workbench page asset' });
+      try { return void send(res, 200, type, await readFile(path.join(directory, asset))); }
+      catch { return void sendJson(res, 404, { error: 'No workbench page asset' }); }
     }
     if (isAgentRequest(req)) return void sendJson(res, 403, { error: 'browser_action_required', message: 'Agents and tools use the bearer workbench API, not the page.' });
     const write = req.method !== 'GET';

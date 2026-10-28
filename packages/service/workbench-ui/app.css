@@ -293,3 +293,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-acceptance-record dt { color: var(--text-secondary); }
 .acp-acceptance-record dd { margin: 0; overflow-wrap: anywhere; }
 .acp-acceptance-record .acp-acceptance { margin-left: 0; }
+
+.acp-chat { height: min(70vh, 640px); border: 1px solid var(--border-color); border-radius: var(--radius); overflow: hidden; }
+.acp-artifact-item { display: grid; gap: 6px; }
+.acp-artifact-row { display: inline-flex; gap: 12px; align-items: baseline; }

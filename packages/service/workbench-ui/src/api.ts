@@ -1,6 +1,7 @@
 import type {
     AcpAgentCatalog,
     AcpAgentDraftInput,
+    AcpChatPage,
     AcpDecisionInput,
     AcpProcessAnswerInput,
     AcpTaskDetail,
@@ -59,6 +60,11 @@ export const acpTaskService = {
         return call(`/tasks?${params}`);
     },
     get: (jobId: string): Promise<AcpTaskDetail> => call(`/tasks/${encodeURIComponent(jobId)}`),
+    chat: (jobId: string, before: number | undefined, limit: number): Promise<AcpChatPage> => {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (before !== undefined) params.set('before', String(before));
+        return call(`/tasks/${encodeURIComponent(jobId)}/chat?${params}`);
+    },
     decide: (jobId: string, reviewId: string, input: AcpDecisionInput): Promise<unknown> =>
         post(`/tasks/${encodeURIComponent(jobId)}/reviews/${encodeURIComponent(reviewId)}/decisions`, input),
     answerProcessRequest: (jobId: string, requestId: string, input: AcpProcessAnswerInput): Promise<AcpTaskDetail> =>

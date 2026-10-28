@@ -254,3 +254,10 @@ export interface AcpDecisionInput {
     clientRequestId: string;
     note?: string;
 }
+
+export interface AcpChatPage {
+    items: { id: string; createdAt: number; kind: 'user' | 'assistant_text'; content: string }[];
+    hasMore: boolean;
+    nextCursor?: string;
+    total: number;
+}

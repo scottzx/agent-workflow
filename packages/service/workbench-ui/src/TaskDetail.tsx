@@ -2,8 +2,9 @@ import { Fragment } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpDecisionInput, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
-import { acpTaskHash, executionLabels, latestReview, safeArtifactUrl } from './model';
+import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
+import { ArtifactItem, ReportPreview, TaskChat } from './Preview';
 import {
     AcceptanceBadge,
     channelLabel,
@@ -23,7 +24,7 @@ import {
     title,
 } from './ui';
 
-type DetailTab = 'overview' | 'review' | 'events';
+type DetailTab = 'overview' | 'review' | 'chat' | 'events';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 function ExecutionCaption({ execution }: { execution?: AcpExecution }) {
@@ -221,6 +222,7 @@ export function AcpTaskDetailPanel({
     const tabs: [DetailTab, string][] = [
         ['overview', text('概览与进展', 'Progress')],
         ['review', text('产物与审核', 'Artifacts & review')],
+        ['chat', text('对话', 'Conversation')],
         ['events', text('事件记录', 'Events')],
     ];
     return (
@@ -480,6 +482,7 @@ export function AcpTaskDetailPanel({
                                 )}
                             </Fragment>
                         )}
+                        {tab === 'chat' && <TaskChat jobId={jobId} />}
                         {tab === 'events' && <TaskEvents detail={detail} />}
                     </Fragment>
                 )}
@@ -767,21 +770,9 @@ function TaskReview({
                                 {result.revision} ·{' '}
                                 {result.deliveryReady ? text('最终交付', 'Final delivery') : text('制作稿', 'Draft')}
                             </strong>
-                            {result.artifacts.map((artifact, index) => {
-                                const url = safeArtifactUrl(artifact.url);
-                                if (url) {
-                                    return (
-                                        <a key={`${url}:${index}`} href={url} target="_blank" rel="noopener noreferrer">
-                                            {artifact.path?.split('/').pop() || text('查看产物', 'Open artifact')}
-                                        </a>
-                                    );
-                                }
-                                return artifact.path ? (
-                                    <span key={`${artifact.path}:${index}`} class="acp-muted">
-                                        {artifact.path.split('/').pop()} · <code>{artifact.path}</code>
-                                    </span>
-                                ) : null;
-                            })}
+                            {result.artifacts.map((artifact, index) => (
+                                <ArtifactItem key={`${artifact.url || artifact.path}:${index}`} artifact={artifact} />
+                            ))}
                         </div>
                     ))}
                 </section>
@@ -820,9 +811,7 @@ function TaskReview({
                             {review.preview.kind === 'markdown' && (
                                 <section class="acp-report-preview">
                                     <p class="acp-muted">{text('报告文件：', 'Report file: ')}<code>{review.preview.reportPath}</code></p>
-                                    <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: 'inherit', lineHeight: 1.7 }}>
-                                        {review.preview.markdown}
-                                    </pre>
+                                    <ReportPreview markdown={review.preview.markdown || ''} path={review.preview.reportPath} />
                                 </section>
                             )}
                             {review.preview.slides.map((slide, index) => (

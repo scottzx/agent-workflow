@@ -28,6 +28,10 @@ test('the gateway serves its own workbench page with a hardened document', async
   assert.match(await page.text(), /\/workbench\/ui\/app\.js/);
   assert.equal((await fetch(`${base}/workbench/ui/app.js`)).status, 200);
   assert.equal((await fetch(`${base}/workbench/ui/build.mjs`)).status, 404);
+  // Only generated renderer chunks are served besides the entry files; names that merely look similar are not.
+  assert.equal((await fetch(`${base}/workbench/ui/chunk-MISSING.js`)).status, 404);
+  assert.equal((await fetch(`${base}/workbench/ui/chunk-..%2Fapp.js`)).status, 404);
+  assert.equal((await fetch(`${base}/workbench/ui/chunk-x.css`)).status, 404);
   assert.equal((await fetch(`${base}/workbench/ui/index.html`)).status, 404);
 });
 

@@ -105,6 +105,8 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@1agents/chat-view": "workspace:*",
+    "@1agents/file-preview": "workspace:*",
     "@scottzx/1acp": "workspace:*",
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.14",

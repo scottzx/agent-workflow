@@ -27,6 +27,7 @@ import { deliveryProgress, deliveryException } from '../execution/delivery-progr
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
+import { chatItems, pageChat } from '../execution/workbench-chat.js';
 import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
@@ -1133,6 +1134,11 @@ export class RemoteAgentGateway {
   updateWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ draft: this.agents.update(agentId, input), ...this.workbenchAgents() })); }
   publishWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() })); }
   workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
+  /** Read-only transcript from the stored A2A history of the job's attempts; the same scope check as the task detail. */
+  workbenchChat(jobId: string, query: { limit?: number; before?: number } = {}) {
+    this.workbenchTask(jobId);
+    return pageChat(chatItems(this.state.jobs.filter(job => job.ledgerJobId === jobId)), query);
+  }
   /** Only the dedicated HTTP workbench calls this; it is deliberately absent from the agent tool catalogue. */
   async decideWorkbenchReview(jobId: string, reviewId: string, input: unknown) {
     return this.workbench(async () => {
@@ -1573,6 +1579,13 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
             throw error;
           }
+        }
+        const chat = /^\/workbench\/tasks\/([^/]+)\/chat$/.exec(pathname);
+        if (chat) {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          const query = z.object({ limit: z.coerce.number().int().min(1).max(200).optional(), before: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
+          try { return json(res, 200, gateway.workbenchChat(decodeURIComponent(chat[1]!), query)); }
+          catch (error) { return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' }); }
         }
         if (url.search) return json(res, 404, { error: 'No workbench route' });
         const route = /^\/workbench\/tasks\/([^/]+)(.*)$/.exec(pathname);

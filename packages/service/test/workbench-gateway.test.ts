@@ -338,3 +338,28 @@ test('agent drafts publish by name and a review decision does not publish', asyn
   assert.equal(JSON.stringify(saved).includes(token), false);
   assert.equal(JSON.stringify(release).includes(token), false);
 });
+
+test('workbench chat pages the stored A2A history newest-first inside the same scope as the task', async t => {
+  const f = await fixture(t);
+  const { jobId } = await f.seed('allowed-root', '对话任务'), hidden = await f.seed('private-root', '隐藏对话');
+  const messages = Array.from({ length: 5 }, (_, i) => ({ messageId: `m${i}`, role: i % 2 ? 'ROLE_AGENT' : 'ROLE_USER', parts: [{ text: `message ${i}` }] }));
+  (f.gateway as any).state.jobs.push({ remote: 'r', originSessionId: 'allowed-root', taskId: 'chat-task', contextId: 'c', cwd: '/x',
+    checkedAt: new Date().toISOString(), ledgerJobId: jobId, attemptId: 'attempt-1',
+    task: { id: 'chat-task', contextId: 'c', status: { state: 'TASK_STATE_WORKING', message: { messageId: 'm4', role: 'ROLE_USER', parts: [{ text: 'message 4' }] } }, history: messages } });
+  const get = async (query: string) => (await f.request(`/workbench/tasks/${jobId}/chat${query}`)).json() as Promise<any>;
+
+  const newest = await get('?limit=2'); assert.ok(newest.items, JSON.stringify(newest));
+  assert.deepEqual(newest.items.map((item: any) => [item.kind, item.content]), [['assistant_text', 'message 3'], ['user', 'message 4']]);
+  assert.equal(newest.hasMore, true);
+  assert.equal(newest.total, 5, 'the status message repeats m4 and must not duplicate it');
+  const older = await get(`?limit=2&before=${newest.nextCursor}`);
+  assert.deepEqual(older.items.map((item: any) => item.content), ['message 1', 'message 2']);
+  const oldest = await get(`?limit=5&before=${older.nextCursor}`);
+  assert.deepEqual([oldest.items.length, oldest.hasMore, oldest.nextCursor], [1, false, undefined]);
+
+  assert.equal((await f.request('/workbench/tasks/no-such-job/chat')).status, 404);
+  assert.equal((await f.request(`/workbench/tasks/${hidden.jobId}/chat`)).status, 404, 'out-of-scope jobs expose no transcript');
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/chat?limit=0`)).status, 400);
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/chat`, {}, null)).status, 401);
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/chat`, { method: 'POST' })).status, 405);
+});
