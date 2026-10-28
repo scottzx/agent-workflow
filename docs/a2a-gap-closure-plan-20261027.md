@@ -1,9 +1,9 @@
 # A2A 缺口收口方案
 
 - 日期：2026-10-27（Asia/Shanghai）。
-- 状态：**P0、P1、P1.5 和 P3 的空闲回收、`INPUT_REQUIRED` 告警与计数已写进源码并通过隔离测试。P2 的接回已在测试里覆盖，真机两项只读检查未做。P3 的受控 delete 已实现，默认关闭。G9 已在单独分支实现并通过隔离测试。未重启服务，未部署。** 进度见 §5.1。
+- 状态（2026-10-28 更新）：**P0、P1、P1.5、P3（含默认关闭的受控 delete）、G3 和 G9 已提交，并随 `workbench-a2a-e2e-20261027` 分支的构建部署到本机测试环境：网关 `com.1agents.a2a-gateway` 和 DSH web（`com.1agents.dsh-web`）里的插件都在跑这份代码。P2 的两项真机检查和上线后 24 小时观察还没做，分支未合并 main、未推送。G4、G5、G6、G8 未开始。** 进度见 §5.1，剩余事项见 §7。
 - 依据：文档里仍写着未完成的 A2A 缺口，并在当日源码上核对过仍成立的部分。会话关闭的代码位置见 [2026-10-26 核对记录](a2a-session-lifecycle-close-resume-20261026.md)。该文第九节的待决定项以本文为准。补充结论来自 `packages/runtime` 的 `ensureSession`、`close` 和 `connectAndLoadSession`，以及 ACP 服务与 DSH 适配器的现有调用。
-- 源码基线：仓库 `@1agents/acp-service` **0.9.0**。2026-10-25 的本机发布记录仍是 0.8.3 本地包；本文不把线上进程写成已经升到 0.9.0。
+- 源码基线：仓库 `@1agents/acp-service` **0.9.0**。2026-10-28 起本机测试环境运行的是这个版本号的本地构建（提交 `b3dc615`），不再是 0.8.3。
 
 ## 1. 仍开放的缺口
 
@@ -338,20 +338,27 @@ P3 给 `INPUT_REQUIRED` 单独计时，初值 2 小时。到时写一条带 sess
 
 G8 不排进 P0–P3。
 
-### 5.1 实施进度（2026-10-27）
+### 5.1 实施进度（2026-10-28 更新）
 
-都在分支 `a2a-gap-closure-20261027` 的工作区里，尚未提交。
+全部改动已提交到分支 `workbench-a2a-e2e-20261027`（由 `a2a-gap-closure-20261027` 和 `a2a-g9-standard-model-20261027` 合入），未合并 main，未推送。
 
-| 期 | 状态 | 说明 |
-| --- | --- | --- |
-| P0 | 已实现 | `retryCallbackBind` 只重试 `EADDRNOTAVAIL`；`/health` 带 `callback: "pending"` |
-| P1 | 已实现 | `remote_agent_close`、spawn/message 的 `lifecycle`、one-shot 终态关闭；宿主 `/sessions/close`、`/sessions/status`；DSH 适配器普通 `session/close`；进程名额等待移出 60 秒，任务保持 `CAPACITY_PENDING` |
-| P1.5 | 已实现 | `taskSlot`、`processSlot.headWaitMs`；`remote_agent_sessions` 按来源列租约 |
-| P2 | 测试已覆盖 | 关闭后 message 接回同一会话并返回 `resumed`、`restoreMethod`；`autoResume: false`；删除与冲突不替换；满额时保持 Pending。`classifyColdAttach` 只记卡点。真机的模型记忆检查和闲置数小时检查仍在上线前做 |
-| G9 | 已实现，单独分支 `a2a-g9-standard-model-20261027` | 见 §4.10 末尾。spawn、message 可传 `provider`、`model`，仅限 `standard` 等非 ACP 预设；目录里没有则任务失败；不传保持宿主默认；回执带实际模型。DSH `selectModel` 会顺带改宿主默认模型 |
-| P3 | 已实现 | 网关按 `sessionLifecycle.idleScanIntervalMs`（默认 60 秒）扫描。只处理 `oneagents-acp-*` 且整个 context 都已终态的会话；`status` 必须返回已附着且没有进行中的回合，查不到就不关。空闲从最后一轮的终态时间算起。时限：job 的 `idleTtlSeconds` 优先，否则 `sessionLifecycle.persistentIdleTtlSeconds`（默认 600）。`INPUT_REQUIRED` 超过 `inputRequiredAlertSeconds`（默认 7200）每轮只告警一次。`/health.sessions` 给出 busy、告警、按原因的关闭数、`restoreMethod` 计数、关闭失败数、`processReleasePending`。one-shot 补关沿用每次 reconcile 的重试，没有另设 30 秒。受控 delete：`remote_agent_close` 加 `mode: "delete"`，网关 `sessionLifecycle.allowDelete` 默认 false，未打开时返回 `DELETE_DISABLED` 且不联系远端。宿主 `/sessions/delete` 调 ACP `session/delete`，把 target 标成 `deleted`。进程已关时适配器只建裸连接发 delete，不重新附着、不拉起 agent。DSH 原生会话历史不删。之后 message 返回 `SESSION_DELETED`，网关和宿主两层都拒绝 |
+| 期 | 状态 | 提交 | 说明 |
+| --- | --- | --- | --- |
+| P0 | 已提交、已部署 | `21acef5` | `retryCallbackBind` 只重试 `EADDRNOTAVAIL`；`/health` 带 `callback: "pending"`。2026-10-28 线上 `/health` 没有 pending，回调已绑定 |
+| P1 | 已提交、已部署 | `21acef5` | `remote_agent_close`、spawn/message 的 `lifecycle`、one-shot 终态关闭；宿主 `/sessions/close`、`/sessions/status`；DSH 适配器普通 `session/close`；进程名额等待移出 60 秒，任务保持 `CAPACITY_PENDING` |
+| P1.5 | 已提交、已部署 | `21acef5` | `taskSlot`、`processSlot.headWaitMs`；`remote_agent_sessions` 按来源列租约 |
+| P2 | 测试已覆盖，真机未查 | `21acef5` | 关闭后 message 接回同一会话并返回 `resumed`、`restoreMethod`；`autoResume: false`；删除与冲突不替换；满额时保持 Pending。`classifyColdAttach` 只记卡点。**真机的模型记忆检查和闲置数小时检查还没做** |
+| P3 | 已提交、已部署 | `21acef5`、`7e855ca` | 网关按 `sessionLifecycle.idleScanIntervalMs`（默认 60 秒）扫描。只处理 `oneagents-acp-*` 且整个 context 都已终态的会话；`status` 必须返回已附着且没有进行中的回合，查不到就不关。空闲从最后一轮的终态时间算起。时限：job 的 `idleTtlSeconds` 优先，否则 `sessionLifecycle.persistentIdleTtlSeconds`（默认 600）。`INPUT_REQUIRED` 超过 `inputRequiredAlertSeconds`（默认 7200）每轮只告警一次。`/health.sessions` 给出 busy、告警、按原因的关闭数、`restoreMethod` 计数、关闭失败数、`processReleasePending`。one-shot 补关沿用每次 reconcile 的重试，没有另设 30 秒。受控 delete：`remote_agent_close` 加 `mode: "delete"`，网关 `sessionLifecycle.allowDelete` 默认 false，未打开时返回 `DELETE_DISABLED` 且不联系远端。宿主 `/sessions/delete` 调 ACP `session/delete`，把 target 标成 `deleted`。进程已关时适配器只建裸连接发 delete，不重新附着、不拉起 agent。DSH 原生会话历史不删。之后 message 返回 `SESSION_DELETED`，网关和宿主两层都拒绝 |
+| G3 | 已提交、已部署 | `4fbc500` | 人审预览按文字稿实际页数校验，不再固定 6 页。原计划不并进本轮，实际已单独提交 |
+| G9 | 已提交、已部署 | `d7ad911` | 见 §4.10 末尾。spawn、message 可传 `provider`、`model`，仅限 `standard` 等非 ACP 预设；目录里没有则任务失败；不传保持宿主默认；回执带实际模型。DSH `selectModel` 会顺带改宿主默认模型 |
 
-隔离测试：`packages/service` 全部 385 项通过，插件 `adapter`、`a2a-executor` 等通过。插件 `service-process.test.mjs` 的「real Cordis startup failure」在本机失败，原因是正在运行的 DSH 占着默认 A2A 存储目录的租约，与这批改动无关。
+部署方式：`node scripts/local-deployment.mjs deploy --env test` 装到固定目录 `~/.local/share/1agents/a2a-gateway/test/runtime`，`current` 指向它。DSH 插件随 `@1agents/acp-service` 整包换进 `~/.dsh/profiles/web/node_modules`，旧包留在 `node_modules/.ignored/@1agents/`。这和 §6 写的不可变 release 目录不同：网关没有保留回滚快照，回滚要从 Git 重新构建。
+
+网关配置里没有 `sessionLifecycle`，全部用默认值：空闲 600 秒回收，`INPUT_REQUIRED` 超过 7200 秒告警，`allowDelete` 关闭。
+
+2026-10-28 的一次 `/health` 读数（只是一次快照，不是观察结论）：`processSlot` 4 个用了 2 个，按空闲回收关闭 4 次、显式和 one-shot 关闭 0 次，`closeFailures` 0，`processReleasePending` 4。`processReleasePending` 不为 0 需要在 24 小时观察里跟进。
+
+测试：2026-10-28 `packages/service` 412 项中 411 项通过。失败的「gateway shutdown cancels an in-flight Reader…」单独连跑 3 次都通过，属于负载下的时序抖动。插件 `service-process.test.mjs` 的「real Cordis startup failure」在本机仍失败，原因是正在运行的 DSH 占着默认 A2A 存储目录的租约，与这批改动无关。两者都会让 `pnpm test:integration` 退出码非 0。
 
 ## 6. 兼容、发布与回滚
 
@@ -361,17 +368,20 @@ G8 不排进 P0–P3。
 - 顺序是先换 DSH 插件并重启 DSH，再换网关并重启网关。重启 DSH 会停掉当时正在跑的会话。窗口选在口播批次的空档，重启前单独确认。本文不执行这次重启。
 - 上线后看 24 小时：闲置 attached 数、`process_release_pending`、进程名额 FIFO 队首等待、`taskSlot` 与 `processSlot`，以及停在 `INPUT_REQUIRED` 超过 2 小时的数量。这些数没有采集前，不宣称容量问题已经消失。封面投递不在这次观察里。
 
-## 7. 留在原计划里的缺口
+## 7. 还没完成的事（2026-10-28 更新）
 
-| 缺口 | 下一步 | 不在本轮的原因 |
+| 事项 | 状态 | 下一步 |
 | --- | --- | --- |
-| G3 六页人审 | 按扩展计划第 2 节，把预览校验改成与 PPT 输入合同一致，再做非六页回归。部署人审前完成 | 和会话关闭没有共同代码路径。混在一次改动里不能单独回滚 |
-| G4 报告交付与通用交付接点 | 扩展计划 P1–P2，等 PPT 人审收口 | 阶段保存已暂停扩展，本文不重新打开 |
+| P2 真机检查 | 未做 | 关闭后接回同一会话，确认模型记得之前的上下文；闲置数小时后再接回一次 |
+| 上线后 24 小时观察 | 未做 | 按 §6 的指标采集，重点看 `processReleasePending`。没有数据前不宣称容量问题已经消失 |
+| 合并与发布 | 未合并 main、未推送 | 分支上还有工作台的提交，以及另一会话提交的 `2ad0486`（chat-view、file-preview），合并前一起核对 |
+| G4 报告交付与通用交付接点 | 未开始 | 扩展计划 P1–P2。G3 已修，PPT 人审这道前置可以重新评估 |
 | G5 workflow Provider、DAG、AP 投影 | 保持未实现 | 账本方案已把它们标成可选，现有派单不依赖它们 |
-| G6 一键 cwd 与自动登记 | 保持手填。若要做，只填本次任务 cwd，不登记目标、不导入历史会话 | 探查验收把这条边界写清楚了 |
-| G7 工作台生产启用 | 父项目单独部署，并配置网关 workbench 凭证 | 本模块本轮不改工作台事实来源 |
-| G8 Codex 只入队 | 单独立项。宿主不在线返回 `HOST_OFFLINE_QUEUED`，已开始执行才算 accepted | 和 grok 进程关闭不是一条路径。放进同一次发布会把封面投递和名额回收绑在一起 |
-| G9 `standard` 不能指定模型 | 单独做。`standard` 在创建后、prompt 前按目录调用 `selectModel`；不传则仍用宿主默认 | 和进程关闭、名额超时不是一条路径。现在改默认模型会波及所有没写模型的 `standard` 派单 |
+| G6 一键 cwd 与自动登记 | 保持手填 | 若要做，只填本次任务 cwd，不登记目标、不导入历史会话 |
+| G7 工作台生产启用 | 测试环境已启用，方式变了 | 不再由父项目部署：网关自己在 `/workbench/ui/` 提供页面，可信网络下不配令牌。生产环境改用账号体系，尚未开始。父应用里旧的工作台页面与 Go 代理待确认后移除。见 [工作台阶段](agent-workbench-phases-20261027.md) |
+| G8 Codex 只入队 | 未开始 | 单独立项。宿主不在线返回 `HOST_OFFLINE_QUEUED`，已开始执行才算 accepted |
+| G3 六页人审 | 已完成 | `4fbc500` |
+| G9 `standard` 不能指定模型 | 已完成 | `d7ad911` |
 
 ## 8. 调用约定（P1 上线之后）
 
