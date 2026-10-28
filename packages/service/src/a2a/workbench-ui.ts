@@ -1,4 +1,7 @@
-/** The gateway's own workbench page. A logged-in same-origin browser reaches the same routes as the bearer API. */
+/**
+ * The gateway's own workbench page. A logged-in same-origin browser reaches the same routes as the bearer API.
+ * Without a configured token the page needs no login; writes still need a same-origin browser.
+ */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -74,7 +77,7 @@ async function readToken(req: IncomingMessage): Promise<unknown> {
 
 export class WorkbenchUi {
   private readonly sessions = new Map<string, number>();
-  constructor(private readonly token: string, private readonly now: () => number = Date.now) {}
+  constructor(private readonly token: string | undefined, private readonly now: () => number = Date.now) {}
 
   /**
    * Serves the page, the login session and static assets. For an authorized page API call it returns
@@ -104,6 +107,7 @@ export class WorkbenchUi {
   }
 
   private authorized(req: IncomingMessage): boolean {
+    if (!this.token) return true;
     const id = cookieValue(req);
     const expires = id ? this.sessions.get(id) : undefined;
     if (!id || expires === undefined) return false;
@@ -112,13 +116,14 @@ export class WorkbenchUi {
   }
 
   private async session(req: IncomingMessage, res: ServerResponse): Promise<undefined> {
-    if (req.method === 'GET') return void sendJson(res, 200, { authenticated: this.authorized(req) });
+    if (req.method === 'GET') return void sendJson(res, 200, { authenticated: this.authorized(req), loginRequired: Boolean(this.token) });
     if (req.method === 'DELETE') {
       const id = cookieValue(req);
       if (id) this.sessions.delete(id);
       return void sendJson(res, 200, { authenticated: false }, { 'Set-Cookie': `${COOKIE}=; HttpOnly; SameSite=Strict; Path=${WORKBENCH_UI_PATH}; Max-Age=0` });
     }
     if (req.method !== 'POST') return void sendJson(res, 405, { error: 'Method not allowed' });
+    if (!this.token) return void sendJson(res, 200, { authenticated: true });
     let supplied: unknown;
     try { supplied = await readToken(req); } catch { return void sendJson(res, 400, { error: 'invalid', message: '请求格式不正确。' }); }
     const expected = Buffer.from(this.token), given = Buffer.from(typeof supplied === 'string' ? supplied : '');

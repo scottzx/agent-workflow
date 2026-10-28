@@ -48,7 +48,7 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
 const post = <T>(path: string, input: unknown) => call<T>(path, { method: 'POST', body: JSON.stringify(input) });
 
 export const session = {
-    status: () => call<{ authenticated: boolean }>('/session'),
+    status: () => call<{ authenticated: boolean; loginRequired?: boolean }>('/session'),
     login: (token: string) => post<{ authenticated: boolean }>('/session', { token }),
     logout: () => call<{ authenticated: boolean }>('/session', { method: 'DELETE' }),
 };

@@ -15,7 +15,7 @@ export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token
   /** Public DSH origin, for example its Tailscale URL. */
   publicUrl?: string;
   /** Gateway workbench that records questions and plan approvals for this host's A2A turns. */
-  workbench?: { url: string; token: string };
+  workbench?: { url: string; token?: string };
 }
 
 /** Routes and in-flight turns are released with the owning Cordis plugin. */

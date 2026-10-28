@@ -33,15 +33,14 @@ export interface ProcessRequestClient {
   report(input: { jobId: string; requestId: string; clientRequestId: string; outcome: string; answers?: Record<string, string | string[]> }): Promise<void>;
 }
 
-export function createWorkbenchProcessClient(options: { url: string; token: string; pollMs?: number }): ProcessRequestClient {
+export function createWorkbenchProcessClient(options: { url: string; token?: string; pollMs?: number }): ProcessRequestClient {
   const url = new URL(options.url);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('a2a.workbench.url must be an HTTP(S) URL without credentials');
-  if (!options.token.trim()) throw new Error('a2a.workbench.token is required');
   const origin = url.origin;
-  const token = options.token;
   const pollMs = options.pollMs ?? 200;
   const endpoint = (path: string) => new URL(path, origin);
-  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  // A gateway without a workbench token (trusted network) accepts requests without a bearer.
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(options.token?.trim() ? { Authorization: `Bearer ${options.token}` } : {}) };
   async function send(path: string, method: string, signal: AbortSignal, body?: unknown): Promise<Response> {
     const response = await fetch(endpoint(path), { method, headers, signal, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     if (!response.ok) throw new Error(`Process request ${method} failed (${response.status})`);

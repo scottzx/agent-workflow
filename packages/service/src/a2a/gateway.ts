@@ -50,7 +50,7 @@ const configSchema = z.object({
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
-  workbench: z.object({ token: string, reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
+  workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
     allowedOrigins: z.array(string).optional() }).strict().optional(),
   /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
   capacityDirectory: z.string().min(1).optional(),
@@ -65,7 +65,7 @@ const configSchema = z.object({
 }).strict().superRefine((config, ctx) => {
   const machineTokens = [...Object.values(config.remotes).map(remote => remote.token), config.callback?.token,
     ...Object.values(config.notificationTargets).map(target => target.token), config.automation?.token];
-  if (config.workbench && machineTokens.includes(config.workbench.token)) {
+  if (config.workbench?.token && machineTokens.includes(config.workbench.token)) {
     ctx.addIssue({ code: 'custom', path: ['workbench', 'token'], message: 'Workbench requires a separate credential from agent remotes' });
   }
   for (const [id, schedule] of Object.entries(config.automation?.schedules ?? {})) {
@@ -1525,7 +1525,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           if (!routed) return;
           pathname = routed.route;
         } else {
-          if (!authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
+          if (gateway.config.workbench.token && !authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
           if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
         }
         if (req.method === 'GET' && pathname === '/workbench/tasks') {

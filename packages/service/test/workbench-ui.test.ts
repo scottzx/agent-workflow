@@ -77,3 +77,18 @@ test('the bearer workbench API still refuses browser origins', async t => {
   const response = await fetch(`${base}/workbench/tasks`, { headers: { Authorization: `Bearer ${token}`, Origin: base } });
   assert.equal(response.status, 403);
 });
+
+test('without a workbench token the page and API need no login, and page writes still need a same-origin browser', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'workbench-ui-open-'));
+  const host = await serveA2AGateway({ stateDirectory: join(root, 'state'), port: 0, remotes: {}, pollIntervalMs: 60_000,
+    workbench: { reviewerId: 'local-owner' } }, { report: false });
+  t.after(async () => { await host.close(); await rm(root, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${host.port}`;
+  assert.deepEqual(await (await fetch(`${base}/workbench/ui/api/session`)).json(), { authenticated: true, loginRequired: false });
+  assert.equal((await fetch(`${base}/workbench/ui/api/tasks`)).status, 200);
+  assert.equal((await fetch(`${base}/workbench/tasks?filter=all`)).status, 200);
+  const draft = { name: 'Excel 求和', acpAgent: 'grok-build', targetId: 'legacy:iso', modeId: 'acceptEdits', options: [] };
+  assert.equal((await fetch(`${base}/workbench/ui/api/agents`, { method: 'POST', body: JSON.stringify(draft) })).status, 403);
+  const created = await fetch(`${base}/workbench/ui/api/agents`, { method: 'POST', headers: { 'Sec-Fetch-Site': 'same-origin', Origin: base }, body: JSON.stringify(draft) });
+  assert.equal(created.status, 200);
+});

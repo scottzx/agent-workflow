@@ -66,7 +66,7 @@ function Login({ onDone }: { onDone: () => void }) {
 }
 
 /** The table and detail read one ACP projection; neither writes task states. */
-function Workbench({ onLogout }: { onLogout: () => void }) {
+function Workbench({ onLogout }: { onLogout?: () => void }) {
     const route = useRoute();
     const [module, setModule] = useState<'tasks' | 'agents'>('tasks');
     const [filter, setFilter] = useState<AcpTaskFilter>('all');
@@ -151,9 +151,11 @@ function Workbench({ onLogout }: { onLogout: () => void }) {
                     <button type="button" class="acp-button" onClick={() => setRefreshKey(key => key + 1)} disabled={loading}>
                         {text('刷新', 'Refresh')}
                     </button>
-                    <button type="button" class="acp-button" onClick={onLogout}>
-                        {text('退出登录', 'Sign out')}
-                    </button>
+                    {onLogout && (
+                        <button type="button" class="acp-button" onClick={onLogout}>
+                            {text('退出登录', 'Sign out')}
+                        </button>
+                    )}
                 </div>
             </header>
             <p class="acp-workbench-source">
@@ -326,10 +328,14 @@ function Workbench({ onLogout }: { onLogout: () => void }) {
 
 function App() {
     const [state, setState] = useState<'checking' | 'login' | 'ready'>('checking');
+    const [loginRequired, setLoginRequired] = useState(true);
     useEffect(() => {
         session
             .status()
-            .then(result => setState(result.authenticated ? 'ready' : 'login'))
+            .then(result => {
+                setLoginRequired(result.loginRequired !== false);
+                setState(result.authenticated ? 'ready' : 'login');
+            })
             .catch(() => setState('login'));
         const expired = () => setState('login');
         loginRequired.addEventListener('required', expired);
@@ -337,7 +343,7 @@ function App() {
     }, []);
     if (state === 'checking') return <p class="acp-muted acp-boot">{text('正在连接网关…', 'Connecting to the gateway…')}</p>;
     if (state === 'login') return <Login onDone={() => setState('ready')} />;
-    return <Workbench onLogout={() => void session.logout().finally(() => setState('login'))} />;
+    return <Workbench onLogout={loginRequired ? () => void session.logout().finally(() => setState('login')) : undefined} />;
 }
 
 render(<App />, document.getElementById('app')!);
