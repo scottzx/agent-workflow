@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { ChatView, useChatPages, type ChatPageLoader } from '@1agents/chat-view';
 import { FilePreview, renderMarkdown } from '@1agents/file-preview';
 import { acpTaskService } from './api';
@@ -15,10 +15,31 @@ const chatLabels =
         ? { empty: '暂无对话内容', loading: '正在读取对话…', loadEarlier: '加载更早的对话', loadingEarlier: '加载中…', retry: '重试', thinking: '思考', input: '输入', output: '输出', showMore: '显示全部', allowed: '已允许', denied: '已拒绝', waiting: '等待回答', plan: '计划', you: '你', agent: '智能体' }
         : undefined;
 
-/** One artifact. A readable URL gets an on-demand inline preview; a path on the execution host is shown as a path. */
-export function ArtifactItem({ artifact }: { artifact: { path?: string; url?: string; mediaType?: string } }) {
-    const [open, setOpen] = useState(false);
-    const url = safeArtifactUrl(artifact.url);
+export interface ArtifactRef {
+    path?: string;
+    url?: string;
+    mediaType?: string;
+    sha256?: string;
+}
+
+/** A published URL as is; a verified file on the execution host through the gateway, which re-checks its digest. */
+export function artifactUrl(jobId: string, artifact: ArtifactRef): string | undefined {
+    const published = safeArtifactUrl(artifact.url);
+    if (published) return published;
+    if (!artifact.sha256 || !/^[a-f0-9]{64}$/.test(artifact.sha256)) return undefined;
+    return new URL(`/workbench/ui/api/tasks/${encodeURIComponent(jobId)}/artifacts/${artifact.sha256}`, location.origin).href;
+}
+
+/** One artifact with an on-demand inline preview; one with neither URL nor receipt digest is shown as a path. */
+export function ArtifactItem({ jobId, artifact, focused }: { jobId: string; artifact: ArtifactRef; focused?: boolean }) {
+    const [open, setOpen] = useState(Boolean(focused));
+    const row = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+        if (!focused) return;
+        setOpen(true);
+        row.current?.scrollIntoView({ block: 'start' });
+    }, [focused]);
+    const url = artifactUrl(jobId, artifact);
     const name = artifact.path?.split('/').pop() || (url ? decodeURIComponent(new URL(url).pathname.split('/').pop() || '') : '') || text('产物', 'Artifact');
     if (!url) {
         return artifact.path ? (
@@ -28,7 +49,7 @@ export function ArtifactItem({ artifact }: { artifact: { path?: string; url?: st
         ) : null;
     }
     return (
-        <div class="acp-artifact-item">
+        <div class="acp-artifact-item" ref={row}>
             <span class="acp-artifact-row">
                 <a href={url} target="_blank" rel="noopener noreferrer">
                     {name}
@@ -50,7 +71,7 @@ export function ReportPreview({ markdown, path }: { markdown: string; path?: str
 }
 
 /** Conversation of one task, newest page first; nothing is requested until this component mounts. */
-export function TaskChat({ jobId }: { jobId: string }) {
+export function TaskChat({ jobId, onOpenFile }: { jobId: string; onOpenFile?: (path: string) => void }) {
     const load = useCallback<ChatPageLoader>(
         async (cursor, limit) => {
             const page = await acpTaskService.chat(jobId, cursor === undefined ? undefined : Number(cursor), limit);
@@ -75,13 +96,14 @@ export function TaskChat({ jobId }: { jobId: string }) {
                 onRetry={pages.reload}
                 diagrams={false}
                 labels={chatLabels}
+                onOpenFile={onOpenFile}
             />
         </div>
     );
 }
 
 /** Task text written by agents (progress, results, plans) is Markdown; it is sanitized before it reaches the page. */
-export function Md({ source, class: className }: { source: string; class?: string }) {
+export function Md({ source, class: className, onOpenFile }: { source: string; class?: string; onOpenFile?: (path: string) => void }) {
     const [html, setHtml] = useState('');
     useEffect(() => {
         let live = true;
@@ -92,7 +114,17 @@ export function Md({ source, class: className }: { source: string; class?: strin
     }, [source]);
     // Until the renderer chunk arrives (or if it fails) the raw text stays readable.
     return html ? (
-        <div class={`fp-md acp-md${className ? ` ${className}` : ''}`} dangerouslySetInnerHTML={{ __html: html }} />
+        <div
+            class={`fp-md acp-md${className ? ` ${className}` : ''}`}
+            dangerouslySetInnerHTML={{ __html: html }}
+            onClick={event => {
+                // A local path names a file on the execution host, never a page of this site.
+                const href = (event.target as HTMLElement).closest('a')?.getAttribute('href');
+                if (!href || /^(https?:|mailto:|#)/i.test(href) || !onOpenFile) return;
+                event.preventDefault();
+                onOpenFile(decodeURIComponent(href.split('#')[0]!).replace(/:\d+$/, ''));
+            }}
+        />
     ) : (
         <p class={className}>{source}</p>
     );

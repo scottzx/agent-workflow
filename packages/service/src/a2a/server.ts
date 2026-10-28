@@ -11,6 +11,8 @@ import { a2aRequestId } from './request-id.js';
 import { FileA2AStore } from './store.js';
 import type { A2ABackend } from './types.js';
 import { a2aPreflightInputSchema } from './preflight.js';
+import { ArtifactContentError, readVerifiedArtifact } from './artifact-content.js';
+import type { A2AVerifiedArtifact } from './result-metadata.js';
 
 async function readBoundedJson(req: IncomingMessage, limit: number): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -300,6 +302,27 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
         }
         const mapped = sessionRouteError(error);
         res.writeHead(mapped.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: mapped.code }));
+      }
+      return;
+    }
+    // Same credential boundary as execution: the caller names a task and a receipt entry, never an arbitrary path.
+    if (req.url === `${path}/artifacts/content`) {
+      try {
+        const body = await readBoundedJson(req, 65536) as { taskId?: unknown; path?: unknown; sha256?: unknown };
+        if (!body || typeof body !== 'object' || typeof body.taskId !== 'string' || typeof body.path !== 'string'
+          || typeof body.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(body.sha256)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid-artifact-request' })); return;
+        }
+        const context = new ServerCallContext({ requestedVersion: '1.0', user: { isAuthenticated: true, userName: 'dsh-a2a' } });
+        const task = await store.taskStore.load(body.taskId, context);
+        const result = (task?.metadata?.['1agents'] as { result?: { artifacts?: A2AVerifiedArtifact[] } } | undefined)?.result;
+        const content = await readVerifiedArtifact(result?.artifacts ?? [], body.path, body.sha256);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': content.length, 'Cache-Control': 'no-store' });
+        res.end(content);
+      } catch (error) {
+        const status = error instanceof ArtifactContentError ? error.status : 400;
+        const code = error instanceof ArtifactContentError ? error.code : 'invalid-artifact-request';
+        res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: code }));
       }
       return;
     }

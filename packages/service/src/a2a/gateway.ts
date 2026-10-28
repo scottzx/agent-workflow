@@ -16,6 +16,7 @@ import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSc
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
 import { artifactInstructions, defaultJobDirectory, defaultManifestPath } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
@@ -167,6 +168,10 @@ interface Job {
   closedAt?: string;
   closeReason?: CloseReason;
   processReleased?: true | 'pending';
+}
+
+export class WorkbenchArtifactError extends Error {
+  constructor(readonly status: 404 | 409 | 413 | 502, readonly code: string) { super(code); }
 }
 
 export class RemoteAgentError extends Error {
@@ -759,12 +764,7 @@ export class RemoteAgentGateway {
     const configured = this.config.remotes[remote];
     const config = configured ? { ...configured, url: pinnedEndpoint ?? configured.url } : undefined;
     if (!config) throw new Error(`Unknown remote: ${remote}`);
-    const client = await this.client(remote, config.url), card = await client.getAgentCard(this.auth(remote));
-    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
-    if (!endpoint) throw new Error('Remote does not advertise a JSONRPC endpoint');
-    const url = new URL(endpoint);
-    if (url.origin !== new URL(config.url).origin || url.username || url.password) throw new Error('Preflight endpoint must use the configured remote origin');
-    url.pathname = `${url.pathname.replace(/\/$/, '')}/preflight`; url.search = ''; url.hash = '';
+    const url = await this.hostRoute(remote, config.url, '/preflight');
     const controller = new AbortController(); this.controllers.add(controller);
     try {
       const response = await fetch(url, { method: 'POST', redirect: 'error',
@@ -773,6 +773,52 @@ export class RemoteAgentGateway {
       if (!response.ok) { await response.body?.cancel(); throw new Error(`Remote preflight failed (HTTP ${response.status})`); }
       return a2aPreflightReportSchema.parse(await response.json());
     } finally { this.controllers.delete(controller); }
+  }
+  /** Host extensions sit beside the JSONRPC endpoint the remote advertises, and only on its configured origin. */
+  private async hostRoute(remote: string, base: string, suffix: string): Promise<URL> {
+    const client = await this.client(remote, base), card = await client.getAgentCard(this.auth(remote));
+    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
+    if (!endpoint) throw new Error('Remote does not advertise a JSONRPC endpoint');
+    const url = new URL(endpoint);
+    if (url.origin !== new URL(base).origin || url.username || url.password) throw new Error('Host endpoint must use the configured remote origin');
+    url.pathname = `${url.pathname.replace(/\/$/, '')}${suffix}`; url.search = ''; url.hash = '';
+    return url;
+  }
+  /** One verified artifact, read from the host that produced it and checked against the recorded receipt again here. */
+  async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
+    this.workbenchTask(jobId);
+    for (const raw of this.state.jobs) {
+      if (raw.ledgerJobId !== jobId) continue;
+      const result = Task.fromJSON(raw.task).metadata?.['1agents']?.result as Partial<A2AResultMetadata> | undefined;
+      const artifact = result?.artifacts?.find(item => item.sha256 === sha256);
+      if (!artifact) continue;
+      const config = this.config.remotes[raw.remote];
+      if (!config) throw new WorkbenchArtifactError(404, 'artifact-host-not-configured');
+      if (artifact.size > ARTIFACT_CONTENT_LIMIT) throw new WorkbenchArtifactError(413, 'artifact-too-large');
+      const controller = new AbortController(); this.controllers.add(controller);
+      try {
+        const url = await this.hostRoute(raw.remote, config.url, '/artifacts/content');
+        const response = await fetch(url, { method: 'POST', redirect: 'error',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
+          body: JSON.stringify({ taskId: raw.taskId, path: artifact.path, sha256 }),
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]) });
+        if (!response.ok) {
+          await response.body?.cancel();
+          // An older host has no such route; everything else keeps the host's own verdict.
+          throw new WorkbenchArtifactError(response.status === 409 || response.status === 413 ? response.status : 404,
+            response.status === 404 || response.status === 409 || response.status === 413 ? 'artifact-unavailable-on-host' : 'artifact-host-unsupported');
+        }
+        const content = Buffer.from(await response.arrayBuffer());
+        if (content.length !== artifact.size || createHash('sha256').update(content).digest('hex') !== sha256) {
+          throw new WorkbenchArtifactError(409, 'artifact-digest-mismatch');
+        }
+        return { content, name: path.basename(artifact.path), ...(artifact.mediaType ? { mediaType: artifact.mediaType } : {}) };
+      } catch (error) {
+        if (error instanceof WorkbenchArtifactError) throw error;
+        throw new WorkbenchArtifactError(502, 'artifact-host-unreachable');
+      } finally { this.controllers.delete(controller); }
+    }
+    throw new WorkbenchArtifactError(404, 'artifact-not-found');
   }
   private async checkDispatch(remote: string, cwd: string, requirements?: z.output<typeof a2aPreflightRequirementsSchema>, pinnedEndpoint?: string): Promise<void> {
     if (!requirements) return;
@@ -1483,6 +1529,15 @@ async function body(req: IncomingMessage): Promise<unknown> {
 function json(res: ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(data));
 }
+const ARTIFACT_TYPES: Record<string, string> = { md: 'text/markdown', txt: 'text/plain', csv: 'text/csv', json: 'application/json', html: 'text/html',
+  pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+  mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav' };
+/** The manifest's media type when well formed, else one from the extension; text is always served as UTF-8. */
+function artifactContentType(name: string, declared?: string): string {
+  const type = declared && /^[a-z0-9][\w.+-]*\/[\w.+-]+$/i.test(declared) ? declared.toLowerCase()
+    : ARTIFACT_TYPES[path.extname(name).slice(1).toLowerCase()] ?? 'application/octet-stream';
+  return type.startsWith('text/') ? `${type}; charset=utf-8` : type;
+}
 function authenticated(req: IncomingMessage, token: string): boolean {
   const expected = Buffer.from(`Bearer ${token}`), supplied = Buffer.from(req.headers.authorization ?? '');
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
@@ -1601,6 +1656,23 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           const query = z.object({ limit: z.coerce.number().int().min(1).max(200).optional(), before: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           try { return json(res, 200, gateway.workbenchChat(decodeURIComponent(chat[1]!), query)); }
           catch (error) { return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' }); }
+        }
+        const artifact = /^\/workbench\/tasks\/([^/]+)\/artifacts\/([a-f0-9]{64})$/.exec(pathname);
+        if (artifact) {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          if (url.search) return json(res, 404, { error: 'No workbench route' });
+          try {
+            const file = await gateway.workbenchArtifact(decodeURIComponent(artifact[1]!), artifact[2]!);
+            // Agent-written bytes: never sniffed, and a sandboxed document with no script or network even when opened directly.
+            res.writeHead(200, { 'Content-Type': artifactContentType(file.name, file.mediaType), 'Content-Length': file.content.length,
+              'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600',
+              'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+              'Content-Security-Policy': "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'" });
+            return void res.end(file.content);
+          } catch (error) {
+            if (error instanceof WorkbenchArtifactError) return json(res, error.status, { error: error.code });
+            return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
+          }
         }
         if (url.search) return json(res, 404, { error: 'No workbench route' });
         const route = /^\/workbench\/tasks\/([^/]+)(.*)$/.exec(pathname);

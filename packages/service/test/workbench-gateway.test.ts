@@ -4,7 +4,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
-import { Task } from '@a2a-js/sdk';
+import { AgentCard, Task } from '@a2a-js/sdk';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { REMOTE_AGENT_METHODS, serveA2AGateway, type A2AGatewayConfig } from '../src/a2a/gateway.js';
 import { createHumanReview } from '../src/execution/human-review.js';
 import { createPptDeliveryRun, scriptDirectory, type PptDeliveryRun } from '../src/execution/ppt-delivery.js';
@@ -362,4 +364,52 @@ test('workbench chat pages the stored A2A history newest-first inside the same s
   assert.equal((await f.request(`/workbench/tasks/${jobId}/chat?limit=0`)).status, 400);
   assert.equal((await f.request(`/workbench/tasks/${jobId}/chat`, {}, null)).status, 401);
   assert.equal((await f.request(`/workbench/tasks/${jobId}/chat`, { method: 'POST' })).status, 405);
+});
+
+test('workbench artifacts are read from the producing host and served only when the bytes match the receipt', async t => {
+  const f = await fixture(t);
+  const { jobId } = await f.seed('allowed-root', '产物任务'), hidden = await f.seed('private-root', '隐藏产物');
+  const bytes = '# 产物\n', sha256 = createHash('sha256').update(bytes).digest('hex');
+  let served = bytes; const asked: unknown[] = [];
+  const remote = createServer((req, res) => { void (async () => {
+    if (req.url === '/.well-known/agent-card.json') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return void res.end(JSON.stringify(AgentCard.toJSON(AgentCard.fromJSON({ name: 'host', description: 'test', version: '1.0.0',
+        supportedInterfaces: [{ url: `${origin}/a2a`, protocolBinding: 'JSONRPC', protocolVersion: '1.0' }],
+        capabilities: {}, defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'], skills: [] }))));
+    }
+    if (req.url !== '/a2a/artifacts/content' || req.headers.authorization !== 'Bearer host-token') { res.writeHead(404); return void res.end(); }
+    const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
+    asked.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' }); res.end(served);
+  })(); });
+  await new Promise<void>(resolve => remote.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(remote.address() as AddressInfo).port}`;
+  t.after(() => new Promise<void>(resolve => { remote.closeAllConnections(); remote.close(() => resolve()); }));
+  (f.gateway as any).config.remotes.host = { url: origin, token: 'host-token' };
+  const artifacts = [{ path: '/work/.1agents/jobs/j/notes.md', size: Buffer.byteLength(bytes), sha256, mediaType: 'text/markdown' }];
+  const raw = (ledgerJobId: string, taskId: string) => ({ remote: 'host', originSessionId: 'allowed-root', taskId, contextId: 'c', cwd: '/work',
+    checkedAt: new Date().toISOString(), ledgerJobId, attemptId: `${taskId}-attempt`,
+    task: { id: taskId, contextId: 'c', status: { state: 'TASK_STATE_COMPLETED' }, metadata: { '1agents': { result: { artifacts } } } } });
+  (f.gateway as any).state.jobs.push(raw(jobId, 'artifact-task'), raw(hidden.jobId, 'hidden-task'));
+  const path = (job: string, digest = sha256) => `/workbench/tasks/${job}/artifacts/${digest}`;
+
+  const ok = await f.request(path(jobId));
+  assert.equal(ok.status, 200);
+  assert.equal(await ok.text(), bytes);
+  assert.equal(ok.headers.get('content-type'), 'text/markdown; charset=utf-8');
+  assert.equal(ok.headers.get('x-content-type-options'), 'nosniff');
+  assert.match(ok.headers.get('content-security-policy') ?? '', /^sandbox;/);
+  assert.match(ok.headers.get('content-disposition') ?? '', /notes\.md/);
+  assert.deepEqual(asked, [{ taskId: 'artifact-task', path: artifacts[0]!.path, sha256 }], 'the host is asked for the receipt entry, not a caller path');
+
+  assert.equal((await f.request(path(jobId, 'a'.repeat(64)))).status, 404);
+  assert.equal((await f.request(path(hidden.jobId))).status, 404, 'out-of-scope tasks expose no artifact bytes');
+  assert.equal((await f.request(path(jobId), {}, null)).status, 401);
+  assert.equal((await f.request(path(jobId), { method: 'POST' })).status, 405);
+  assert.equal((await f.request(`${path(jobId)}?x=1`)).status, 404);
+  served = '# 被替换\n';
+  const changed = await f.request(path(jobId));
+  assert.equal(changed.status, 409, 'bytes that no longer match the receipt are refused');
+  assert.equal((await changed.json() as any).error, 'artifact-digest-mismatch');
 });

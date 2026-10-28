@@ -98,8 +98,29 @@ async function fixture(t: TestContext, outcome: A2ARunResult['outcome'] = 'compl
     assert.ok('id' in result);
     return client.getTask(GetTaskRequest.fromJSON({ id: result.id }), auth);
   };
-  return { root, calls, send, client, auth };
+  return { root, calls, send, client, auth, origin };
 }
+
+test('the host serves back only verified artifact bytes for a task, and refuses anything changed or unregistered', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const artifact = join(f.root, 'notes.md'), other = join(f.root, 'secret.txt'), manifest = join(f.root, 'artifacts.json');
+  await writeFile(artifact, '# notes'); await writeFile(other, 'not registered');
+  await writeFile(manifest, JSON.stringify({ artifacts: [{ path: artifact, mediaType: 'text/markdown' }] }));
+  const task = await f.send({ preflight: { jobDirectory: f.root }, resultContract: { jobId: 'read', artifactManifestPath: manifest } });
+  const { sha256 } = (task.metadata?.['1agents'] as { result: A2AResultMetadata }).result.artifacts[0]!;
+  const read = (body: Record<string, unknown>, token = 'test-token') => fetch(`${f.origin}/a2a/artifacts/content`, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+  const served = await read({ taskId: task.id, path: artifact, sha256 });
+  assert.equal(served.status, 200);
+  assert.equal(await served.text(), '# notes');
+  assert.equal((await read({ taskId: task.id, path: artifact, sha256 }, 'wrong')).status, 401);
+  const otherHash = createHash('sha256').update('not registered').digest('hex');
+  assert.equal((await read({ taskId: task.id, path: other, sha256: otherHash })).status, 404);
+  assert.equal((await read({ taskId: 'missing', path: artifact, sha256 })).status, 404);
+  assert.equal((await read({ taskId: task.id, path: artifact, sha256: 'not-a-hash' })).status, 400);
+  await writeFile(artifact, '# edited');
+  assert.equal((await read({ taskId: task.id, path: artifact, sha256 })).status, 409);
+});
 
 test('completed tasks and same-context continuations keep real IDs, verified URLs, and independent records', { timeout: 10000 }, async t => {
   const f = await fixture(t);

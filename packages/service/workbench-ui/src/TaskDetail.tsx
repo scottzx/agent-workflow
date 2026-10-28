@@ -4,7 +4,7 @@ import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpDecisionInput, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
-import { ArtifactItem, Md, ReportPreview, TaskChat } from './Preview';
+import { ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
 import {
     channelLabel,
     date,
@@ -87,6 +87,7 @@ export function AcpTaskDetailPanel({
     const [decisionMessage, setDecisionMessage] = useState('');
     const [decisionError, setDecisionError] = useState('');
     const [confirmCancel, setConfirmCancel] = useState(false);
+    const [focusedArtifact, setFocusedArtifact] = useState<string>();
     const decisionRequest = useRef<{ key: string; id: string } | null>(null);
     const alive = useRef(true);
     const requestInFlight = useRef(false);
@@ -148,6 +149,16 @@ export function AcpTaskDetailPanel({
         setDecisionMessage('');
         setNote('');
         navigateAcpTask({ jobId, reviewId: id, full });
+    };
+
+    /** A link in agent text opens the preview only when it names a registered artifact; other host paths stay inert. */
+    const openFile = (path: string) => {
+        const registered = (detail?.artifacts || []).some(result =>
+            result.artifacts.some(item => typeof item === 'object' && (item as ArtifactRef).path === path)
+        );
+        if (!registered) return;
+        setFocusedArtifact(path);
+        setTab('review');
     };
 
     const decide = async (action: AcpReviewAction) => {
@@ -320,6 +331,7 @@ export function AcpTaskDetailPanel({
                                 detail={detail}
                                 onReview={id => selectReview(id)}
                                 onReload={() => void load()}
+                                onOpenFile={openFile}
                             />
                         )}
                         {tab === 'progress' && (
@@ -332,6 +344,7 @@ export function AcpTaskDetailPanel({
                                     review={currentReview}
                                     requestedReviewId={reviewId}
                                     onSelect={selectReview}
+                                    focusedArtifact={focusedArtifact}
                                 />
                                 {currentReview && (
                                     <Fragment>
@@ -480,7 +493,7 @@ export function AcpTaskDetailPanel({
                                 )}
                             </Fragment>
                         )}
-                        {tab === 'chat' && <TaskChat jobId={jobId} />}
+                        {tab === 'chat' && <TaskChat jobId={jobId} onOpenFile={openFile} />}
                         {tab === 'events' && (
                             <Fragment>
                                 <TaskTechnical detail={detail} />
@@ -521,10 +534,12 @@ function TaskOverview({
     detail,
     onReview,
     onReload,
+    onOpenFile,
 }: {
     detail: AcpTaskDetail;
     onReview: (id: string) => void;
     onReload: () => void;
+    onOpenFile: (path: string) => void;
 }) {
     const current = detail.attempts.find(attempt => attempt.attemptId === detail.currentAttemptId);
     const answer = current?.result?.resultSummary;
@@ -547,19 +562,19 @@ function TaskOverview({
             {detail.description && (
                 <section class="acp-detail-section">
                     <h3>{text('任务描述', 'Task description')}</h3>
-                    <Md source={detail.description} />
+                    <Md source={detail.description} onOpenFile={onOpenFile} />
                 </section>
             )}
             {answer ? (
                 <section class="acp-detail-section">
                     <h3>{text('最新回答', 'Latest answer')}</h3>
-                    <Md source={answer} />
+                    <Md source={answer} onOpenFile={onOpenFile} />
                 </section>
             ) : (
                 detail.progressSummary && (
                     <section class="acp-detail-section">
                         <h3>{text('当前进展', 'Current progress')}</h3>
-                        <Md source={detail.progressSummary} />
+                        <Md source={detail.progressSummary} onOpenFile={onOpenFile} />
                     </section>
                 )
             )}
@@ -810,20 +825,22 @@ function TaskReview({
     review,
     requestedReviewId,
     onSelect,
+    focusedArtifact,
 }: {
     detail: AcpTaskDetail;
     review?: AcpReview;
     requestedReviewId?: string;
     onSelect: (id: string) => void;
+    focusedArtifact?: string;
 }) {
-    const artifactResults = [...(detail.progress?.availableResults || [])];
+    const artifactResults: { revision: string; artifacts: ArtifactRef[]; deliveryReady?: boolean }[] = [
+        ...(detail.progress?.availableResults || []),
+    ];
     for (const result of detail.artifacts || []) {
         if (!artifactResults.some(item => item.revision === result.revision)) {
             artifactResults.push({
                 revision: result.revision,
-                artifacts: result.artifacts.map(item =>
-                    typeof item === 'string' ? { url: item } : (item as { url?: string; path?: string })
-                ),
+                artifacts: result.artifacts.map(item => (typeof item === 'string' ? { url: item } : (item as ArtifactRef))),
                 deliveryReady: detail.executionStatus === 'completed',
             });
         }
@@ -840,7 +857,12 @@ function TaskReview({
                                 {result.deliveryReady ? text('最终交付', 'Final delivery') : text('制作稿', 'Draft')}
                             </strong>
                             {result.artifacts.map((artifact, index) => (
-                                <ArtifactItem key={`${artifact.url || artifact.path}:${index}`} artifact={artifact} />
+                                <ArtifactItem
+                                    key={`${artifact.url || artifact.path}:${index}`}
+                                    jobId={detail.jobId}
+                                    artifact={artifact}
+                                    focused={Boolean(focusedArtifact && artifact.path === focusedArtifact)}
+                                />
                             ))}
                         </div>
                     ))}
