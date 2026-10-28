@@ -206,7 +206,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   border-radius: 8px;
 }
 .acp-attempt summary, .acp-context summary { display: flex; justify-content: space-between; gap: 8px; cursor: pointer; overflow-wrap: anywhere; }
-.acp-result-summary { white-space: pre-wrap; margin: 8px 0 0; }
+.acp-result-summary { margin: 8px 0 0; }
 .acp-child-task {
   display: flex;
   justify-content: space-between;
@@ -297,3 +297,12 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-chat { height: min(70vh, 640px); border: 1px solid var(--border-color); border-radius: var(--radius); overflow: hidden; }
 .acp-artifact-item { display: grid; gap: 6px; }
 .acp-artifact-row { display: inline-flex; gap: 12px; align-items: baseline; }
+
+/* With a detail open, the list and the drawer scroll on their own inside the viewport. */
+.acp-workbench.has-detail:not(.is-full-detail) { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+.has-detail:not(.is-full-detail) .acp-workbench-body { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
+.has-detail:not(.is-full-detail) .acp-workbench-table, .has-detail:not(.is-full-detail) .acp-detail { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.has-detail:not(.is-full-detail) .acp-workbench-table { overflow-x: auto; }
+.acp-md { padding: 0; }
+.acp-md > :first-child { margin-top: 0; }
+.acp-md > :last-child { margin-bottom: 0; }

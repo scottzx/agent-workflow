@@ -4,7 +4,7 @@ import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpDecisionInput, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
-import { ArtifactItem, ReportPreview, TaskChat } from './Preview';
+import { ArtifactItem, Md, ReportPreview, TaskChat } from './Preview';
 import {
     AcceptanceBadge,
     channelLabel,
@@ -12,6 +12,7 @@ import {
     displayStatus,
     duration,
     EmptyState,
+    eventLabel,
     ErrorState,
     ExecutionRole,
     ExecutionService,
@@ -24,7 +25,7 @@ import {
     title,
 } from './ui';
 
-type DetailTab = 'overview' | 'review' | 'chat' | 'events';
+type DetailTab = 'overview' | 'progress' | 'review' | 'chat' | 'events';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 function ExecutionCaption({ execution }: { execution?: AcpExecution }) {
@@ -220,7 +221,8 @@ export function AcpTaskDetailPanel({
         }
     };
     const tabs: [DetailTab, string][] = [
-        ['overview', text('概览与进展', 'Progress')],
+        ['overview', text('概览', 'Overview')],
+        ['progress', text('进展', 'Progress')],
         ['review', text('产物与审核', 'Artifacts & review')],
         ['chat', text('对话', 'Conversation')],
         ['events', text('事件记录', 'Events')],
@@ -284,7 +286,7 @@ export function AcpTaskDetailPanel({
                                 {text('当前为缓存状态，等待同步', 'Cached status; awaiting synchronization')}
                             </span>
                         )}
-                        {detail.progressSummary && <p class="acp-current-progress">{detail.progressSummary}</p>}
+                        {detail.progressSummary && <Md source={detail.progressSummary} class="acp-current-progress" />}
                     </Fragment>
                 )}
             </header>
@@ -323,10 +325,10 @@ export function AcpTaskDetailPanel({
                             <TaskOverview
                                 detail={detail}
                                 onReview={id => selectReview(id)}
-                                full={full}
                                 onReload={() => void load()}
                             />
                         )}
+                        {tab === 'progress' && <TaskProgress detail={detail} onReview={id => selectReview(id)} full={full} />}
                         {tab === 'review' && (
                             <Fragment>
                                 <TaskReview
@@ -483,7 +485,12 @@ export function AcpTaskDetailPanel({
                             </Fragment>
                         )}
                         {tab === 'chat' && <TaskChat jobId={jobId} />}
-                        {tab === 'events' && <TaskEvents detail={detail} />}
+                        {tab === 'events' && (
+                            <Fragment>
+                                <TaskTechnical detail={detail} />
+                                <TaskEvents detail={detail} />
+                            </Fragment>
+                        )}
                     </Fragment>
                 )}
             </div>
@@ -528,19 +535,68 @@ function AcceptanceSection({ detail }: { detail: AcpTaskDetail }) {
 function TaskOverview({
     detail,
     onReview,
-    full,
     onReload,
 }: {
     detail: AcpTaskDetail;
     onReview: (id: string) => void;
-    full: boolean;
     onReload: () => void;
 }) {
-    const stages = detail.progress?.stages || [];
+    const current = detail.attempts.find(attempt => attempt.attemptId === detail.currentAttemptId);
+    const answer = current?.result?.resultSummary;
     return (
         <Fragment>
             <ProcessRequestPanel jobId={detail.jobId} requests={detail.processRequests} onReload={onReload} />
             {detail.executionStatus === 'completed' && <AcceptanceSection detail={detail} />}
+            {detail.pendingReviewId && (
+                <p class="acp-notice">
+                    {text('有产物等待你审核。', 'An artifact is waiting for your review.')}{' '}
+                    <button type="button" class="acp-link" onClick={() => onReview(detail.pendingReviewId!)}>
+                        {text('去审核', 'Review')}
+                    </button>
+                </p>
+            )}
+            {detail.description && (
+                <section class="acp-detail-section">
+                    <h3>{text('任务描述', 'Task description')}</h3>
+                    <Md source={detail.description} />
+                </section>
+            )}
+            {answer && (
+                <section class="acp-detail-section">
+                    <h3>{text('最新回答', 'Latest answer')}</h3>
+                    <Md source={answer} />
+                </section>
+            )}
+            <div class="acp-task-facts">
+                <span>
+                    {text('创建', 'Created')}
+                    <strong>{date(detail.createdAt)}</strong>
+                </span>
+                <span>
+                    {text('最近更新', 'Last updated')}
+                    <strong>{date(detail.updatedAt)}</strong>
+                </span>
+                {detail.progress?.executionElapsedMs !== undefined && (
+                    <span>
+                        {text('实际执行', 'Execution time')}
+                        <strong>{duration(detail.progress.executionElapsedMs)}</strong>
+                    </span>
+                )}
+                {detail.progress?.humanWaitingMs !== undefined && (
+                    <span>
+                        {text('人工等待', 'Human wait')}
+                        <strong>{duration(detail.progress.humanWaitingMs)}</strong>
+                    </span>
+                )}
+            </div>
+        </Fragment>
+    );
+}
+
+function TaskProgress({ detail, onReview, full }: { detail: AcpTaskDetail; onReview: (id: string) => void; full: boolean }) {
+    const stages = detail.progress?.stages || [];
+    return (
+        <Fragment>
             {stages.length > 0 && (
                 <section class="acp-detail-section">
                     <h3>{text('阶段进展', 'Stage progress')}</h3>
@@ -584,87 +640,36 @@ function TaskOverview({
                     </ol>
                 </section>
             )}
-            <div class="acp-task-facts">
-                <ExecutionFacts execution={detail.execution} />
-                <span>
-                    {text('创建', 'Created')}
-                    <strong>{date(detail.createdAt)}</strong>
-                </span>
-                <span>
-                    {text('最近更新', 'Last updated')}
-                    <strong>{date(detail.updatedAt)}</strong>
-                </span>
-                {detail.progress?.executionElapsedMs !== undefined && (
-                    <span>
-                        {text('实际执行', 'Execution time')}
-                        <strong>{duration(detail.progress.executionElapsedMs)}</strong>
-                    </span>
-                )}
-                {detail.progress?.humanWaitingMs !== undefined && (
-                    <span>
-                        {text('人工等待', 'Human wait')}
-                        <strong>{duration(detail.progress.humanWaitingMs)}</strong>
-                    </span>
-                )}
-            </div>
             <section class="acp-detail-section">
                 <h3>{text('执行轮次', 'Execution attempts')}</h3>
                 {detail.attempts.length ? (
-                    [...detail.attempts].reverse().map((attempt, index) => {
-                        const identity = executionLabels(attempt.execution, language);
-                        return (
-                            <details class="acp-attempt" key={attempt.attemptId} open={index === 0}>
-                                <summary>
-                                    <span>
-                                        {attempt.attemptId === detail.currentAttemptId
-                                            ? text('当前执行', 'Current attempt')
-                                            : text('历史执行', 'Past attempt')}{' '}
-                                        · {attempt.attemptId}
-                                    </span>
-                                    <Status value={attempt.executionStatus} />
-                                </summary>
-                                <dl>
-                                    <dt>{text('任务方式', 'Task mode')}</dt>
-                                    <dd>{identity.mode}</dd>
-                                    <dt>{text('角色或预设', 'Role / preset')}</dt>
-                                    <dd>
-                                        <ExecutionRole execution={attempt.execution} />
-                                    </dd>
-                                    <dt>{text('执行服务', 'Execution service')}</dt>
-                                    <dd>
-                                        <ExecutionService execution={attempt.execution} />
-                                    </dd>
-                                    <ServiceProvenance execution={attempt.execution} />
-                                    <dt>{text('原始目标 ID', 'Raw target ID')}</dt>
-                                    <dd>
-                                        {attempt.execution?.targetId ||
-                                            attempt.targetId ||
-                                            text('未记录', 'Not recorded')}
-                                    </dd>
-                                    <dt>{text('更新时间', 'Updated')}</dt>
-                                    <dd>{date(attempt.updatedAt)}</dd>
-                                    {attempt.previousAttemptId && (
-                                        <Fragment>
-                                            <dt>{text('接续执行', 'Continues attempt')}</dt>
-                                            <dd>{attempt.previousAttemptId}</dd>
-                                        </Fragment>
+                    [...detail.attempts].reverse().map((attempt, index) => (
+                        <details class="acp-attempt" key={attempt.attemptId} open={index === 0}>
+                            <summary>
+                                <span>
+                                    {attempt.attemptId === detail.currentAttemptId
+                                        ? text('当前执行', 'Current attempt')
+                                        : text('历史执行', 'Past attempt')}{' '}
+                                    · {date(attempt.createdAt || attempt.updatedAt)}
+                                </span>
+                                <Status value={attempt.executionStatus} />
+                            </summary>
+                            {attempt.stale && (
+                                <p class="acp-stale">
+                                    {text(
+                                        '此轮状态待核实；历史在途执行不会被隐藏。',
+                                        'This attempt needs verification; unresolved prior work remains visible.'
                                     )}
-                                </dl>
-                                {attempt.stale && (
-                                    <p class="acp-stale">
-                                        {text(
-                                            '此轮状态待核实；历史在途执行不会被隐藏。',
-                                            'This attempt needs verification; unresolved prior work remains visible.'
-                                        )}
-                                    </p>
-                                )}
-                                {attempt.diagnostic && <p class="acp-decision-error">{attempt.diagnostic}</p>}
-                                {attempt.result?.resultSummary && (
-                                    <p class="acp-result-summary">{attempt.result.resultSummary}</p>
-                                )}
-                            </details>
-                        );
-                    })
+                                </p>
+                            )}
+                            {attempt.diagnostic && <p class="acp-decision-error">{attempt.diagnostic}</p>}
+                            {attempt.attemptId !== detail.currentAttemptId && attempt.result?.resultSummary && (
+                                <div class="acp-result-summary">
+                                    <Md source={attempt.result.resultSummary} />
+                                </div>
+                            )}
+                        </details>
+                    ))
                 ) : (
                     <p class="acp-muted">{text('暂无执行记录', 'No execution attempts')}</p>
                 )}
@@ -690,7 +695,58 @@ function TaskOverview({
                     <p class="acp-muted">{text('当前没有已创建的子任务', 'No subtasks have been created')}</p>
                 )}
             </section>
-            <details class="acp-context">
+        </Fragment>
+    );
+}
+
+/** Where and how the task ran: identifiers and routing that help diagnosis but not review. */
+function TaskTechnical({ detail }: { detail: AcpTaskDetail }) {
+    return (
+        <Fragment>
+            <section class="acp-detail-section">
+                <h3>{text('执行信息', 'Execution details')}</h3>
+                <div class="acp-task-facts">
+                    <ExecutionFacts execution={detail.execution} />
+                </div>
+                {[...detail.attempts].reverse().map(attempt => {
+                    const identity = executionLabels(attempt.execution, language);
+                    return (
+                        <details class="acp-attempt" key={attempt.attemptId}>
+                            <summary>
+                                <span>
+                                    {attempt.attemptId === detail.currentAttemptId
+                                        ? text('当前执行', 'Current attempt')
+                                        : text('历史执行', 'Past attempt')}{' '}
+                                    · {attempt.attemptId}
+                                </span>
+                            </summary>
+                            <dl>
+                                <dt>{text('任务方式', 'Task mode')}</dt>
+                                <dd>{identity.mode}</dd>
+                                <dt>{text('角色或预设', 'Role / preset')}</dt>
+                                <dd>
+                                    <ExecutionRole execution={attempt.execution} />
+                                </dd>
+                                <dt>{text('执行服务', 'Execution service')}</dt>
+                                <dd>
+                                    <ExecutionService execution={attempt.execution} />
+                                </dd>
+                                <ServiceProvenance execution={attempt.execution} />
+                                <dt>{text('原始目标 ID', 'Raw target ID')}</dt>
+                                <dd>{attempt.execution?.targetId || attempt.targetId || text('未记录', 'Not recorded')}</dd>
+                                <dt>{text('更新时间', 'Updated')}</dt>
+                                <dd>{date(attempt.updatedAt)}</dd>
+                                {attempt.previousAttemptId && (
+                                    <Fragment>
+                                        <dt>{text('接续执行', 'Continues attempt')}</dt>
+                                        <dd>{attempt.previousAttemptId}</dd>
+                                    </Fragment>
+                                )}
+                            </dl>
+                        </details>
+                    );
+                })}
+                <details class="acp-context">
                 <summary>{text('任务来源', 'Task source')}</summary>
                 <dl>
                     <ServiceProvenance execution={detail.execution} />
@@ -732,6 +788,7 @@ function TaskOverview({
                     )}
                 </dl>
             </details>
+            </section>
         </Fragment>
     );
 }
@@ -775,6 +832,17 @@ function TaskReview({
                             ))}
                         </div>
                     ))}
+                </section>
+            )}
+            {artifactResults.length === 0 && (
+                <section class="acp-detail-section">
+                    <h3>{text('已有产物', 'Available artifacts')}</h3>
+                    <p class="acp-muted">
+                        {text(
+                            '这个任务还没有登记产物。产物不会从对话内容里推断：智能体需要按任务要求把文件写到指定的任务目录，并登记到产物清单，执行端校验通过后才会显示在这里。',
+                            'No artifacts are registered for this task. They are never inferred from the conversation: the agent must write files to the task directory and list them in the artifact manifest, and the executor verifies them before they appear here.'
+                        )}
+                    </p>
                 </section>
             )}
             {detail.reviews.length > 0 ? (
@@ -931,7 +999,7 @@ function TaskEvents({ detail }: { detail: AcpTaskDetail }) {
                         <li key={event.eventId}>
                             <time>{date(event.observedAt)}</time>
                             <div>
-                                <strong>{event.type}</strong>
+                                <strong title={event.type}>{eventLabel(event.type)}</strong>
                                 {event.attemptId && (
                                     <small>
                                         {text('执行轮次：', 'Attempt: ')}
@@ -940,7 +1008,7 @@ function TaskEvents({ detail }: { detail: AcpTaskDetail }) {
                                 )}
                                 {event.data !== undefined && (
                                     <details>
-                                        <summary>{text('查看事件信息', 'Event details')}</summary>
+                                        <summary>{text('技术详情', 'Technical details')}</summary>
                                         <pre>{JSON.stringify(event.data, null, 2)}</pre>
                                     </details>
                                 )}

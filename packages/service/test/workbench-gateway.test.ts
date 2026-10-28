@@ -104,7 +104,7 @@ test('workbench list and detail are scoped pure projections without private exec
   assert.equal(detail.progress.stages.find((s: any) => s.stage === 'make').planned, true);
   assert.ok(detail.progress.humanWaitingMs >= 60_000);
   const encoded = JSON.stringify(detail);
-  assert.ok(!encoded.includes('private-prompt-must-not-leak')); assert.ok(!encoded.includes('private-input-must-not-leak'));
+  assert.equal(detail.description, 'private-prompt-must-not-leak', 'the prompt is the task description'); assert.ok(!encoded.includes('private-input-must-not-leak'), 'other input fields stay private');
   assert.ok(!encoded.includes(token)); assert.ok(!encoded.includes(hidden.jobId));
   assert.equal((await f.request(`/workbench/tasks/${hidden.jobId}`)).status, 404);
   assert.equal((await f.request('/workbench/tasks?originSessionId=private-root')).status, 400);

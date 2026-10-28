@@ -1,6 +1,6 @@
-import { useCallback, useState } from 'preact/hooks';
+import { useCallback, useEffect, useState } from 'preact/hooks';
 import { ChatView, useChatPages, type ChatPageLoader } from '@1agents/chat-view';
-import { FilePreview } from '@1agents/file-preview';
+import { FilePreview, renderMarkdown } from '@1agents/file-preview';
 import { acpTaskService } from './api';
 import { safeArtifactUrl } from './model';
 import { language, text } from './ui';
@@ -77,5 +77,23 @@ export function TaskChat({ jobId }: { jobId: string }) {
                 labels={chatLabels}
             />
         </div>
+    );
+}
+
+/** Task text written by agents (progress, results, plans) is Markdown; it is sanitized before it reaches the page. */
+export function Md({ source, class: className }: { source: string; class?: string }) {
+    const [html, setHtml] = useState('');
+    useEffect(() => {
+        let live = true;
+        renderMarkdown(source).then(next => live && setHtml(next)).catch(() => live && setHtml(''));
+        return () => {
+            live = false;
+        };
+    }, [source]);
+    // Until the renderer chunk arrives (or if it fails) the raw text stays readable.
+    return html ? (
+        <div class={`fp-md acp-md${className ? ` ${className}` : ''}`} dangerouslySetInnerHTML={{ __html: html }} />
+    ) : (
+        <p class={className}>{source}</p>
     );
 }

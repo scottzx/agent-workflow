@@ -52,6 +52,30 @@ export function statusLabel(status: string): string {
     return label ? text(...label) : status;
 }
 
+/** Event names for the timeline; unknown types fall back to the raw name so nothing is hidden. */
+export function eventLabel(type: string): string {
+    const labels: Record<string, [string, string]> = {
+        'job.created': ['任务创建', 'Task created'],
+        'job.migrated': ['历史任务迁入', 'Imported from earlier record'],
+        'job.acceptance_recorded': ['业务验收已记录', 'Business acceptance recorded'],
+        'attempt.prepared': ['新一轮执行已准备', 'New attempt prepared'],
+        'attempt.dispatching': ['正在派发给执行端', 'Dispatching to the executor'],
+        'attempt.accepted': ['执行端已接收任务', 'Executor accepted the task'],
+        'attempt.submission_failed': ['派发失败', 'Dispatch failed'],
+        'attempt.submission_unknown': ['派发结果待核实', 'Dispatch result needs verification'],
+        'attempt.state_changed': ['执行状态变化', 'Execution status changed'],
+        'attempt.result_updated': ['执行结果更新', 'Result updated'],
+        'attempt.observation_conflict': ['状态观测冲突', 'Conflicting status observation'],
+        'attempt.cancellation_requested': ['已请求取消', 'Cancellation requested'],
+        'human_review.comment': ['人工审核：已留言', 'Review: comment added'],
+        'human_review.approve': ['人工审核：已通过', 'Review: approved'],
+        'human_review.changes_requested': ['人工审核：要求修改', 'Review: changes requested'],
+        'human_review.cancel': ['人工审核：已取消任务', 'Review: task canceled'],
+    };
+    const label = labels[type];
+    return label ? text(...label) : type;
+}
+
 export function phaseLabel(value: string): string {
     const names: Record<string, [string, string]> = {
         research: ['临时智能体分析', 'Project analysis'],
@@ -109,8 +133,18 @@ export function duration(ms?: number) {
         : text(`${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`, `${Math.floor(minutes / 60)} h ${minutes % 60} min`);
 }
 
+/** Markdown markers read as noise in a one-line table cell, so the excerpt keeps only the words. */
+export function plainText(markdown: string): string {
+    return markdown
+        .replace(/```[^\n]*\n?/g, ' ')
+        .replace(/^\s*\|?[\s:|-]+\|[\s:|-]*$/gm, ' ')
+        .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+\.)\s+/gm, '')
+        .replace(/[|*_`~]/g, ' ');
+}
+
 export function progressExcerpt(value?: string): string {
-    const characters = Array.from((value || '').replace(/\s+/g, ' ').trim());
+    const characters = Array.from(plainText(value || '').replace(/\s+/g, ' ').trim());
     return characters.length > 50 ? `${characters.slice(0, 49).join('')}…` : characters.join('') || '—';
 }
 

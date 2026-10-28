@@ -247,7 +247,9 @@ test('executor metadata exposes a bounded whitelist without raw binding, input, 
   assert.deepEqual(metadata, { kind: 'temporary', targetId: 'legacy:host', presetStatus: 'recorded', service: 'host-service', agentPreset: 'standard', provider: 'a2a',
     serviceInfo: { kind: 'a2a', source: 'target_snapshot', host: 'private.example', port: 443, locality: 'network', connectionAlias: 'host-service' } });
   assert.deepEqual(detail.attempts[0]?.execution, metadata);
-  const output = JSON.stringify(detail);
+  const { description, ...rest } = detail;
+  assert.equal(description, 'private prompt', 'the prompt is exposed only as the task description');
+  const output = JSON.stringify(rest);
   for (const privateValue of ['private prompt', 'https://private.example/internal', '/private/workspace', '/private/allowed', 'private-skill', 'private credential']) assert.equal(output.includes(privateValue), false);
 });
 
@@ -351,7 +353,7 @@ test('a live process request waits in the confirmation queue and an expired one 
   assert.equal(parentDetail.executionStatus, 'working');
   assert.equal(parentDetail.pendingProcessRequestId, 'prc-1');
   assert.equal(parentDetail.processRequests[0]?.requestId, 'prc-1');
-  assert.equal(JSON.stringify(snapshot).includes('secret-prompt'), false);
+  assert.equal(JSON.stringify({ ...snapshot, details: Object.fromEntries(Object.entries(snapshot.details).map(([id, { description: _d, ...rest }]) => [id, rest])) }).includes('secret-prompt'), false, 'only the description may carry the prompt');
   const pending = listWorkbenchTasks(snapshot, { filter: 'pending' });
   assert.equal(pending.counts.pending, 1);
   assert.equal(pending.items.some(item => item.jobId === parent.job.jobId), true);

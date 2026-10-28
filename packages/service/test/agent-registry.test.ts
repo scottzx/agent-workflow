@@ -96,7 +96,7 @@ test('trial and formal tasks share the pending queue and agent rows keep their o
   assert.deepEqual(pending.items.map(item => item.channel).sort(), ['formal', 'trial']);
   assert.equal(pending.items.find(item => item.channel === 'trial')?.agentId, 'agt-12345678');
   assert.equal(pending.items.find(item => item.channel === 'formal')?.agentId, 'resident:resident-role');
-  assert.equal(JSON.stringify(snapshot).includes('secret-prompt'), false);
+  assert.equal(JSON.stringify({ ...snapshot, details: Object.fromEntries(Object.entries(snapshot.details).map(([id, { description: _d, ...rest }]) => [id, rest])) }).includes('secret-prompt'), false, 'only the description may carry the prompt');
   assert.equal(JSON.stringify(snapshot).includes('/secret/project'), false);
   const catalog = projectWorkbenchAgents({
     drafts: [{ agentId: 'agt-12345678', name: '公众号草稿', acpAgent: 'grok-build', targetId: 'writer', modeId: 'bypassPermissions', options: [{ id: 'model', value: 'grok-2', model: true }], updatedAt: '2026-10-27T00:00:00.000Z' }],

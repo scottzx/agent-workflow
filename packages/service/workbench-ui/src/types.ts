@@ -237,6 +237,8 @@ export interface AcpProcessAnswerInput {
     stopTask?: true;
 }
 export interface AcpTaskDetail extends AcpTaskSummary {
+    /** What the task was asked to do (the first attempt's prompt), Markdown. */
+    description?: string;
     attempts: AcpAttempt[];
     children: AcpTaskSummary[];
     ancestors?: AcpTaskSummary[];

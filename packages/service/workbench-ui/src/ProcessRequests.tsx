@@ -2,6 +2,7 @@ import { Fragment } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpProcessQuestion, AcpProcessRequest } from './types';
+import { Md } from './Preview';
 import { text } from './ui';
 
 const statusLabel = (status: string) =>
@@ -144,7 +145,7 @@ export function ProcessRequestPanel({
                         <small>
                             {text('截止', 'Deadline')} {new Date(request.deadlineAt).toLocaleString()}
                         </small>
-                        {request.planContent && <p>{request.planContent}</p>}
+                        {request.planContent && <Md source={request.planContent} />}
                         {request.kind === 'permission' && (
                             <>
                                 <p>{request.toolTitle}</p>

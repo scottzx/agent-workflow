@@ -38,6 +38,8 @@ export type WorkbenchReview = HumanReviewRequest & { canReview: boolean; resumeS
 export type WorkbenchProcessRequest = ProcessRequest & { canAnswer: boolean };
 export type WorkbenchAttempt = Omit<LedgerAttempt, 'input' | 'targetSnapshot' | 'backendRunRef'> & { backendRunRef?: Record<string, string>; execution: WorkbenchExecution };
 export interface AcpTaskDetail extends AcpTaskSummary {
+  /** The first attempt's prompt: what the task was asked to do. Other input fields stay private. */
+  description?: string;
   attempts: WorkbenchAttempt[]; children: AcpTaskSummary[]; ancestors: AcpTaskSummary[];
   progress: WorkbenchProgress; reviews: WorkbenchReview[]; processRequests: WorkbenchProcessRequest[]; events: LedgerEvent[]; dependencies: WorkbenchDependency[];
   artifacts: { revision: string; digest?: string; artifacts: unknown[] }[];
@@ -282,7 +284,10 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
     const humanEvents: LedgerEvent[] = ownReviews.flatMap(review => review.history.map((decision, index) => ({ eventId: decision.decisionId, sourceId: ledger.sourceId, sequence: -(index + 1), jobId: review.jobId,
       attemptId: review.attemptId, jobVersion: 0, type: `human_review.${decision.action}`, observedAt: decision.at,
       data: { reviewId: review.reviewId, revision: review.revision, actor: decision.actor, ...(decision.note ? { note: decision.note } : {}) } })));
-    details[job.jobId] = { ...summaries.get(job.jobId)!, attempts, children, ancestors, progress: progress(job, run, source.reviews, ledger.attempts[job.currentAttemptId], source.now ?? Date.now()),
+    const asked = Object.values(ledger.attempts).filter(attempt => attempt.jobId === job.jobId)
+      .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''))[0]?.input as { prompt?: unknown } | undefined;
+    const description = typeof asked?.prompt === 'string' && asked.prompt.trim() ? asked.prompt.slice(0, 20_000) : undefined;
+    details[job.jobId] = { ...summaries.get(job.jobId)!, ...(description ? { description } : {}), attempts, children, ancestors, progress: progress(job, run, source.reviews, ledger.attempts[job.currentAttemptId], source.now ?? Date.now()),
       processRequests: (source.processRequests ?? []).filter(request => request.jobId === job.jobId || children.some(child => child.jobId === request.jobId)).map(request => {
         const projected = projectProcessRequest(request, now);
         const owner = ledger.jobs[request.jobId];
