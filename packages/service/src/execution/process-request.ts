@@ -22,6 +22,10 @@ export const processRequestAnswerSchema = z.object({
   clientRequestId: id,
   outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']),
   answers: z.record(z.string().trim().min(1).max(4000), answerValue).optional(),
+  /** Why a person rejected; shown on the page and, when the task is stopped, in the notice to the origin session. */
+  note: plain(2000).pipe(z.string().trim().min(1)).optional(),
+  /** Reject and cancel the task, so the agent cannot retry the tool another way. */
+  stopTask: z.literal(true).optional(),
 }).strict();
 export type ProcessRequestAnswerInput = z.infer<typeof processRequestAnswerSchema>;
 
@@ -109,18 +113,19 @@ export function sameProcessRequest(record: ProcessRequest, input: ProcessRequest
     && (record.toolTitle ?? '') === (input.toolTitle ?? '') && (record.toolDetail ?? '') === (input.toolDetail ?? '');
 }
 
-export function createProcessRequest(input: ProcessRequestCreateInput, at = new Date()): ProcessRequest {
+export function createProcessRequest(input: ProcessRequestCreateInput, at = new Date(), ttlMs = PROCESS_REQUEST_TTL_MS): ProcessRequest {
   const parsed = processRequestCreateSchema.parse(input);
   const createdAt = at.toISOString();
   return {
     requestId: parsed.requestId ?? randomUUID(), jobId: parsed.jobId, attemptId: parsed.attemptId, sessionId: parsed.sessionId, kind: parsed.kind,
     ...(parsed.questions ? { questions: parsed.questions } : {}), ...(parsed.planContent ? { planContent: parsed.planContent } : {}),
     ...(parsed.toolTitle ? { toolTitle: parsed.toolTitle } : {}), ...(parsed.toolDetail ? { toolDetail: parsed.toolDetail } : {}),
-    status: 'pending', createdAt, updatedAt: createdAt, deadlineAt: new Date(at.getTime() + PROCESS_REQUEST_TTL_MS).toISOString(),
+    status: 'pending', createdAt, updatedAt: createdAt, deadlineAt: new Date(at.getTime() + ttlMs).toISOString(),
   };
 }
 
 function assertAnswer(request: ProcessRequest, input: ProcessRequestAnswerInput): void {
+  if ((input.note || input.stopTask) && input.outcome !== 'rejected') throw new ProcessRequestError('invalid', 'Only a rejection carries a note or stops the task');
   if (request.kind === 'question') {
     if (input.outcome !== 'accepted' && input.outcome !== 'cancelled') throw new ProcessRequestError('invalid', 'Question answers must be accepted or cancelled');
     if (input.outcome === 'cancelled' && input.answers && Object.keys(input.answers).length) throw new ProcessRequestError('invalid', 'A cancelled question has no answers');
@@ -147,7 +152,8 @@ export function answerProcessRequest(request: ProcessRequest, input: ProcessRequ
   const parsed = processRequestAnswerSchema.parse(input);
   assertAnswer(request, parsed);
   if (request.answer?.clientRequestId === parsed.clientRequestId) {
-    if (request.answer.outcome !== parsed.outcome || stable(request.answer.answers ?? null) !== stable(parsed.answers ?? null)) {
+    if (request.answer.outcome !== parsed.outcome || stable(request.answer.answers ?? null) !== stable(parsed.answers ?? null)
+      || (request.answer.note ?? '') !== (parsed.note ?? '') || Boolean(request.answer.stopTask) !== Boolean(parsed.stopTask)) {
       throw new ProcessRequestError('idempotency_conflict', 'clientRequestId conflicts with a recorded answer');
     }
     return { request: structuredClone(request), idempotent: true };

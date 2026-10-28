@@ -59,6 +59,12 @@ test('tool permission requests carry the tool and allow approve, reject or cance
   for (const outcome of ['accepted', 'abandoned'] as const) {
     assert.throws(() => answerProcessRequest(request, { clientRequestId: `wb-${outcome}`, outcome }, at), (error: ProcessRequestError) => error.code === 'invalid');
   }
+  const stopped = answerProcessRequest(request, { clientRequestId: 'wb-stop', outcome: 'rejected', note: 'Do not run scripts here', stopTask: true }, at).request;
+  assert.equal(stopped.answer?.note, 'Do not run scripts here'); assert.equal(stopped.answer?.stopTask, true);
+  assert.throws(() => answerProcessRequest(stopped, { clientRequestId: 'wb-stop', outcome: 'rejected', note: 'Other reason', stopTask: true }, at), (error: ProcessRequestError) => error.code === 'idempotency_conflict');
+  assert.throws(() => answerProcessRequest(request, { clientRequestId: 'wb-note', outcome: 'approved', note: 'Fine' }, at), (error: ProcessRequestError) => error.code === 'invalid');
+  assert.throws(() => answerProcessRequest(request, { clientRequestId: 'wb-stop-cancel', outcome: 'cancelled', stopTask: true }, at), (error: ProcessRequestError) => error.code === 'invalid');
+  assert.equal(Date.parse(createProcessRequest(permission, at, 30 * 60_000).deadlineAt) - at.getTime(), 30 * 60_000);
   assert.throws(() => createProcessRequest({ ...permission, toolTitle: undefined }, at));
   assert.throws(() => createProcessRequest({ ...question, toolTitle: 'run_terminal_command' }, at));
 });

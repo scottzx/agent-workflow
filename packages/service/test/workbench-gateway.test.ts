@@ -245,6 +245,30 @@ test('process requests register once, answer once, and expire instead of accepti
   assert.equal(durable.processRequests.find((item: any) => item.requestId === 'prc-2').status, 'expired');
 });
 
+test('the deadline follows the configured timeout and reject-and-stop cancels the task with the note', async t => {
+  const f = await fixture(t);
+  f.config.workbench!.requestTimeoutMinutes = 30;
+  await f.restart();
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '分发任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId, path = `/workbench/tasks/${jobId}/process-requests`;
+  const before = Date.now();
+  const created = await (await f.request(path, post({ requestId: 'prc-tool', jobId, attemptId: prepared.attempt.attemptId, sessionId: 'dsh-1',
+    kind: 'permission', toolTitle: 'run_terminal_command', toolDetail: '{"command":"rm -rf build"}' }))).json() as any;
+  const ttl = Date.parse(created.deadlineAt) - before;
+  assert.ok(ttl >= 30 * 60_000 - 1000 && ttl <= 30 * 60_000 + 1000, `deadline ${ttl}ms`);
+  const answered = await f.request(`${path}/prc-tool/answers`, post({ clientRequestId: 'wb-stop', outcome: 'rejected', note: '不要删除构建目录', stopTask: true }));
+  assert.equal(answered.status, 200);
+  const detail = await answered.json() as any;
+  assert.equal(detail.processRequests[0].answer.note, '不要删除构建目录');
+  assert.equal(detail.processRequests[0].answer.stopTask, true);
+  const cancellation = (f.gateway as any).state.executionCancellations[prepared.attempt.attemptId];
+  assert.match(cancellation.reason, /人工拒绝工具调用并停止任务（run_terminal_command）：不要删除构建目录/);
+  // A replay records nothing new and does not cancel twice.
+  assert.equal((await f.request(`${path}/prc-tool/answers`, post({ clientRequestId: 'wb-stop', outcome: 'rejected', note: '不要删除构建目录', stopTask: true }))).status, 200);
+});
+
 test('abandoning through human review closes further child dispatch admission', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '人工放弃任务'), internals = f.gateway as any;
   internals.advanceDelivery = Object.getPrototypeOf(f.gateway).advanceDelivery;

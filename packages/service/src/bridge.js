@@ -115,6 +115,15 @@ function handshakeMs() {
   const value = Number(process.env.ACP_HANDSHAKE_TIMEOUT_MS);
   return Number.isFinite(value) && value > 0 ? value : 60_000;
 }
+// How long a permission, question or plan prompt waits for a person. The A2A
+// workbench deadline (workbench.requestTimeoutMinutes) must not be longer.
+function interactionTimeoutMs() {
+  const value = Number(process.env.ACP_INTERACTION_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 5 * 60 * 1000;
+}
+function interactionTimeoutText() {
+  return `${Math.round(interactionTimeoutMs() / 60_000)}min`;
+}
 function clearHandshake(launchId) {
   const timer = handshakeTimers.get(launchId);
   if (timer) clearTimeout(timer);
@@ -3446,13 +3455,13 @@ async function handleExitPlanModeCallback(req, ctx) {
             event: "exit_plan_mode_timeout",
             requestId,
             toolCallId,
-            message: "exit_plan_mode auto-abandoned after 5min timeout.",
+            message: `exit_plan_mode auto-abandoned after ${interactionTimeoutText()} timeout.`,
           });
         } catch {
           // socket may already be closed
         }
       },
-      5 * 60 * 1000,
+      interactionTimeoutMs(),
     );
 
     const payload = {
@@ -3526,13 +3535,13 @@ async function handleAskUserQuestionCallback(req, ctx) {
             event: "ask_user_question_timeout",
             requestId,
             toolCallId,
-            message: "ask_user_question auto-cancelled after 5min timeout.",
+            message: `ask_user_question auto-cancelled after ${interactionTimeoutText()} timeout.`,
           });
         } catch {
           // socket may already be closed
         }
       },
-      5 * 60 * 1000,
+      interactionTimeoutMs(),
     );
 
     const payload = {
@@ -3671,7 +3680,7 @@ async function handlePermissionRequestCallback(req, ctx) {
   );
 
   return new Promise((resolve, reject) => {
-    // Timeout handler: 5 minutes auto-deny
+    // Timeout handler: auto-deny after the interaction timeout
     const timer = setTimeout(
       () => {
         console.warn(`[acpx-server] Permission request ${requestId} timed out. Auto-denying.`);
@@ -3682,10 +3691,10 @@ async function handlePermissionRequestCallback(req, ctx) {
         sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
           event: "permission_timeout",
           requestId,
-          message: `Permission request for "${req.raw.toolCall.title}" auto-denied after 5min timeout.`,
+          message: `Permission request for "${req.raw.toolCall.title}" auto-denied after ${interactionTimeoutText()} timeout.`,
         });
       },
-      5 * 60 * 1000,
+      interactionTimeoutMs(),
     );
 
     // Save pending info — include session and full payload so the reconnect

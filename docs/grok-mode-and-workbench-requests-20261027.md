@@ -26,7 +26,7 @@ bypass 只覆盖工具权限。下面两类仍会停下等人，与 mode 无关�
 - Grok `_x.ai/ask_user_question`，DSH 插件 `adapter.question` 调用 `userQuestions.ask`。
 - 退出计划 `_x.ai/exit_plan_mode`，`adapter.plan` 用同一提问接口，选项是批准或拒绝。
 
-桥接里提问保存在内存，5 分钟无答复就取消（`bridge.js` 的 `ask_user_question`）。DSH 轮次因此停在 `blocked` 时，A2A 记为 `input-required`，说明是「DSH blocked the task before its next model step」。
+桥接里提问保存在内存，无答复到期就取消（`bridge.js` 的 `ask_user_question`；期限默认 5 分钟，由 `ACP_INTERACTION_TIMEOUT_MS` 设置，工具审批和计划审批同用这个期限）。DSH 轮次因此停在 `blocked` 时，A2A 记为 `input-required`，说明是「DSH blocked the task before its next model step」。
 
 ## 试跑后按 Agent 固定
 
@@ -61,7 +61,7 @@ Grok 的分发任务要避开工具审批时，试跑接受的 mode 是 `bypassP
 - `question`：`adapter.question` 收到的题目、选项、是否多选。
 - `plan`：计划正文，决定映射为 `approved` 或 `rejected`。取消映射为现有的 `abandoned`。
 
-2026-10-28 起，没被 mode 短路的工具审批也作为第三类过程请求 `permission` 进入这个队列：记录工具名和待批准的参数（例如命令），人只能允许本次、拒绝或取消，5 分钟内无人回答按取消处理，工具被拒绝。每次工具调用单独成一条，先前的允许不覆盖之后同样的命令。Grok 试跑接受了 `bypassPermissions` 之后，该工作区新建的 Grok 会话会套用这个 mode，工具审批在 runtime 里短路，不再出现这类请求。
+2026-10-28 起，没被 mode 短路的工具审批也作为第三类过程请求 `permission` 进入这个队列：记录工具名和待批准的参数（例如命令），人只能允许本次、拒绝或取消，到期无人回答按取消处理，工具被拒绝。每次工具调用单独成一条，先前的允许不覆盖之后同样的命令。Grok 试跑接受了 `bypassPermissions` 之后，该工作区新建的 Grok 会话会套用这个 mode，工具审批在 runtime 里短路，不再出现这类请求。
 
 ## 接入方式
 
@@ -71,7 +71,7 @@ DSH 执行器在 `execute()` 期间把这份引用绑到当前会话，回合结
 
 DSH 界面先答复时，插件把该答复回写工作台，卡片关闭。工作台先答复时，插件中止 DSH 提问，并把 `accepted` / `approved` / `rejected` 交回 ACP。取消和过期分别交回问题的 `cancelled` 或计划的 `abandoned`。这次答复不另发 A2A 用户消息。
 
-同一 `clientRequestId` 配同一正文只记一次。同一 id 换正文返回冲突。已经决定后再换一个 id，返回已决定。期限是 5 分钟。读取过期只改展示；超时后的提交把记录写成过期并拒绝。题目和计划正文留在过程请求里，不写入账本通知。
+同一 `clientRequestId` 配同一正文只记一次。同一 id 换正文返回冲突。已经决定后再换一个 id，返回已决定。期限由网关 `workbench.requestTimeoutMinutes` 设置，默认 5 分钟。ACP 桥接的 `ACP_INTERACTION_TIMEOUT_MS` 不能短于它，否则桥接先到期拒绝，页面上的请求还显示等待中。读取过期只改展示；超时后的提交把记录写成过期并拒绝。题目和计划正文留在过程请求里，不写入账本通知。
 
 「待我确认」同时计入未决的结果验收和未过期的过程请求。子任务上的过程请求会显示到父任务。详情在结果验收旁边列出过程请求，当前尝试且仍在执行时才可提交。
 
@@ -86,3 +86,17 @@ DSH 界面先答复时，插件把该答复回写工作台，卡片关闭。工�
 请求正文只保留题目、选项、计划文本，以及工具审批的工具名和待批准参数（上限 16KB），不写入凭据、完整 prompt 或工具输出。
 
 工作台下一层按 [智能体开发阶段与运行阶段](agent-workbench-phases-20261027.md) 扩展：任务与智能体同级，试跑和正式任务进入同一清单和同一审核。该结构已写入网关投影、命名发布存储和父应用页面。发布名字尚未同步到 DSH 的 `agent-session-settings.json`。六页人审预览、报告交付、workflow 执行、一键 cwd 和工作台生产启用不在这次改动里。六页人审预览仍按 [缺口收口方案](a2a-gap-closure-plan-20261027.md) 单独处理。试跑后按 Agent 固定 mode 与配置选项已写入 DSH 插件。编辑这份源码不会改变已经安装的网关，要等发布后再加载。未重启 DSH，未部署。
+
+## 拒绝理由与停止任务
+
+ACP 的权限答复只有选项，没有理由字段，拒绝理由送不到 Grok。页面上的工具审批因此有两个拒绝按钮，两种拒绝都可以附理由（最多 2000 字）：
+
+- 「拒绝这次调用」：只拒绝这一次，Grok 可能换个方式继续。
+- 「拒绝并停止任务」：先记下拒绝，等待中的插件把拒绝交回 Grok，然后网关取消整个任务（与 `execution_cancel` 相同）。取消记录带上「人工拒绝工具调用并停止任务（工具名）：理由」，任务以取消结束时，发给发起会话的通知结果前面加上这句话。若 Grok 在取消送达前已经结束这一轮，任务按已完成收尾，页面照旧显示「工具未获批准」，通知里没有这句理由。
+
+理由和停止标记都只允许出现在 `rejected` 答复上，并计入幂等比较：同一 `clientRequestId` 换了理由视为冲突。计划审批的「退回计划」也可附理由，但没有停止任务的按钮。
+
+## 新请求提醒
+
+网关配置 `workbench.desktopNotifications: true` 时，过程请求第一次登记就在本机弹出 macOS 通知，标题是「任务工作台 · 任务名」，正文是等待批准的工具（或计划、问题）和处理期限。装了 `terminal-notifier` 时点通知打开 `workbench.publicBaseUrl`；没装时用 `osascript` 显示，点了不跳转。重放同一请求不会再弹。
+

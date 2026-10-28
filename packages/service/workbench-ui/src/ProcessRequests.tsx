@@ -88,6 +88,7 @@ export function ProcessRequestPanel({
 }) {
     const items = requests ?? [];
     const [answers, setAnswers] = useState<Record<string, Record<string, string | string[]>>>({});
+    const [notes, setNotes] = useState<Record<string, string>>({});
     const [busyId, setBusyId] = useState('');
     const [error, setError] = useState('');
     const requestIds = useRef<Record<string, string>>({});
@@ -99,8 +100,10 @@ export function ProcessRequestPanel({
     const submit = async (
         request: AcpProcessRequest,
         outcome: 'accepted' | 'cancelled' | 'approved' | 'rejected' | 'abandoned',
-        withAnswers: boolean
+        withAnswers: boolean,
+        stopTask = false
     ) => {
+        const note = outcome === 'rejected' ? notes[request.requestId]?.trim() : '';
         setBusyId(request.requestId);
         setError('');
         try {
@@ -108,6 +111,8 @@ export function ProcessRequestPanel({
                 clientRequestId: clientRequestId(request.requestId),
                 outcome,
                 ...(withAnswers ? { answers: answers[request.requestId] ?? {} } : {}),
+                ...(note ? { note } : {}),
+                ...(stopTask ? { stopTask: true as const } : {}),
             });
             onReload();
         } catch (err) {
@@ -186,6 +191,18 @@ export function ProcessRequestPanel({
                                 </button>
                             </div>
                         )}
+                        {request.canAnswer && request.kind !== 'question' && (
+                            <textarea
+                                class="acp-reject-note"
+                                maxLength={2000}
+                                placeholder={text('拒绝理由（可选）', 'Reason for rejecting (optional)')}
+                                value={notes[request.requestId] ?? ''}
+                                onInput={event => {
+                                    const next = event.currentTarget.value;
+                                    setNotes(current => ({ ...current, [request.requestId]: next }));
+                                }}
+                            />
+                        )}
                         {request.canAnswer && request.kind === 'plan' && (
                             <div class="acp-agent-actions">
                                 <button type="button" class="acp-button" disabled={busyId === request.requestId} onClick={() => void submit(request, 'approved', false)}>
@@ -205,7 +222,16 @@ export function ProcessRequestPanel({
                                     {text('允许本次', 'Allow once')}
                                 </button>
                                 <button type="button" class="acp-button" disabled={busyId === request.requestId} onClick={() => void submit(request, 'rejected', false)}>
-                                    {text('拒绝', 'Reject')}
+                                    {text('拒绝这次调用', 'Reject this call')}
+                                </button>
+                                <button
+                                    type="button"
+                                    class="acp-button acp-danger"
+                                    title={text('拒绝并取消整个任务，Agent 不会再换方式重试', 'Reject and cancel the task so the agent cannot retry another way')}
+                                    disabled={busyId === request.requestId}
+                                    onClick={() => void submit(request, 'rejected', false, true)}
+                                >
+                                    {text('拒绝并停止任务', 'Reject and stop task')}
                                 </button>
                                 <button type="button" class="acp-button" disabled={busyId === request.requestId} onClick={() => void submit(request, 'cancelled', false)}>
                                     {text('取消', 'Cancel')}
@@ -216,7 +242,9 @@ export function ProcessRequestPanel({
                             <small>
                                 {statusLabel(request.status)}
                                 {request.kind === 'permission' && request.answer?.outcome === 'approved' && ` · ${text('已允许', 'Allowed')}`}
-                                {request.kind === 'permission' && request.answer?.outcome === 'rejected' && ` · ${text('已拒绝', 'Rejected')}`}
+                                {request.kind === 'permission' && request.answer?.outcome === 'rejected' &&
+                                    ` · ${request.answer.stopTask ? text('已拒绝并停止任务', 'Rejected and stopped the task') : text('已拒绝', 'Rejected')}`}
+                                {request.answer?.note && ` · ${request.answer.note}`}
                             </small>
                         )}
                     </article>

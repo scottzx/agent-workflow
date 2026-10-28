@@ -17,6 +17,7 @@ import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.j
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
+import { notifyDesktop } from './desktop-notify.js';
 import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
@@ -51,7 +52,11 @@ const configSchema = z.object({
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
   workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
-    allowedOrigins: z.array(string).optional() }).strict().optional(),
+    allowedOrigins: z.array(string).optional(),
+    /** How long a question, plan or tool approval waits for a person. The ACP bridge's ACP_INTERACTION_TIMEOUT_MS must be at least as long. */
+    requestTimeoutMinutes: z.number().int().min(1).max(24 * 60).default(5),
+    /** Show a macOS notification when a request starts waiting. */
+    desktopNotifications: z.boolean().default(false) }).strict().optional(),
   /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
   capacityDirectory: z.string().min(1).optional(),
   /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
@@ -171,7 +176,7 @@ export class RemoteAgentError extends Error {
 interface NoticeRecord { notice: RemoteAgentNotice; target?: string; acknowledged?: boolean; delivered?: boolean; sessionDeliveryId?: string }
 interface ExecutionNotice { noticeId: string; messageId: string; originSessionId: string; jobId: string; attemptId: string;
   executionStatus: string; resultSummary: string; artifactLinks: any[]; createdAt: string; processedAt?: string; text: string }
-interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean;
+interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean; reason?: string;
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
 interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[] }
@@ -573,7 +578,7 @@ export class RemoteAgentGateway {
       jobId = job.parentJobRef?.jobId;
     }
   }
-  private async cancelExecution(origin: string, jobId: string, cascade?: boolean) {
+  private async cancelExecution(origin: string, jobId: string, cascade?: boolean, reason?: string) {
     const job = this.ledger.get(origin, jobId), run = this.state.pptDeliveries.runs[job.currentAttemptId] as PptDeliveryRun | undefined;
     if (this.state.reportReviews?.[job.currentAttemptId] && cascade === false) throw new Error('Report cancellation must include its child task');
     if (run && cascade === false) throw new Error('PPT delivery cancellation must include its child tasks');
@@ -581,7 +586,7 @@ export class RemoteAgentGateway {
     if (record && cascade === true && !record.cascade) { record.cascade = true; record.status = 'pending'; }
     if (!record) {
       record = { jobId, attemptId: job.currentAttemptId, originSessionId: origin, cascade: cascade ?? Boolean(run || this.state.reportReviews?.[job.currentAttemptId]),
-        requestedAt: new Date().toISOString(), status: 'pending', targets: [], diagnostics: [] };
+        requestedAt: new Date().toISOString(), status: 'pending', targets: [], diagnostics: [], ...(reason ? { reason } : {}) };
       this.state.executionCancellations![record.attemptId] = record;
     }
     // Close admission synchronously and durably, before waiting for an in-flight submit or contacting a backend.
@@ -808,11 +813,12 @@ export class RemoteAgentGateway {
     if (typeof meta?.sessionId === 'string' && meta.sessionId) job.sessionId = meta.sessionId;
     const state = taskState(job);
     if (actionable.has(state)) {
+      const reason = state === 'TASK_STATE_CANCELED' && job.attemptId ? this.state.executionCancellations?.[job.attemptId]?.reason : undefined;
       const noticeId = createHash('sha256').update(JSON.stringify([job.remote, job.taskId, state, task.status?.timestamp])).digest('hex');
       if (!this.state.notices.some(value => value.notice.noticeId === noticeId)) this.state.notices.push({
         ...(this.sessions.hasBinding(job.originSessionId) ? { sessionDeliveryId: `a2a-notice:${noticeId}` } : { target: job.notificationTarget }),
         notice: { noticeId, originSessionId: job.originSessionId, remote: job.remote, taskId: job.taskId, contextId: job.contextId,
-          cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: resultText(task),
+          cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: reason ? `${reason}\n\n${resultText(task)}`.trim() : resultText(task),
           ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}), createdAt: new Date().toISOString() } });
     }
     if (job.attemptId) {
@@ -1181,8 +1187,13 @@ export class RemoteAgentGateway {
           return projectProcessRequest(existing);
         }
       }
-      const created = createProcessRequest(parsed);
+      const config = this.config.workbench;
+      const created = createProcessRequest(parsed, undefined, config ? config.requestTimeoutMinutes * 60_000 : undefined);
       this.writeProcessRequest(created);
+      if (config?.desktopNotifications) {
+        const what = created.kind === 'permission' ? `工具「${created.toolTitle}」等待批准` : created.kind === 'plan' ? '计划等待批准' : '问题等待回答';
+        notifyDesktop(`任务工作台 · ${scope.title}`.slice(0, 120), `${what}，${config.requestTimeoutMinutes} 分钟内处理`.slice(0, 240), config.publicBaseUrl);
+      }
       return created;
     });
   }
@@ -1193,7 +1204,8 @@ export class RemoteAgentGateway {
   }
   /** Completes the stored request. The caller must still finish the original userQuestions wait; this does not send another prompt. */
   async answerProcessRequest(jobId: string, requestId: string, input: unknown) {
-    return this.workbench(async () => {
+    let stop: { origin: string; reason: string } | undefined;
+    const task = await this.workbench(async () => {
       if (this.closed) throw new Error('Gateway is closed');
       this.workbenchTask(jobId);
       const stored = this.state.processRequests?.find(item => item.requestId === requestId && item.jobId === jobId);
@@ -1210,8 +1222,15 @@ export class RemoteAgentGateway {
         throw error;
       }
       if (!result.idempotent) this.writeProcessRequest(result.request);
-      return this.workbenchTask(jobId);
+      const view = this.workbenchTask(jobId);
+      if (parsed.stopTask && !result.idempotent) stop = { origin: view.originSessionId,
+        reason: `人工拒绝工具调用并停止任务${stored.toolTitle ? `（${stored.toolTitle.slice(0, 200)}）` : ''}${parsed.note ? `：${parsed.note}` : ''}` };
+      return view;
     });
+    // Recorded first, so the waiting agent sees the rejection before the cancel lands.
+    if (!stop) return task;
+    await this.cancelExecution(stop.origin, jobId, undefined, stop.reason);
+    return this.workbenchTask(jobId);
   }
   private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle | undefined {
     if (value === undefined) return previous;

@@ -193,7 +193,7 @@ export interface AcpProcessRequest {
     status: 'pending' | 'answered' | 'cancelled' | 'expired';
     deadlineAt: string;
     canAnswer?: boolean;
-    answer?: { clientRequestId: string; outcome: string; answers?: Record<string, string | string[]> };
+    answer?: { clientRequestId: string; outcome: string; answers?: Record<string, string | string[]>; note?: string; stopTask?: true };
 }
 export interface AcpAgentOption {
     id: string;
@@ -233,6 +233,8 @@ export interface AcpProcessAnswerInput {
     clientRequestId: string;
     outcome: 'accepted' | 'cancelled' | 'approved' | 'rejected' | 'abandoned';
     answers?: Record<string, string | string[]>;
+    note?: string;
+    stopTask?: true;
 }
 export interface AcpTaskDetail extends AcpTaskSummary {
     attempts: AcpAttempt[];
