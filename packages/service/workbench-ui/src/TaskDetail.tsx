@@ -6,7 +6,6 @@ import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
 import { ArtifactItem, Md, ReportPreview, TaskChat } from './Preview';
 import {
-    AcceptanceBadge,
     channelLabel,
     date,
     displayStatus,
@@ -21,6 +20,7 @@ import {
     ServiceProvenance,
     Status,
     statusLabel,
+    taskStatus,
     text,
     title,
 } from './ui';
@@ -268,26 +268,20 @@ export function AcpTaskDetailPanel({
                 </h2>
                 {detail && (
                     <p class="acp-channel-line">
+                        <Status value={taskStatus(detail)} />
                         <span class="acp-mode-label">{channelLabel(detail.channel)}</span>
                         {detail.agentName && <span>{detail.agentName}</span>}
+                        {detail.stale && (
+                            <span class="acp-stale">
+                                {text('当前为缓存状态，等待同步', 'Cached status; awaiting synchronization')}
+                            </span>
+                        )}
                     </p>
                 )}
                 {detail?.pendingProcessRequestId && tab !== 'overview' && (
                     <button type="button" class="acp-link" onClick={() => setTab('overview')}>
                         {text('有过程请求待回答', 'A process request is waiting')}
                     </button>
-                )}
-                {detail && (
-                    <Fragment>
-                        <Status value={displayStatus(detail)} />
-                        <AcceptanceBadge task={detail} />
-                        {detail.stale && (
-                            <span class="acp-stale">
-                                {text('当前为缓存状态，等待同步', 'Cached status; awaiting synchronization')}
-                            </span>
-                        )}
-                        {detail.progressSummary && <Md source={detail.progressSummary} class="acp-current-progress" />}
-                    </Fragment>
                 )}
             </header>
             <nav class="acp-detail-tabs" aria-label={text('任务详情视图', 'Task detail views')} role="tablist">
@@ -328,7 +322,9 @@ export function AcpTaskDetailPanel({
                                 onReload={() => void load()}
                             />
                         )}
-                        {tab === 'progress' && <TaskProgress detail={detail} onReview={id => selectReview(id)} full={full} />}
+                        {tab === 'progress' && (
+                            <TaskProgress detail={detail} onReview={id => selectReview(id)} onReload={() => void load()} full={full} />
+                        )}
                         {tab === 'review' && (
                             <Fragment>
                                 <TaskReview
@@ -498,36 +494,25 @@ export function AcpTaskDetailPanel({
     );
 }
 
+/** The verdict itself is the header status; this keeps only what the chip cannot say. */
 function AcceptanceSection({ detail }: { detail: AcpTaskDetail }) {
     const acceptance = detail.businessAcceptance;
+    if (!acceptance) return null;
     return (
         <section class="acp-detail-section">
             <h3>{text('业务验收', 'Business acceptance')}</h3>
-            {acceptance ? (
-                <dl class="acp-acceptance-record">
-                    <dt>{text('结论', 'Verdict')}</dt>
-                    <dd>
-                        <AcceptanceBadge task={detail} />
-                    </dd>
-                    <dt>{text('结果版本', 'Result revision')}</dt>
-                    <dd>{acceptance.resultRevision}</dd>
-                    <dt>{text('记录时间', 'Recorded')}</dt>
-                    <dd>{date(acceptance.recordedAt)}</dd>
-                    {acceptance.note && (
-                        <Fragment>
-                            <dt>{text('说明', 'Note')}</dt>
-                            <dd>{acceptance.note}</dd>
-                        </Fragment>
-                    )}
-                </dl>
-            ) : (
-                <p class="acp-muted">
-                    {text(
-                        '尚未验收。由发起任务的会话核对结果后用 execution_review 记录。',
-                        'Not accepted yet. The session that started the task records it with execution_review after checking the result.'
-                    )}
-                </p>
-            )}
+            <dl class="acp-acceptance-record">
+                <dt>{text('结果版本', 'Result revision')}</dt>
+                <dd>{acceptance.resultRevision}</dd>
+                <dt>{text('记录时间', 'Recorded')}</dt>
+                <dd>{date(acceptance.recordedAt)}</dd>
+                {acceptance.note && (
+                    <Fragment>
+                        <dt>{text('说明', 'Note')}</dt>
+                        <dd>{acceptance.note}</dd>
+                    </Fragment>
+                )}
+            </dl>
         </section>
     );
 }
@@ -545,7 +530,11 @@ function TaskOverview({
     const answer = current?.result?.resultSummary;
     return (
         <Fragment>
-            <ProcessRequestPanel jobId={detail.jobId} requests={detail.processRequests} onReload={onReload} />
+            <ProcessRequestPanel
+                jobId={detail.jobId}
+                requests={detail.processRequests?.filter(request => request.status === 'pending')}
+                onReload={onReload}
+            />
             {detail.executionStatus === 'completed' && <AcceptanceSection detail={detail} />}
             {detail.pendingReviewId && (
                 <p class="acp-notice">
@@ -561,11 +550,18 @@ function TaskOverview({
                     <Md source={detail.description} />
                 </section>
             )}
-            {answer && (
+            {answer ? (
                 <section class="acp-detail-section">
                     <h3>{text('最新回答', 'Latest answer')}</h3>
                     <Md source={answer} />
                 </section>
+            ) : (
+                detail.progressSummary && (
+                    <section class="acp-detail-section">
+                        <h3>{text('当前进展', 'Current progress')}</h3>
+                        <Md source={detail.progressSummary} />
+                    </section>
+                )
             )}
             <div class="acp-task-facts">
                 <span>
@@ -593,10 +589,26 @@ function TaskOverview({
     );
 }
 
-function TaskProgress({ detail, onReview, full }: { detail: AcpTaskDetail; onReview: (id: string) => void; full: boolean }) {
+function TaskProgress({
+    detail,
+    onReview,
+    onReload,
+    full,
+}: {
+    detail: AcpTaskDetail;
+    onReview: (id: string) => void;
+    onReload: () => void;
+    full: boolean;
+}) {
     const stages = detail.progress?.stages || [];
     return (
         <Fragment>
+            {/* Pending requests sit in the overview where they need an answer; settled ones are history. */}
+            <ProcessRequestPanel
+                jobId={detail.jobId}
+                requests={detail.processRequests?.filter(request => request.status !== 'pending')}
+                onReload={onReload}
+            />
             {stages.length > 0 && (
                 <section class="acp-detail-section">
                     <h3>{text('阶段进展', 'Stage progress')}</h3>

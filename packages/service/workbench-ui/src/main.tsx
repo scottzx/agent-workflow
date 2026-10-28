@@ -6,10 +6,8 @@ import { executionLabels, taskDepth } from './model';
 import { AcpTaskDetailPanel } from './TaskDetail';
 import type { AcpTaskFilter, AcpTaskList, AcpTaskSummary } from './types';
 import {
-    AcceptanceBadge,
     channelLabel,
     date,
-    displayStatus,
     ErrorState,
     errorText,
     ExecutionRole,
@@ -19,6 +17,7 @@ import {
     phaseLabel,
     progressExcerpt,
     Status,
+    taskStatus,
     text,
     title,
     useRoute,
@@ -249,8 +248,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                                 {task.agentName && <small class="acp-cell-note">{task.agentName}</small>}
                                             </td>
                                             <td>
-                                                <Status value={displayStatus(task)} />
-                                                <AcceptanceBadge task={task} />
+                                                <Status value={taskStatus(task)} />
                                                 {!!task.unresolvedAttemptIds?.length && (
                                                     <small class="acp-stale">{text('有待核实的历史执行', 'Prior execution needs verification')}</small>
                                                 )}

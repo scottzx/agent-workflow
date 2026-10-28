@@ -178,8 +178,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-detail-tools { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--text-muted); flex-wrap: wrap; }
 .acp-detail-tools div { display: flex; gap: 6px; flex-wrap: wrap; }
 .acp-breadcrumb { display: flex; gap: 6px; flex-wrap: wrap; color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
-.acp-channel-line { display: flex; gap: 8px; align-items: center; margin: 0; color: var(--text-secondary); }
-.acp-current-progress { margin: 0; color: var(--text-secondary); }
+.acp-channel-line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0; color: var(--text-secondary); }
 .acp-detail-tabs { display: flex; gap: 4px; padding: 0 12px; border-bottom: 1px solid var(--border-color); overflow-x: auto; }
 .acp-detail-tabs button {
   padding: 9px 10px;
@@ -286,13 +285,12 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   .has-detail .acp-workbench-table { display: none; }
 }
 .acp-status-tool_blocked { background: var(--danger-bg); color: var(--danger); }
-.acp-acceptance { display: inline-block; margin-left: 6px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-color); font-size: 12px; color: var(--text-secondary); }
-.acp-acceptance-accepted { border-color: var(--success); color: var(--success); }
-.acp-acceptance-changes_requested { border-color: var(--warning); color: var(--warning); }
+/* Accepted is completed plus the origin session's sign-off: same colour, an ink hairline marks the difference. */
+.acp-status-accepted { background: var(--success-bg); color: var(--success); outline: 1px solid var(--success); outline-offset: -1px; }
+.acp-status-acceptance_changes { background: var(--warning-bg); color: var(--warning); }
 .acp-acceptance-record { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
 .acp-acceptance-record dt { color: var(--text-secondary); }
 .acp-acceptance-record dd { margin: 0; overflow-wrap: anywhere; }
-.acp-acceptance-record .acp-acceptance { margin-left: 0; }
 
 .acp-chat { height: min(70vh, 640px); border: 1px solid var(--border-color); border-radius: var(--radius); overflow: hidden; }
 .acp-artifact-item { display: grid; gap: 6px; }

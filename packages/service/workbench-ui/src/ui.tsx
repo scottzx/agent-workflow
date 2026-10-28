@@ -47,6 +47,8 @@ export function statusLabel(status: string): string {
         resuming: ['等待续跑', 'Waiting to resume'],
         applied: ['已处理', 'Applied'],
         tool_blocked: ['工具未获批准', 'Tool not approved'],
+        accepted: ['已验收', 'Accepted'],
+        acceptance_changes: ['验收要求修改', 'Acceptance: changes requested'],
     };
     const label = labels[status];
     return label ? text(...label) : status;
@@ -104,17 +106,14 @@ export function Status({ value }: { value: string }) {
     return <span class={`acp-status acp-status-${value.replace(/[^a-z_]/gi, '')}`}>{statusLabel(value)}</span>;
 }
 
-const acceptanceLabels: Record<string, [string, string]> = {
-    accepted: ['已验收', 'Accepted'],
-    changes_requested: ['验收要求修改', 'Acceptance: changes requested'],
-    pending: ['验收待定', 'Acceptance pending'],
-};
-
-/** The origin session's business acceptance of the current result; absent until execution_review records one. */
-export function AcceptanceBadge({ task }: { task: AcpTaskSummary }) {
-    const status = task.businessAcceptance?.reviewStatus;
-    if (!status) return null;
-    return <span class={`acp-acceptance acp-acceptance-${status}`}>{text(...acceptanceLabels[status]!)}</span>;
+/** One status for a task: a completed result the origin session has reviewed shows the acceptance verdict instead. */
+export function taskStatus(task: AcpTaskSummary) {
+    const status = displayStatus(task);
+    const verdict = task.businessAcceptance?.reviewStatus;
+    if (status !== 'completed') return status;
+    if (verdict === 'accepted') return 'accepted';
+    if (verdict === 'changes_requested') return 'acceptance_changes';
+    return status;
 }
 
 export function date(value?: string | null) {
