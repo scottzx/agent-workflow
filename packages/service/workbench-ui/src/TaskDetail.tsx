@@ -769,10 +769,17 @@ function TaskReview({
                             </strong>
                             {result.artifacts.map((artifact, index) => {
                                 const url = safeArtifactUrl(artifact.url);
-                                return url ? (
-                                    <a key={`${url}:${index}`} href={url} target="_blank" rel="noopener noreferrer">
-                                        {artifact.path?.split('/').pop() || text('查看产物', 'Open artifact')}
-                                    </a>
+                                if (url) {
+                                    return (
+                                        <a key={`${url}:${index}`} href={url} target="_blank" rel="noopener noreferrer">
+                                            {artifact.path?.split('/').pop() || text('查看产物', 'Open artifact')}
+                                        </a>
+                                    );
+                                }
+                                return artifact.path ? (
+                                    <span key={`${artifact.path}:${index}`} class="acp-muted">
+                                        {artifact.path.split('/').pop()} · <code>{artifact.path}</code>
+                                    </span>
                                 ) : null;
                             })}
                         </div>

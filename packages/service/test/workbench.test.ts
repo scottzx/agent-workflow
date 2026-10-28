@@ -71,8 +71,11 @@ test('historical result versions apply the same receipt and artifact filtering a
   for (const result of [attempt.result!, ...attempt.resultHistory!]) {
     assert.equal(result.structuredResultRef, undefined);
     assert.deepEqual(result.artifactLinks, ['https://example.invalid/script.md']);
-    if (result.resultArtifacts) assert.deepEqual(result.resultArtifacts, [{ path: '/output/script.md', url: 'https://example.invalid/script.md', sha256: 'b'.repeat(64), size: 100 }]);
+    if (result.resultArtifacts) assert.deepEqual(result.resultArtifacts, [{ path: '/private/local-only', sha256: 'a'.repeat(64), size: 42 },
+      { path: '/output/script.md', url: 'https://example.invalid/script.md', sha256: 'b'.repeat(64), size: 100 }]);
   }
+  // Path-only artifacts are listed (name/path, no link) alongside linked ones.
+  assert.deepEqual(detail.artifacts.at(-1)?.artifacts, ['https://example.invalid/script.md', { path: '/private/local-only', sha256: 'a'.repeat(64), size: 42 }]);
   assert.deepEqual(source, before);
 });
 

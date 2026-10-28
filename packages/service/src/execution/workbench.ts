@@ -126,8 +126,9 @@ function safeArtifact(input: unknown): unknown | undefined {
   if (typeof input === 'string') { try { const url = new URL(input); return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? input : undefined; } catch { return undefined; } }
   if (!input || typeof input !== 'object') return undefined;
   const value = input as Record<string, unknown>;
-  if (typeof value.url !== 'string' || !safeArtifact(value.url)) return undefined;
-  const result: Record<string, unknown> = { url: value.url };
+  // Path-only artifacts (no url) are listed by name/path without a link; a present but unsafe url is still dropped.
+  if (value.url !== undefined ? typeof value.url !== 'string' || !safeArtifact(value.url) : typeof value.path !== 'string') return undefined;
+  const result: Record<string, unknown> = value.url !== undefined ? { url: value.url } : {};
   for (const key of ['name', 'path', 'mediaType', 'size', 'sha256']) if (['string', 'number'].includes(typeof value[key])) result[key] = value[key];
   return result;
 }
@@ -273,7 +274,11 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
     }
     const attempts = Object.values(ledger.attempts).filter(attempt => attempt.jobId === job.jobId)
       .map(attempt => attemptView(attempt, source.runs.some(item => item.jobId === job.jobId && item.attemptId === attempt.attemptId)));
-    if (!run) for (const attempt of attempts) if (attempt.result?.artifactLinks.length) artifacts.push({ revision: attempt.result.resultRevision ?? attempt.attemptId, digest: attempt.result.resultDigest, artifacts: attempt.result.artifactLinks });
+    if (!run) for (const attempt of attempts) {
+      const pathOnly = (attempt.result?.resultArtifacts ?? []).filter(item => !(item as { url?: string }).url);
+      const links = [...(attempt.result?.artifactLinks ?? []), ...pathOnly];
+      if (links.length) artifacts.push({ revision: attempt.result!.resultRevision ?? attempt.attemptId, digest: attempt.result!.resultDigest, artifacts: links });
+    }
     const humanEvents: LedgerEvent[] = ownReviews.flatMap(review => review.history.map((decision, index) => ({ eventId: decision.decisionId, sourceId: ledger.sourceId, sequence: -(index + 1), jobId: review.jobId,
       attemptId: review.attemptId, jobVersion: 0, type: `human_review.${decision.action}`, observedAt: decision.at,
       data: { reviewId: review.reviewId, revision: review.revision, actor: decision.actor, ...(decision.note ? { note: decision.note } : {}) } })));
