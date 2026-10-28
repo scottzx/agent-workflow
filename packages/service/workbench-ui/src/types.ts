@@ -55,6 +55,17 @@ export interface AcpTaskSummary {
     resultRevision?: string;
     inFlightAttemptIds?: string[];
     unresolvedAttemptIds?: string[];
+    businessAcceptance?: AcpBusinessAcceptance;
+    blockedTools?: string[];
+}
+
+export interface AcpBusinessAcceptance {
+    attemptId: string;
+    resultRevision: string;
+    resultDigest: string;
+    reviewStatus: 'pending' | 'accepted' | 'changes_requested';
+    note?: string;
+    recordedAt: string;
 }
 
 export interface AcpTaskList {
@@ -174,9 +185,11 @@ export interface AcpProcessRequest {
     requestId: string;
     jobId: string;
     attemptId: string;
-    kind: 'question' | 'plan';
+    kind: 'question' | 'plan' | 'permission';
     questions?: AcpProcessQuestion[];
     planContent?: string;
+    toolTitle?: string;
+    toolDetail?: string;
     status: 'pending' | 'answered' | 'cancelled' | 'expired';
     deadlineAt: string;
     canAnswer?: boolean;

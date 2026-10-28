@@ -117,9 +117,10 @@ class Queue<T> {
   }
 }
 
-function acpFromProcessView(kind: 'question' | 'plan', view: ProcessRequestView): JsonObject {
+function acpFromProcessView(kind: 'question' | 'plan' | 'permission', view: ProcessRequestView): JsonObject {
   const outcome = view.answer?.outcome;
   const closed = view.status === 'expired' || view.status === 'cancelled' || outcome === 'cancelled' || outcome === 'abandoned';
+  if (kind === 'permission') return { outcome: !closed && (outcome === 'approved' || outcome === 'rejected') ? outcome : 'cancelled' };
   if (kind === 'plan') return { outcome: !closed && (outcome === 'approved' || outcome === 'rejected') ? outcome : 'abandoned' };
   if (!closed && outcome === 'accepted' && view.answer?.answers) return { outcome: 'accepted', answers: view.answer.answers };
   return { outcome: 'cancelled' };
@@ -524,9 +525,17 @@ export class AcpAdapter implements LlmAdapter {
     const allow = params.options.find(o => o.kind === 'allow_once');
     const deny = params.options.find(o => o.kind === 'reject_once');
     if (!allow) return { outcome: { outcome: 'cancelled' } };
-    const decision = await this.ctx.approval.request({ agent, toolName: params.toolCall.title || 'ACP tool',
-      reason: JSON.stringify(params.toolCall.rawInput ?? params.toolCall.content ?? {}, null, 2), signal });
-    const selected = decision === 'allowed-once' ? allow : decision === 'rejected' ? deny : undefined;
+    const toolName = params.toolCall.title || 'ACP tool';
+    const reason = JSON.stringify(params.toolCall.rawInput ?? params.toolCall.content ?? {}, null, 2);
+    // An A2A turn also offers the approval to the workbench; the first answer wins. The tool call id keeps
+    // each call its own request, so an earlier approval never covers a later identical command.
+    const result = await this.withProcessRequest(agent, signal, { kind: 'permission', body: [params.toolCall.toolCallId, toolName, reason],
+      toolTitle: toolName.slice(0, 500), toolDetail: reason.slice(0, 16 * 1024),
+      local: async localSignal => {
+        const decision = await this.ctx.approval.request({ agent, toolName, reason, signal: localSignal });
+        return { outcome: decision === 'allowed-once' ? 'approved' : decision === 'rejected' ? 'rejected' : 'cancelled' };
+      } });
+    const selected = result.outcome === 'approved' ? allow : result.outcome === 'rejected' ? deny : undefined;
     return { outcome: selected ? { outcome: 'selected', optionId: selected.optionId } : { outcome: 'cancelled' } };
   }
   private questionsOf(p: JsonObject): ProcessQuestionInput[] {
@@ -559,7 +568,8 @@ export class AcpAdapter implements LlmAdapter {
   }
   /** The workbench answer completes this wait. A later A2A user message does not. */
   private async withProcessRequest(agent: Agent, signal: AbortSignal, spec: {
-    kind: 'question' | 'plan'; body: unknown; questions?: ProcessQuestionInput[]; planContent?: string;
+    kind: 'question' | 'plan' | 'permission'; body: unknown; questions?: ProcessQuestionInput[]; planContent?: string;
+    toolTitle?: string; toolDetail?: string;
     local: (signal: AbortSignal) => Promise<JsonObject>;
   }): Promise<JsonObject> {
     const fallback = spec.kind === 'plan' ? 'abandoned' : 'cancelled';
@@ -568,7 +578,8 @@ export class AcpAdapter implements LlmAdapter {
     if (!binding) return spec.local(signal);
     const requestId = `prc-${createHash('sha256').update(JSON.stringify([binding.jobId, binding.attemptId, spec.kind, spec.body])).digest('hex').slice(0, 32)}`;
     let opened: { requestId: string };
-    try { opened = await this.processRequests.open({ requestId, jobId: binding.jobId, attemptId: binding.attemptId, sessionId: agent.id, kind: spec.kind, questions: spec.questions, planContent: spec.planContent }); }
+    try { opened = await this.processRequests.open({ requestId, jobId: binding.jobId, attemptId: binding.attemptId, sessionId: agent.id, kind: spec.kind, questions: spec.questions, planContent: spec.planContent,
+      ...(spec.toolTitle ? { toolTitle: spec.toolTitle, toolDetail: spec.toolDetail } : {}) }); }
     catch { return spec.local(signal); }
     if (signal.aborted) {
       void this.reportProcess(binding.jobId, opened.requestId, fallback, undefined, `dsh-cancel:${opened.requestId}`);

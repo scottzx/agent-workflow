@@ -241,6 +241,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-event-list small { display: block; color: var(--text-muted); overflow-wrap: anywhere; }
 .acp-process-request { display: grid; gap: 6px; border-color: var(--warning); }
 .acp-process-request p { margin: 0; white-space: pre-wrap; }
+.acp-tool-detail { margin: 0; padding: 8px 10px; max-height: 240px; overflow: auto; border-radius: 6px; background: var(--bg-panel); }
 
 .acp-empty, .acp-error { padding: 20px; text-align: center; color: var(--text-muted); }
 .acp-empty strong, .acp-error strong { display: block; color: var(--text-main); }
@@ -284,3 +285,11 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   .has-detail .acp-workbench-body, .acp-agent-layout { grid-template-columns: minmax(0, 1fr); }
   .has-detail .acp-workbench-table { display: none; }
 }
+.acp-status-tool_blocked { background: var(--danger-bg); color: var(--danger); }
+.acp-acceptance { display: inline-block; margin-left: 6px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-color); font-size: 12px; color: var(--text-secondary); }
+.acp-acceptance-accepted { border-color: var(--success); color: var(--success); }
+.acp-acceptance-changes_requested { border-color: var(--warning); color: var(--warning); }
+.acp-acceptance-record { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+.acp-acceptance-record dt { color: var(--text-secondary); }
+.acp-acceptance-record dd { margin: 0; overflow-wrap: anywhere; }
+.acp-acceptance-record .acp-acceptance { margin-left: 0; }

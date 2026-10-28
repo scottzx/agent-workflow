@@ -5,6 +5,7 @@ import type { AcpDecisionInput, AcpExecution, AcpReview, AcpReviewAction, AcpTas
 import { acpTaskHash, executionLabels, latestReview, safeArtifactUrl } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
 import {
+    AcceptanceBadge,
     channelLabel,
     date,
     displayStatus,
@@ -275,6 +276,7 @@ export function AcpTaskDetailPanel({
                 {detail && (
                     <Fragment>
                         <Status value={displayStatus(detail)} />
+                        <AcceptanceBadge task={detail} />
                         {detail.stale && (
                             <span class="acp-stale">
                                 {text('当前为缓存状态，等待同步', 'Cached status; awaiting synchronization')}
@@ -486,6 +488,40 @@ export function AcpTaskDetailPanel({
     );
 }
 
+function AcceptanceSection({ detail }: { detail: AcpTaskDetail }) {
+    const acceptance = detail.businessAcceptance;
+    return (
+        <section class="acp-detail-section">
+            <h3>{text('业务验收', 'Business acceptance')}</h3>
+            {acceptance ? (
+                <dl class="acp-acceptance-record">
+                    <dt>{text('结论', 'Verdict')}</dt>
+                    <dd>
+                        <AcceptanceBadge task={detail} />
+                    </dd>
+                    <dt>{text('结果版本', 'Result revision')}</dt>
+                    <dd>{acceptance.resultRevision}</dd>
+                    <dt>{text('记录时间', 'Recorded')}</dt>
+                    <dd>{date(acceptance.recordedAt)}</dd>
+                    {acceptance.note && (
+                        <Fragment>
+                            <dt>{text('说明', 'Note')}</dt>
+                            <dd>{acceptance.note}</dd>
+                        </Fragment>
+                    )}
+                </dl>
+            ) : (
+                <p class="acp-muted">
+                    {text(
+                        '尚未验收。由发起任务的会话核对结果后用 execution_review 记录。',
+                        'Not accepted yet. The session that started the task records it with execution_review after checking the result.'
+                    )}
+                </p>
+            )}
+        </section>
+    );
+}
+
 function TaskOverview({
     detail,
     onReview,
@@ -501,6 +537,7 @@ function TaskOverview({
     return (
         <Fragment>
             <ProcessRequestPanel jobId={detail.jobId} requests={detail.processRequests} onReload={onReload} />
+            {detail.executionStatus === 'completed' && <AcceptanceSection detail={detail} />}
             {stages.length > 0 && (
                 <section class="acp-detail-section">
                     <h3>{text('阶段进展', 'Stage progress')}</h3>

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JobLedger, type LedgerTargetSnapshot } from '../src/execution/ledger.js';
 import { createHumanReview, decideHumanReview } from '../src/execution/human-review.js';
-import { createProcessRequest, PROCESS_REQUEST_TTL_MS } from '../src/execution/process-request.js';
+import { answerProcessRequest, createProcessRequest, PROCESS_REQUEST_TTL_MS } from '../src/execution/process-request.js';
 import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask } from '../src/execution/workbench.js';
 import type { PptDeliveryRun } from '../src/execution/ppt-delivery.js';
 
@@ -362,4 +362,43 @@ test('a live process request waits in the confirmation queue and an expired one 
   assert.equal(expiredDetail.processRequests[0]?.canAnswer, false);
   assert.equal(listWorkbenchTasks(expired, { filter: 'pending' }).total, 0);
   assert.equal(request.status, 'pending');
+});
+
+test('a finished task whose tool approval lapsed is not shown as completed, and acceptance shows on the current result only', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const finish = (title: string, digest: string) => {
+    const job = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'grok' }, input: {}, title });
+    ledger.markDispatching(job.attempt.attemptId);
+    ledger.accept(job.attempt.attemptId, { taskId: `${title}-task`, sessionId: `${title}-session` }, { executionStatus: 'completed', resultSummary: 'done',
+      resultRevision: 'result-1', resultDigest: digest.repeat(64) });
+    return job;
+  };
+  const lapsed = finish('lapsed', 'a'), approved = finish('approved', 'b'), accepted = finish('accepted', 'c');
+  const at = new Date('2026-10-27T02:00:00.000Z');
+  const permission = (requestId: string, job: ReturnType<typeof finish>) => createProcessRequest({ requestId, jobId: job.job.jobId, attemptId: job.attempt.attemptId,
+    sessionId: 'dsh-1', kind: 'permission', toolTitle: 'python3 sum.py', toolDetail: 'python3 sum.py' }, at);
+  const granted = answerProcessRequest(permission('prc-ok', approved), { clientRequestId: 'answer-1', outcome: 'approved' }, at).request;
+  ledger.acceptance('session-a', accepted.job.jobId, { attemptId: accepted.attempt.attemptId, resultRevision: 'result-1', resultDigest: 'c'.repeat(64), reviewStatus: 'accepted', note: '750.0 matches' });
+  const snapshot = workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner', now: at.getTime() + PROCESS_REQUEST_TTL_MS + 1,
+    processRequests: [permission('prc-lapsed', lapsed), permission('prc-lapsed-2', lapsed), granted, permission('prc-accepted', accepted)] });
+
+  const blocked = getWorkbenchTask(snapshot, lapsed.job.jobId);
+  assert.equal(blocked.executionStatus, 'completed');
+  assert.equal(blocked.displayStatus, 'tool_blocked');
+  assert.deepEqual(blocked.blockedTools, ['python3 sum.py']);
+  assert.match(blocked.progressSummary, /1 个工具调用未获批准/);
+  assert.equal(blocked.businessAcceptance, undefined);
+  assert.equal(getWorkbenchTask(snapshot, approved.job.jobId).displayStatus, 'completed');
+  const failed = listWorkbenchTasks(snapshot, { filter: 'failed' });
+  assert.deepEqual(failed.items.map(item => item.jobId), [lapsed.job.jobId]);
+
+  const done = getWorkbenchTask(snapshot, accepted.job.jobId);
+  assert.equal(done.displayStatus, 'completed', 'an explicit acceptance settles a lapsed approval');
+  assert.equal(done.businessAcceptance?.reviewStatus, 'accepted');
+  assert.equal(done.businessAcceptance?.note, '750.0 matches');
+  assert.equal(listWorkbenchTasks(snapshot).items.find(item => item.jobId === accepted.job.jobId)?.businessAcceptance?.reviewStatus, 'accepted');
+
+  ledger.observe(accepted.attempt.attemptId, { executionStatus: 'completed', resultSummary: 'redone', resultRevision: 'result-2', resultDigest: 'd'.repeat(64), resultAvailable: true });
+  const revised = getWorkbenchTask(workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner' }), accepted.job.jobId);
+  assert.equal(revised.businessAcceptance, undefined, 'acceptance of an older result does not carry over');
 });

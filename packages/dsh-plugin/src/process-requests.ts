@@ -1,4 +1,4 @@
-/** Polls the gateway workbench for a question or plan answer. The token stays in plugin config. */
+/** Polls the gateway workbench for a question, plan or tool permission answer. The token stays in plugin config. */
 import { setTimeout as delay } from 'node:timers/promises';
 
 export interface ProcessQuestionInput {
@@ -13,14 +13,16 @@ export interface ProcessRequestOpenInput {
   jobId: string;
   attemptId: string;
   sessionId: string;
-  kind: 'question' | 'plan';
+  kind: 'question' | 'plan' | 'permission';
   questions?: ProcessQuestionInput[];
   planContent?: string;
+  toolTitle?: string;
+  toolDetail?: string;
 }
 export interface ProcessRequestView {
   requestId: string;
   jobId: string;
-  kind: 'question' | 'plan';
+  kind: 'question' | 'plan' | 'permission';
   status: 'pending' | 'answered' | 'cancelled' | 'expired';
   deadlineAt: string;
   answer?: { clientRequestId: string; outcome: string; answers?: Record<string, string | string[]> };

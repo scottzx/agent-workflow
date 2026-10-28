@@ -46,6 +46,7 @@ export function statusLabel(status: string): string {
         processing: ['正在续跑', 'Resuming'],
         resuming: ['等待续跑', 'Waiting to resume'],
         applied: ['已处理', 'Applied'],
+        tool_blocked: ['工具未获批准', 'Tool not approved'],
     };
     const label = labels[status];
     return label ? text(...label) : status;
@@ -77,6 +78,19 @@ export function displayStatus(task: AcpTaskSummary) {
 
 export function Status({ value }: { value: string }) {
     return <span class={`acp-status acp-status-${value.replace(/[^a-z_]/gi, '')}`}>{statusLabel(value)}</span>;
+}
+
+const acceptanceLabels: Record<string, [string, string]> = {
+    accepted: ['已验收', 'Accepted'],
+    changes_requested: ['验收要求修改', 'Acceptance: changes requested'],
+    pending: ['验收待定', 'Acceptance pending'],
+};
+
+/** The origin session's business acceptance of the current result; absent until execution_review records one. */
+export function AcceptanceBadge({ task }: { task: AcpTaskSummary }) {
+    const status = task.businessAcceptance?.reviewStatus;
+    if (!status) return null;
+    return <span class={`acp-acceptance acp-acceptance-${status}`}>{text(...acceptanceLabels[status]!)}</span>;
 }
 
 export function date(value?: string | null) {

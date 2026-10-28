@@ -46,6 +46,23 @@ test('plan approval has no question answers and cancellation closes the request'
   assert.throws(() => answerProcessRequest(request, { clientRequestId: 'wb-bad', outcome: 'approved', answers: { note: 'extra' } }), (error: ProcessRequestError) => error.code === 'invalid');
 });
 
+test('tool permission requests carry the tool and allow approve, reject or cancel only', () => {
+  const permission = { requestId: 'prc-perm', jobId: 'job-1', attemptId: 'attempt-1', sessionId: 'dsh-1', kind: 'permission' as const,
+    toolTitle: 'run_terminal_command', toolDetail: '{"command":"python3 sum.py"}' };
+  const request = createProcessRequest(permission, at);
+  assert.equal(request.toolTitle, 'run_terminal_command');
+  assert.equal(sameProcessRequest(request, permission), true);
+  assert.equal(sameProcessRequest(request, { ...permission, toolDetail: '{"command":"rm -rf /"}' }), false);
+  assert.equal(answerProcessRequest(request, { clientRequestId: 'wb-allow', outcome: 'approved' }, at).request.status, 'answered');
+  assert.equal(answerProcessRequest(request, { clientRequestId: 'wb-deny', outcome: 'rejected' }, at).request.status, 'answered');
+  assert.equal(answerProcessRequest(request, { clientRequestId: 'wb-cancel', outcome: 'cancelled' }, at).request.status, 'cancelled');
+  for (const outcome of ['accepted', 'abandoned'] as const) {
+    assert.throws(() => answerProcessRequest(request, { clientRequestId: `wb-${outcome}`, outcome }, at), (error: ProcessRequestError) => error.code === 'invalid');
+  }
+  assert.throws(() => createProcessRequest({ ...permission, toolTitle: undefined }, at));
+  assert.throws(() => createProcessRequest({ ...question, toolTitle: 'run_terminal_command' }, at));
+});
+
 test('execution metadata reaches the run options and cannot carry extra fields', () => {
   const request = SendMessageRequest.fromJSON({ message: { messageId: randomUUID(), role: 'ROLE_USER', parts: [{ text: 'work' }] },
     metadata: { '1agents': { cwd: '/tmp/project', execution: { jobId: ' job-1 ', attemptId: 'attempt-1', token: 'secret' } } } });

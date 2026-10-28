@@ -129,11 +129,23 @@ export function ProcessRequestPanel({
                     });
                 return (
                     <article key={request.requestId} class="acp-process-request">
-                        <strong>{request.kind === 'plan' ? text('计划审批', 'Plan approval') : text('提问', 'Question')}</strong>
+                        <strong>
+                            {request.kind === 'plan'
+                                ? text('计划审批', 'Plan approval')
+                                : request.kind === 'permission'
+                                  ? text('工具审批', 'Tool approval')
+                                  : text('提问', 'Question')}
+                        </strong>
                         <small>
                             {text('截止', 'Deadline')} {new Date(request.deadlineAt).toLocaleString()}
                         </small>
                         {request.planContent && <p>{request.planContent}</p>}
+                        {request.kind === 'permission' && (
+                            <>
+                                <p>{request.toolTitle}</p>
+                                {request.toolDetail && <pre class="acp-tool-detail">{request.toolDetail}</pre>}
+                            </>
+                        )}
                         {request.questions?.map(question => (
                             <Fragment key={question.id}>
                                 <p>
@@ -187,7 +199,26 @@ export function ProcessRequestPanel({
                                 </button>
                             </div>
                         )}
-                        {!request.canAnswer && <small>{statusLabel(request.status)}</small>}
+                        {request.canAnswer && request.kind === 'permission' && (
+                            <div class="acp-agent-actions">
+                                <button type="button" class="acp-button acp-primary" disabled={busyId === request.requestId} onClick={() => void submit(request, 'approved', false)}>
+                                    {text('允许本次', 'Allow once')}
+                                </button>
+                                <button type="button" class="acp-button" disabled={busyId === request.requestId} onClick={() => void submit(request, 'rejected', false)}>
+                                    {text('拒绝', 'Reject')}
+                                </button>
+                                <button type="button" class="acp-button" disabled={busyId === request.requestId} onClick={() => void submit(request, 'cancelled', false)}>
+                                    {text('取消', 'Cancel')}
+                                </button>
+                            </div>
+                        )}
+                        {!request.canAnswer && (
+                            <small>
+                                {statusLabel(request.status)}
+                                {request.kind === 'permission' && request.answer?.outcome === 'approved' && ` · ${text('已允许', 'Allowed')}`}
+                                {request.kind === 'permission' && request.answer?.outcome === 'rejected' && ` · ${text('已拒绝', 'Rejected')}`}
+                            </small>
+                        )}
                     </article>
                 );
             })}

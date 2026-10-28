@@ -1,4 +1,4 @@
-/** Live ACP questions and plan approvals. Callers persist each returned value before the waiting call resumes. */
+/** Live ACP questions, plan approvals and tool permissions. Callers persist each returned value before the waiting call resumes. */
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
@@ -25,11 +25,19 @@ export const processRequestAnswerSchema = z.object({
 }).strict();
 export type ProcessRequestAnswerInput = z.infer<typeof processRequestAnswerSchema>;
 
-function assertBody(input: { kind: 'question' | 'plan'; questions?: ProcessQuestion[]; planContent?: string }, ctx: z.RefinementCtx): void {
+type ProcessKind = 'question' | 'plan' | 'permission';
+const processKind = z.enum(['question', 'plan', 'permission']);
+/** The tool name and the arguments a person approves. Tool output never enters the record. */
+const toolTitle = plain(500).pipe(z.string().trim().min(1));
+const toolDetail = plain(16 * 1024);
+
+function assertBody(input: { kind: ProcessKind; questions?: ProcessQuestion[]; planContent?: string; toolTitle?: string; toolDetail?: string }, ctx: z.RefinementCtx): void {
   if (input.kind === 'question' && !input.questions?.length) ctx.addIssue({ code: 'custom', path: ['questions'], message: 'A question request needs questions' });
   if (input.kind === 'plan' && !input.planContent) ctx.addIssue({ code: 'custom', path: ['planContent'], message: 'A plan request needs plan text' });
-  if (input.kind === 'question' && input.planContent) ctx.addIssue({ code: 'custom', path: ['planContent'], message: 'A question request has no plan text' });
-  if (input.kind === 'plan' && input.questions) ctx.addIssue({ code: 'custom', path: ['questions'], message: 'A plan request has no questions' });
+  if (input.kind === 'permission' && !input.toolTitle) ctx.addIssue({ code: 'custom', path: ['toolTitle'], message: 'A permission request needs the tool title' });
+  if (input.kind !== 'plan' && input.planContent) ctx.addIssue({ code: 'custom', path: ['planContent'], message: 'Only a plan request has plan text' });
+  if (input.kind !== 'question' && input.questions) ctx.addIssue({ code: 'custom', path: ['questions'], message: 'Only a question request has questions' });
+  if (input.kind !== 'permission' && (input.toolTitle || input.toolDetail)) ctx.addIssue({ code: 'custom', path: ['toolTitle'], message: 'Only a permission request names a tool' });
 }
 
 export const processRequestCreateSchema = z.object({
@@ -37,9 +45,11 @@ export const processRequestCreateSchema = z.object({
   jobId: id,
   attemptId: id,
   sessionId: id,
-  kind: z.enum(['question', 'plan']),
+  kind: processKind,
   questions: z.array(processQuestionSchema).min(1).max(20).optional(),
   planContent: plain(64 * 1024).pipe(z.string().trim().min(1)).optional(),
+  toolTitle: toolTitle.optional(),
+  toolDetail: toolDetail.optional(),
 }).strict().superRefine(assertBody);
 export type ProcessRequestCreateInput = z.infer<typeof processRequestCreateSchema>;
 
@@ -51,9 +61,11 @@ export interface ProcessRequest {
   jobId: string;
   attemptId: string;
   sessionId: string;
-  kind: 'question' | 'plan';
+  kind: ProcessKind;
   questions?: ProcessQuestion[];
   planContent?: string;
+  toolTitle?: string;
+  toolDetail?: string;
   status: ProcessRequestStatus;
   createdAt: string;
   deadlineAt: string;
@@ -65,9 +77,11 @@ export const processRequestSchema = z.object({
   jobId: id,
   attemptId: id,
   sessionId: id,
-  kind: z.enum(['question', 'plan']),
+  kind: processKind,
   questions: z.array(processQuestionSchema).min(1).max(20).optional(),
   planContent: plain(64 * 1024).pipe(z.string().trim().min(1)).optional(),
+  toolTitle: toolTitle.optional(),
+  toolDetail: toolDetail.optional(),
   status: z.enum(['pending', 'answered', 'cancelled', 'expired']),
   createdAt: z.string().datetime(),
   deadlineAt: z.string().datetime(),
@@ -91,7 +105,8 @@ function stable(value: unknown): string {
 export function sameProcessRequest(record: ProcessRequest, input: ProcessRequestCreateInput): boolean {
   return record.jobId === input.jobId && record.attemptId === input.attemptId && record.sessionId === input.sessionId
     && record.kind === input.kind && stable(record.questions ?? null) === stable(input.questions ?? null)
-    && (record.planContent ?? '') === (input.planContent ?? '');
+    && (record.planContent ?? '') === (input.planContent ?? '')
+    && (record.toolTitle ?? '') === (input.toolTitle ?? '') && (record.toolDetail ?? '') === (input.toolDetail ?? '');
 }
 
 export function createProcessRequest(input: ProcessRequestCreateInput, at = new Date()): ProcessRequest {
@@ -100,6 +115,7 @@ export function createProcessRequest(input: ProcessRequestCreateInput, at = new 
   return {
     requestId: parsed.requestId ?? randomUUID(), jobId: parsed.jobId, attemptId: parsed.attemptId, sessionId: parsed.sessionId, kind: parsed.kind,
     ...(parsed.questions ? { questions: parsed.questions } : {}), ...(parsed.planContent ? { planContent: parsed.planContent } : {}),
+    ...(parsed.toolTitle ? { toolTitle: parsed.toolTitle } : {}), ...(parsed.toolDetail ? { toolDetail: parsed.toolDetail } : {}),
     status: 'pending', createdAt, updatedAt: createdAt, deadlineAt: new Date(at.getTime() + PROCESS_REQUEST_TTL_MS).toISOString(),
   };
 }
@@ -115,6 +131,11 @@ function assertAnswer(request: ProcessRequest, input: ProcessRequestAnswerInput)
         throw new ProcessRequestError('invalid', 'Answers must address the recorded questions');
       }
     }
+    return;
+  }
+  if (request.kind === 'permission') {
+    if (!['approved', 'rejected', 'cancelled'].includes(input.outcome)) throw new ProcessRequestError('invalid', 'Permission answers must be approved, rejected, or cancelled');
+    if (input.answers) throw new ProcessRequestError('invalid', 'A permission answer has no question answers');
     return;
   }
   if (!['approved', 'rejected', 'abandoned'].includes(input.outcome)) throw new ProcessRequestError('invalid', 'Plan answers must be approved, rejected, or abandoned');

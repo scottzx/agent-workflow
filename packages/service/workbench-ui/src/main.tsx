@@ -6,6 +6,7 @@ import { executionLabels, taskDepth } from './model';
 import { AcpTaskDetailPanel } from './TaskDetail';
 import type { AcpTaskFilter, AcpTaskList, AcpTaskSummary } from './types';
 import {
+    AcceptanceBadge,
     channelLabel,
     date,
     displayStatus,
@@ -107,6 +108,11 @@ function Workbench({ onLogout }: { onLogout: () => void }) {
             window.clearInterval(interval);
         };
     }, [filter, offset, refreshKey]);
+
+    // A task link opened while the agents module is showing still lands on that task.
+    useEffect(() => {
+        if (route.jobId) setModule('tasks');
+    }, [route.jobId]);
 
     useEffect(() => {
         const close = (event: KeyboardEvent) => {
@@ -242,6 +248,7 @@ function Workbench({ onLogout }: { onLogout: () => void }) {
                                             </td>
                                             <td>
                                                 <Status value={displayStatus(task)} />
+                                                <AcceptanceBadge task={task} />
                                                 {!!task.unresolvedAttemptIds?.length && (
                                                     <small class="acp-stale">{text('有待核实的历史执行', 'Prior execution needs verification')}</small>
                                                 )}

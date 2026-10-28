@@ -1,5 +1,5 @@
 /** Human-readable projections of the execution ledger. Reading never dispatches or acknowledges work. */
-import type { JobRef, LedgerAttempt, LedgerEvent, LedgerJob, LedgerState } from './ledger.js';
+import type { BusinessAcceptance, JobRef, LedgerAttempt, LedgerEvent, LedgerJob, LedgerState } from './ledger.js';
 import type { ReportReviewRun } from './report-review.js';
 import type { PptDeliveryRun } from './ppt-delivery.js';
 import { deliveryProgress } from './delivery-progress.js';
@@ -24,6 +24,10 @@ export interface AcpTaskSummary {
   stale: boolean; reviewStatus?: HumanReviewStatus; pendingReviewId?: string; pendingProcessRequestId?: string; progressSummary: string;
   channel: 'trial' | 'formal' | 'standalone'; agentId?: string; agentName?: string; agentPhase?: 'developing' | 'published';
   inFlightAttemptIds: string[]; unresolvedAttemptIds: string[]; execution: WorkbenchExecution;
+  /** The origin session's execution_review for the current result, if one was recorded. */
+  businessAcceptance?: BusinessAcceptance;
+  /** Tools the finished attempt asked for that nobody approved; its result may be incomplete. */
+  blockedTools?: string[];
 }
 export interface WorkbenchStage { stage: string; name: string; status: string; planned: boolean; jobId?: string; attemptId?: string }
 export interface WorkbenchProgress { stage: string; phase: string; stages: WorkbenchStage[]; completedStages: string[];
@@ -173,17 +177,33 @@ function pendingProcessRequest(requests: readonly ProcessRequest[], job: LedgerJ
     .map(request => projectProcessRequest(request, now)).filter(request => request.status === 'pending')
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 }
+/** Same rule as the ledger view: acceptance counts only for the current completed result revision and digest. */
+function currentAcceptance(job: LedgerJob, ledger: LedgerState): BusinessAcceptance | undefined {
+  const attempt = ledger.attempts[job.currentAttemptId], result = attempt?.result;
+  if (attempt?.executionStatus !== 'completed' || !result?.resultAvailable) return undefined;
+  return (ledger.acceptances[job.jobId] ?? []).findLast(item => item.attemptId === attempt.attemptId
+    && item.resultRevision === result.resultRevision && item.resultDigest === result.resultDigest);
+}
+function blockedTools(requests: readonly ProcessRequest[], job: LedgerJob, now: number): string[] {
+  if (job.executionStatus !== 'completed') return [];
+  return requests.filter(request => request.kind === 'permission' && request.jobId === job.jobId && request.attemptId === job.currentAttemptId)
+    .map(request => projectProcessRequest(request, now)).filter(request => request.answer?.outcome !== 'approved')
+    .map(request => request.toolTitle ?? '').filter((name, index, all) => name && all.indexOf(name) === index);
+}
 function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: readonly HumanReviewRequest[], ledger: LedgerState, actorId: string, requests: readonly ProcessRequest[], now: number): AcpTaskSummary {
   const attempt = ledger.attempts[job.currentAttemptId], review = latestReview(reviews, job), pending = review?.status === 'pending' && !terminal.has(job.executionStatus) && (!run || !terminal.has(run.executionStatus));
   const pendingRequest = terminal.has(job.executionStatus) ? undefined : pendingProcessRequest(requests, job, now);
   const awaitingResume = review?.resume?.status === 'pending' && !terminal.has(job.executionStatus);
   const resumeError = awaitingResume ? run?.diagnostics?.findLast(item => item.startsWith('Human continuation deferred:')) : undefined;
-  const displayStatus = pending || pendingRequest ? 'awaiting_human' : awaitingResume && !resumeError ? 'resuming' : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? 'changes_requested' : job.executionStatus;
+  const acceptance = currentAcceptance(job, ledger), blocked = blockedTools(requests, job, now);
+  const toolBlocked = blocked.length > 0 && acceptance?.reviewStatus !== 'accepted';
+  const displayStatus = toolBlocked ? 'tool_blocked' : pending || pendingRequest ? 'awaiting_human' : awaitingResume && !resumeError ? 'resuming' : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? 'changes_requested' : job.executionStatus;
   const phase = pending ? 'human_review' : pendingRequest ? 'process_request' : awaitingResume ? 'human_resume' : run?.phase ?? attempt?.phase ?? job.purpose ?? '';
   const progressSummary = pending ? `${review.title}已形成，等待确认 ${review.revision}；通过后开始设计制作。`
-    : pendingRequest ? (pendingRequest.kind === 'plan' ? '计划待批准，请在过程请求里提交。' : '有待回答的问题，请在过程请求里提交。')
+    : pendingRequest ? (pendingRequest.kind === 'plan' ? '计划待批准，请在过程请求里提交。' : pendingRequest.kind === 'permission' ? `工具「${pendingRequest.toolTitle}」待批准，请在过程请求里提交。` : '有待回答的问题，请在过程请求里提交。')
     : awaitingResume ? resumeError ? `决定已保存，继续执行受阻：${resumeError.slice('Human continuation deferred:'.length).trim()}` : '本版决定已保存，等待系统继续处理。'
     : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? run?.summaryRevisionPending ? '修改意见已保存，正在提交原作者。' : '修改意见已提交原作者，等待新版本。'
+    : toolBlocked ? `执行已结束，但有 ${blocked.length} 个工具调用未获批准，结果可能不完整，请核对后再验收。`
     : attempt?.diagnostic || (run ? runDescription(run) : attempt?.result?.resultSummary || stateDescriptions[job.executionStatus] || '等待同步执行进展。');
   const execution = executionView(attempt, job.targetId, Boolean(run));
   const development = describeTaskDevelopment(attempt?.targetSnapshot?.development, { targetId: job.targetId, resident: execution.kind === 'resident', residentName: execution.targetName });
@@ -194,7 +214,8 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
     createdAt: job.createdAt, updatedAt: [job.updatedAt, review?.updatedAt, pendingRequest?.updatedAt].filter((value): value is string => Boolean(value)).sort().at(-1)!, stale: attempt?.stale ?? true,
     inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds], execution,
     ...(review ? { reviewStatus: review.status } : {}), ...(pending && review.reviewerId === actorId ? { pendingReviewId: review.reviewId } : {}),
-    ...(pendingRequest ? { pendingProcessRequestId: pendingRequest.requestId } : {}), progressSummary };
+    ...(pendingRequest ? { pendingProcessRequestId: pendingRequest.requestId } : {}), progressSummary,
+    ...(acceptance ? { businessAcceptance: structuredClone(acceptance) } : {}), ...(blocked.length ? { blockedTools: blocked } : {}) };
 }
 function bubbleProcessWait(summaries: Map<string, AcpTaskSummary>): void {
   const tasks = [...summaries.values()];
@@ -293,7 +314,7 @@ export function listWorkbenchTasks(snapshot: WorkbenchSnapshot, query: Workbench
   const rootIds = new Set(snapshot.tasks.filter(task => !task.parentJobRef || !Object.hasOwn(snapshot.details, task.parentJobRef.jobId)).map(task => task.jobId));
   const needsPerson = (task: AcpTaskSummary) => Boolean(task.pendingReviewId || task.pendingProcessRequestId);
   const isWorking = (task: AcpTaskSummary) => task.displayStatus === 'resuming' || !needsPerson(task) && ['working', 'submitted', 'not_started'].includes(task.executionStatus);
-  const isFailed = (task: AcpTaskSummary) => task.unresolvedAttemptIds.length > 0 || ['failed', 'rejected', 'unknown', 'auth_required', 'input_required'].includes(task.executionStatus) && !['awaiting_human', 'resuming'].includes(task.displayStatus);
+  const isFailed = (task: AcpTaskSummary) => task.unresolvedAttemptIds.length > 0 || task.displayStatus === 'tool_blocked' || ['failed', 'rejected', 'unknown', 'auth_required', 'input_required'].includes(task.executionStatus) && !['awaiting_human', 'resuming'].includes(task.displayStatus);
   const roots = snapshot.tasks.filter(task => rootIds.has(task.jobId));
   const counts = { all: roots.length, pending: roots.filter(needsPerson).length, working: roots.filter(isWorking).length, failed: roots.filter(isFailed).length };
   const matches = snapshot.tasks.filter(task => filter === 'all' ? true : filter === 'pending' ? needsPerson(task) : filter === 'working' ? isWorking(task) : isFailed(task));

@@ -32,6 +32,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const changes = [];
   const creationsInput = [];
   const closedSessions = [];
+  const permissionResults = [];
   const deletedSessions = [];
   const commands = new Map();
   let model = 'native-a';
@@ -111,6 +112,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
           return streamConfig.result ?? { stopReason: 'end_turn' };
         }
         const permission = await connection.client.request('session/request_permission', { sessionId: params.sessionId, toolCall: { toolCallId: 'edit', title: 'Edit file', rawInput: { path: '/tmp/example' } }, options: [{ optionId: 'once', name: 'Allow once', kind: 'allow_once' }, { optionId: 'no', name: 'Reject', kind: 'reject_once' }] });
+        permissionResults.push(permission.outcome);
         if (interaction !== 'pending') assert.equal(permission.outcome.optionId, 'once');
         return streamConfig.result ?? { stopReason: 'end_turn' };
       });
@@ -157,7 +159,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics, streamConfig.processRequests);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
-  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, deletedSessions, commands, attaches, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
+  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, deletedSessions, permissionResults, commands, attaches, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
 
@@ -235,6 +237,41 @@ test('workbench answers complete the live question and plan, and DSH answers clo
   await collect(failed.adapter, failed.options('open-failed'));
   assert.equal(failedOpen, true);
   unbindA2AExecution(failed.local.id, execution);
+});
+
+test('tool permission goes to the workbench for an A2A turn; either answer completes it', { timeout: 10000 }, async t => {
+  const execution = { jobId: 'job-perm', attemptId: 'attempt-perm' };
+  t.after(() => unbindA2AExecution('dsh-session', execution));
+  const opened = [];
+  const workbench = {
+    async open(input) { opened.push(input); return { requestId: input.requestId, deadlineAt: new Date(Date.now() + 60_000).toISOString(), status: 'pending' }; },
+    async wait(input) { return { requestId: input.requestId, jobId: 'job-perm', kind: 'permission', status: 'answered', deadlineAt: '', answer: { clientRequestId: 'wb-perm', outcome: 'approved' } }; },
+    async report() { throw new Error('the workbench answered first'); },
+  };
+  // The local DSH approval stays pending until the workbench answer aborts it.
+  const workbenchWins = await fixture(t, false, 'pending', async () => {}, [], { processRequests: workbench });
+  bindA2AExecution(workbenchWins.local.id, execution);
+  await collect(workbenchWins.adapter, workbenchWins.options('perm-workbench'));
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].kind, 'permission');
+  assert.equal(opened[0].toolTitle, 'Edit file');
+  assert.match(opened[0].toolDetail, /\/tmp\/example/);
+  assert.deepEqual(workbenchWins.permissionResults, [{ outcome: 'selected', optionId: 'once' }]);
+  unbindA2AExecution(workbenchWins.local.id, execution);
+
+  const reports = [];
+  const dsh = {
+    async open(input) { return { requestId: input.requestId, deadlineAt: new Date(Date.now() + 60_000).toISOString(), status: 'pending' }; },
+    async wait(input) { await new Promise((_, reject) => input.signal.addEventListener('abort', () => reject(input.signal.reason), { once: true })); },
+    async report(input) { reports.push(input); },
+  };
+  const dshWins = await fixture(t, false, 'permission', async () => {}, [], { processRequests: dsh });
+  bindA2AExecution(dshWins.local.id, execution);
+  await collect(dshWins.adapter, dshWins.options('perm-dsh'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(reports.map(item => item.outcome), ['approved']);
+  assert.deepEqual(dshWins.permissionResults, [{ outcome: 'selected', optionId: 'once' }]);
+  unbindA2AExecution(dshWins.local.id, execution);
 });
 
 test('unadvertised initial mode fails before prompting', { timeout: 5000 }, async t => {
