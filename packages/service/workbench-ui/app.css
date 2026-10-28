@@ -19,6 +19,12 @@
   --danger-bg: #fdecea;
   --radius: 10px;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* One 4px spacing scale for the detail panel; space comes from these steps, never from stretched rows or UA margins. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -217,13 +223,15 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   white-space: nowrap;
 }
 .acp-detail-tabs button[aria-selected='true'] { color: var(--accent); border-bottom-color: var(--accent); }
-.acp-detail-content { padding: 14px 16px; display: grid; gap: 14px; }
-.acp-detail-section { display: grid; gap: 8px; }
+/* Rows pack at the top: the content grows to dock the preview drawer, and that extra height must stay below the last row. */
+.acp-detail-content { padding: var(--space-4); display: grid; gap: var(--space-5); align-content: start; }
+.acp-detail-section { display: grid; gap: var(--space-2); align-content: start; }
+.acp-detail-section > h3 { margin: 0; }
 .acp-stage-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
 .acp-stage-list li { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: start; }
 .acp-stage-list small { display: block; color: var(--text-muted); }
-.acp-task-facts { display: flex; flex-wrap: wrap; gap: 8px 20px; color: var(--text-muted); font-size: 12px; }
-.acp-task-facts > span { display: grid; gap: 2px; }
+.acp-task-facts { display: flex; flex-wrap: wrap; align-items: start; gap: var(--space-2) var(--space-5); color: var(--text-muted); font-size: 12px; }
+.acp-task-facts > span { display: grid; gap: var(--space-1); align-content: start; }
 .acp-task-facts strong { color: var(--text-main); font-size: 13px; font-weight: 500; }
 .acp-attempt, .acp-context, .acp-process-request, .acp-review-event, .acp-artifact-group, .acp-script-slide {
   padding: 10px 12px;
@@ -326,6 +334,11 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .has-detail:not(.is-full-detail) .acp-workbench-body { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
 .has-detail:not(.is-full-detail) .acp-workbench-table, .has-detail:not(.is-full-detail) .acp-detail { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .has-detail:not(.is-full-detail) .acp-workbench-table { overflow-x: auto; }
-.acp-md { padding: 0; }
-.acp-md > :first-child { margin-top: 0; }
-.acp-md > :last-child { margin-bottom: 0; }
+/* Agent markdown sits on the section's text edge. The file-preview CSS is appended after this file, so the
+   doubled class is what wins over its .fp-md padding and margins rather than source order. */
+.fp-md.acp-md { padding: 0; }
+.fp-md.acp-md > * { margin-top: 0; margin-bottom: 0; }
+.fp-md.acp-md > * + * { margin-top: var(--space-3); }
+.fp-md.acp-md > :is(h1, h2, h3, h4) + * { margin-top: var(--space-2); }
+.fp-md.acp-md > * + :is(h1, h2, h3, h4) { margin-top: var(--space-5); }
+.fp-md.acp-md li + li { margin-top: var(--space-1); }
