@@ -184,10 +184,15 @@ function currentAcceptance(job: LedgerJob, ledger: LedgerState): BusinessAccepta
   return (ledger.acceptances[job.jobId] ?? []).findLast(item => item.attemptId === attempt.attemptId
     && item.resultRevision === result.resultRevision && item.resultDigest === result.resultDigest);
 }
+/** A tool is blocked when its latest request was not approved; an agent's retry that a person allowed clears it. */
 function blockedTools(requests: readonly ProcessRequest[], job: LedgerJob, now: number): string[] {
   if (job.executionStatus !== 'completed') return [];
-  return requests.filter(request => request.kind === 'permission' && request.jobId === job.jobId && request.attemptId === job.currentAttemptId)
-    .map(request => projectProcessRequest(request, now)).filter(request => request.answer?.outcome !== 'approved')
+  const latest = new Map<string, ProcessRequest>();
+  for (const request of requests.filter(request => request.kind === 'permission' && request.jobId === job.jobId && request.attemptId === job.currentAttemptId)
+    .map(request => projectProcessRequest(request, now)).sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+    latest.set(JSON.stringify([request.toolTitle ?? '', request.toolDetail ?? '']), request);
+  }
+  return [...latest.values()].filter(request => request.answer?.outcome !== 'approved')
     .map(request => request.toolTitle ?? '').filter((name, index, all) => name && all.indexOf(name) === index);
 }
 function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: readonly HumanReviewRequest[], ledger: LedgerState, actorId: string, requests: readonly ProcessRequest[], now: number): AcpTaskSummary {

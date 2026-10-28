@@ -402,3 +402,23 @@ test('a finished task whose tool approval lapsed is not shown as completed, and 
   const revised = getWorkbenchTask(workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner' }), accepted.job.jobId);
   assert.equal(revised.businessAcceptance, undefined, 'acceptance of an older result does not carry over');
 });
+
+test('an expired tool approval that the agent retried and a person allowed does not mark the task blocked', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const job = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'grok' }, input: {}, title: 'retry' });
+  ledger.markDispatching(job.attempt.attemptId);
+  ledger.accept(job.attempt.attemptId, { taskId: 'retry-task', sessionId: 'retry-session' }, { executionStatus: 'completed', resultSummary: 'Python 3.12.8',
+    resultRevision: 'result-1', resultDigest: 'e'.repeat(64) });
+  const first = new Date('2026-10-28T03:01:42.000Z'), second = new Date('2026-10-28T03:06:46.000Z');
+  const permission = (requestId: string, toolTitle: string, at: Date) => createProcessRequest({ requestId, jobId: job.job.jobId, attemptId: job.attempt.attemptId,
+    sessionId: 'dsh-1', kind: 'permission', toolTitle, toolDetail: toolTitle }, at);
+  const retried = answerProcessRequest(permission('prc-2', 'python3 --version', second), { clientRequestId: 'answer-2', outcome: 'approved' }, second).request;
+  const view = (requests: ReturnType<typeof permission>[]) => getWorkbenchTask(workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner',
+    now: second.getTime() + PROCESS_REQUEST_TTL_MS + 1, processRequests: requests }), job.job.jobId);
+  const cleared = view([permission('prc-1', 'python3 --version', first), retried]);
+  assert.equal(cleared.displayStatus, 'completed');
+  assert.equal(cleared.blockedTools, undefined);
+  const other = view([permission('prc-1', 'python3 --version', first), retried, permission('prc-3', 'rm sum.txt', second)]);
+  assert.equal(other.displayStatus, 'tool_blocked', 'an approval of one tool does not clear a different one');
+  assert.deepEqual(other.blockedTools, ['rm sum.txt']);
+});
