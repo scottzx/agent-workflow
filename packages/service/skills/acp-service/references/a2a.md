@@ -256,6 +256,8 @@ gateway 将状态、任务归属和通知原子落盘；通知有稳定 `noticeI
 
 spawn/message 可传 `resultContract: {jobId, parentTaskId?, parentSessionId?, originSessionId?, artifactManifestPath?}`。身份不由模型填入：get/list 的 `resultMetadata` 来自执行宿主，包含真实 task/context/session/request ID、cwd/preset、起止时间、outcome、预检和验证后的产物。lineage 明确标为调用方声明。manifest 路径及所列文件均须在已通过预检的 jobDirectory 内，严格格式：
 
+**默认产物位置**：调用方没有声明 `jobDirectory` 和 `artifactManifestPath` 时，网关为每个任务指定 `<cwd>/.1agents/jobs/<jobId>/`（执行宿主在预检时创建，不跟随符号链接），清单为该目录下的 `manifest-<attemptId>.json`，并把位置与格式附在提示词末尾。默认清单是可选的：没有清单就没有产物，清单损坏只记入 `validation`，不会让已完成的任务失败。执行宿主不支持（旧版本或预检失败）时，网关回退为不带默认位置派发。调用方自己声明的清单仍按严格模式校验。
+
 ```json
 {"artifacts":[{"path":"/tmp/actual-job/final.pptx","url":"http://actual-host/artifacts/job/final.pptx","mediaType":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
 ```

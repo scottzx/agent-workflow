@@ -2,11 +2,12 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, open, realpath, stat, unlink } from 'node:fs/promises';
+import { access, lstat, mkdir, open, realpath, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
+import { isDefaultJobDirectory } from './job-directory.js';
 import type { A2APreflightInput, A2APreflightReport } from './types.js';
 
 const absolutePath = z.string().min(1).max(4096).refine(value => isAbsolute(value) && !value.includes('\0'), 'Expected an absolute host path');
@@ -36,6 +37,16 @@ const within = (root: string, path: string): boolean => {
   const tail = relative(root, path);
   return tail === '' || (!tail.startsWith(`..${sep}`) && tail !== '..' && !isAbsolute(tail));
 };
+/** Creates `<cwd>/.1agents/jobs/<id>` segment by segment, refusing symbolic links so nothing is created outside cwd. */
+async function ensureDefaultJobDirectory(cwd: string, directory: string): Promise<void> {
+  let current = cwd;
+  for (const segment of relative(cwd, directory).split(sep)) {
+    current = join(current, segment);
+    const info = await lstat(current).catch(() => undefined);
+    if (info?.isSymbolicLink()) throw new Error('the default job directory path must not contain symbolic links');
+    if (!info) await mkdir(current, { mode: 0o700 });
+  }
+}
 const failure = (error: unknown): string => error instanceof Error ? error.message.slice(0, 400) : 'Host check failed';
 
 /** Enforce an explicitly supplied cwd allowlist against host realpaths and access permissions.
@@ -88,6 +99,7 @@ export async function runA2APreflight(raw: A2APreflightInput): Promise<A2APrefli
   }
   if (input.jobDirectory) await check('jobDirectory', async () => {
     if (!cwdOk) throw new Error('Cannot validate writable scope without a valid cwd');
+    if (isDefaultJobDirectory(input.cwd, input.jobDirectory!)) await ensureDefaultJobDirectory(input.cwd, input.jobDirectory!);
     const directory = await realpath(input.jobDirectory!);
     if (!(await stat(directory)).isDirectory()) throw new Error('jobDirectory must already exist and be a directory');
     const temporaryRoots = await Promise.all(['/tmp', tmpdir()].map(path => realpath(path).catch(() => undefined)));

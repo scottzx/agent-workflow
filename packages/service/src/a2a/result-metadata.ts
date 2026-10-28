@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import { lstat, open, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { z } from 'zod';
+import { isDefaultJobDirectory } from './job-directory.js';
 import type { A2APreflightReport, A2ATarget } from './types.js';
 
 const identifier = z.string().trim().min(1).max(512);
@@ -141,12 +142,23 @@ export async function createA2AResultMetadata(input: {
   };
   if (contract?.artifactManifestPath && input.outcome === 'completed' && !input.validationCode) {
     const root = target?.preflight?.ok && target.preflight.jobDirectory;
-    if (!root) throw new A2AResultValidationError('artifact-job-directory-not-admitted');
-    if (await realpath(root) !== root) throw new A2AResultValidationError('job-directory-changed');
+    // A manifest the gateway announced by default is optional: no admitted directory or manifest means no artifacts,
+    // and a bad one is reported in `validation` without failing a task that otherwise completed.
+    const implicit = Boolean(target?.cwd) && isDefaultJobDirectory(target!.cwd, dirname(contract.artifactManifestPath));
+    if (!root) {
+      if (implicit) return metadata;
+      throw new A2AResultValidationError('artifact-job-directory-not-admitted');
+    }
+    if (await realpath(root) !== root) {
+      if (implicit) { metadata.validation = { status: 'failed', code: 'job-directory-changed' }; return metadata; }
+      throw new A2AResultValidationError('job-directory-changed');
+    }
+    if (implicit && !(await lstat(contract.artifactManifestPath).catch(() => undefined))) return metadata;
     try { metadata.artifacts = await verifiedArtifacts(root, contract.artifactManifestPath); }
     catch (error) {
-      if (error instanceof A2AResultValidationError) throw error;
-      throw new A2AResultValidationError('artifact-manifest-or-file-unavailable');
+      const code = error instanceof A2AResultValidationError ? error.code : 'artifact-manifest-or-file-unavailable';
+      if (implicit) { metadata.validation = { status: 'failed', code }; return metadata; }
+      throw error instanceof A2AResultValidationError ? error : new A2AResultValidationError(code);
     }
     metadata.validation = { status: 'passed' };
   }

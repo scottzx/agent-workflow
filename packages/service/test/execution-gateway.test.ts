@@ -519,3 +519,16 @@ test('stage progress is queryable without a root wakeup; failure notice contains
   assert.match(text, /已有 PPT（未完成最终验收）/); assert.match(text, /http:\/\/example.invalid\/retained.pptx/);
   assert.doesNotMatch(text, /\[最终 PPT\]/);
 });
+
+test('every task is told where to put artifacts, per job and per attempt, unless the caller declared its own', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, clientRequestId: 'artifact-default' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  const prompt = f.backend.runs[0]!.prompt;
+  assert.ok(prompt.startsWith(String(rawSpawn.prompt)), 'the original prompt is untouched');
+  assert.ok(prompt.includes(`/project/.1agents/jobs/${first.jobId}/`));
+  assert.ok(prompt.includes(`/project/.1agents/jobs/${first.jobId}/manifest-${first.attemptId}.json`));
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'done' });
+  const got = await until(() => gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: first.taskId }) as Promise<any>, item => item.state === 'TASK_STATE_COMPLETED');
+  assert.deepEqual(got.resultMetadata.artifacts, [], 'no manifest means no artifacts, and the task still completes');
+});

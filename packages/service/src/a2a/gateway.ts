@@ -16,6 +16,7 @@ import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSc
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { artifactInstructions, defaultJobDirectory, defaultManifestPath } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
 import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
@@ -391,15 +392,29 @@ export class RemoteAgentGateway {
       if ((provider === undefined) !== (model === undefined)) throw new Error('provider and model must be passed together');
       if (provider && isAcpAgentPreset(resolved.agentPreset)) throw new Error('provider and model apply only to standard presets; oneagents-acp-* presets switch models through session/set_config_option');
       const preflight = fields.preflight === undefined ? undefined : a2aPreflightRequirementsSchema.parse(fields.preflight);
-      const requirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
+      const declaredRequirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
-      const resultContract = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
+      const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
+      // Unless the caller declared its own artifact location, every task gets <cwd>/.1agents/jobs/<jobId>/ and a
+      // per-attempt manifest, announced to the agent in the prompt. The host creates the directory during preflight.
+      let artifacts = !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && resolved.cwd
+        ? { directory: defaultJobDirectory(resolved.cwd, job.jobId), manifest: defaultManifestPath(resolved.cwd, job.jobId, attempt.attemptId) } : undefined;
+      const withArtifacts = <T>(declared: T, add: (found: NonNullable<typeof artifacts>) => T): T => artifacts ? add(artifacts) : declared;
+      let requirements = withArtifacts(declaredRequirements, found => ({ ...declaredRequirements, jobDirectory: found.directory }));
+      let resultContract = withArtifacts(declaredResult, found => ({ ...(declaredResult ?? { jobId: job.jobId }), artifactManifestPath: found.manifest }));
       const networkRole = resolved.target.binding.skillPolicy === 'network_pinned' ? resolved.target.binding.roleId : undefined;
       if (resolved.target.binding.skillPolicy && !networkRole) throw new Error('Network skill policy requires a fixed roleId');
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
       const roleLockPath = fields.roleLockPath === undefined ? undefined
         : z.string().min(1).refine(path.isAbsolute, 'Expected an absolute role lock path').parse(fields.roleLockPath);
-      await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
+      try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
+      catch (error) {
+        // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
+        // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
+        if (!artifacts) throw error;
+        artifacts = undefined; requirements = declaredRequirements; resultContract = declaredResult;
+        await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
+      }
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
       const fresh = this.targets.resolve(input.targetId, input.input);
@@ -408,7 +423,7 @@ export class RemoteAgentGateway {
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
+        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '') }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
           ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
