@@ -30,17 +30,28 @@ export function artifactUrl(jobId: string, artifact: ArtifactRef): string | unde
     return new URL(`/workbench/ui/api/tasks/${encodeURIComponent(jobId)}/artifacts/${artifact.sha256}`, location.origin).href;
 }
 
-/** One artifact with an on-demand inline preview; one with neither URL nor receipt digest is shown as a path. */
-export function ArtifactItem({ jobId, artifact, focused }: { jobId: string; artifact: ArtifactRef; focused?: boolean }) {
-    const [open, setOpen] = useState(Boolean(focused));
-    const row = useRef<HTMLDivElement>(null);
-    useEffect(() => {
-        if (!focused) return;
-        setOpen(true);
-        row.current?.scrollIntoView({ block: 'start' });
-    }, [focused]);
+function artifactName(artifact: ArtifactRef, url?: string): string {
+    return (
+        artifact.path?.split('/').pop() ||
+        (url ? decodeURIComponent(new URL(url).pathname.split('/').pop() || '') : '') ||
+        text('产物', 'Artifact')
+    );
+}
+
+/** One artifact; its preview opens in the detail's bottom drawer. Without URL or receipt digest it is only a path. */
+export function ArtifactItem({
+    jobId,
+    artifact,
+    active,
+    onPreview,
+}: {
+    jobId: string;
+    artifact: ArtifactRef;
+    active?: boolean;
+    onPreview: (artifact: ArtifactRef) => void;
+}) {
     const url = artifactUrl(jobId, artifact);
-    const name = artifact.path?.split('/').pop() || (url ? decodeURIComponent(new URL(url).pathname.split('/').pop() || '') : '') || text('产物', 'Artifact');
+    const name = artifactName(artifact, url);
     if (!url) {
         return artifact.path ? (
             <span class="acp-muted">
@@ -49,19 +60,57 @@ export function ArtifactItem({ jobId, artifact, focused }: { jobId: string; arti
         ) : null;
     }
     return (
-        <div class="acp-artifact-item" ref={row}>
-            <span class="acp-artifact-row">
-                <a href={url} target="_blank" rel="noopener noreferrer">
-                    {name}
-                </a>
-                <button type="button" class="acp-link" aria-expanded={open} onClick={() => setOpen(!open)}>
-                    {open ? text('收起预览', 'Hide preview') : text('预览', 'Preview')}
+        <span class="acp-artifact-row">
+            <a href={url} target="_blank" rel="noopener noreferrer">
+                {name}
+            </a>
+            <button type="button" class="acp-link" aria-pressed={active} onClick={() => onPreview(artifact)}>
+                {active ? text('预览中', 'Previewing') : text('预览', 'Preview')}
+            </button>
+        </span>
+    );
+}
+
+/** Bottom drawer inside the task detail: the preview stays beside whatever tab opened it. */
+export function ArtifactDrawer({ jobId, artifact, onClose }: { jobId: string; artifact: ArtifactRef; onClose: () => void }) {
+    const url = artifactUrl(jobId, artifact);
+    const name = artifactName(artifact, url);
+    const close = useRef<HTMLButtonElement>(null);
+    useEffect(() => {
+        close.current?.focus({ preventScroll: true });
+        // Captured before the page's own Escape (which closes the whole detail): the first press closes only the drawer.
+        const onKey = (event: KeyboardEvent) => {
+            if (event.key !== 'Escape') return;
+            event.stopPropagation();
+            onClose();
+        };
+        document.addEventListener('keydown', onKey, true);
+        return () => document.removeEventListener('keydown', onKey, true);
+    }, [onClose]);
+    return (
+        <section class="acp-artifact-drawer" role="dialog" aria-label={name}>
+            <header class="acp-artifact-drawer-header">
+                <div>
+                    <strong>{name}</strong>
+                    {artifact.path && <small title={artifact.path}>{artifact.path}</small>}
+                </div>
+                {url && (
+                    <a class="acp-button" href={url} target="_blank" rel="noopener noreferrer">
+                        {text('新窗口打开', 'Open in new tab')}
+                    </a>
+                )}
+                <button type="button" class="acp-button" ref={close} onClick={onClose}>
+                    {text('关闭', 'Close')}
                 </button>
-            </span>
-            {open && (
-                <FilePreview name={name} path={artifact.path} url={url} mediaType={artifact.mediaType} diagrams={false} hideHeader labels={labels} />
-            )}
-        </div>
+            </header>
+            <div class="acp-artifact-drawer-body">
+                {url ? (
+                    <FilePreview key={url} name={name} path={artifact.path} url={url} mediaType={artifact.mediaType} diagrams={false} hideHeader labels={labels} />
+                ) : (
+                    <p class="acp-muted">{text('该产物没有可读取的地址', 'This artifact has no readable address')}</p>
+                )}
+            </div>
+        </section>
     );
 }
 

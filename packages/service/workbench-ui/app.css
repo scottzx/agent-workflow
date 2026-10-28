@@ -173,7 +173,33 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: var(--radius);
+  /* A column whose content grows, so the preview drawer docks at the bottom even when the content is short. */
+  display: flex;
+  flex-direction: column;
 }
+.acp-detail > * { flex-shrink: 0; }
+.acp-detail-content { flex-grow: 1; }
+.is-full-detail .acp-detail { min-height: calc(100dvh - 140px); }
+/* Floating over the detail it belongs to: the one place in the panel that keeps an elevation shadow. */
+.acp-artifact-drawer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  height: min(62vh, 620px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border-color);
+  border-radius: var(--radius) var(--radius) 0 0;
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.18);
+}
+.acp-artifact-drawer-header { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border-color); }
+.acp-artifact-drawer-header div { flex: 1; min-width: 0; display: grid; }
+.acp-artifact-drawer-header small { color: var(--text-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acp-artifact-drawer-header a.acp-button { text-decoration: none; }
+.acp-artifact-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px; }
+/* In the side panel the panel itself has a fixed height: leave its header, tabs and the artifact list in view above. */
+.has-detail:not(.is-full-detail) .acp-artifact-drawer { height: 55%; }
 .acp-detail-header { padding: 14px 16px; border-bottom: 1px solid var(--border-color); display: grid; gap: 6px; justify-items: start; }
 .acp-detail-tools { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--text-muted); flex-wrap: wrap; }
 .acp-detail-tools div { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -293,7 +319,6 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-acceptance-record dd { margin: 0; overflow-wrap: anywhere; }
 
 .acp-chat { height: min(70vh, 640px); border: 1px solid var(--border-color); border-radius: var(--radius); overflow: hidden; }
-.acp-artifact-item { display: grid; gap: 6px; }
 .acp-artifact-row { display: inline-flex; gap: 12px; align-items: baseline; }
 
 /* With a detail open, the list and the drawer scroll on their own inside the viewport. */

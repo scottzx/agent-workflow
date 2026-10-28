@@ -4,7 +4,7 @@ import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpDecisionInput, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
-import { ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
+import { ArtifactDrawer, ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
 import {
     channelLabel,
     date,
@@ -87,7 +87,8 @@ export function AcpTaskDetailPanel({
     const [decisionMessage, setDecisionMessage] = useState('');
     const [decisionError, setDecisionError] = useState('');
     const [confirmCancel, setConfirmCancel] = useState(false);
-    const [focusedArtifact, setFocusedArtifact] = useState<string>();
+    const [previewing, setPreviewing] = useState<ArtifactRef>();
+    const closePreview = useCallback(() => setPreviewing(undefined), []);
     const decisionRequest = useRef<{ key: string; id: string } | null>(null);
     const alive = useRef(true);
     const requestInFlight = useRef(false);
@@ -142,6 +143,8 @@ export function AcpTaskDetailPanel({
         if (detail) heading.current?.focus();
     }, [!!detail]);
 
+    useEffect(() => setPreviewing(undefined), [jobId]);
+
     const selectReview = (id: string) => {
         setReviewId(id);
         setTab('review');
@@ -153,12 +156,10 @@ export function AcpTaskDetailPanel({
 
     /** A link in agent text opens the preview only when it names a registered artifact; other host paths stay inert. */
     const openFile = (path: string) => {
-        const registered = (detail?.artifacts || []).some(result =>
-            result.artifacts.some(item => typeof item === 'object' && (item as ArtifactRef).path === path)
-        );
-        if (!registered) return;
-        setFocusedArtifact(path);
-        setTab('review');
+        const found = (detail?.artifacts || [])
+            .flatMap(result => result.artifacts)
+            .find(item => typeof item === 'object' && (item as ArtifactRef).path === path) as ArtifactRef | undefined;
+        if (found) setPreviewing(found);
     };
 
     const decide = async (action: AcpReviewAction) => {
@@ -344,7 +345,8 @@ export function AcpTaskDetailPanel({
                                     review={currentReview}
                                     requestedReviewId={reviewId}
                                     onSelect={selectReview}
-                                    focusedArtifact={focusedArtifact}
+                                    previewing={previewing}
+                                    onPreview={setPreviewing}
                                 />
                                 {currentReview && (
                                     <Fragment>
@@ -503,6 +505,7 @@ export function AcpTaskDetailPanel({
                     </Fragment>
                 )}
             </div>
+            {previewing && <ArtifactDrawer jobId={jobId} artifact={previewing} onClose={closePreview} />}
         </aside>
     );
 }
@@ -825,13 +828,15 @@ function TaskReview({
     review,
     requestedReviewId,
     onSelect,
-    focusedArtifact,
+    previewing,
+    onPreview,
 }: {
     detail: AcpTaskDetail;
     review?: AcpReview;
     requestedReviewId?: string;
     onSelect: (id: string) => void;
-    focusedArtifact?: string;
+    previewing?: ArtifactRef;
+    onPreview: (artifact: ArtifactRef) => void;
 }) {
     const artifactResults: { revision: string; artifacts: ArtifactRef[]; deliveryReady?: boolean }[] = [
         ...(detail.progress?.availableResults || []),
@@ -861,7 +866,11 @@ function TaskReview({
                                     key={`${artifact.url || artifact.path}:${index}`}
                                     jobId={detail.jobId}
                                     artifact={artifact}
-                                    focused={Boolean(focusedArtifact && artifact.path === focusedArtifact)}
+                                    active={
+                                        !!previewing &&
+                                        (previewing.url || previewing.path) === (artifact.url || artifact.path)
+                                    }
+                                    onPreview={onPreview}
                                 />
                             ))}
                         </div>
