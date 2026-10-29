@@ -785,6 +785,12 @@ export class RemoteAgentGateway {
     return url;
   }
   /** One verified artifact, read from the host that produced it and checked against the recorded receipt again here. */
+  /** The execution host replaced a finished task's result (manual takeover): read it now rather than wait for a webhook. */
+  async refreshWorkbenchTask(jobId: string) {
+    this.workbenchTask(jobId);
+    await Promise.allSettled(this.state.jobs.filter(raw => raw.ledgerJobId === jobId).map(raw => this.refresh(raw)));
+    return this.workbenchTask(jobId);
+  }
   async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
     this.workbenchTask(jobId);
     for (const raw of this.state.jobs) {
@@ -1685,11 +1691,12 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         const one = /^\/process-requests\/([^/]+)$/.exec(rest);
         try {
           if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
+          if (rest === '/refresh' && req.method === 'POST') return json(res, 200, await gateway.refreshWorkbenchTask(jobId));
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
           if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
           if (answer && req.method === 'POST') return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), await body(req)));
           if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
-          if (rest === '' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' || rest === '/refresh' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
           return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });

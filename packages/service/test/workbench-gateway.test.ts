@@ -366,6 +366,24 @@ test('workbench chat pages the stored A2A history newest-first inside the same s
   assert.equal((await f.request(`/workbench/tasks/${jobId}/chat`, { method: 'POST' })).status, 405);
 });
 
+test('a host that replaced a finished result asks the gateway to read that job again', async t => {
+  const f = await fixture(t);
+  const { jobId } = await f.seed('allowed-root', '接管任务'), hidden = await f.seed('private-root', '隐藏接管');
+  const raw = (ledgerJobId: string, taskId: string) => ({ remote: 'r', originSessionId: 'allowed-root', taskId, contextId: 'c', cwd: '/x',
+    checkedAt: new Date().toISOString(), ledgerJobId, attemptId: `${taskId}-attempt`, task: { id: taskId, contextId: 'c', status: { state: 'TASK_STATE_COMPLETED' } } });
+  (f.gateway as any).state.jobs.push(raw(jobId, 'mine'), raw(hidden.jobId, 'theirs'), raw('other-job', 'unrelated'));
+  const refreshed: string[] = [];
+  (f.gateway as any).refresh = async (job: { taskId: string }) => { refreshed.push(job.taskId); };
+  const ok = await f.request(`/workbench/tasks/${jobId}/refresh`, { method: 'POST' });
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json() as any).jobId, jobId);
+  assert.deepEqual(refreshed, ['mine']);
+  assert.equal((await f.request(`/workbench/tasks/${hidden.jobId}/refresh`, { method: 'POST' })).status, 404, 'out-of-scope jobs are not read');
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/refresh`, { method: 'POST' }, null)).status, 401);
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/refresh`)).status, 405);
+  assert.deepEqual(refreshed, ['mine']);
+});
+
 test('workbench artifacts are read from the producing host and served only when the bytes match the receipt', async t => {
   const f = await fixture(t);
   const { jobId } = await f.seed('allowed-root', '产物任务'), hidden = await f.seed('private-root', '隐藏产物');

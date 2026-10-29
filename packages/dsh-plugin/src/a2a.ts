@@ -18,8 +18,12 @@ export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token
   workbench?: { url: string; token?: string };
 }
 
+/** In-process takeover controls of the mounted host; absent while A2A is disabled or closed. */
+export type A2AHostControls = Pick<Awaited<ReturnType<typeof createA2AServer>>, 'sessionTask' | 'resubmit'>;
+
 /** Routes and in-flight turns are released with the owning Cordis plugin. */
-export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string, diagnostics?: Diagnostics, sessions?: SessionControl): Promise<() => Promise<void>> {
+export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string, diagnostics?: Diagnostics, sessions?: SessionControl,
+  expose?: (host: A2AHostControls | undefined) => void): Promise<() => Promise<void>> {
   if (options.enabled === false) return async () => {};
   const token = options.token ?? process.env[options.tokenEnv ?? 'DSH_A2A_TOKEN'];
   if (!token) throw new Error('Set DSH_A2A_TOKEN or a2a.token before enabling DSH A2A');
@@ -44,7 +48,9 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
       throw error;
     }
     let closing: Promise<void> | undefined;
+    expose?.({ sessionTask: server.sessionTask, resubmit: server.resubmit });
     close = () => closing ??= (async () => {
+      expose?.(undefined);
       for (const dispose of routes.reverse()) dispose();
       await server.close();
     })();

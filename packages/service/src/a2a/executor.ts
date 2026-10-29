@@ -202,6 +202,9 @@ export class A2ASessionExecutor implements AgentExecutor {
 
   isRunning(taskId: string): boolean { return this.active.has(taskId); }
 
+  /** A person took the session over: the pending question is no longer answered through A2A. */
+  releaseInput(taskId: string): void { this.awaitingInput.delete(taskId); }
+
   async execute(context: RequestContext, bus: ExecutionEventBus): Promise<void> {
     if (this.stopped) throw new UnsupportedOperationError('A2A host is stopping');
     if (this.active.has(context.taskId)) throw new UnsupportedOperationError('This task already has an active execution');

@@ -1,7 +1,7 @@
 import { Fragment } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
-import type { AcpDecisionInput, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
+import type { AcpDecisionInput, AcpDshSession, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
 import { ArtifactDrawer, ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
@@ -27,6 +27,48 @@ import {
 
 type DetailTab = 'overview' | 'progress' | 'review' | 'chat' | 'events';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+// Inside DSH the page sits in a same-origin frame whose host can open the task's own session.
+const embedded = window.parent !== window;
+
+/** Manual takeover: continue in the DSH session; the agent's submit_to_review hands the result back. */
+function TakeOver({ detail }: { detail: AcpTaskDetail }) {
+    const sessionId = detail.attempts.find(attempt => attempt.attemptId === detail.currentAttemptId)?.backendRunRef?.sessionId;
+    const [session, setSession] = useState<AcpDshSession | null>(null);
+    useEffect(() => {
+        setSession(null);
+        if (!embedded || !sessionId) return;
+        let live = true;
+        acpTaskService.dshSession(sessionId).then(
+            value => live && setSession(value),
+            () => live && setSession(null)
+        );
+        return () => {
+            live = false;
+        };
+    }, [sessionId, detail.executionStatus]);
+    // Sessions of another execution host are not on this DSH.
+    if (!sessionId || !session?.available) return null;
+    const running = session.task?.running === true;
+    return (
+        <button
+            type="button"
+            class="acp-button acp-primary"
+            disabled={running}
+            title={
+                running
+                    ? text('A2A 任务仍在执行，结束后可接管', 'The A2A task is still running; take over once it ends')
+                    : text(
+                          '在 DSH 会话中继续处理；满意后让智能体调用 submit_to_review 提交回工作流',
+                          'Continue in the DSH session; when satisfied, have the agent call submit_to_review'
+                      )
+            }
+            onClick={() => window.parent.postMessage({ type: '1agents:open-session', sessionId }, location.origin)}
+        >
+            {running ? text('执行中…', 'Running…') : text('在 DSH 中接管', 'Take over in DSH')}
+        </button>
+    );
+}
 
 function ExecutionCaption({ execution }: { execution?: AcpExecution }) {
     const labels = executionLabels(execution, language);
@@ -245,6 +287,7 @@ export function AcpTaskDetailPanel({
                 <div class="acp-detail-tools">
                     <span>{text('任务详情', 'Task details')}</span>
                     <div>
+                        {detail && <TakeOver detail={detail} />}
                         <button type="button" class="acp-button" onClick={copyLink}>
                             {text('复制链接', 'Copy link')}
                         </button>

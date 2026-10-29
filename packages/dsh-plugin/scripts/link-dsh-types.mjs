@@ -5,7 +5,7 @@ import { resolve, join } from 'node:path';
 const checkout = process.argv[2];
 if (!checkout) throw new Error('Usage: node scripts/link-dsh-types.mjs /absolute/path/DSH');
 const root = resolve(checkout);
-const needed = new Set(['dsh-llm', 'dsh-agent', 'dsh-session', 'dsh-user-approval', 'dsh-user-questions', 'dsh-commands', 'dsh-host-webserver', 'dsh-api-session-controller', 'dsh-session-projection', 'dsh-agent-preset-registry', 'dsh-workspace', 'dsh-session-persistence', 'dsh-storage', 'dsh-storage-domain', 'dsh-storage-json']);
+const needed = new Set(['dsh-llm', 'dsh-agent', 'dsh-session', 'dsh-user-approval', 'dsh-user-questions', 'dsh-commands', 'dsh-host-webserver', 'dsh-api-session-controller', 'dsh-session-projection', 'dsh-agent-preset-registry', 'dsh-workspace', 'dsh-session-persistence', 'dsh-storage', 'dsh-storage-domain', 'dsh-storage-json', 'dsh-tools', 'dsh-client-connection']);
 const links = new Map();
 for (const group of readdirSync(join(root, 'packages'), { withFileTypes: true })) {
   if (!group.isDirectory()) continue;

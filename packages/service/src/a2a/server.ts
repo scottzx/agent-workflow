@@ -13,6 +13,7 @@ import type { A2ABackend } from './types.js';
 import { a2aPreflightInputSchema } from './preflight.js';
 import { ArtifactContentError, readVerifiedArtifact } from './artifact-content.js';
 import type { A2AVerifiedArtifact } from './result-metadata.js';
+import { a2aSessionTask, resubmitA2ASession, type A2AResubmission, type A2ASessionTask } from './resubmit.js';
 
 async function readBoundedJson(req: IncomingMessage, limit: number): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -181,6 +182,10 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
   card: AgentCard;
   handler: (request: IncomingMessage, response: ServerResponse) => Promise<void>;
   cardHandler: (request: IncomingMessage, response: ServerResponse) => Promise<void>;
+  /** The A2A task a DSH session last ran, for in-process takeover controls. */
+  sessionTask: (sessionId: string) => A2ASessionTask | undefined;
+  /** Hand a taken-over session's result back to the workflow as a new completed snapshot. */
+  resubmit: (input: { sessionId: string; summary: string }) => Promise<A2AResubmission>;
   close: () => Promise<void>;
 }> {
   if (!options.token?.trim()) throw new Error('A2A requires a bearer token');
@@ -389,7 +394,13 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
     void pending.then(clean, clean);
     return pending;
   };
-  return { path, card, handler, cardHandler, close: async () => {
+  return { path, card, handler, cardHandler,
+    sessionTask: sessionId => a2aSessionTask({ store, executor }, sessionId),
+    resubmit: input => {
+      if (stopped) return Promise.reject(new Error('A2A host is stopping'));
+      return resubmitA2ASession({ store, executor, push: (event, context, task) => sender.send(event, context, task) }, input);
+    },
+    close: async () => {
     if (stopped) return;
     stopped = true;
     for (const res of responses) res.destroy();

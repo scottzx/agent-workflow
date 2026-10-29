@@ -90,6 +90,7 @@ export interface AcpAttempt {
     execution?: AcpExecution;
     executionStatus: string;
     submissionStatus?: string;
+    backendRunRef?: { remote?: string; taskId?: string; contextId?: string; sessionId?: string };
     createdAt?: string | null;
     updatedAt?: string;
     checkedAt?: string;
@@ -255,6 +256,12 @@ export interface AcpDecisionInput {
     digest: string;
     clientRequestId: string;
     note?: string;
+}
+
+/** A task's DSH session as seen by the DSH host that embeds the page. */
+export interface AcpDshSession {
+    available: boolean;
+    task?: { taskId: string; jobId?: string; state: string; running: boolean; resubmittable: boolean };
 }
 
 export interface AcpChatPage {

@@ -3,6 +3,7 @@ import type {
     AcpAgentDraftInput,
     AcpChatPage,
     AcpDecisionInput,
+    AcpDshSession,
     AcpProcessAnswerInput,
     AcpTaskDetail,
     AcpTaskFilter,
@@ -60,6 +61,8 @@ export const acpTaskService = {
         return call(`/tasks?${params}`);
     },
     get: (jobId: string): Promise<AcpTaskDetail> => call(`/tasks/${encodeURIComponent(jobId)}`),
+    /** Only DSH serves this route: whether the session is on this host and its A2A turn is still running. */
+    dshSession: (sessionId: string): Promise<AcpDshSession> => call(`/dsh/sessions/${encodeURIComponent(sessionId)}`),
     chat: (jobId: string, before: number | undefined, limit: number): Promise<AcpChatPage> => {
         const params = new URLSearchParams({ limit: String(limit) });
         if (before !== undefined) params.set('before', String(before));

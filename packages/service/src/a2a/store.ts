@@ -317,6 +317,20 @@ export class FileA2AStore {
     return target && structuredClone(target);
   }
 
+  /** The most recently updated task this host ran in one DSH session, within the caller's scope. */
+  latestTaskForSession(sessionId: string, context: ServerCallContext): Task | undefined {
+    this.assertOpen();
+    text(sessionId, 'session ID');
+    const scope = scopeOf(context);
+    let latest: Task | undefined;
+    for (const cached of this.tasks.values()) {
+      if (cached.scope.tenant !== scope.tenant || cached.scope.owner !== scope.owner) continue;
+      if ((cached.task.metadata?.['1agents'] as { sessionId?: unknown } | undefined)?.sessionId !== sessionId) continue;
+      if (!latest || Date.parse(cached.task.status?.timestamp ?? '') > Date.parse(latest.status?.timestamp ?? '')) latest = cached.task;
+    }
+    return latest && parseTask(Task.toJSON(latest));
+  }
+
   saveTarget(contextId: string, target: A2ATarget, context: ServerCallContext): void {
     this.assertOpen();
     text(contextId, 'context ID');

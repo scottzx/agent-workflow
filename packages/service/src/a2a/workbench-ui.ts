@@ -42,8 +42,28 @@ function sendJson(res: ServerResponse, status: number, data: unknown, headers: R
   send(res, status, 'application/json', JSON.stringify(data), headers);
 }
 
+/**
+ * The page and its static assets under WORKBENCH_UI_PATH. `frameAncestors` lets a host that embeds the
+ * page in its own frame (DSH) allow exactly that; the gateway's own page is never framed.
+ */
+export async function serveWorkbenchPage(req: IncomingMessage, res: ServerResponse, pathname: string, options: { frameAncestors?: "'none'" | "'self'" } = {}): Promise<void> {
+  const headers: Record<string, string> = options.frameAncestors === "'self'"
+    ? { 'Content-Security-Policy': SECURITY_HEADERS['Content-Security-Policy'].replace("frame-ancestors 'none'", "frame-ancestors 'self'") } : {};
+  if (req.method !== 'GET') return sendJson(res, 405, { error: 'Method not allowed' }, headers);
+  const directory = assetDirectory();
+  if (!directory) return sendJson(res, 503, { error: 'Workbench page is not built' }, headers);
+  if (pathname === WORKBENCH_UI_PATH || pathname === `${WORKBENCH_UI_PATH}/`) {
+    return send(res, 200, 'text/html; charset=utf-8', await readFile(path.join(directory, 'index.html')), headers);
+  }
+  const asset = pathname.slice(`${WORKBENCH_UI_PATH}/`.length);
+  const type = Object.hasOwn(ASSETS, asset) ? ASSETS[asset] : CHUNK.test(asset) ? ASSETS['app.js'] : undefined;
+  if (!type) return sendJson(res, 404, { error: 'No workbench page asset' }, headers);
+  try { return send(res, 200, type, await readFile(path.join(directory, asset)), headers); }
+  catch { return sendJson(res, 404, { error: 'No workbench page asset' }, headers); }
+}
+
 /** Agent sessions and CLI tools never act as the human reviewer. */
-function isAgentRequest(req: IncomingMessage): boolean {
+export function isAgentRequest(req: IncomingMessage): boolean {
   if (['x-oneagents-session-id', 'x-oneagents-session-token', 'x-oneagents-turn-id'].some(name => req.headers[name])) return true;
   const origin = String(req.headers['x-oneagents-origin'] ?? '').toLowerCase();
   return origin === 'mcp' || origin === 'cli' || Boolean(req.headers.authorization);
@@ -87,19 +107,7 @@ export class WorkbenchUi {
    */
   async handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<{ route: string } | undefined> {
     const pathname = url.pathname;
-    if (!pathname.startsWith(`${API_PATH}/`)) {
-      if (req.method !== 'GET') return void sendJson(res, 405, { error: 'Method not allowed' });
-      const directory = assetDirectory();
-      if (!directory) return void sendJson(res, 503, { error: 'Workbench page is not built' });
-      if (pathname === WORKBENCH_UI_PATH || pathname === `${WORKBENCH_UI_PATH}/`) {
-        return void send(res, 200, 'text/html; charset=utf-8', await readFile(path.join(directory, 'index.html')));
-      }
-      const asset = pathname.slice(`${WORKBENCH_UI_PATH}/`.length);
-      const type = Object.hasOwn(ASSETS, asset) ? ASSETS[asset] : CHUNK.test(asset) ? ASSETS['app.js'] : undefined;
-      if (!type) return void sendJson(res, 404, { error: 'No workbench page asset' });
-      try { return void send(res, 200, type, await readFile(path.join(directory, asset))); }
-      catch { return void sendJson(res, 404, { error: 'No workbench page asset' }); }
-    }
+    if (!pathname.startsWith(`${API_PATH}/`)) return void await serveWorkbenchPage(req, res, pathname);
     if (isAgentRequest(req)) return void sendJson(res, 403, { error: 'browser_action_required', message: 'Agents and tools use the bearer workbench API, not the page.' });
     const write = req.method !== 'GET';
     if (write && !sameOriginBrowser(req)) {

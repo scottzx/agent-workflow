@@ -13,7 +13,7 @@ import type {} from '@deepseek-ai/dsh-user-questions';
 import type {} from '@deepseek-ai/dsh-commands';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type {} from '@deepseek-ai/dsh-agent-preset-registry';
-import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
+import type { McpServer, NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
 import { State, hasActiveWriter, type Binding } from './state.js';
@@ -140,6 +140,8 @@ export class AcpAdapter implements LlmAdapter {
   private output = new Map<string, (update: SessionUpdate) => void>();
   private lifetime = new AbortController();
   private readonly sessionSettings: AgentSessionSettings;
+  /** MCP servers offered when a session is created or restored, such as the A2A hand-back tool. */
+  mcpServersFor?: (sessionId: string) => McpServer[];
   constructor(private ctx: Context, private config: Config, private readonly diagnostics?: Diagnostics, private readonly processRequests?: ProcessRequestClient) {
     this.state = new State(config.stateDirectory);
     this.sessionSettings = new AgentSessionSettings(config.stateDirectory);
@@ -372,7 +374,7 @@ export class AcpAdapter implements LlmAdapter {
         // sent. Mode and reasoning effort come from ACP 设置: session/set_mode,
         // session/set_config_option, or the settings kept by a native import.
         // initialModeId below still selects an advertised native mode.
-        const params: NewSessionRequest = { cwd, mcpServers: [], ...(capacityId ? { _meta: { '1agents': { capacityId } } } : {}) };
+        const params: NewSessionRequest = { cwd, mcpServers: this.mcpServersFor?.(agent.id) ?? [], ...(capacityId ? { _meta: { '1agents': { capacityId } } } : {}) };
         const admit = <T>(request: () => Promise<T>): Promise<T> => capacityId
           ? requestWhenAdmitted({
             request,
