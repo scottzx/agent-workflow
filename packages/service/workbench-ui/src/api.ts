@@ -61,8 +61,8 @@ export const acpTaskService = {
         return call(`/tasks?${params}`);
     },
     get: (jobId: string): Promise<AcpTaskDetail> => call(`/tasks/${encodeURIComponent(jobId)}`),
-    /** Only DSH serves this route: whether the session is on this host and its A2A turn is still running. */
-    dshSession: (sessionId: string): Promise<AcpDshSession> => call(`/dsh/sessions/${encodeURIComponent(sessionId)}`),
+    /** Only DSH serves this route: the session on this host that ran an A2A task, and whether its turn is still running. */
+    dshSession: (taskId: string): Promise<AcpDshSession> => call(`/dsh/tasks/${encodeURIComponent(taskId)}`),
     chat: (jobId: string, before: number | undefined, limit: number): Promise<AcpChatPage> => {
         const params = new URLSearchParams({ limit: String(limit) });
         if (before !== undefined) params.set('before', String(before));

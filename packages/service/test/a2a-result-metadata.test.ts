@@ -110,6 +110,8 @@ test('a taken-over session hands its result back as a newer completed snapshot w
   const sessionId = (task.metadata?.['1agents'] as { sessionId: string }).sessionId;
   assert.deepEqual(f.host.sessionTask(sessionId), { taskId: task.id, contextId: task.contextId, jobId: 'takeover', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true });
   assert.equal(f.host.sessionTask('elsewhere'), undefined);
+  assert.equal(f.host.taskSession(task.id), sessionId);
+  assert.equal(f.host.taskSession('unknown-task'), undefined);
   await assert.rejects(f.host.resubmit({ sessionId: 'elsewhere', summary: 'done' }), { code: 'NOT_A2A_SESSION' });
   await assert.rejects(f.host.resubmit({ sessionId, summary: '  ' }), { code: 'INVALID_SUMMARY' });
   // The person edited the draft and added a file during takeover.

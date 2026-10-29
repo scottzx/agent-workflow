@@ -261,6 +261,7 @@ export interface AcpDecisionInput {
 /** A task's DSH session as seen by the DSH host that embeds the page. */
 export interface AcpDshSession {
     available: boolean;
+    sessionId?: string;
     task?: { taskId: string; jobId?: string; state: string; running: boolean; resubmittable: boolean };
 }
 

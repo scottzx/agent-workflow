@@ -19,7 +19,7 @@ export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token
 }
 
 /** In-process takeover controls of the mounted host; absent while A2A is disabled or closed. */
-export type A2AHostControls = Pick<Awaited<ReturnType<typeof createA2AServer>>, 'sessionTask' | 'resubmit'>;
+export type A2AHostControls = Pick<Awaited<ReturnType<typeof createA2AServer>>, 'sessionTask' | 'taskSession' | 'resubmit'>;
 
 /** Routes and in-flight turns are released with the owning Cordis plugin. */
 export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string, diagnostics?: Diagnostics, sessions?: SessionControl,
@@ -48,7 +48,7 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
       throw error;
     }
     let closing: Promise<void> | undefined;
-    expose?.({ sessionTask: server.sessionTask, resubmit: server.resubmit });
+    expose?.({ sessionTask: server.sessionTask, taskSession: server.taskSession, resubmit: server.resubmit });
     close = () => closing ??= (async () => {
       expose?.(undefined);
       for (const dispose of routes.reverse()) dispose();

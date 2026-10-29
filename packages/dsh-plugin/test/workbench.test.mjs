@@ -38,7 +38,8 @@ test('DSH serves the workbench page framed by itself and forwards only owner bro
       : req.headers.cookie === 'dsh=guest' ? { peer: { principal: { kind: 'remote' } } } : { rejection: 401 } },
     sessionController: { inspect: async id => id === 'local-session' ? { meta: { id } } : null },
   };
-  const host = { sessionTask: id => id === 'local-session' ? { taskId: 't', contextId: 'c', jobId: 'j', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true } : undefined };
+  const host = { taskSession: id => ({ 'local-task': 'local-session', 'gone-task': 'gone-session' })[id],
+    sessionTask: id => id === 'local-session' ? { taskId: 'local-task', contextId: 'c', jobId: 'j', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true } : undefined };
   const dsh = await listen(t, workbenchHandler(ctx, { workbench: { url: `${gw.origin}/ignored-path`, token: 'gw-token' }, host: () => host }));
   const owner = { cookie: 'dsh=owner' }, write = { ...owner, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
 
@@ -66,9 +67,11 @@ test('DSH serves the workbench page framed by itself and forwards only owner bro
   assert.equal((await fetch(`${dsh}/workbench/ui/api/tasks`, { headers: { ...owner, authorization: 'Bearer x' } })).status, 403, 'agents never act as the reviewer');
   assert.equal(gw.seen.length, before);
 
-  assert.deepEqual(await (await fetch(`${dsh}/workbench/ui/api/dsh/sessions/local-session`, { headers: owner })).json(), { available: true, task: host.sessionTask('local-session') });
-  assert.deepEqual(await (await fetch(`${dsh}/workbench/ui/api/dsh/sessions/elsewhere`, { headers: owner })).json(), { available: false });
-  assert.equal((await fetch(`${dsh}/workbench/ui/api/dsh/sessions/elsewhere`)).status, 401);
+  assert.deepEqual(await (await fetch(`${dsh}/workbench/ui/api/dsh/tasks/local-task`, { headers: owner })).json(),
+    { available: true, sessionId: 'local-session', task: host.sessionTask('local-session') });
+  assert.deepEqual(await (await fetch(`${dsh}/workbench/ui/api/dsh/tasks/remote-task`, { headers: owner })).json(), { available: false }, 'another host ran it');
+  assert.deepEqual(await (await fetch(`${dsh}/workbench/ui/api/dsh/tasks/gone-task`, { headers: owner })).json(), { available: false }, 'its session was deleted');
+  assert.equal((await fetch(`${dsh}/workbench/ui/api/dsh/tasks/local-task`)).status, 401);
 });
 
 test('an ACP agent hands its session back through the stdio MCP server, bound to that session only', async t => {

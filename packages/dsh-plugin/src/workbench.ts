@@ -53,14 +53,17 @@ export function workbenchHandler(ctx: Context, options: WorkbenchProxyOptions) {
     if (req.method !== 'GET' && req.method !== 'HEAD' && req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'browser_action_required' });
     const route = url.pathname.slice(API.length);
     if (route === '/session') return json(res, 200, { authenticated: true, loginRequired: false });
-    const session = /^\/dsh\/sessions\/([^/]+)$/.exec(route);
-    if (session) {
+    // The gateway records only the A2A task ID; this host knows which of its sessions ran it.
+    const task = /^\/dsh\/tasks\/([^/]+)$/.exec(route);
+    if (task) {
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
-      const id = decodeURIComponent(session[1]!);
-      if (id.length > 256) return json(res, 400, { error: 'Invalid session id' });
-      const available = await ctx.sessionController.inspect(id as SessionId).then(found => found != null, () => false);
-      const task = available ? options.host()?.sessionTask(id) : undefined;
-      return json(res, 200, { available, ...(task ? { task } : {}) });
+      const taskId = decodeURIComponent(task[1]!);
+      if (taskId.length > 256) return json(res, 400, { error: 'Invalid task id' });
+      const host = options.host(), sessionId = host?.taskSession(taskId);
+      const available = sessionId !== undefined && await ctx.sessionController.inspect(sessionId as SessionId).then(found => found != null, () => false);
+      if (!available) return json(res, 200, { available: false });
+      const current = host!.sessionTask(sessionId);
+      return json(res, 200, { available, sessionId, ...(current ? { task: current } : {}) });
     }
     if (!gateway) return json(res, 503, { error: 'workbench_not_configured', message: '未配置 a2a.workbench，无法连接任务网关。' });
     // As on the gateway page, only the execution host opens process requests.

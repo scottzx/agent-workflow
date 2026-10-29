@@ -331,6 +331,14 @@ export class FileA2AStore {
     return latest && parseTask(Task.toJSON(latest));
   }
 
+  /** The DSH session a task ran in, within the caller's scope. */
+  sessionOfTask(taskId: string, context: ServerCallContext): string | undefined {
+    this.assertOpen();
+    text(taskId, 'task ID');
+    const sessionId = (this.tasks.get(key(scopeOf(context), taskId))?.task.metadata?.['1agents'] as { sessionId?: unknown } | undefined)?.sessionId;
+    return typeof sessionId === 'string' ? sessionId : undefined;
+  }
+
   saveTarget(contextId: string, target: A2ATarget, context: ServerCallContext): void {
     this.assertOpen();
     text(contextId, 'context ID');

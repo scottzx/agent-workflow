@@ -53,6 +53,11 @@ export function a2aSessionTask(deps: Pick<Deps, 'store' | 'executor'>, sessionId
     running, resubmittable: !running && resubmittable.has(state) };
 }
 
+/** The DSH session that ran an A2A task; the gateway ledger records only the task ID. */
+export function a2aTaskSession(deps: Pick<Deps, 'store'>, taskId: string): string | undefined {
+  return deps.store.sessionOfTask(taskId, hostContext());
+}
+
 export async function resubmitA2ASession(deps: Deps, input: { sessionId: string; summary: string }): Promise<A2AResubmission> {
   const summary = input.summary.trim();
   if (!summary || Buffer.byteLength(summary) > SUMMARY_LIMIT) throw new A2AResubmitError('INVALID_SUMMARY', 'summary must be non-empty text of at most 64 KiB');

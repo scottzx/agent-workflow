@@ -33,23 +33,25 @@ const embedded = window.parent !== window;
 
 /** Manual takeover: continue in the DSH session; the agent's submit_to_review hands the result back. */
 function TakeOver({ detail }: { detail: AcpTaskDetail }) {
-    const sessionId = detail.attempts.find(attempt => attempt.attemptId === detail.currentAttemptId)?.backendRunRef?.sessionId;
+    // The gateway knows only the A2A task ID; DSH maps it to the session that ran it.
+    const taskId = detail.attempts.find(attempt => attempt.attemptId === detail.currentAttemptId)?.backendRunRef?.taskId;
     const [session, setSession] = useState<AcpDshSession | null>(null);
     useEffect(() => {
         setSession(null);
-        if (!embedded || !sessionId) return;
+        if (!embedded || !taskId) return;
         let live = true;
-        acpTaskService.dshSession(sessionId).then(
+        acpTaskService.dshSession(taskId).then(
             value => live && setSession(value),
             () => live && setSession(null)
         );
         return () => {
             live = false;
         };
-    }, [sessionId, detail.executionStatus]);
+    }, [taskId, detail.executionStatus]);
     // Sessions of another execution host are not on this DSH.
-    if (!sessionId || !session?.available) return null;
-    const running = session.task?.running === true;
+    const sessionId = session?.available ? session.sessionId : undefined;
+    if (!sessionId) return null;
+    const running = session!.task?.running === true;
     return (
         <button
             type="button"
