@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
-import { CapacityGovernor, type CapacityKind, type CapacityOptions } from '../src/capacity.js';
-import { CapacityQueue } from '../src/capacity-queue.js';
+import { CapacityGovernor, type CapacityKind, type CapacityLease, type CapacityOptions } from '../src/capacity.js';
+import { CapacityQueue, type CapacityPendingAdmission } from '../src/capacity-queue.js';
 
 const automatic = (id: string, kind: CapacityKind = 'task') => ({ id, kind, source: 'automatic' as const });
 const interactive = (id: string, kind: CapacityKind = 'task') => ({ id, kind, source: 'interactive' as const });
@@ -253,4 +253,74 @@ test('an immediately admitted request does not report pending', async t => {
   const { lastSequence } = JSON.parse(readFileSync(join(directory, 'queue', 'counter.json'), 'utf8'));
   assert.equal(lastSequence, 1);
   await lease.release();
+});
+
+function isPending(value: CapacityLease | CapacityPendingAdmission): value is CapacityPendingAdmission {
+  return 'pending' in value && value.pending === true;
+}
+
+test('tryAdmit keeps a full process slot queued and reports elapsed wait without sleeping', async t => {
+  const { governor, queue, directory } = fixture(t);
+  const occupied = await governor.acquire(automatic('occupied', 'process'));
+  const waiting = await queue.tryAdmit(automatic('waiting', 'process'));
+  assert.equal(isPending(waiting), true);
+  if (!isPending(waiting)) return;
+  assert.equal(waiting.position, 1);
+  assert.equal((await governor.snapshot('process')).used, 1);
+  const queued = entries(directory);
+  assert.equal(queued.length, 1);
+  const names = readdirSync(join(directory, 'queue')).filter(name => name.startsWith('entry-'));
+  const path = join(directory, 'queue', names[0]!);
+  const record = JSON.parse(readFileSync(path, 'utf8'));
+  record.enqueuedAt = Date.now() - 61_000;
+  writeFileSync(path, JSON.stringify(record));
+  const again = await queue.tryAdmit(automatic('waiting', 'process'));
+  assert.equal(isPending(again), true);
+  if (!isPending(again)) return;
+  assert.ok(again.waitedMs >= 60_000);
+  assert.equal(entries(directory).length, 1);
+  assert.equal(await queue.cancel({ id: 'waiting', kind: 'process' }), true);
+  assert.equal(entries(directory).length, 0);
+  assert.equal((await governor.snapshot('process')).used, 1);
+  assert.equal(await queue.cancel({ id: 'waiting', kind: 'process' }), false);
+  await occupied.release();
+});
+
+test('process lease origins stay in separate groups and unlabeled leases stay unlabeled', async t => {
+  const { governor, queue, directory } = fixture(t, { softLimit: 4, hardLimit: 5 });
+  await governor.acquire({ ...automatic('job-1', 'process'), origin: 'job' });
+  await governor.acquire({ ...automatic('warm-1', 'process'), origin: 'prewarm' });
+  await governor.acquire({ ...automatic('user-1', 'process'), origin: 'user-opened' });
+  await governor.acquire(automatic('old-1', 'process'));
+  const waiting = await queue.tryAdmit(automatic('waiting', 'process'));
+  assert.equal(isPending(waiting), true);
+  const names = readdirSync(join(directory, 'queue')).filter(name => name.startsWith('entry-'));
+  assert.equal(names.length, 1);
+  const path = join(directory, 'queue', names[0]!);
+  const record = JSON.parse(readFileSync(path, 'utf8'));
+  record.enqueuedAt = Date.now() - 61_000;
+  writeFileSync(path, JSON.stringify(record));
+  const report = await governor.inspect();
+  const ids = (origin: 'prewarm' | 'job' | 'user-opened' | 'unlabeled') => report.sessions[origin].map(item => item.id).sort();
+  assert.deepEqual(ids('job'), ['job-1']);
+  assert.deepEqual(ids('prewarm'), ['warm-1']);
+  assert.deepEqual(ids('user-opened'), ['user-1']);
+  assert.deepEqual(ids('unlabeled'), ['old-1']);
+  assert.equal(report.taskSlot.used, 0);
+  assert.ok(report.taskSlot.used < report.taskSlot.limit);
+  assert.equal(report.processSlot.used, report.processSlot.limit);
+  assert.ok(await queue.headWaitMs('process') >= 60_000);
+  assert.deepEqual((await governor.inspect()).sessions.unlabeled.map(item => item.id), ['old-1']);
+  await queue.cancel({ id: 'waiting', kind: 'process' });
+});
+
+test('tryAdmit acquires a free process slot and cancel does not release that lease', async t => {
+  const { governor, queue, directory } = fixture(t);
+  const admitted = await queue.tryAdmit(automatic('free', 'process'));
+  assert.equal(isPending(admitted), false);
+  assert.equal(entries(directory).length, 0);
+  assert.equal(await queue.cancel({ id: 'free', kind: 'process' }), false);
+  assert.equal((await governor.snapshot('process')).used, 1);
+  if (!isPending(admitted)) await admitted.release();
+  assert.equal((await governor.snapshot('process')).used, 0);
 });

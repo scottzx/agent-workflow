@@ -57,6 +57,24 @@ class RoleSkillLoadingError extends Error {
   constructor(cause: unknown) { super('Role skills could not be loaded or verified; the model was not started', { cause }); }
 }
 
+const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS', 'MODEL_UNAVAILABLE', 'MODEL_SELECTION_UNSUPPORTED']);
+
+function sessionFailureCode(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  const queue = [error];
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    const record = current as { code?: unknown; message?: unknown; cause?: unknown };
+    if (typeof record.code === 'string' && sessionFailureCodes.has(record.code)) return record.code;
+    if (record.code === -32003 || record.message === 'Session was deleted') return 'SESSION_DELETED';
+    if (typeof record.message === 'string' && /cwd conflicts|preset conflicts|identity conflicts/.test(record.message)) return 'SESSION_CONFLICT';
+    if (record.cause !== undefined) queue.push(record.cause);
+  }
+  return undefined;
+}
+
 async function waitForPreparation(previous: Promise<void>, signal: AbortSignal): Promise<void> {
   signal.throwIfAborted();
   let abort!: () => void;
@@ -71,6 +89,7 @@ async function waitForPreparation(previous: Promise<void>, signal: AbortSignal):
 /** Validate application metadata before the SDK starts an execution. */
 export function parseA2AInput(request: SendMessageRequest, options: A2AExecutionOptions): {
   prompt: string; input: A2APrepareInput; resultContract?: A2AResultContract;
+  execution?: { jobId: string; attemptId: string };
 } {
   const message = request.message;
   if (!message?.messageId.trim() || message.role !== Role.ROLE_USER) throw new RequestMalformedError('A user message with messageId is required');
@@ -82,10 +101,11 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   const metadata: unknown = request.metadata?.['1agents'];
   if (metadata !== undefined && (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))) throw new RequestMalformedError('metadata.1agents must be an object');
   const value = (metadata ?? {}) as Record<string, unknown>;
-  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
-  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath']) {
+  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
+  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath', 'provider', 'model']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !(value[key] as string).trim())) throw new RequestMalformedError(`${key} must be a nonempty string`);
   }
+  if ((value.provider === undefined) !== (value.model === undefined)) throw new RequestMalformedError('provider and model must be passed together');
   if (value.roleId !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value.roleId as string)
       || !options.roleSkills || !Object.hasOwn(options.roleSkills.profiles, value.roleId as string))) throw new RequestMalformedError('Unknown host role');
   if (value.roleLockPath !== undefined && (!options.roleSkills || !isAbsolute(value.roleLockPath as string)
@@ -100,11 +120,26 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   if (preflight && !preflight.success) throw new RequestMalformedError('Invalid preflight requirements');
   const resultContract = value.resultContract === undefined ? undefined : a2aResultContractSchema.safeParse(value.resultContract);
   if (resultContract && !resultContract.success) throw new RequestMalformedError('Invalid result contract');
+  const execution = executionOf(value.execution);
   return { prompt, input: { cwd, agentPreset: value.agentPreset as string | undefined,
     ...(preflight?.success ? { preflight: preflight.data } : {}),
     ...(value.roleId ? { roleId: value.roleId as string } : {}),
-    ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}) },
-    ...(resultContract?.success ? { resultContract: resultContract.data } : {}) };
+    ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}),
+    ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}) },
+    ...(resultContract?.success ? { resultContract: resultContract.data } : {}),
+    ...(execution ? { execution } : {}) };
+}
+
+function executionOf(value: unknown): { jobId: string; attemptId: string } | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestMalformedError('execution must be an object');
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) if (key !== 'jobId' && key !== 'attemptId') throw new RequestMalformedError(`Unknown metadata.1agents.execution field: ${key}`);
+  for (const key of ['jobId', 'attemptId'] as const) {
+    const item = record[key];
+    if (typeof item !== 'string' || !item.trim() || item.length > 512 || item.includes('\0')) throw new RequestMalformedError(`execution.${key} must be a nonempty string`);
+  }
+  return { jobId: (record.jobId as string).trim(), attemptId: (record.attemptId as string).trim() };
 }
 
 /** SDK owns the execution lifetime; an HTTP disconnect never aborts this signal. */
@@ -167,6 +202,9 @@ export class A2ASessionExecutor implements AgentExecutor {
 
   isRunning(taskId: string): boolean { return this.active.has(taskId); }
 
+  /** A person took the session over: the pending question is no longer answered through A2A. */
+  releaseInput(taskId: string): void { this.awaitingInput.delete(taskId); }
+
   async execute(context: RequestContext, bus: ExecutionEventBus): Promise<void> {
     if (this.stopped) throw new UnsupportedOperationError('A2A host is stopping');
     if (this.active.has(context.taskId)) throw new UnsupportedOperationError('This task already has an active execution');
@@ -187,12 +225,14 @@ export class A2ASessionExecutor implements AgentExecutor {
     // DSH deduplicates prompts by rpcId across the whole session. A Task can
     // have several input-required turns, each with its own message identity.
     const requestId = a2aRequestId(context.taskId, context.userMessage.messageId);
-    const status = (state: TaskState, text?: string, error?: SafeError): void => {
+    const status = (state: TaskState, text?: string, error?: SafeError, capacity?: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number }, slots?: { taskSlot: { limit: number; used: number }; processSlot: { limit: number; used: number; headWaitMs: number } }): void => {
       bus.publish(AgentEvent.statusUpdate({ taskId: context.taskId, contextId: context.contextId,
         status: { state, timestamp: new Date().toISOString(), message: text ? Message.fromJSON({
           messageId: randomUUID(), role: 'ROLE_AGENT', contextId: context.contextId, taskId: context.taskId, parts: [{ text }],
-        }) : undefined }, metadata: target || error || resultMetadata ? { '1agents': {
+        }) : undefined }, metadata: target || error || resultMetadata || capacity || slots ? { '1agents': {
           ...target, ...(resultMetadata ? { result: resultMetadata } : {}), ...(error ? { error } : {}),
+          ...(capacity ? { capacity } : {}),
+          ...(slots ? { taskSlot: slots.taskSlot, processSlot: slots.processSlot } : {}),
         } } : undefined }));
     };
     const submitted = (text?: string): void => {
@@ -227,7 +267,8 @@ export class A2ASessionExecutor implements AgentExecutor {
         }
       }
       signal.throwIfAborted();
-      status(TaskState.TASK_STATE_WORKING);
+      // ACP process admission is still ahead of this call. Stay submitted until the slot is held.
+      if (!target?.agentPreset?.startsWith('oneagents-acp-')) status(TaskState.TASK_STATE_WORKING);
     };
     try {
       const parsed = parseA2AInput(context.request, this.options);
@@ -254,20 +295,28 @@ export class A2ASessionExecutor implements AgentExecutor {
         await waitForPreparation(previous, controller.signal);
         controller.signal.throwIfAborted();
         const saved = this.store.loadTarget(context.contextId, context.context);
+        if (saved?.state === 'deleted') throw Object.assign(new Error('Session was deleted'), { code: 'SESSION_DELETED' });
         if (saved?.roleSkills) submitted();
         let role;
         try { role = await this.roleFor(input, saved, key, controller.signal); }
         catch (error) { throw new RoleSkillLoadingError(error); }
         controller.signal.throwIfAborted();
+        const agentPreset = input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset;
+        // ACP Agents publish their own model options through session/set_config_option.
+        if (input.provider && agentPreset?.startsWith('oneagents-acp-')) throw Object.assign(new Error('provider and model apply only to standard presets'), { code: 'MODEL_SELECTION_UNSUPPORTED' });
         // ACP session preparation can itself wait in the process FIFO.
-        if ((input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset)?.startsWith('oneagents-acp-')) pendingCapacity();
+        if (agentPreset?.startsWith('oneagents-acp-')) pendingCapacity();
         // Acquire only after context/role waits, immediately before session creation.
         capacityLease = await acquireCapacity();
         controller.signal.throwIfAborted();
         target = await this.backend.prepare({ sessionId: saved?.sessionId,
           cwd: input.cwd ?? saved?.cwd ?? this.options.defaultCwd,
-          agentPreset: input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset,
-          ...(input.preflight ? { preflight: input.preflight } : {}) }, { signal: controller.signal });
+          agentPreset,
+          ...(input.preflight ? { preflight: input.preflight } : {}),
+          ...(input.provider ? { provider: input.provider, model: input.model } : {}) }, { signal: controller.signal });
+        if (input.provider && !target.provider) throw Object.assign(new Error('The host did not apply the requested model'), { code: 'MODEL_UNAVAILABLE' });
+        // The DSH session keeps its earlier selection; report it until a new value is passed.
+        if (!target.provider && saved?.provider) { target.provider = saved.provider; target.model = saved.model; }
         if (role) { target.roleId = role.roleId; target.roleSkills = role.summary; promptPrefix = role.promptPrefix; }
         this.store.saveTarget(context.contextId, target, context.context);
       } finally {
@@ -278,7 +327,22 @@ export class A2ASessionExecutor implements AgentExecutor {
       // Preparation can include I/O or a cold ACP handshake. Never start the
       // model using a memory observation taken before that work.
       await beforeStart();
-      const result = await this.backend.run(target, promptPrefix + prompt, { requestId, signal: controller.signal, beforeStart });
+      const onCapacity = (pending: { code: 'CAPACITY_PENDING'; position: number; waitedMs: number } | undefined): void => {
+        if (!target?.agentPreset?.startsWith('oneagents-acp-')) return;
+        void this.capacity.slotView().then(slots => {
+          if (pending) {
+            submitted();
+            status(TaskState.TASK_STATE_SUBMITTED, 'CAPACITY_PENDING', undefined, pending, slots);
+          } else status(TaskState.TASK_STATE_WORKING, undefined, undefined, undefined, slots);
+        }).catch(() => {
+          if (pending) {
+            submitted();
+            status(TaskState.TASK_STATE_SUBMITTED, 'CAPACITY_PENDING', undefined, pending);
+          } else status(TaskState.TASK_STATE_WORKING);
+        });
+      };
+      const result = await this.backend.run(target, promptPrefix + prompt, { requestId, signal: controller.signal, beforeStart, onCapacity,
+        ...(parsed.execution ? { execution: parsed.execution } : {}) });
       returnedError = result.outcome === 'failed' && result.error !== undefined
         ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
       returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
@@ -318,7 +382,7 @@ export class A2ASessionExecutor implements AgentExecutor {
       });
       resultMetadata = await createA2AResultMetadata({ taskId: context.taskId, contextId: context.contextId,
         requestId, startedAt, outcome: controller.signal.aborted ? 'canceled' : 'failed', target, contract: resultContract,
-        validationCode: capacityFailure?.code ?? (error instanceof A2AResultValidationError ? error.code : error instanceof RoleSkillLoadingError ? 'role-skills-unavailable' : undefined),
+        validationCode: capacityFailure?.code ?? sessionFailureCode(error) ?? (error instanceof A2AResultValidationError ? error.code : error instanceof RoleSkillLoadingError ? 'role-skills-unavailable' : undefined),
         ...(error instanceof A2APreflightError ? { preflight: error.report } : {}) });
       try { await saveA2AResultMetadata(resultMetadata, target); }
       catch { resultMetadata.validation = { status: 'failed', code: 'result-record-write-failed' }; delete resultMetadata.recordPath; }

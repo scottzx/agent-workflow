@@ -33,6 +33,7 @@ class DeferredBackend implements A2ABackend {
   readonly preparations: A2APrepareInput[] = [];
   readonly runs: Array<{
     target: A2ATarget; prompt: string; requestId: string; signal: AbortSignal;
+    execution?: { jobId: string; attemptId: string };
     result: ReturnType<typeof deferred<A2ARunResult>>;
   }> = [];
 
@@ -45,9 +46,10 @@ class DeferredBackend implements A2ABackend {
     };
   }
 
-  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal }): Promise<A2ARunResult> {
+  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; execution?: { jobId: string; attemptId: string } }): Promise<A2ARunResult> {
     const result = deferred<A2ARunResult>();
-    const call = { target: structuredClone(target), prompt, ...options, result };
+    const call = { target: structuredClone(target), prompt, requestId: options.requestId, signal: options.signal,
+      ...(options.execution ? { execution: { ...options.execution } } : {}), result };
     this.runs.push(call);
     const abort = (): void => result.reject(options.signal.reason);
     options.signal.addEventListener('abort', abort, { once: true });
@@ -694,6 +696,15 @@ test('HTTP authentication, version negotiation and invalid input fail before bac
   assert.equal(f.backend.runs.length, 0);
 });
 
+test('gateway execution metadata is forwarded to the run and kept out of session preparation', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const task = await submit(f.client, message('work', { metadata: { cwd: '/tmp/a2a-project', execution: { jobId: 'job-1', attemptId: 'attempt-1' } } }));
+  assert.deepEqual(f.backend.preparations[0], { sessionId: undefined, cwd: '/tmp/a2a-project', agentPreset: 'coding' });
+  assert.deepEqual(f.backend.runs[0]?.execution, { jobId: 'job-1', attemptId: 'attempt-1' });
+  f.backend.runs[0]!.result.resolve({ text: 'done', outcome: 'completed' });
+  await waitForTask(f.client, task.id, TaskState.TASK_STATE_COMPLETED);
+});
+
 test('slow allowed webhooks do not delay SendMessage or completion, and push configs support standard CRUD', { timeout: 10000 }, async t => {
   const release = deferred<void>();
   const entered = deferred<void>();
@@ -769,4 +780,14 @@ test('callback destinations require an allowed origin and redirects never reach 
   await waitForTask(f.client, task.id, TaskState.TASK_STATE_COMPLETED);
   await f.close();
   assert.equal(forbiddenHits, 0, 'Webhook redirect leaked a request outside the allowlist');
+});
+
+test('a host-default ACP preset rejects provider and model before preparing a session', async t => {
+  const f = await fixture(t, { defaultAgentPreset: 'oneagents-acp-grok' });
+  await assert.rejects(f.client.sendMessage(message('half', { metadata: { provider: 'deepseek' } }), authenticated), /passed together/);
+  const task = await submit(f.client, message('work', { metadata: { provider: 'deepseek', model: 'deepseek-v4' } }));
+  const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+  assert.equal((failed.metadata?.['1agents'] as { result: { validation: { code: string } } }).result.validation.code, 'MODEL_SELECTION_UNSUPPORTED');
+  assert.equal(f.backend.preparations.length, 0);
+  assert.equal(f.backend.runs.length, 0);
 });

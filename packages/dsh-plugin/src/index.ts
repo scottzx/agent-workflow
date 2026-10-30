@@ -11,6 +11,13 @@ import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
 import { mountDshA2A, type DshA2AOptions } from './a2a.js';
+import { createWorkbenchProcessClient } from './process-requests.js';
+import { registerNativeApprovals } from './native-approvals.js';
+import type {} from '@deepseek-ai/dsh-tools';
+import { defineTool } from '@deepseek-ai/dsh-tools';
+import { WORKBENCH_UI_PATH, currentA2AExecution } from '@1agents/acp-service/a2a';
+import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
+import { workbenchHandler } from './workbench.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
@@ -33,8 +40,11 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   const diagnosticOwner = await openDiagnostics(resolve(input.diagnosticsDirectory ?? join(config.stateDirectory, 'diagnostics')));
   const { diagnostics } = diagnosticOwner;
   let closeA2A: (() => Promise<void>) | undefined;
-  const adapter = new AcpAdapter(ctx, config, diagnostics);
+  const processRequests = input.a2a?.workbench ? createWorkbenchProcessClient(input.a2a.workbench) : undefined;
+  const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
+  // A Cordis listener is released with this plugin's fiber.
+  if (processRequests) registerNativeApprovals(ctx, processRequests);
   const nativeSessions = new NativeSessions(ctx, adapter, config);
   ctx.provide('oneagentsAcpSessions', nativeSessions);
   ctx.effect(() => async () => {
@@ -74,5 +84,28 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     });
     ctx.effect(() => dispose);
   }
-  if (input.a2a) closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics);
+  if (input.a2a) {
+    const review = await ReviewHandBack.open(join(home, 'plugins', '1agents-acp', 'review.secret'), input.a2a.workbench);
+    ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: WORKBENCH_UI_PATH, handler: workbenchHandler(ctx, { workbench: input.a2a!.workbench, host: () => review.host }) }));
+    ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: REVIEW_SUBMIT_PATH, handler: review.handler }));
+    ctx.effect(() => ctx.tools.register(defineTool({
+      name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
+      parameters: { summary: { type: 'string', required: true, description: SUMMARY_DESCRIPTION } },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { message: { type: 'string', required: true } } },
+        render: (_args, value) => [{ type: 'text', text: value.message }] },
+      async execute(args, exec) {
+        if (!exec.agent) throw new Error(`${SUBMIT_TOOL} requires an owning agent session`);
+        return { message: await review.submit(exec.agent.id, args.summary) };
+      },
+    })));
+    // ACP agents reach the same hand-back through a per-session MCP server, offered only to A2A task sessions.
+    const origin = `${(ctx.webServer as { protocol?: string }).protocol ?? 'http:'}//127.0.0.1:${ctx.webServer.port}`;
+    adapter.mcpServersFor = sessionId => review.host && (currentA2AExecution(sessionId) || review.host.sessionTask(sessionId))
+      ? [review.mcpServer(sessionId, origin)] : [];
+    closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics, {
+      release: sessionId => adapter.releaseSession(sessionId),
+      delete: sessionId => adapter.deleteSession(sessionId),
+      status: sessionId => adapter.sessionStatus(sessionId),
+    }, host => { review.host = host; });
+  }
 }

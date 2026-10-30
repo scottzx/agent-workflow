@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "xingjian-showroom",
+  "kind": "original",
+  "locked": true,
+  "input": {
+    "repo": "scottzx/xingjian-showroom",
+    "commit": "40ed6130143215aa5c60826da72e8be6d2020de6",
+    "exclude": [],
+    "audience": "需要向客户展示商品或空间方案的销售与设计团队"
+  },
+  "features": "features.json",
+  "accepted": null
+}

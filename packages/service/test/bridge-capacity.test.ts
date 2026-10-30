@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -127,5 +127,42 @@ test('bridge cancels pending session launches, including profile keys and late s
       assert.equal(ws.events.some(event => event.event === 'session_ready'), false);
       assert.equal(ws.events.some(event => event.code === 'SESSION_NOT_FOUND'), false);
     } finally { Reflect.set(bridge.runtime, 'ensureSession', originalEnsure); }
+  });
+
+  await t.test('a full process slot returns CAPACITY_PENDING before the handshake budget', async () => {
+    const occupied = await governor.acquire({ kind: 'process', source: 'automatic', id: 'occupied-probe' });
+    const ws = peer();
+    const started = Date.now();
+    try {
+      await deadline(bridge.dispatchCommand(ws, { action: 'ensure_session', sessionId: 'pending-capacity-id', workspacePath: directory,
+        agentType: 'codex', responsePolicy: 'summary', capacityId: 'a2a-probe-1' }));
+      assert.ok(Date.now() - started < 5000);
+      const pending = ws.events.find(event => event.code === 'CAPACITY_PENDING');
+      assert.ok(pending);
+      const data = pending.data as { position?: unknown; waitedMs?: unknown };
+      assert.equal(typeof data.position, 'number');
+      assert.ok((data.position as number) >= 1);
+      assert.equal(typeof data.waitedMs, 'number');
+      assert.equal(ws.events.some(event => event.event === 'session_ready'), false);
+      assert.equal(bridge.activeSessions.has('pending-capacity-id'), false);
+      const names = queueEntries();
+      assert.equal(names.length, 1);
+      const file = join(capacityDirectory, 'queue', names[0]!);
+      const record = JSON.parse(readFileSync(file, 'utf8'));
+      record.enqueuedAt = Date.now() - 61_000;
+      writeFileSync(file, JSON.stringify(record));
+      const again = peer();
+      await deadline(bridge.dispatchCommand(again, { action: 'ensure_session', sessionId: 'pending-capacity-id-2', workspacePath: directory,
+        agentType: 'codex', responsePolicy: 'summary', capacityId: 'a2a-probe-1' }));
+      const waited = again.events.find(event => event.code === 'CAPACITY_PENDING');
+      assert.ok(waited);
+      assert.ok((waited.data as { waitedMs: number }).waitedMs >= 60_000);
+      assert.equal(queueEntries().length, 1);
+      await deadline(bridge.dispatchCommand(again, { action: 'capacity_cancel', sessionId: 'pending-capacity-id-2', capacityId: 'a2a-probe-1' }));
+      assert.equal(queueEntries().length, 0);
+      assert.equal((await governor.snapshot('process')).used, 1);
+      assert.equal(bridge.activeSessions.has('pending-capacity-id'), false);
+      assert.equal(bridge.activeSessions.has('pending-capacity-id-2'), false);
+    } finally { await occupied.release(); }
   });
 });

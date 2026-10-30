@@ -10,12 +10,12 @@ import { decideHumanReview, type HumanReviewDecisionInput } from '../src/executi
 
 const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, slideCount = 6) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'ppt-human-review-test-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = join(root, 'project'); await mkdir(project);
   const files: { path: string; sha256: string }[] = [];
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < Math.max(6, slideCount); i++) {
     const path = `fact-${i}.md`, content = `Source fact ${i}`;
     await writeFile(join(project, path), content); files.push({ path, sha256: hash(content) });
   }
@@ -45,7 +45,7 @@ async function fixture(t: TestContext) {
   };
   async function writeScript(revision = run.scriptRevision ?? 1) {
     const directory = join(run.jobDirectory, 'coordinator', `script-v${revision}`); await mkdir(directory, { recursive: true });
-    const script = { title: `Project script v${revision}`, slides: files.map((file, i) => ({ title: `Page ${i} v${revision}`, message: `Source fact ${i}`,
+    const script = { title: `Project script v${revision}`, slides: files.slice(0, slideCount).map((file, i) => ({ title: `Page ${i} v${revision}`, message: `Source fact ${i}`,
       body: [`Version ${revision} content`], visual: 'Diagram', sources: [`${file.path}:1`], facts: [`Source fact ${i}`], notes: '' })) };
     await writeFile(join(directory, 'slide-script.json'), JSON.stringify(script));
     await writeFile(join(directory, 'slide-script.md'), `# Script v${revision}`); await writeFile(join(directory, 'project-summary.md'), `Project summary v${revision}`);
@@ -153,3 +153,17 @@ test('approved script byte drift is held for reconciliation and cannot start pro
   await f.step(); assert.equal(f.run.stage, 'summary'); assert.equal(f.calls.filter(call => call.request.purpose === 'ppt_production').length, 0);
   assert.equal(f.latestReview.resume?.status, 'pending'); assert.ok(f.run.diagnostics.some(message => message.includes('Human continuation deferred')));
 });
+
+for (const slideCount of [8, 12]) {
+  test(`a ${slideCount}-page script reaches human review with all ${slideCount} pages and production keeps N pages`, async t => {
+    const f = await fixture(t, slideCount); await f.untilHuman();
+    assert.equal(f.run.phase, 'awaiting_human'); assert.equal(f.latestReview.status, 'pending');
+    assert.equal(f.latestReview.preview.slides.length, slideCount);
+    assert.match(f.latestReview.title, new RegExp(`${slideCount}页文字稿`));
+    await f.decide('approve'); await f.step();
+    assert.equal(f.run.stage, 'make'); assert.equal(f.run.executionStatus, 'working');
+    const contract = JSON.parse(await readFile(join(f.run.jobDirectory, 'revision-1', 'production-contract.json'), 'utf8'));
+    assert.equal(contract.slideCount, slideCount); assert.equal(contract.artifacts.length, slideCount + 2);
+    assert.ok(contract.artifacts.some((item: { path: string }) => item.path.endsWith(`slide-${slideCount}.png`)));
+  });
+}

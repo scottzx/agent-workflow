@@ -105,19 +105,50 @@ let capacityLaunchAbort = new AbortController();
 const sessionLaunchControllers = new Map();
 const initializingSessionControllers = new Map();
 const capacityLaunchSignals = new Map();
+// A probed process lease is held before ensureSession. onBeforeSpawn must
+// consume that lease instead of acquiring a second slot. launchId !== capacityId.
+const preparedProcessLeases = new Map();
+const preparedByLaunch = new Map();
+const preparedLaunches = new Set();
+const handshakeTimers = new Map();
+function handshakeMs() {
+  const value = Number(process.env.ACP_HANDSHAKE_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 60_000;
+}
+// How long a permission, question or plan prompt waits for a person. The A2A
+// workbench deadline (workbench.requestTimeoutMinutes) must not be longer.
+function interactionTimeoutMs() {
+  const value = Number(process.env.ACP_INTERACTION_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 5 * 60 * 1000;
+}
+function interactionTimeoutText() {
+  return `${Math.round(interactionTimeoutMs() / 60_000)}min`;
+}
+function clearHandshake(launchId) {
+  const timer = handshakeTimers.get(launchId);
+  if (timer) clearTimeout(timer);
+  handshakeTimers.delete(launchId);
+  preparedLaunches.delete(launchId);
+  preparedByLaunch.delete(launchId);
+}
+const launchOrigins = new Map();
 const capacityLifecycle = createCapacityLifecycle({
-  acquire: request => processCapacity.acquire(request, {
-    signal: capacityLaunchSignals.get(request.id) || capacityLaunchAbort.signal,
-  }),
+  acquire: request => {
+    const prepared = preparedByLaunch.get(request.id);
+    if (prepared) return prepared;
+    const origin = launchOrigins.get(request.id);
+    return processCapacity.acquire(origin ? { ...request, origin } : request, {
+      signal: capacityLaunchSignals.get(request.id) || capacityLaunchAbort.signal,
+    });
+  },
 });
 const runtime = createAcpRuntime({
   // Includes compatibility checks, probes and pre-warm launches. Native user
   // processes outside this service are not admitted through this governor.
   processLifecycle: {
     async onBeforeSpawn(launch) {
-      const session = launch.scope.kind === "runtime-session"
-        ? sessionLaunchControllers.get(launch.scope.sessionKey)
-        : undefined;
+      const sessionKey = launch.scope.kind === "runtime-session" ? launch.scope.sessionKey : undefined;
+      const session = sessionKey ? sessionLaunchControllers.get(sessionKey) : undefined;
       // Capture the generation before the lifecycle's deferred acquire runs.
       const signal = AbortSignal.any([
         capacityLaunchAbort.signal,
@@ -125,19 +156,45 @@ const runtime = createAcpRuntime({
       ]);
       capacityLaunchSignals.set(launch.launchId, signal);
       signal.throwIfAborted();
+      if (sessionKey && preparedProcessLeases.has(sessionKey)) {
+        const lease = preparedProcessLeases.get(sessionKey);
+        preparedProcessLeases.delete(sessionKey);
+        preparedByLaunch.set(launch.launchId, Promise.resolve(lease));
+        preparedLaunches.add(launch.launchId);
+      }
+      const origin = typeof sessionKey === "string" && sessionKey.startsWith("prewarm_grok_")
+        ? "prewarm"
+        : typeof sessionKey === "string" && sessionKey ? "user-opened" : undefined;
+      if (origin) launchOrigins.set(launch.launchId, origin);
       await capacityLifecycle.onBeforeSpawn(launch);
       signal.throwIfAborted();
+      // The 60s budget starts only after the process slot is held.
+      if (preparedLaunches.has(launch.launchId)) {
+        const timer = setTimeout(() => {
+          if (!preparedLaunches.has(launch.launchId)) return;
+          const current = sessionKey ? sessionLaunchControllers.get(sessionKey) : undefined;
+          current?.controller.abort(new Error("ACP handshake timed out"));
+        }, handshakeMs());
+        timer.unref?.();
+        handshakeTimers.set(launch.launchId, timer);
+      }
     },
     async onSpawned(started) {
+      clearHandshake(started.launchId);
       await capacityLifecycle.onSpawned(started);
       capacityLaunchSignals.delete(started.launchId);
+      launchOrigins.delete(started.launchId);
     },
     onSpawnFailed(failure) {
+      clearHandshake(failure.launchId);
       capacityLaunchSignals.delete(failure.launchId);
+      launchOrigins.delete(failure.launchId);
       return capacityLifecycle.onSpawnFailed(failure);
     },
     onExit(exit) {
+      clearHandshake(exit.launchId);
       capacityLaunchSignals.delete(exit.launchId);
+      launchOrigins.delete(exit.launchId);
       return capacityLifecycle.onExit(exit);
     },
   },
@@ -1625,6 +1682,29 @@ export async function dispatchCommand(ws, payload) {
             }
           }
 
+          if (typeof payload.capacityId === "string" && payload.capacityId.trim()) {
+            const capacityId = payload.capacityId.trim();
+            if (capacityId.length > 4096) {
+              sendError(ws, sessionId, "INVALID_PARAMS", "capacityId is invalid");
+              console.timeEnd(`ensure_session_${sessionId}`);
+              break;
+            }
+            const admission = await processCapacity.tryAdmit(
+              { kind: "process", source: "automatic", id: capacityId, origin: capacityId.startsWith("a2a-") ? "job" : "user-opened" },
+              { signal: initializationSignal },
+            );
+            if (admission?.pending === true) {
+              sendCapacityPending(ws, sessionId, admission);
+              console.timeEnd(`ensure_session_${sessionId}`);
+              break;
+            }
+            const previousLease = preparedProcessLeases.get(runtimeSessionKey);
+            if (previousLease && previousLease !== admission) {
+              try { await previousLease.release(); } catch { /* A later exit observation retries release. */ }
+            }
+            preparedProcessLeases.set(runtimeSessionKey, admission);
+          }
+
           console.log(
             `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
@@ -1729,6 +1809,11 @@ export async function dispatchCommand(ws, payload) {
               );
             }
           } catch (error) {
+            const leftover = preparedProcessLeases.get(runtimeSessionKey);
+            if (leftover) {
+              preparedProcessLeases.delete(runtimeSessionKey);
+              try { await leftover.release(); } catch { /* A later exit observation retries release. */ }
+            }
             if (initialization.controller.signal.aborted && initializedHandle) {
               const current = activeSessions.get(sessionId);
               if (current?.handle === initializedHandle) {
@@ -2626,6 +2711,16 @@ export async function dispatchCommand(ws, payload) {
           break;
         }
 
+        case "capacity_cancel": {
+          const capacityId = typeof payload.capacityId === "string" ? payload.capacityId.trim() : "";
+          if (!capacityId || capacityId.length > 4096) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "capacityId is required");
+            return;
+          }
+          await processCapacity.cancel({ id: capacityId, kind: "process" });
+          break;
+        }
+
         default:
           sendError(ws, sessionId, "UNKNOWN_ACTION", `Action ${action} is not supported`);
       }
@@ -2781,6 +2876,18 @@ function notifySessionTakenOver(previousWs, nextWs, sessionId) {
   } catch (err) {
     console.warn(`[acpx-server] Failed to notify taken-over ws for ${sessionId}:`, err.message);
   }
+}
+
+function sendCapacityPending(ws, sessionId, pending) {
+  ws.send(JSON.stringify({
+    event: "error",
+    sessionId,
+    code: "CAPACITY_PENDING",
+    message: "CAPACITY_PENDING",
+    scope: "control",
+    terminal: false,
+    data: { position: pending.position, waitedMs: pending.waitedMs },
+  }));
 }
 
 // Helper for sending error events
@@ -3348,13 +3455,13 @@ async function handleExitPlanModeCallback(req, ctx) {
             event: "exit_plan_mode_timeout",
             requestId,
             toolCallId,
-            message: "exit_plan_mode auto-abandoned after 5min timeout.",
+            message: `exit_plan_mode auto-abandoned after ${interactionTimeoutText()} timeout.`,
           });
         } catch {
           // socket may already be closed
         }
       },
-      5 * 60 * 1000,
+      interactionTimeoutMs(),
     );
 
     const payload = {
@@ -3428,13 +3535,13 @@ async function handleAskUserQuestionCallback(req, ctx) {
             event: "ask_user_question_timeout",
             requestId,
             toolCallId,
-            message: "ask_user_question auto-cancelled after 5min timeout.",
+            message: `ask_user_question auto-cancelled after ${interactionTimeoutText()} timeout.`,
           });
         } catch {
           // socket may already be closed
         }
       },
-      5 * 60 * 1000,
+      interactionTimeoutMs(),
     );
 
     const payload = {
@@ -3531,11 +3638,12 @@ async function handlePermissionRequestCallback(req, ctx) {
     return { outcome: "allow_once" };
   }
 
-  // Per-session mode shortcut — gates the prompt without round-tripping
-  // through the UI. approve-reads falls through to the normal flow
-  // (1acp internally auto-allows read/search; everything else prompts).
-  // approve-all and deny-all are blanket decisions for the entire
-  // session until the user toggles the mode again.
+  // Bridge permissionMode (approve-reads / approve-all / deny-all) is not
+  // applied. Tool posture follows ACP settings the user can select or import:
+  // native mode (session/set_mode; Grok handled above) and config options such
+  // as reasoning effort (session/set_config_option). Other agents fall through
+  // to project allow-rules and a prompt.
+  /*
   if (!grokMode && session.permissionMode === "approve-all") {
     console.log(
       `[acpx-server] permission mode=approve-all → auto allow_once for ${req.raw.toolCall.title}`,
@@ -3548,6 +3656,7 @@ async function handlePermissionRequestCallback(req, ctx) {
     );
     return { outcome: "reject_once" };
   }
+  */
 
   // Project-level "总是允许" allowlist: a prior allow_always for this
   // tool+prefix auto-approves without prompting again. Read fresh from the
@@ -3571,7 +3680,7 @@ async function handlePermissionRequestCallback(req, ctx) {
   );
 
   return new Promise((resolve, reject) => {
-    // Timeout handler: 5 minutes auto-deny
+    // Timeout handler: auto-deny after the interaction timeout
     const timer = setTimeout(
       () => {
         console.warn(`[acpx-server] Permission request ${requestId} timed out. Auto-denying.`);
@@ -3582,10 +3691,10 @@ async function handlePermissionRequestCallback(req, ctx) {
         sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
           event: "permission_timeout",
           requestId,
-          message: `Permission request for "${req.raw.toolCall.title}" auto-denied after 5min timeout.`,
+          message: `Permission request for "${req.raw.toolCall.title}" auto-denied after ${interactionTimeoutText()} timeout.`,
         });
       },
-      5 * 60 * 1000,
+      interactionTimeoutMs(),
     );
 
     // Save pending info — include session and full payload so the reconnect

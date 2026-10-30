@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JobLedger, type LedgerTargetSnapshot } from '../src/execution/ledger.js';
 import { createHumanReview, decideHumanReview } from '../src/execution/human-review.js';
+import { answerProcessRequest, createProcessRequest, PROCESS_REQUEST_TTL_MS } from '../src/execution/process-request.js';
 import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask } from '../src/execution/workbench.js';
 import type { PptDeliveryRun } from '../src/execution/ppt-delivery.js';
 
@@ -70,8 +71,11 @@ test('historical result versions apply the same receipt and artifact filtering a
   for (const result of [attempt.result!, ...attempt.resultHistory!]) {
     assert.equal(result.structuredResultRef, undefined);
     assert.deepEqual(result.artifactLinks, ['https://example.invalid/script.md']);
-    if (result.resultArtifacts) assert.deepEqual(result.resultArtifacts, [{ path: '/output/script.md', url: 'https://example.invalid/script.md', sha256: 'b'.repeat(64), size: 100 }]);
+    if (result.resultArtifacts) assert.deepEqual(result.resultArtifacts, [{ path: '/private/local-only', sha256: 'a'.repeat(64), size: 42 },
+      { path: '/output/script.md', url: 'https://example.invalid/script.md', sha256: 'b'.repeat(64), size: 100 }]);
   }
+  // Path-only artifacts are listed (name/path, no link) alongside linked ones.
+  assert.deepEqual(detail.artifacts.at(-1)?.artifacts, ['https://example.invalid/script.md', { path: '/private/local-only', sha256: 'a'.repeat(64), size: 42 }]);
   assert.deepEqual(source, before);
 });
 
@@ -243,7 +247,9 @@ test('executor metadata exposes a bounded whitelist without raw binding, input, 
   assert.deepEqual(metadata, { kind: 'temporary', targetId: 'legacy:host', presetStatus: 'recorded', service: 'host-service', agentPreset: 'standard', provider: 'a2a',
     serviceInfo: { kind: 'a2a', source: 'target_snapshot', host: 'private.example', port: 443, locality: 'network', connectionAlias: 'host-service' } });
   assert.deepEqual(detail.attempts[0]?.execution, metadata);
-  const output = JSON.stringify(detail);
+  const { description, ...rest } = detail;
+  assert.equal(description, 'private prompt', 'the prompt is exposed only as the task description');
+  const output = JSON.stringify(rest);
   for (const privateValue of ['private prompt', 'https://private.example/internal', '/private/workspace', '/private/allowed', 'private-skill', 'private credential']) assert.equal(output.includes(privateValue), false);
 });
 
@@ -319,4 +325,105 @@ test('historical service hosts stay frozen when a later execution uses another e
   assert.equal(detail.execution.serviceInfo?.host, 'new.example');
   assert.equal(detail.attempts.find(a => a.attemptId === first.attempt.attemptId)?.execution.serviceInfo?.host, 'old.example');
   assert.equal(detail.attempts.find(a => a.attemptId === next.attempt.attemptId)?.execution.serviceInfo?.host, 'new.example');
+});
+
+test('a live process request waits in the confirmation queue and an expired one does not', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const parent = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'host' }, input: { prompt: 'secret-prompt' }, title: 'Distribution' });
+  ledger.markDispatching(parent.attempt.attemptId);
+  ledger.accept(parent.attempt.attemptId, { taskId: 'parent-task', sessionId: 'parent-session' }, { executionStatus: 'working' });
+  const child = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'author' }, input: {}, title: 'Author',
+    parentJobRef: { sourceId: ledger.sourceId, jobId: parent.job.jobId }, parentAttemptId: parent.attempt.attemptId });
+  ledger.markDispatching(child.attempt.attemptId);
+  ledger.accept(child.attempt.attemptId, { taskId: 'child-task', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const at = new Date('2026-10-27T02:00:00.000Z');
+  const request = createProcessRequest({ requestId: 'prc-1', jobId: child.job.jobId, attemptId: child.attempt.attemptId, sessionId: 'dsh-1', kind: 'question',
+    questions: [{ id: '0', question: 'Choose targets', options: [{ label: 'A' }], multiSelect: true }] }, at);
+  const source = { ledger: ledger.snapshot(), runs: [], reviews: [], processRequests: [request], actorId: 'owner', now: at.getTime() + 60_000 };
+  const before = structuredClone(source);
+  const snapshot = workbenchSnapshot(source);
+  assert.deepEqual(source, before);
+  const detail = getWorkbenchTask(snapshot, child.job.jobId);
+  assert.equal(detail.executionStatus, 'working');
+  assert.equal(detail.displayStatus, 'awaiting_human');
+  assert.equal(detail.pendingProcessRequestId, 'prc-1');
+  assert.equal(detail.processRequests[0]?.canAnswer, true);
+  assert.equal(detail.processRequests[0]?.questions?.[0]?.question, 'Choose targets');
+  const parentDetail = getWorkbenchTask(snapshot, parent.job.jobId);
+  assert.equal(parentDetail.executionStatus, 'working');
+  assert.equal(parentDetail.pendingProcessRequestId, 'prc-1');
+  assert.equal(parentDetail.processRequests[0]?.requestId, 'prc-1');
+  assert.equal(JSON.stringify({ ...snapshot, details: Object.fromEntries(Object.entries(snapshot.details).map(([id, { description: _d, ...rest }]) => [id, rest])) }).includes('secret-prompt'), false, 'only the description may carry the prompt');
+  const pending = listWorkbenchTasks(snapshot, { filter: 'pending' });
+  assert.equal(pending.counts.pending, 1);
+  assert.equal(pending.items.some(item => item.jobId === parent.job.jobId), true);
+  assert.equal(pending.items.some(item => item.jobId === child.job.jobId), true);
+  assert.equal(listWorkbenchTasks(snapshot, { filter: 'working' }).items.some(item => item.jobId === child.job.jobId || item.jobId === parent.job.jobId), false);
+  const expired = workbenchSnapshot({ ...source, now: at.getTime() + PROCESS_REQUEST_TTL_MS + 1 });
+  const expiredDetail = getWorkbenchTask(expired, child.job.jobId);
+  assert.equal(expiredDetail.pendingProcessRequestId, undefined);
+  assert.equal(expiredDetail.displayStatus, 'working');
+  assert.equal(expiredDetail.processRequests[0]?.status, 'expired');
+  assert.equal(expiredDetail.processRequests[0]?.canAnswer, false);
+  assert.equal(listWorkbenchTasks(expired, { filter: 'pending' }).total, 0);
+  assert.equal(request.status, 'pending');
+});
+
+test('a finished task whose tool approval lapsed is not shown as completed, and acceptance shows on the current result only', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const finish = (title: string, digest: string) => {
+    const job = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'grok' }, input: {}, title });
+    ledger.markDispatching(job.attempt.attemptId);
+    ledger.accept(job.attempt.attemptId, { taskId: `${title}-task`, sessionId: `${title}-session` }, { executionStatus: 'completed', resultSummary: 'done',
+      resultRevision: 'result-1', resultDigest: digest.repeat(64) });
+    return job;
+  };
+  const lapsed = finish('lapsed', 'a'), approved = finish('approved', 'b'), accepted = finish('accepted', 'c');
+  const at = new Date('2026-10-27T02:00:00.000Z');
+  const permission = (requestId: string, job: ReturnType<typeof finish>) => createProcessRequest({ requestId, jobId: job.job.jobId, attemptId: job.attempt.attemptId,
+    sessionId: 'dsh-1', kind: 'permission', toolTitle: 'python3 sum.py', toolDetail: 'python3 sum.py' }, at);
+  const granted = answerProcessRequest(permission('prc-ok', approved), { clientRequestId: 'answer-1', outcome: 'approved' }, at).request;
+  ledger.acceptance('session-a', accepted.job.jobId, { attemptId: accepted.attempt.attemptId, resultRevision: 'result-1', resultDigest: 'c'.repeat(64), reviewStatus: 'accepted', note: '750.0 matches' });
+  const snapshot = workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner', now: at.getTime() + PROCESS_REQUEST_TTL_MS + 1,
+    processRequests: [permission('prc-lapsed', lapsed), permission('prc-lapsed-2', lapsed), granted, permission('prc-accepted', accepted)] });
+
+  const blocked = getWorkbenchTask(snapshot, lapsed.job.jobId);
+  assert.equal(blocked.executionStatus, 'completed');
+  assert.equal(blocked.displayStatus, 'tool_blocked');
+  assert.deepEqual(blocked.blockedTools, ['python3 sum.py']);
+  assert.match(blocked.progressSummary, /1 个工具调用未获批准/);
+  assert.equal(blocked.businessAcceptance, undefined);
+  assert.equal(getWorkbenchTask(snapshot, approved.job.jobId).displayStatus, 'completed');
+  const failed = listWorkbenchTasks(snapshot, { filter: 'failed' });
+  assert.deepEqual(failed.items.map(item => item.jobId), [lapsed.job.jobId]);
+
+  const done = getWorkbenchTask(snapshot, accepted.job.jobId);
+  assert.equal(done.displayStatus, 'completed', 'an explicit acceptance settles a lapsed approval');
+  assert.equal(done.businessAcceptance?.reviewStatus, 'accepted');
+  assert.equal(done.businessAcceptance?.note, '750.0 matches');
+  assert.equal(listWorkbenchTasks(snapshot).items.find(item => item.jobId === accepted.job.jobId)?.businessAcceptance?.reviewStatus, 'accepted');
+
+  ledger.observe(accepted.attempt.attemptId, { executionStatus: 'completed', resultSummary: 'redone', resultRevision: 'result-2', resultDigest: 'd'.repeat(64), resultAvailable: true });
+  const revised = getWorkbenchTask(workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner' }), accepted.job.jobId);
+  assert.equal(revised.businessAcceptance, undefined, 'acceptance of an older result does not carry over');
+});
+
+test('an expired tool approval that the agent retried and a person allowed does not mark the task blocked', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const job = ledger.prepare({ originSessionId: 'session-a', targetSnapshot: { targetId: 'grok' }, input: {}, title: 'retry' });
+  ledger.markDispatching(job.attempt.attemptId);
+  ledger.accept(job.attempt.attemptId, { taskId: 'retry-task', sessionId: 'retry-session' }, { executionStatus: 'completed', resultSummary: 'Python 3.12.8',
+    resultRevision: 'result-1', resultDigest: 'e'.repeat(64) });
+  const first = new Date('2026-10-28T03:01:42.000Z'), second = new Date('2026-10-28T03:06:46.000Z');
+  const permission = (requestId: string, toolTitle: string, at: Date) => createProcessRequest({ requestId, jobId: job.job.jobId, attemptId: job.attempt.attemptId,
+    sessionId: 'dsh-1', kind: 'permission', toolTitle, toolDetail: toolTitle }, at);
+  const retried = answerProcessRequest(permission('prc-2', 'python3 --version', second), { clientRequestId: 'answer-2', outcome: 'approved' }, second).request;
+  const view = (requests: ReturnType<typeof permission>[]) => getWorkbenchTask(workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner',
+    now: second.getTime() + PROCESS_REQUEST_TTL_MS + 1, processRequests: requests }), job.job.jobId);
+  const cleared = view([permission('prc-1', 'python3 --version', first), retried]);
+  assert.equal(cleared.displayStatus, 'completed');
+  assert.equal(cleared.blockedTools, undefined);
+  const other = view([permission('prc-1', 'python3 --version', first), retried, permission('prc-3', 'rm sum.txt', second)]);
+  assert.equal(other.displayStatus, 'tool_blocked', 'an approval of one tool does not clear a different one');
+  assert.deepEqual(other.blockedTools, ['rm sum.txt']);
 });

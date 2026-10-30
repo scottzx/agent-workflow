@@ -88,6 +88,8 @@ function parseTask(value: unknown): Task {
   return task;
 }
 
+const targetStates = new Set(['attached', 'busy', 'idle', 'closing', 'closed', 'stale', 'deleted']);
+
 function parseTarget(value: unknown): A2ATarget {
   const source = record(value, 'target');
   const sessionId = text(source.sessionId, 'session ID');
@@ -97,9 +99,48 @@ function parseTarget(value: unknown): A2ATarget {
   const preflight = source.preflight === undefined ? undefined : a2aPreflightReportSchema.parse(source.preflight);
   const roleSkills = source.roleSkills === undefined ? undefined : a2aRoleSkillsSchema.parse(source.roleSkills);
   const roleId = source.roleId === undefined ? undefined : text(source.roleId, 'role identity');
+  const provider = source.provider === undefined ? undefined : text(source.provider, 'model provider');
+  const model = source.model === undefined ? undefined : text(source.model, 'model');
+  if ((provider !== undefined) !== (model !== undefined)) throw new Error('A2A model provider and model must be stored together');
   if ((roleId !== undefined) !== (roleSkills !== undefined)) throw new Error('A2A role identity and skill lock must be stored together');
+  let state: A2ATarget['state'];
+  if (source.state !== undefined) {
+    if (typeof source.state !== 'string' || !targetStates.has(source.state)) throw new Error('Invalid A2A target state');
+    state = source.state as A2ATarget['state'];
+  }
+  let lastUsedAt: string | undefined;
+  if (source.lastUsedAt !== undefined) {
+    lastUsedAt = text(source.lastUsedAt, 'last used time');
+    if (!Number.isFinite(Date.parse(lastUsedAt))) throw new Error('Invalid A2A target last used time');
+  }
+  let resumed: boolean | undefined;
+  if (source.resumed !== undefined) {
+    if (typeof source.resumed !== 'boolean') throw new Error('Invalid A2A resume marker');
+    resumed = source.resumed;
+  }
+  let restoreMethod: A2ATarget['restoreMethod'];
+  if (source.restoreMethod !== undefined) {
+    if (source.restoreMethod !== 'session/load' && source.restoreMethod !== 'session/resume') throw new Error('Invalid A2A restore method');
+    restoreMethod = source.restoreMethod;
+  }
+  let lifecycle: A2ATarget['lifecycle'];
+  if (source.lifecycle !== undefined) {
+    const policy = record(source.lifecycle, 'target lifecycle');
+    if (policy.mode !== 'persistent' && policy.mode !== 'one-shot') throw new Error('Invalid A2A target lifecycle');
+    if (policy.idleTtlSeconds !== undefined && (!Number.isSafeInteger(policy.idleTtlSeconds) || (policy.idleTtlSeconds as number) < 0)) {
+      throw new Error('Invalid A2A target idle TTL');
+    }
+    if (policy.closeAfter !== undefined && policy.closeAfter !== 'terminal' && policy.closeAfter !== 'ack') {
+      throw new Error('Invalid A2A target close timing');
+    }
+    lifecycle = { mode: policy.mode, ...(policy.idleTtlSeconds === undefined ? {} : { idleTtlSeconds: policy.idleTtlSeconds as number }),
+      ...(policy.closeAfter === undefined ? {} : { closeAfter: policy.closeAfter }) };
+  }
   return { sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), ...(preflight === undefined ? {} : { preflight }),
-    ...(roleSkills === undefined ? {} : { roleId, roleSkills }) };
+    ...(roleSkills === undefined ? {} : { roleId, roleSkills }), ...(state === undefined ? {} : { state }),
+    ...(resumed === undefined ? {} : { resumed }), ...(restoreMethod === undefined ? {} : { restoreMethod }),
+    ...(lastUsedAt === undefined ? {} : { lastUsedAt }), ...(lifecycle === undefined ? {} : { lifecycle }),
+    ...(provider === undefined ? {} : { provider, model }) };
 }
 
 function validatePushUrl(value: unknown): string {
@@ -274,6 +315,28 @@ export class FileA2AStore {
     text(contextId, 'context ID');
     const target = this.targets.get(key(scopeOf(context), contextId));
     return target && structuredClone(target);
+  }
+
+  /** The most recently updated task this host ran in one DSH session, within the caller's scope. */
+  latestTaskForSession(sessionId: string, context: ServerCallContext): Task | undefined {
+    this.assertOpen();
+    text(sessionId, 'session ID');
+    const scope = scopeOf(context);
+    let latest: Task | undefined;
+    for (const cached of this.tasks.values()) {
+      if (cached.scope.tenant !== scope.tenant || cached.scope.owner !== scope.owner) continue;
+      if ((cached.task.metadata?.['1agents'] as { sessionId?: unknown } | undefined)?.sessionId !== sessionId) continue;
+      if (!latest || Date.parse(cached.task.status?.timestamp ?? '') > Date.parse(latest.status?.timestamp ?? '')) latest = cached.task;
+    }
+    return latest && parseTask(Task.toJSON(latest));
+  }
+
+  /** The DSH session a task ran in, within the caller's scope. */
+  sessionOfTask(taskId: string, context: ServerCallContext): string | undefined {
+    this.assertOpen();
+    text(taskId, 'task ID');
+    const sessionId = (this.tasks.get(key(scopeOf(context), taskId))?.task.metadata?.['1agents'] as { sessionId?: unknown } | undefined)?.sessionId;
+    return typeof sessionId === 'string' ? sessionId : undefined;
   }
 
   saveTarget(contextId: string, target: A2ATarget, context: ServerCallContext): void {
