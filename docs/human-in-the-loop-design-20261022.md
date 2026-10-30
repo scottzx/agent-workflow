@@ -1,4 +1,4 @@
-# 1acp 人工审核节点与异步确认机制调整思路
+# agent-workflow 人工审核节点与异步确认机制调整思路
 
 - 整理日期：2026-10-22（Asia/Shanghai）
 - 状态：首版已实现并完成隔离验证，尚未切换生产服务；见 [实施记录](task-workbench-implementation-20261022.md)。
@@ -162,7 +162,7 @@ flowchart TD
 
 ## 九、证据与实现入口
 
-以下路径用于定位前序检查结论。1acp 内部路径相对本文件所在的 `docs` 目录。
+以下路径用于定位前序检查结论。agent-workflow 内部路径相对本文件所在的 `docs` 目录。
 
 - [PPT 交付编排](../packages/service/src/execution/ppt-delivery.ts)：`validateSummary`、`advancePptDelivery`、`revise`、执行预算和最终收据。
 - [任务账本](../packages/service/src/execution/ledger.ts)：`BusinessAcceptance`、`acceptance`、完成状态与版本摘要校验。

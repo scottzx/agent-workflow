@@ -12,7 +12,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/scottzx/1acp.git",
+    "url": "git+https://github.com/scottzx/agent-workflow.git",
     "directory": "packages/chat-view"
   },
   "publishConfig": {

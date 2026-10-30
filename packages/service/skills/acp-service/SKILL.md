@@ -5,6 +5,8 @@ description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通�
 
 # ACP Service
 
+本技能属于 **agent-workflow**（一芥天地 / DreamMate World，一芥智能）。npm 包名仍是 `@1agents/acp-service`，命令名仍是 `acp-service`。
+
 `@1agents/acp-service` 将 Agent runtime、CLI、ACP 服务、DSH 插件和 A2A 实现打进同一个 npm 包。原生 Agent 的可执行文件、登录凭据和模型配置由执行主机提供。
 
 ## 选择调用入口

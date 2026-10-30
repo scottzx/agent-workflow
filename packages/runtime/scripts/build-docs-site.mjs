@@ -13,7 +13,7 @@ import {
 const root = process.cwd();
 const docsDir = path.join(root, "docs");
 const outDir = path.join(root, "dist", "docs-site");
-const repoBase = "https://github.com/scottzx/1acp";
+const repoBase = "https://github.com/scottzx/agent-workflow";
 const repoEditBase = `${repoBase}/edit/main/packages/runtime/docs`;
 const cname = readCname();
 const siteBase = cname ? `https://${cname}` : "";

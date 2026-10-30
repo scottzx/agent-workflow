@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy 1ACP release page
+    name: Deploy agent-workflow release page
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -37,7 +37,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build and validate 1ACP release page
+      - name: Build and validate agent-workflow release page
         run: node scripts/build-release-site.mjs
 
       - name: Configure Pages
