@@ -37,6 +37,9 @@ jobs:
           name: runtime-tests
           path: runtime-tests.tgz
           retention-days: 7
+      # The workbench page bundles these two workspace packages, so they are built first.
+      - run: pnpm --filter @1agents/file-preview build
+      - run: pnpm --filter @1agents/chat-view build
       - run: pnpm --filter @1agents/acp-service build
       - run: pnpm --filter @1agents/acp-service typecheck
       - run: pnpm --filter @1agents/acp-service test:only
