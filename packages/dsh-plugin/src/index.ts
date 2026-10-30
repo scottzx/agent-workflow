@@ -12,6 +12,7 @@ import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
 import { mountDshA2A, type DshA2AOptions } from './a2a.js';
 import { createWorkbenchProcessClient } from './process-requests.js';
+import { registerNativeApprovals } from './native-approvals.js';
 import type {} from '@deepseek-ai/dsh-tools';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { WORKBENCH_UI_PATH, currentA2AExecution } from '@1agents/acp-service/a2a';
@@ -42,6 +43,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   const processRequests = input.a2a?.workbench ? createWorkbenchProcessClient(input.a2a.workbench) : undefined;
   const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
+  // A Cordis listener is released with this plugin's fiber.
+  if (processRequests) registerNativeApprovals(ctx, processRequests);
   const nativeSessions = new NativeSessions(ctx, adapter, config);
   ctx.provide('oneagentsAcpSessions', nativeSessions);
   ctx.effect(() => async () => {

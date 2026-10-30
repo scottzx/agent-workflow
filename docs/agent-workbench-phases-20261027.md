@@ -38,7 +38,7 @@
 - 结果验收：绑定任务、轮次、版本和摘要。
 - 过程请求：提问和计划审批，绑定当次请求。
 
-试跑和正式都走这两类。待我确认是同一个队列，不按阶段再拆一个收件箱。2026-10-28 起工具审批也作为过程请求进入这个队列：可以附理由拒绝，或拒绝并停止任务；期限由网关 `workbench.requestTimeoutMinutes` 设置（测试环境 30 分钟）；新请求可弹 macOS 通知。结果验收在页面上只显示，仍由发起会话用 `execution_review` 记录，页面没有验收按钮。细节见 [Grok 权限模式与工作台的两类人工事项](grok-mode-and-workbench-requests-20261027.md)。
+试跑和正式都走这两类。待我确认是同一个队列，不按阶段再拆一个收件箱。2026-10-28 起 ACP 工具审批也作为过程请求进入这个队列；2026-10-30 起，A2A 任务里 DSH 自己工具的审批（例如 standard preset 下 bash 申请 danger-full-access）也进来，而且只能在工作台回答，工作台不可达时才退回 DSH 界面。工具审批：可以附理由拒绝，或拒绝并停止任务；期限由网关 `workbench.requestTimeoutMinutes` 设置（测试环境 30 分钟）；新请求可弹 macOS 通知。结果验收在页面上只显示，仍由发起会话用 `execution_review` 记录，页面没有验收按钮。细节见 [Grok 权限模式与工作台的两类人工事项](grok-mode-and-workbench-requests-20261027.md)。
 
 ## 已接入
 
