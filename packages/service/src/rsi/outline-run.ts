@@ -20,8 +20,22 @@ const featuresSchema = z.object({ repo: z.string(), commit: z.string(), confirma
   features: z.array(z.object({ id: z.string().min(1), name: z.string().min(1) }).passthrough()).min(1) }).passthrough();
 const resultsSchema = z.array(z.object({ itemId: z.string(), pass: z.boolean(), evidence: z.array(z.unknown()) }).strict());
 
+const reviewSchema = z.object({
+  verdict: z.enum(['pass', 'revise']),
+  summary: z.string().trim().min(1).max(4000),
+  scores: z.record(z.string(), z.number().int().min(1).max(5)),
+  issues: z.array(z.object({ where: z.string().trim().min(1).max(300), problem: z.string().trim().min(1).max(2000),
+    suggestion: z.string().trim().min(1).max(2000), severity: z.enum(['must', 'should']) }).strict()).max(30),
+  /** On a re-review: what became of each issue from the previous review. */
+  previous: z.array(z.object({ where: z.string().trim().min(1).max(300), status: z.enum(['fixed', 'partly', 'not_fixed', 'disagreed']),
+    note: z.string().trim().max(2000).optional() }).strict()).max(30).optional(),
+}).passthrough().refine(review => review.verdict === 'pass' || review.issues.length > 0, { message: 'A revise verdict needs at least one issue' });
+
 export type CheckResult = z.infer<typeof resultsSchema>[number];
-export interface OutlineRound { round: number; jobId: string; executionStatus: string; passed: boolean; results: CheckResult[]; outlineSha256?: string }
+export type QualityReview = z.infer<typeof reviewSchema>;
+/** One QA pass over a frozen copy of the outline, in its own session. */
+export interface ReviewRecord { jobId?: string; executionStatus: string; outlineCopy: string; review?: QualityReview; error?: string }
+export interface OutlineRound { round: number; jobId: string; executionStatus: string; passed: boolean; results: CheckResult[]; outlineSha256?: string; review?: ReviewRecord }
 export interface OutlineRunReport {
   roleId: string; caseId: string; repo: string; commit: string; workDirectory: string; outlinePath: string;
   featuresConfirmed: boolean; rounds: OutlineRound[]; passed: boolean; startedAt: string; finishedAt: string;
@@ -31,6 +45,8 @@ export interface OutlineRunOptions {
   targetId: string; agentPreset: string; originSessionId: string;
   /** Times a failed check goes back to the executor. The design default is one. */
   maxBounces?: number; pollMs?: number; timeoutMs?: number; python?: string;
+  /** A QA agent reviews each outline that passes the program checks and may send it back for revision. */
+  qa?: { agentPreset?: string; targetId?: string; maxRevisions?: number };
   invoke: (method: string, params: Record<string, unknown>) => Promise<any>;
   log?: (line: string) => void; now?: () => Date;
 }
@@ -81,6 +97,20 @@ function bouncePrompt(results: CheckResult[], round: number): string {
 }
 
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+
+function reviewPrompt(qaRole: string, kase: z.infer<typeof caseSchema>, work: string, copy: string, output: string): string {
+  return `${qaRole}\n\n## 本次质检\n\n- 工作目录：${work}\n- 要审的大纲：\`${copy}\`\n- 项目副本（只读）：\`${path.join(work, 'project')}\`\n- 功能清单：\`${path.join(work, 'features.json')}\`\n- 仓库：${kase.input.repo}\n- 受众：${kase.input.audience}\n\n把质检结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
+}
+
+/** A re-review continues the same QA session, so it remembers its own issues and checks them first. */
+function reReviewPrompt(copy: string, output: string, round: number): string {
+  return `执行者按你上一轮的意见改了大纲（第 ${round} 轮）。新版本：\`${copy}\`。\n\n按 QA.md 的复审要求：先在 previous 里逐条写清上一轮每条意见改到位没有，再用同样的标准打分，只提仍然存在的问题。把结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
+}
+
+function revisePrompt(review: QualityReview, round: number): string {
+  const issues = review.issues.map(issue => `- [${issue.severity === 'must' ? '必须改' : '建议改'}] ${issue.where}：${issue.problem}\n  建议：${issue.suggestion}`).join('\n');
+  return `质检智能体审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n${issues}\n\n请在同一个 outline.json 上逐条修改。不同意的意见，在最终答复里说明理由。改完用任务里给的 Python 再运行自查，P1 到 P7 全部通过后结束，最终答复给出文件路径。`;
+}
 
 async function check(work: string, python: string, jobId: string): Promise<{ results: CheckResult[]; outlineSha256?: string }> {
   const outline = path.join(work, 'outline.json');
@@ -137,24 +167,67 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   };
 
   const role = await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8');
+  const qaRole = options.qa ? await readFile(path.join(roleDirectory, 'QA.md'), 'utf8') : '';
+  const outlinePath = path.join(work, 'outline.json');
+  /**
+   * One QA session per task: the first review opens it and each re-review continues it. The QA agent reads a
+   * frozen copy; if it touches the live outline anyway, the executor's version is restored.
+   */
+  let qaJobId: string | undefined;
+  const review = async (round: number): Promise<ReviewRecord> => {
+    await mkdir(path.join(work, 'reviews'), { recursive: true });
+    const copy = path.join(work, 'reviews', `outline-r${round}.json`), output = path.join(work, 'reviews', `review-r${round}.json`);
+    const bytes = await readFile(outlinePath);
+    await writeFile(copy, bytes);
+    const clientRequestId = `${roleId}:${kase.id}:${stamp}:review-${round}`;
+    if (qaJobId) {
+      await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId: qaJobId, clientRequestId, input: { prompt: reReviewPrompt(copy, output, round) } });
+    } else {
+      const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.qa!.targetId ?? options.targetId,
+        title: `质检：产品介绍大纲 ${kase.input.repo}`, clientRequestId,
+        input: { cwd: work, agentPreset: options.qa!.agentPreset ?? options.agentPreset, prompt: reviewPrompt(qaRole, kase, work, copy, output) } });
+      qaJobId = String(submitted.jobId);
+    }
+    const record: ReviewRecord = { jobId: qaJobId, executionStatus: await wait(qaJobId), outlineCopy: copy };
+    const after = await readFile(outlinePath).catch(() => undefined);
+    if (!after || sha256(after) !== sha256(bytes)) { await writeFile(outlinePath, bytes); record.error = '质检智能体改动了 outline.json，已恢复执行者的版本'; }
+    if (record.executionStatus !== 'completed') return { ...record, error: record.error ?? `质检任务没有完成（${record.executionStatus}）` };
+    try { record.review = reviewSchema.parse(JSON.parse(await readFile(output, 'utf8'))); }
+    catch (error) { record.error = [record.error, `质检结果读不出来：${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('；'); }
+    return record;
+  };
   const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.targetId,
     title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`,
     input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(role, kase, work, python) } });
   const jobId = String(submitted.jobId);
   const rounds: OutlineRound[] = [];
+  let bounces = 0, revisions = 0;
   for (let round = 1; ; round++) {
     const executionStatus = await wait(jobId);
     const checked = executionStatus === 'completed' ? await check(work, python, jobId) : { results: [] };
-    const results = checked.results, passed = executionStatus === 'completed' && results.every(result => result.pass);
-    rounds.push({ round, jobId, executionStatus, passed, results, ...(checked.outlineSha256 ? { outlineSha256: checked.outlineSha256 } : {}) });
-    log(`第 ${round} 轮：${passed ? '检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
-    if (passed || executionStatus !== 'completed' || round > maxBounces) break;
+    const results = checked.results, programPassed = executionStatus === 'completed' && results.every(result => result.pass);
+    const record: OutlineRound = { round, jobId, executionStatus, passed: programPassed, results, ...(checked.outlineSha256 ? { outlineSha256: checked.outlineSha256 } : {}) };
+    rounds.push(record);
+    log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
+    if (executionStatus !== 'completed') break;
+    let feedback: string;
+    if (!programPassed) {
+      if (bounces >= maxBounces) break;
+      bounces++; feedback = bouncePrompt(results, round);
+    } else if (options.qa) {
+      record.review = await review(round);
+      const verdict = record.review.review?.verdict;
+      record.passed = verdict === 'pass';
+      log(`第 ${round} 轮质检：${verdict ? `${verdict === 'pass' ? '通过' : '需要修改'}，${JSON.stringify(record.review.review!.scores)}` : record.review.error}`);
+      if (verdict !== 'revise' || revisions >= (options.qa.maxRevisions ?? 1)) break;
+      revisions++; feedback = revisePrompt(record.review.review!, round);
+    } else break;
     await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId,
-      clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${round + 1}`, input: { prompt: bouncePrompt(results, round) } });
+      clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${round + 1}`, input: { prompt: feedback } });
     log(`已打回执行者（第 ${round + 1} 轮）`);
   }
   const report: OutlineRunReport = { roleId, caseId: kase.id, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work,
-    outlinePath: path.join(work, 'outline.json'), featuresConfirmed: Boolean(features.confirmation), rounds,
+    outlinePath, featuresConfirmed: Boolean(features.confirmation), rounds,
     passed: rounds.at(-1)!.passed, startedAt, finishedAt: now().toISOString() };
   await writeFile(path.join(work, 'run.json'), JSON.stringify(report, null, 2) + '\n');
   return report;

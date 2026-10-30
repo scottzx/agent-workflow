@@ -142,3 +142,61 @@ test('without bounces left a failed check ends the run, and a failed task is not
   assert.equal(stuck.passed, false);
   assert.equal(stuck.rounds[0]!.executionStatus, 'timed_out', 'a task that never finishes is recorded, not thrown');
 });
+
+test('with QA on, a QA agent in its own session reviews a frozen copy, its issues go back to the executor, and the same QA session re-reviews the revision', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t);
+  let work = '', reviews = 0;
+  const first = outline('example/demo', f.commit), revised = { ...first, project: { ...first.project, oneLiner: '一行命令生成产品介绍' } };
+  const review = (verdict: string, issues: unknown[]) => ({ verdict, summary: verdict === 'pass' ? '可以了' : '开头太空泛', issues,
+    scores: { 吸引力: verdict === 'pass' ? 4 : 2, 具体: 4, 受众: 4, 结构: 4, 可信: 5, 行动: 4 } });
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: { agentPreset: 'qa-preset' },
+    invoke: async (method, params: any) => {
+      f.calls.push({ method, params });
+      const qaReview = async () => {
+        reviews++;
+        await writeFile(join(work, 'reviews', `review-r${reviews}.json`), JSON.stringify(reviews === 1
+          ? review('revise', [{ where: 'project/oneLiner', problem: '示例项目四个字说明不了任何事', suggestion: '改成“一行命令生成产品介绍”', severity: 'must' }])
+          : { ...review('pass', []), previous: [{ where: 'project/oneLiner', status: 'fixed', note: '已改' }] }));
+        return { jobId: 'qa-1' };
+      };
+      if (method === 'execution_submit' && params.title.startsWith('质检')) return qaReview();
+      if (method === 'execution_continue' && params.jobId === 'qa-1') return qaReview();
+      if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
+      if (method === 'execution_continue') { await writeFile(join(work, 'outline.json'), JSON.stringify(revised)); return { jobId: 'job-1' }; }
+      return { executionStatus: 'completed' };
+    } });
+  assert.equal(report.passed, true);
+  assert.deepEqual(report.rounds.map(r => [r.round, r.review?.review?.verdict]), [[1, 'revise'], [2, 'pass']]);
+  assert.equal(f.calls.filter(call => call.method === 'execution_submit' && call.params.title.startsWith('质检')).length, 1, 'one QA session per task');
+  const reReview = f.calls.find(call => call.method === 'execution_continue' && call.params.jobId === 'qa-1')!.params;
+  assert.match(reReview.input.prompt, /reviews\/outline-r2\.json/); assert.match(reReview.input.prompt, /previous/);
+  assert.deepEqual(report.rounds[1]!.review!.review!.previous, [{ where: 'project/oneLiner', status: 'fixed', note: '已改' }]);
+  assert.equal(report.rounds[1]!.review!.jobId, 'qa-1');
+  const qaSubmit = f.calls.find(call => call.method === 'execution_submit' && call.params.title.startsWith('质检'))!.params;
+  assert.equal(qaSubmit.input.agentPreset, 'qa-preset');
+  assert.match(qaSubmit.input.prompt, /# 产品介绍大纲 · 质检/, 'the QA role leads the review prompt');
+  assert.match(qaSubmit.input.prompt, /reviews\/outline-r1\.json/, 'QA reviews a frozen copy');
+  const back = f.calls.find(call => call.method === 'execution_continue' && call.params.jobId === 'job-1')!.params;
+  assert.equal(back.jobId, 'job-1', 'the issues go back to the executor session');
+  assert.match(back.input.prompt, /\[必须改\] project\/oneLiner/); assert.match(back.input.prompt, /一行命令生成产品介绍/);
+  assert.equal(JSON.parse(await readFile(join(work, 'reviews', 'outline-r1.json'), 'utf8')).project.oneLiner, '示例项目', 'the pre-QA version is kept');
+  assert.equal(JSON.parse(await readFile(join(work, 'reviews', 'outline-r2.json'), 'utf8')).project.oneLiner, '一行命令生成产品介绍');
+});
+
+test('a QA agent that edits the outline itself is undone, and a run without a readable review stops without sending anything back', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t);
+  let work = '';
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
+    invoke: async (method, params: any) => {
+      f.calls.push({ method, params });
+      if (method === 'execution_submit' && params.title.startsWith('质检')) { await writeFile(join(work, 'outline.json'), '{"tampered":true}'); return { jobId: 'qa-1' }; }
+      if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
+      return { executionStatus: 'completed' };
+    } });
+  assert.equal(report.passed, false);
+  assert.match(report.rounds[0]!.review!.error!, /改动了 outline\.json，已恢复.*读不出来/);
+  assert.equal(JSON.parse(await readFile(join(work, 'outline.json'), 'utf8')).schemaVersion, 1, "the executor's outline is restored");
+  assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
+});
