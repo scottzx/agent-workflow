@@ -55,6 +55,8 @@ const configSchema = z.object({
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
   workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
+    /** Shared with a host that serves this page itself (DSH). Over the bearer API, only its relayed page requests may publish or decide reviews. */
+    pageRelaySecret: z.string().min(32).optional(),
     allowedOrigins: z.array(string).optional(),
     /** How long a question, plan or tool approval waits for a person. The ACP bridge's ACP_INTERACTION_TIMEOUT_MS must be at least as long. */
     requestTimeoutMinutes: z.number().int().min(1).max(24 * 60).default(5),
@@ -1548,6 +1550,13 @@ function authenticated(req: IncomingMessage, token: string): boolean {
   const expected = Buffer.from(`Bearer ${token}`), supplied = Buffer.from(req.headers.authorization ?? '');
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
+/** Publishing and review decisions are a person's acts, made on the workbench page. */
+const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/];
+function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
+  if (!secret) return false;
+  const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
 async function listen(server: http.Server, port: number, host: string): Promise<number> {
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
   return (server.address() as AddressInfo).port;
@@ -1628,6 +1637,9 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         } else {
           if (gateway.config.workbench.token && !authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
           if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
+          if (req.method === 'POST' && PAGE_ONLY_ROUTES.some(route => route.test(pathname)) && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) {
+            return json(res, 403, { error: 'page_action_required', message: '发布和验收决定只能由人在工作台页面发起。' });
+          }
         }
         if (req.method === 'GET' && pathname === '/workbench/tasks') {
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),

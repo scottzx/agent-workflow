@@ -12,6 +12,7 @@ import { createHumanReview } from '../src/execution/human-review.js';
 import { createPptDeliveryRun, scriptDirectory, type PptDeliveryRun } from '../src/execution/ppt-delivery.js';
 
 const token = 'independent-workbench-test-credential';
+const relaySecret = 'page-relay-secret-for-workbench-tests-0001';
 const preview = { title: '待审核文字稿', slides: Array.from({ length: 6 }, (_, i) => ({
   title: `第 ${i + 1} 页`, message: '项目事实', body: ['完整文字内容'], visual: '流程示意',
   sources: ['README.md:1'], facts: ['基于项目文件'], notes: '',
@@ -20,7 +21,7 @@ const preview = { title: '待审核文字稿', slides: Array.from({ length: 6 },
 async function fixture(t: TestContext, workbench = true) {
   const root = await mkdtemp(join(tmpdir(), 'workbench-gateway-'));
   const config: A2AGatewayConfig = { stateDirectory: join(root, 'state'), port: 0, remotes: {}, pollIntervalMs: 60_000,
-    ...(workbench ? { workbench: { token, reviewerId: 'local-owner', reviewerName: '本机用户', allowedOrigins: ['allowed-root'] } } : {}) };
+    ...(workbench ? { workbench: { token, reviewerId: 'local-owner', reviewerName: '本机用户', allowedOrigins: ['allowed-root'], pageRelaySecret: relaySecret } } : {}) };
   let host = await serveA2AGateway(config, { report: false });
   // The constructor's initial reconcile is empty; no background dispatch is
   // involved in this HTTP admission/identity fixture.
@@ -68,13 +69,15 @@ async function fixture(t: TestContext, workbench = true) {
   const request = (path: string, init: RequestInit = {}, credential: string | null = token) => fetch(`http://127.0.0.1:${host.port}` + path, {
     ...init, headers: { ...(credential ? { Authorization: `Bearer ${credential}` } : {}), ...(init.headers ?? {}) },
   });
-  return { root, config, seed, request, get gateway() { return host.gateway; }, get kicks() { return kicks; },
+  return { root, config, seed, request, get base() { return `http://127.0.0.1:${host.port}`; }, get gateway() { return host.gateway; }, get kicks() { return kicks; },
     restart: async () => { await host.close(); host = await serveA2AGateway(config, { report: false }); (host.gateway as any).advanceDelivery = async () => { kicks++; }; },
   };
 }
 
 const decisions = (jobId: string, reviewId: string) => `/workbench/tasks/${jobId}/reviews/${reviewId}/decisions`;
 const post = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+/** A page request relayed by a host that serves the workbench page itself (DSH). */
+const relayed = (body: unknown, secret = relaySecret): RequestInit => ({ ...post(body), headers: { 'Content-Type': 'application/json', 'X-Workbench-Page-Relay': secret } });
 
 test('workbench HTTP is disabled without configuration and requires its separate credential', async t => {
   const disabled = await fixture(t, false);
@@ -115,19 +118,19 @@ test('workbench list and detail are scoped pure projections without private exec
 
 test('human comments retain waiting state, use configured identity and replay durably once', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '评论任务'), path = decisions(item.jobId, item.review.reviewId);
-  const first = await f.request(path, post(item.decision));
+  const first = await f.request(path, relayed(item.decision));
   assert.equal(first.status, 200);
   const detail = await first.json() as any, recorded = detail.reviews[0].history[0];
   assert.equal(detail.displayStatus, 'awaiting_human'); assert.equal(detail.reviews[0].status, 'pending');
   assert.deepEqual(recorded.actor, { id: 'local-owner', displayName: '本机用户', source: '1agents-web' });
   assert.equal(recorded.note, item.decision.note); assert.equal(f.kicks, 0);
-  const replay = await f.request(path, post(item.decision));
+  const replay = await f.request(path, relayed(item.decision));
   const replayed = await replay.json() as any;
   assert.equal(replayed.reviews[0].history.length, 1); assert.equal(replayed.reviews[0].history[0].decisionId, recorded.decisionId);
-  const conflict = await f.request(path, post({ ...item.decision, note: '换了内容，不能沿用幂等标识。' }));
+  const conflict = await f.request(path, relayed({ ...item.decision, note: '换了内容，不能沿用幂等标识。' }));
   assert.equal(conflict.status, 409); assert.equal((await conflict.json() as any).error, 'idempotency_conflict');
   await f.restart();
-  const afterRestart = await f.request(path, post(item.decision));
+  const afterRestart = await f.request(path, relayed(item.decision));
   assert.equal(afterRestart.status, 200);
   const durable = await afterRestart.json() as any;
   assert.equal(durable.reviews[0].history.length, 1); assert.equal(durable.reviews[0].history[0].decisionId, recorded.decisionId);
@@ -135,16 +138,16 @@ test('human comments retain waiting state, use configured identity and replay du
 
 test('workbench rejects client identity, wrong version, unauthorized reviewer and changed frozen bytes', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '版本任务'), path = decisions(item.jobId, item.review.reviewId);
-  const identity = await f.request(path, post({ ...item.decision, actor: { id: 'forged-human', source: '1agents-web' } }));
+  const identity = await f.request(path, relayed({ ...item.decision, actor: { id: 'forged-human', source: '1agents-web' } }));
   assert.equal(identity.status, 400);
-  const wrong = await f.request(path, post({ ...item.decision, revision: 'script-v0' }));
+  const wrong = await f.request(path, relayed({ ...item.decision, revision: 'script-v0' }));
   assert.equal(wrong.status, 409); assert.equal((await wrong.json() as any).error, 'version_conflict');
   item.run.humanReviews![0]!.reviewerId = 'another-person';
-  const otherPerson = await f.request(path, post(item.decision));
+  const otherPerson = await f.request(path, relayed(item.decision));
   assert.equal(otherPerson.status, 403);
   item.run.humanReviews![0]!.reviewerId = 'local-owner';
   await writeFile(item.scriptPath, JSON.stringify({ ...preview, title: '被替换的内容' }));
-  const changedBytes = await f.request(path, post(item.decision));
+  const changedBytes = await f.request(path, relayed(item.decision));
   assert.equal(changedBytes.status, 409); assert.equal((await changedBytes.json() as any).error, 'version_conflict');
   assert.equal(item.run.humanReviews![0]!.history.length, 0); assert.equal(f.kicks, 0);
 });
@@ -154,14 +157,14 @@ test('old review cannot approve a new version and repeated approval records one 
   const old = structuredClone(item.review);
   old.reviewId = 'old-review'; old.revision = 'script-v0'; old.status = 'superseded';
   item.run.humanReviews!.unshift(old);
-  const stale = await f.request(decisions(item.jobId, old.reviewId), post({ ...item.decision, action: 'approve', revision: old.revision }));
+  const stale = await f.request(decisions(item.jobId, old.reviewId), relayed({ ...item.decision, action: 'approve', revision: old.revision }));
   assert.equal(stale.status, 409);
   const approvedInput = { ...item.decision, action: 'approve', note: undefined };
-  const approved = await f.request(path, post(approvedInput));
+  const approved = await f.request(path, relayed(approvedInput));
   assert.equal(approved.status, 200);
   const first = await approved.json() as any, current = first.reviews.find((r: any) => r.reviewId === item.review.reviewId);
   assert.equal(current.status, 'approved'); assert.equal(current.resume.status, 'pending'); assert.equal(current.history.length, 1);
-  const again = await f.request(path, post(approvedInput));
+  const again = await f.request(path, relayed(approvedInput));
   assert.equal(again.status, 200);
   const replayed = (await again.json() as any).reviews.find((r: any) => r.reviewId === item.review.reviewId);
   assert.equal(replayed.history.length, 1); assert.equal(replayed.history[0].decisionId, current.history[0].decisionId);
@@ -274,7 +277,7 @@ test('the deadline follows the configured timeout and reject-and-stop cancels th
 test('abandoning through human review closes further child dispatch admission', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '人工放弃任务'), internals = f.gateway as any;
   internals.advanceDelivery = Object.getPrototypeOf(f.gateway).advanceDelivery;
-  const response = await f.request(decisions(item.jobId, item.review.reviewId), post({ ...item.decision, action: 'cancel', note: undefined }));
+  const response = await f.request(decisions(item.jobId, item.review.reviewId), relayed({ ...item.decision, action: 'cancel', note: undefined }));
   assert.equal(response.status, 200);
   await internals.advancingDeliveries.get(item.run.attemptId);
   assert.equal(f.gateway.workbenchTask(item.jobId).executionStatus, 'canceled');
@@ -319,11 +322,11 @@ test('agent drafts publish by name and a review decision does not publish', asyn
   assert.equal(updatedBody.draft.modeId, 'acceptEdits');
   assert.equal(updatedBody.developing.find((row: any) => row.acpAgent === 'codex').modeId, 'write');
   const item = await f.seed('allowed-root', '审核不发布');
-  const decision = await f.request(decisions(item.jobId, item.review.reviewId), post(item.decision));
+  const decision = await f.request(decisions(item.jobId, item.review.reviewId), relayed(item.decision));
   assert.equal(decision.status, 200);
   const beforePublish = await (await f.request('/workbench/agents')).json() as any;
   assert.equal(beforePublish.published.length, 0);
-  const published = await f.request(`/workbench/agents/${draft.draft.agentId}/publish`, post({ releaseName: '公众号-grok' }));
+  const published = await f.request(`/workbench/agents/${draft.draft.agentId}/publish`, relayed({ releaseName: '公众号-grok' }));
   assert.equal(published.status, 200);
   const release = await published.json() as any;
   assert.equal(release.release.releaseName, '公众号-grok');
@@ -331,14 +334,47 @@ test('agent drafts publish by name and a review decision does not publish', asyn
   assert.equal(release.developing.find((row: any) => row.agentId === draft.draft.agentId).targetId, undefined);
   assert.equal(release.published[0].agentId, 'release:公众号-grok');
   assert.equal(release.published[0].counterpartId, draft.draft.agentId);
-  const again = await f.request(`/workbench/agents/${draft.draft.agentId}/publish`, post({ releaseName: '公众号-grok' }));
+  const again = await f.request(`/workbench/agents/${draft.draft.agentId}/publish`, relayed({ releaseName: '公众号-grok' }));
   assert.equal(again.status, 409);
-  const missing = await f.request('/workbench/agents/agt-missing1/publish', post({ releaseName: '别的名字' }));
+  const missing = await f.request('/workbench/agents/agt-missing1/publish', relayed({ releaseName: '别的名字' }));
   assert.equal(missing.status, 404);
   const saved = JSON.parse(await readFile(join(f.config.stateDirectory, 'agent-registry.json'), 'utf8'));
   assert.equal(saved.releases.length, 1);
   assert.equal(JSON.stringify(saved).includes(token), false);
   assert.equal(JSON.stringify(release).includes(token), false);
+});
+
+test('only the page publishes and decides reviews; bearer callers need the page relay secret', async t => {
+  const f = await fixture(t), item = await f.seed('allowed-root', '只能人决定'), path = decisions(item.jobId, item.review.reviewId);
+  const draft = await (await f.request('/workbench/agents', post({ name: '大纲草稿', acpAgent: 'grok-build', targetId: 'outline' }))).json() as any;
+  const publish = `/workbench/agents/${draft.draft.agentId}/publish`;
+  for (const init of [post(item.decision), relayed(item.decision, 'x'.repeat(relaySecret.length)), relayed(item.decision, 'short')]) {
+    const refused = await f.request(path, init);
+    assert.equal(refused.status, 403);
+    assert.equal((await refused.json() as any).error, 'page_action_required');
+  }
+  assert.equal((await f.request(publish, post({ releaseName: '大纲-grok' }))).status, 403);
+  const untouched = await (await f.request(`/workbench/tasks/${item.jobId}`)).json() as any;
+  assert.equal(untouched.reviews[0].history.length, 0);
+  assert.equal((await (await f.request('/workbench/agents')).json() as any).published.length, 0);
+
+  // A gateway without a relay secret accepts these two only from its own page.
+  const secret = f.gateway.config.workbench!.pageRelaySecret;
+  f.gateway.config.workbench!.pageRelaySecret = undefined;
+  assert.equal((await f.request(path, relayed(item.decision))).status, 403);
+  f.gateway.config.workbench!.pageRelaySecret = secret;
+  assert.equal((await f.request(path, relayed(item.decision))).status, 200);
+  assert.equal((await f.request(publish, relayed({ releaseName: '大纲-grok' }))).status, 200);
+
+  // The gateway's own page needs no relay secret: its login and same-origin checks stand in for it.
+  const other = await f.seed('allowed-root', '页面决定');
+  const browser = (cookie?: string) => ({ 'Sec-Fetch-Site': 'same-origin', Origin: f.base, 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) });
+  const login = await f.request('/workbench/ui/api/session', { method: 'POST', headers: browser(), body: JSON.stringify({ token }) }, null);
+  const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
+  const onPage = await f.request(`/workbench/ui/api/tasks/${other.jobId}/reviews/${other.review.reviewId}/decisions`,
+    { method: 'POST', headers: browser(cookie), body: JSON.stringify(other.decision) }, null);
+  assert.equal(onPage.status, 200);
+  assert.equal((await onPage.json() as any).reviews[0].history.length, 1);
 });
 
 test('workbench chat pages the stored A2A history newest-first inside the same scope as the task', async t => {

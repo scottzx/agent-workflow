@@ -17,8 +17,8 @@ const BODY_LIMIT = 1024 * 1024;
 const PASSED_HEADERS = ['content-type', 'content-disposition', 'content-security-policy', 'x-content-type-options', 'cache-control'];
 
 export interface WorkbenchProxyOptions {
-  /** Gateway origin and bearer token (the same as a2a.workbench). */
-  workbench?: { url: string; token?: string };
+  /** Gateway origin, bearer token and page relay secret (the same as a2a.workbench). */
+  workbench?: { url: string; token?: string; pageRelaySecret?: string };
   host: () => A2AHostControls | undefined;
 }
 
@@ -71,7 +71,9 @@ export function workbenchHandler(ctx: Context, options: WorkbenchProxyOptions) {
     let body: Buffer | undefined;
     try { body = req.method === 'GET' || req.method === 'HEAD' ? undefined : await bounded(req); }
     catch { return json(res, 413, { error: 'Request body too large' }); }
+    // The relay secret tells the gateway this request comes from the person on this page, so it may publish and decide reviews.
     const headers: Record<string, string> = { ...(options.workbench!.token?.trim() ? { Authorization: `Bearer ${options.workbench!.token}` } : {}),
+      ...(options.workbench!.pageRelaySecret ? { 'X-Workbench-Page-Relay': options.workbench!.pageRelaySecret } : {}),
       ...(body ? { 'Content-Type': String(req.headers['content-type'] ?? 'application/json') } : {}) };
     let response: Response;
     try {

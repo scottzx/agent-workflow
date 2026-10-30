@@ -14,8 +14,9 @@ export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token
   stateDirectory?: string;
   /** Public DSH origin, for example its Tailscale URL. */
   publicUrl?: string;
-  /** Gateway workbench that records questions and plan approvals for this host's A2A turns. */
-  workbench?: { url: string; token?: string };
+  /** Gateway workbench that records questions and plan approvals for this host's A2A turns.
+   * `pageRelaySecret` matches the gateway's workbench.pageRelaySecret so this host's page can publish and decide reviews. */
+  workbench?: { url: string; token?: string; pageRelaySecret?: string };
 }
 
 /** In-process takeover controls of the mounted host; absent while A2A is disabled or closed. */

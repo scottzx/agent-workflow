@@ -21,7 +21,7 @@ async function gateway(t) {
   const seen = [];
   const origin = await listen(t, async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk;
-    seen.push({ method: req.method, url: req.url, authorization: req.headers.authorization, cookie: req.headers.cookie, origin: req.headers.origin, body });
+    seen.push({ method: req.method, url: req.url, authorization: req.headers.authorization, relay: req.headers['x-workbench-page-relay'], cookie: req.headers.cookie, origin: req.headers.origin, body });
     if (req.url.includes('/artifacts/')) {
       res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Security-Policy': 'sandbox', 'X-Content-Type-Options': 'nosniff', 'Set-Cookie': 'leak=1' });
       return res.end('# bytes');
@@ -40,7 +40,7 @@ test('DSH serves the workbench page framed by itself and forwards only owner bro
   };
   const host = { taskSession: id => ({ 'local-task': 'local-session', 'gone-task': 'gone-session' })[id],
     sessionTask: id => id === 'local-session' ? { taskId: 'local-task', contextId: 'c', jobId: 'j', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true } : undefined };
-  const dsh = await listen(t, workbenchHandler(ctx, { workbench: { url: `${gw.origin}/ignored-path`, token: 'gw-token' }, host: () => host }));
+  const dsh = await listen(t, workbenchHandler(ctx, { workbench: { url: `${gw.origin}/ignored-path`, token: 'gw-token', pageRelaySecret: 'page-relay-secret' }, host: () => host }));
   const owner = { cookie: 'dsh=owner' }, write = { ...owner, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
 
   const page = await fetch(`${dsh}/workbench/ui/`);
@@ -52,10 +52,11 @@ test('DSH serves the workbench page framed by itself and forwards only owner bro
 
   const list = await fetch(`${dsh}/workbench/ui/api/tasks?filter=all`, { headers: owner });
   assert.equal(list.status, 200);
-  assert.deepEqual(gw.seen.at(-1), { method: 'GET', url: '/workbench/tasks?filter=all', authorization: 'Bearer gw-token', cookie: undefined, origin: undefined, body: '' });
+  assert.deepEqual(gw.seen.at(-1), { method: 'GET', url: '/workbench/tasks?filter=all', authorization: 'Bearer gw-token', relay: 'page-relay-secret', cookie: undefined, origin: undefined, body: '' });
   const decide = await fetch(`${dsh}/workbench/ui/api/tasks/j/reviews/r/decisions`, { method: 'POST', headers: write, body: '{"action":"approve"}' });
   assert.equal(decide.status, 200);
   assert.equal(gw.seen.at(-1).body, '{"action":"approve"}');
+  assert.equal(gw.seen.at(-1).relay, 'page-relay-secret', 'the gateway accepts a decision only from a relayed page');
   const artifact = await fetch(`${dsh}/workbench/ui/api/tasks/j/artifacts/${'a'.repeat(64)}`, { headers: owner });
   assert.equal(await artifact.text(), '# bytes');
   assert.equal(artifact.headers.get('content-security-policy'), 'sandbox', 'the gateway sandbox reaches the browser');
