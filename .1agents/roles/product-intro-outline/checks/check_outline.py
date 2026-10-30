@@ -1,4 +1,4 @@
-"""Program checks P1-P7 for a product intro outline.
+"""Program checks P1-P11 for a product intro outline.
 
 Usage: check_outline.py <outline.json> <features.json> <project-copy-dir>
 
@@ -8,12 +8,55 @@ reported as missing. Prints one JSON result per checklist item and exits 1 if
 any item fails.
 """
 import json
+import re
 import sys
 from pathlib import Path
 
 import jsonschema
 
 ROLE = Path(__file__).resolve().parent.parent
+MAX_POINTS = 5
+# Unfinished text a reader must never see. A limitation the project itself states, such as 待确认, is not a placeholder.
+PLACEHOLDER = re.compile(r'待补|待填|占位|TODO|TBD|FIXME|XXX')
+RELEASE_FILE = re.compile(r'[\w.-]*?v?(\d+\.\d+\.\d+)[\w.-]*?\.(?:zip|tar\.gz|tgz|dmg|exe|pkg|msi|apk|deb|rpm)\b')
+VERSION = re.compile(r'v?(\d+\.\d+\.\d+)')
+
+
+def reader_text(outline):
+    """Every string the audience reads, with its JSON path."""
+    project = outline['project']
+    yield 'project/name', project['name']
+    yield 'project/oneLiner', project['oneLiner']
+    for sec in outline['sections']:
+        base = f"sections/{sec['id']}"
+        if sec['status'] != 'present':
+            yield f'{base}/reason', sec['reason']
+            continue
+        yield f'{base}/title', sec['title']
+        for i, slide in enumerate(sec['slides']):
+            yield f'{base}/slides/{i}/title', slide['title']
+            for j, point in enumerate(slide['points']):
+                yield f'{base}/slides/{i}/points/{j}', point['text']
+
+
+def version_records(root):
+    """The versions a project declares: package.json, and the first heading of its release notes or changelog."""
+    records = {}
+    manifest = root / 'package.json'
+    if manifest.is_file():
+        version = json.loads(manifest.read_text('utf-8')).get('version')
+        if isinstance(version, str) and VERSION.fullmatch(version.strip()):
+            records['package.json'] = VERSION.fullmatch(version.strip()).group(1)
+    for name in ('RELEASE_NOTES.md', 'CHANGELOG.md'):
+        notes = root / name
+        if not notes.is_file():
+            continue
+        for line in notes.read_text('utf-8', errors='replace').splitlines():
+            found = VERSION.search(line) if line.startswith('#') else None
+            if found:
+                records[name] = found.group(1)
+                break
+    return records
 
 
 def main(outline_path: str, features_path: str, project: str) -> int:
@@ -68,6 +111,36 @@ def main(outline_path: str, features_path: str, project: str) -> int:
     p7 = [{'message': f'missing {i}'} for i in template if i not in ids]
     p7 += [{'message': f'unexpected or repeated {i}'} for n, i in enumerate(ids) if i not in template or i in ids[:n]]
     report('P7', p7)
+
+    report('P8', [{'path': f"sections/{sec['id']}/slides/{i}", 'message': f'{len(slide["points"])} points, at most {MAX_POINTS}'}
+                  for sec in outline['sections'] if sec['status'] == 'present' for i, slide in enumerate(sec['slides']) if len(slide['points']) > MAX_POINTS])
+
+    texts = list(reader_text(outline))
+    report('P9', [{'path': where, 'message': f'placeholder {m.group(0)}'} for where, text in texts for m in [PLACEHOLDER.search(text)] if m])
+
+    seen, repeated = {}, []
+    for where, text in texts:
+        if '/points/' not in where:
+            continue
+        key = re.sub(r'[\s\W_]+', '', text)
+        slide = where.rsplit('/points/', 1)[0]
+        if len(key) < 12:
+            continue
+        if key in seen and seen[key].rsplit('/points/', 1)[0] != slide:
+            repeated.append({'path': where, 'message': f'same text as {seen[key]}'})
+        seen.setdefault(key, where)
+    report('P10', repeated)
+
+    records = version_records(root)
+    p11 = []
+    for where, text in texts:
+        for m in RELEASE_FILE.finditer(text):
+            stated = m.group(1)
+            if len(set(records.values())) > 1:
+                p11.append({'path': where, 'message': f'{m.group(0)} hard-codes {stated}, but the project version records disagree {records}; do not hard-code a version'})
+            elif records and stated not in records.values():
+                p11.append({'path': where, 'message': f'{m.group(0)} says {stated}, the project declares {records}'})
+    report('P11', p11)
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 0 if all(r['pass'] for r in results) else 1

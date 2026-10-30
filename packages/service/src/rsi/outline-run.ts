@@ -1,6 +1,6 @@
 /**
  * One product-intro outline run on a role's case: the executor writes outline.json in a prepared
- * work directory, the role's program checks (P1–P7) run on it, and a failed check goes back to the
+ * work directory, the role's program checks run on it, and a failed check goes back to the
  * same session with its evidence. No model judges the result here; people accept it on the workbench.
  * The checked bytes are recorded by sha256, and a delivered copy in the job's artifact folder must match them.
  */
@@ -93,7 +93,7 @@ async function checkInterpreter(name: string): Promise<string> {
 
 function bouncePrompt(results: CheckResult[], round: number): string {
   const failed = results.filter(result => !result.pass).map(result => `- ${result.itemId}：${JSON.stringify(result.evidence)}`).join('\n');
-  return `宿主程序检查没有通过（第 ${round} 轮），下面是未通过的检查项和证据：\n\n${failed}\n\n请在同一个 outline.json 上修改，用任务里给的 Python 再运行自查，P1 到 P7 全部通过后结束，最终答复给出文件路径。`;
+  return `宿主程序检查没有通过（第 ${round} 轮），下面是未通过的检查项和证据：\n\n${failed}\n\n请在同一个 outline.json 上修改，用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。`;
 }
 
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
@@ -109,7 +109,7 @@ function reReviewPrompt(copy: string, output: string, round: number): string {
 
 function revisePrompt(review: QualityReview, round: number): string {
   const issues = review.issues.map(issue => `- [${issue.severity === 'must' ? '必须改' : '建议改'}] ${issue.where}：${issue.problem}\n  建议：${issue.suggestion}`).join('\n');
-  return `质检智能体审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n${issues}\n\n请在同一个 outline.json 上逐条修改。不同意的意见，在最终答复里说明理由。改完用任务里给的 Python 再运行自查，P1 到 P7 全部通过后结束，最终答复给出文件路径。`;
+  return `质检智能体审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n${issues}\n\n请在同一个 outline.json 上逐条修改。不同意的意见，在最终答复里说明理由。改完用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。`;
 }
 
 async function check(work: string, python: string, jobId: string): Promise<{ results: CheckResult[]; outlineSha256?: string }> {

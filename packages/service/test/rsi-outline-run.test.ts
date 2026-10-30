@@ -200,3 +200,39 @@ test('a QA agent that edits the outline itself is undone, and a run without a re
   assert.equal(JSON.parse(await readFile(join(work, 'outline.json'), 'utf8')).schemaVersion, 1, "the executor's outline is restored");
   assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
 });
+
+test('P8-P11 catch the deterministic problems QA used to find, and leave legitimate text alone', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t), dir = join(f.root, 'checks-case'), project = join(dir, 'project');
+  await mkdir(project, { recursive: true });
+  await writeFile(join(project, 'README.md'), '# 示例\n\n一个命令行工具。\n');
+  await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'demo', version: '1.0.0' }));
+  await writeFile(join(project, 'RELEASE_NOTES.md'), '# Demo v0.9.0\n\n首个版本。\n');
+  await writeFile(join(dir, 'features.json'), await readFile(join(f.role, 'cases', 'demo', 'features.json')));
+  const run = async (doc: unknown) => {
+    await writeFile(join(dir, 'outline.json'), JSON.stringify(doc));
+    const out = spawnSync('python3', ['-I', join(f.role, 'checks', 'check_outline.py'), join(dir, 'outline.json'), join(dir, 'features.json'), project], { encoding: 'utf8' });
+    return Object.fromEntries((JSON.parse(out.stdout) as { itemId: string; pass: boolean; evidence: any[] }[]).map(r => [r.itemId, r]));
+  };
+  const point = (text: string) => ({ text, sources: [{ path: 'README.md' }] });
+  const clean = outline('example/demo', f.commit) as any;
+  clean.sections[0].slides[0].points.push(point('需要 Node.js 22.18.0 以上'), point('部分尺寸仍标注待确认，以现场为准'));
+  const ok = await run(clean);
+  assert.deepEqual(['P8', 'P9', 'P10', 'P11'].map(id => ok[id]!.pass), [true, true, true, true], 'a runtime version and a stated limitation are not flagged');
+
+  const bad = outline('example/demo', f.commit) as any;
+  bad.sections[0].slides[0].points = [1, 2, 3, 4, 5, 6].map(n => point(`第 ${n} 条要点`));
+  bad.sections[2].slides[0].points.push(point('联系人与邮箱（待补）'));
+  bad.sections[1].slides[0].points.push(point('推送到 main 后自动构建并发布到静态站点'));
+  bad.sections[3].slides[0].points.push(point('推送到 main 后，自动构建并发布到静态站点。'));
+  bad.sections[3].slides[0].points.push(point('下载 demo-v1.0.0-web.zip 解压即用'));
+  const r = await run(bad);
+  assert.deepEqual(r.P8!.evidence.map((e: any) => e.path), ['sections/positioning/slides/0']);
+  assert.match(JSON.stringify(r.P9!.evidence), /architecture\/slides\/0\/points\/1.*待补/);
+  assert.match(JSON.stringify(r.P10!.evidence), /getting_started\/slides\/0\/points\/1.*same text as sections\/features\/slides\/0\/points\/1/, 'punctuation does not hide a repeat');
+  assert.match(JSON.stringify(r.P11!.evidence), /demo-v1\.0\.0-web\.zip.*records disagree/, 'release notes say 0.9.0, package.json says 1.0.0');
+
+  await writeFile(join(project, 'RELEASE_NOTES.md'), '# Demo v1.0.0\n');
+  assert.equal((await run(bad)).P11!.pass, true, 'a hard-coded version is fine when every record agrees');
+  bad.sections[3].slides[0].points.at(-1).text = '下载 demo-v2.0.0-web.zip';
+  assert.match(JSON.stringify((await run(bad)).P11!.evidence), /says 2\.0\.0/);
+});
