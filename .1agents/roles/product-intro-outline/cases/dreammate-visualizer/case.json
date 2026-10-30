@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "dreammate-visualizer",
+  "kind": "variant",
+  "locked": true,
+  "input": {
+    "repo": "scottzx/dreammate-visualizer",
+    "commit": "2a1165691f49d13f9b8d96f1178466e670084b3d",
+    "exclude": ["docs/brochure"],
+    "audience": "想了解个人智能体能力网络的开发者和早期用户"
+  },
+  "features": null,
+  "accepted": null
+}

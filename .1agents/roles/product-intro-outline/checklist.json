@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "roleId": "product-intro-outline",
+  "outlineTemplate": {
+    "locked": true,
+    "sections": ["positioning", "features", "architecture", "getting_started", "screenshots"]
+  },
+  "items": [
+    { "id": "P1", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "大纲 JSON 符合 checks/outline.schema.json" },
+    { "id": "P2", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "字体是微软雅黑" },
+    { "id": "P3", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "四档字号都是整数" },
+    { "id": "P4", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "每页版式都在 style.layouts 里" },
+    { "id": "P5", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "每个出处的文件在固定提交里存在、行号不超出文件长度，且不在用例排除的目录里" },
+    { "id": "P6", "type": "program", "source": "task", "severity": "block", "locked": true,
+      "rule": "确认过的每个功能 ID 至少出现在一条要点里，且没有清单外的 ID" },
+    { "id": "P7", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "章节 ID 和 outlineTemplate 一致，不缺、不重复" },
+    { "id": "A1", "type": "agent", "source": "task", "severity": "block", "locked": true,
+      "rule": "每条要点的出处确实支持它的说法。只查有没有依据，不评价写得好不好",
+      "evidence": "不通过的要点：页标题、要点原文、出处路径和行号、出处里实际写了什么" },
+    { "id": "A2", "type": "agent", "source": "task", "severity": "block", "locked": true,
+      "rule": "标为不适用的章节，原因属实",
+      "evidence": "不通过的章节：章节 ID、给出的原因、仓库里与之矛盾的文件路径" }
+  ],
+  "program": { "run": "checks/check_outline.py", "schema": "checks/outline.schema.json" }
+}
