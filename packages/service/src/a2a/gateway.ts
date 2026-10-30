@@ -32,6 +32,7 @@ import { answerProcessRequest, createProcessRequest, expireProcessRequest, proce
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
 import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
+import { RSI_METHODS, RoleVersionRegistry, VersionLockError } from '../rsi/versions.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
@@ -54,6 +55,9 @@ const configSchema = z.object({
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
+  /** Roles whose versions this gateway keeps: each role directory, its locked preset, and where frozen copies go. */
+  rsi: z.object({ roles: z.record(string, z.object({ directory: string.refine(path.isAbsolute), preset: string.optional() }).strict()),
+    snapshotRoot: string.refine(path.isAbsolute) }).strict().optional(),
   workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
     /** Shared with a host that serves this page itself (DSH). Over the bearer API, only its relayed page requests may publish or decide reviews. */
     pageRelaySecret: z.string().min(32).optional(),
@@ -115,11 +119,16 @@ const executionListSchema = z.object({ ...originFields, targetId: string.optiona
 const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional() }).strict();
 const executionEventsSchema = z.object({ ...originFields, jobId: string.optional(), afterSequence: z.number().int().nonnegative().optional(),
   limit: z.number().int().min(1).max(500).default(100) }).strict();
+/** A person's verdict from the page on a generic task's current result. A change request says what to change. */
+const pageAcceptanceSchema = z.object({ clientRequestId: string, attemptId: string, resultRevision: string, resultDigest: string,
+  reviewStatus: z.enum(['accepted', 'changes_requested']), note: z.string().trim().min(1).max(16000).optional() }).strict()
+  .refine(input => input.reviewStatus !== 'changes_requested' || input.note, { path: ['note'], message: 'changes_requested requires a note' });
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
   reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
+  ...RSI_METHODS,
   execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
@@ -213,6 +222,7 @@ export class RemoteAgentGateway {
   readonly targets: TargetDirectory;
   readonly agents: AgentRegistry;
   readonly projectDiscovery?: ProjectRoleDiscovery;
+  readonly rsiVersions?: RoleVersionRegistry;
   readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
   private readonly stateFile: string;
@@ -263,6 +273,7 @@ export class RemoteAgentGateway {
       this.targets = new TargetDirectory(this.config.stateDirectory, this.config.remotes);
       this.targets.ensureLegacyRemotes();
       this.agents = new AgentRegistry(this.config.stateDirectory);
+      if (this.config.rsi) this.rsiVersions = new RoleVersionRegistry(path.join(this.config.stateDirectory, 'rsi-versions.json'), this.config.rsi.snapshotRoot, this.config.rsi.roles);
       this.ledger = new JobLedger(this.state.ledger, next => {
         atomicJson(this.stateFile, { ...this.state, version: 2, ledger: next });
         this.state.ledger = next; this.state.version = 2;
@@ -995,6 +1006,10 @@ export class RemoteAgentGateway {
       if (!this.projectDiscovery) throw new Error('Project discovery is disabled; configure projectDiscovery in the trusted gateway configuration');
       return this.projectDiscovery.invoke(method, params);
     }
+    if (Object.hasOwn(RSI_METHODS, method)) {
+      if (!this.rsiVersions) throw new Error('Role versions are disabled; configure rsi in the trusted gateway configuration');
+      return this.rsiVersions.invoke(method, params);
+    }
     if (Object.hasOwn(TARGET_METHODS, method)) {
       if (method === 'execution_target_probe') return this.probeTarget(z.object({ targetId: string }).strict().parse(params).targetId);
       return this.targets.invoke(method, params);
@@ -1062,6 +1077,7 @@ export class RemoteAgentGateway {
     }
     if (method === 'execution_review') {
       const { originSessionId, jobId, ...review } = executionReviewSchema.parse(params);
+      if (this.acceptedOnPageOnly(originSessionId, jobId)) throw new Error('Trial and RSI training tasks are accepted by a person on the workbench page, not through execution_review');
       return this.ledger.acceptance(originSessionId, jobId, review);
     }
     if (method === 'execution_inbox') {
@@ -1207,6 +1223,50 @@ export class RemoteAgentGateway {
   workbenchChat(jobId: string, query: { limit?: number; before?: number } = {}) {
     this.workbenchTask(jobId);
     return pageChat(chatItems(this.state.jobs.filter(job => job.ledgerJobId === jobId)), query);
+  }
+  /** The release gate: each role's versions, newest first, with what changed and how they did on re-verification. */
+  workbenchRsi() {
+    const registry = this.rsiVersions!;
+    return { roles: registry.roleIds().map(roleId => ({ roleId, published: registry.published(roleId)?.version, versions: registry.list(roleId).reverse() })) };
+  }
+  async workbenchRsiDiff(roleId: string, version: string) { return { roleId, version, diff: await this.rsiVersions!.diff(roleId, version) }; }
+  /** A person puts a proposed version live from the page. */
+  publishRoleVersion(roleId: string, version: string, input: unknown) {
+    return this.workbench(async () => {
+      const { note } = z.object({ note: z.string().trim().min(1).max(4000).optional() }).strict().parse(input);
+      const config = this.config.workbench!;
+      const published = this.rsiVersions!.publish(roleId, version, { id: config.reviewerId, ...(config.reviewerName ? { displayName: config.reviewerName } : {}) }, note);
+      return { published, ...this.workbenchRsi() };
+    });
+  }
+  /** Trial tasks and RSI training runs are a person's call on the page; execution_review stays for everything else. */
+  private acceptedOnPageOnly(originSessionId: string, jobId: string): boolean {
+    const job = this.ledger.get(originSessionId, jobId), attempt = this.ledger.getAttempt(job.currentAttemptId);
+    return readDevelopment(attempt.targetSnapshot?.development)?.channel === 'trial' || Boolean(job.purpose?.startsWith('rsi:'));
+  }
+  /** A generic task's current result, accepted or sent back from the page. Workflows with their own review keep it. */
+  async acceptWorkbenchTask(jobId: string, input: unknown) {
+    return this.workbench(async () => {
+      if (this.closed) throw new Error('Gateway is closed');
+      const scope = this.workbenchTask(jobId), config = this.config.workbench!;
+      if (this.state.reportReviews?.[scope.currentAttemptId] || this.state.pptDeliveries.runs[scope.currentAttemptId]) {
+        throw new HumanReviewError('forbidden', 'This task is decided through its own review');
+      }
+      const decision = pageAcceptanceSchema.parse(input);
+      const replay = (this.ledger.snapshot().acceptances[jobId] ?? []).find(item => item.clientRequestId === decision.clientRequestId);
+      if (replay) {
+        if (replay.attemptId !== decision.attemptId || replay.reviewStatus !== decision.reviewStatus || (replay.note ?? '') !== (decision.note ?? '')
+          || replay.resultRevision !== decision.resultRevision || replay.resultDigest !== decision.resultDigest) {
+          throw new HumanReviewError('idempotency_conflict', 'clientRequestId conflicts with a recorded acceptance');
+        }
+        return this.workbenchTask(jobId);
+      }
+      try {
+        this.ledger.acceptance(scope.originSessionId, jobId, { ...decision,
+          actor: { id: config.reviewerId, ...(config.reviewerName ? { displayName: config.reviewerName } : {}), source: '1agents-web' } });
+      } catch (error) { throw new HumanReviewError('version_conflict', error instanceof Error ? error.message : 'The displayed result is no longer current'); }
+      return this.workbenchTask(jobId);
+    });
   }
   /** Only the dedicated HTTP workbench calls this; it is deliberately absent from the agent tool catalogue. */
   async decideWorkbenchReview(jobId: string, reviewId: string, input: unknown) {
@@ -1551,7 +1611,8 @@ function authenticated(req: IncomingMessage, token: string): boolean {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 /** Publishing and review decisions are a person's acts, made on the workbench page. */
-const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/];
+const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/acceptance$/,
+  /^\/workbench\/rsi\/roles\/[^/]+\/versions\/[^/]+\/publish$/];
 function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
   if (!secret) return false;
   const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
@@ -1668,6 +1729,20 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             throw error;
           }
         }
+        const rsiVersion = /^\/workbench\/rsi\/roles\/([^/]+)\/versions\/([^/]+)\/(diff|publish)$/.exec(pathname);
+        if (pathname === '/workbench/rsi' || rsiVersion) {
+          if (!gateway.rsiVersions) return json(res, 404, { error: 'rsi_disabled' });
+          if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+          try {
+            if (!rsiVersion) return req.method === 'GET' ? json(res, 200, gateway.workbenchRsi()) : json(res, 405, { error: 'Method not allowed' });
+            const roleId = decodeURIComponent(rsiVersion[1]!), version = decodeURIComponent(rsiVersion[2]!);
+            if (rsiVersion[3] === 'diff') return req.method === 'GET' ? json(res, 200, await gateway.workbenchRsiDiff(roleId, version)) : json(res, 405, { error: 'Method not allowed' });
+            return req.method === 'POST' ? json(res, 200, await gateway.publishRoleVersion(roleId, version, await body(req))) : json(res, 405, { error: 'Method not allowed' });
+          } catch (error) {
+            if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
+            return json(res, 409, { error: error instanceof VersionLockError ? 'locked' : 'version_conflict', message: error instanceof Error ? error.message : 'Version unavailable' });
+          }
+        }
         const chat = /^\/workbench\/tasks\/([^/]+)\/chat$/.exec(pathname);
         if (chat) {
           if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
@@ -1705,10 +1780,11 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
           if (rest === '/refresh' && req.method === 'POST') return json(res, 200, await gateway.refreshWorkbenchTask(jobId));
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
+          if (rest === '/acceptance' && req.method === 'POST') return json(res, 200, await gateway.acceptWorkbenchTask(jobId, await body(req)));
           if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
           if (answer && req.method === 'POST') return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), await body(req)));
           if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
-          if (rest === '' || rest === '/refresh' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' || rest === '/refresh' || review || answer || one || rest === '/process-requests' || rest === '/acceptance') return json(res, 405, { error: 'Method not allowed' });
           return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });
@@ -1783,7 +1859,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     }
     const entry = { id: 'a2a-gateway', name: 'DSH 远端智能体', kind: 'agent_runtime' as const,
       capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http' as const, port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS,
-      metadata: { local_only_methods: [...Object.keys(TARGET_METHODS), ...Object.keys(DISCOVERY_METHODS)] } };
+      metadata: { local_only_methods: [...Object.keys(TARGET_METHODS), ...Object.keys(DISCOVERY_METHODS), ...Object.keys(RSI_METHODS)] } };
     const contractViolations = methodContractViolations(REMOTE_AGENT_METHODS);
     if (contractViolations.length) console.error(`[a2a-gateway] DreamMate registration contract violated: ${contractViolations.join('; ')}`);
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);

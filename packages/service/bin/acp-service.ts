@@ -62,7 +62,7 @@ function printUnifiedHelp(binName: string) {
   roles sync --profile <file>            Resolve current network skills into a versioned task lock
   a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
-  rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
+  rsi run|propose|versions|eval ...       Coach commands: run a case, propose and re-verify role versions
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
 
   help = help.replace(/^Commands:/m, serverCommands);

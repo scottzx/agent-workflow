@@ -567,6 +567,12 @@ function AcceptanceSection({ detail }: { detail: AcpTaskDetail }) {
                 <dd>{acceptance.resultRevision}</dd>
                 <dt>{text('记录时间', 'Recorded')}</dt>
                 <dd>{date(acceptance.recordedAt)}</dd>
+                {acceptance.actor && (
+                    <Fragment>
+                        <dt>{text('验收人', 'Accepted by')}</dt>
+                        <dd>{acceptance.actor.displayName || acceptance.actor.id}</dd>
+                    </Fragment>
+                )}
                 {acceptance.note && (
                     <Fragment>
                         <dt>{text('说明', 'Note')}</dt>
@@ -574,6 +580,61 @@ function AcceptanceSection({ detail }: { detail: AcpTaskDetail }) {
                     </Fragment>
                 )}
             </dl>
+        </section>
+    );
+}
+
+/** A person's verdict on the current result of a task that has no review of its own. A change request says what to change. */
+function AcceptanceActions({ detail, onReload }: { detail: AcpTaskDetail; onReload: () => void }) {
+    const [note, setNote] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState('');
+    const result = detail.attempts.find(attempt => attempt.attemptId === detail.currentAttemptId)?.result;
+    if (detail.businessAcceptance || detail.reviews.length || !result?.resultAvailable || !result.resultRevision || !result.resultDigest) return null;
+    const submit = async (reviewStatus: 'accepted' | 'changes_requested') => {
+        setBusy(true);
+        setError('');
+        try {
+            await acpTaskService.accept(detail.jobId, {
+                clientRequestId: crypto.randomUUID(),
+                attemptId: detail.currentAttemptId,
+                resultRevision: result.resultRevision!,
+                resultDigest: result.resultDigest!,
+                reviewStatus,
+                ...(note.trim() ? { note: note.trim() } : {}),
+            });
+            onReload();
+        } catch (err) {
+            setError(
+                err instanceof AcpTaskApiError && err.code === 'version_conflict'
+                    ? text('结果已经更新，请刷新后再验收', 'The result changed; reload before deciding')
+                    : err instanceof Error
+                      ? err.message
+                      : String(err)
+            );
+        } finally {
+            setBusy(false);
+        }
+    };
+    return (
+        <section class="acp-detail-section">
+            <h3>{text('验收这次结果', 'Accept this result')}</h3>
+            {error && <p class="acp-muted">{error}</p>}
+            <textarea
+                class="acp-reject-note"
+                maxLength={16000}
+                placeholder={text('修改意见（要求修改时必填）', 'What to change (required when requesting changes)')}
+                value={note}
+                onInput={event => setNote(event.currentTarget.value)}
+            />
+            <div class="acp-agent-actions">
+                <button type="button" class="acp-button acp-primary" disabled={busy} onClick={() => void submit('accepted')}>
+                    {text('验收通过', 'Accept')}
+                </button>
+                <button type="button" class="acp-button" disabled={busy || !note.trim()} onClick={() => void submit('changes_requested')}>
+                    {text('要求修改', 'Request changes')}
+                </button>
+            </div>
         </section>
     );
 }
@@ -599,6 +660,7 @@ function TaskOverview({
                 onReload={onReload}
             />
             {detail.executionStatus === 'completed' && <AcceptanceSection detail={detail} />}
+            {detail.executionStatus === 'completed' && <AcceptanceActions detail={detail} onReload={onReload} />}
             {detail.pendingReviewId && (
                 <p class="acp-notice">
                     {text('有产物等待你审核。', 'An artifact is waiting for your review.')}{' '}

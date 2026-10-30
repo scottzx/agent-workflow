@@ -33,6 +33,8 @@ export interface LedgerResult {
 export interface BusinessAcceptance {
   attemptId: string; resultRevision: string; resultDigest: string;
   reviewStatus: 'pending' | 'accepted' | 'changes_requested'; note?: string; recordedAt: string;
+  /** Present when a person decided on the workbench page; execution_review records carry none. */
+  actor?: { id: string; displayName?: string; source: '1agents-web' }; clientRequestId?: string;
 }
 export interface LedgerAttempt {
   attemptId: string; jobId: string; operation: string; clientRequestId?: string; requestDigest: string;

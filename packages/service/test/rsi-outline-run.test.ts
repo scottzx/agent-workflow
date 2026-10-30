@@ -5,6 +5,7 @@ import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { evaluateVersion } from '../src/rsi/evaluate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
@@ -70,6 +71,7 @@ test('a failed program check goes back to the same task with its evidence, and t
   assert.deepEqual(report.rounds[0]!.results.filter(r => !r.pass).map(r => r.itemId), ['P2']);
   const submit = f.calls.find(call => call.method === 'execution_submit')!.params;
   assert.equal(submit.targetId, 'dsh-host'); assert.equal(submit.input.agentPreset, 'standard');
+  assert.equal(submit.purpose, 'rsi:product-intro-outline:demo', 'a training run is marked for page-only acceptance');
   assert.match(submit.input.prompt, /# 产品介绍大纲/, 'the role instructions lead the prompt');
   assert.ok(submit.input.prompt.includes(f.commit));
   assert.match(submit.input.prompt, /自查用的 Python：`\/[^`]+`/, 'the executor gets the checker interpreter by absolute path');
@@ -141,4 +143,39 @@ test('without bounces left a failed check ends the run, and a failed task is not
     invoke: async method => method === 'execution_submit' ? { jobId: 'job-4' } : { executionStatus: 'working' } });
   assert.equal(stuck.passed, false);
   assert.equal(stuck.rounds[0]!.executionStatus, 'timed_out', 'a task that never finishes is recorded, not thrown');
+});
+
+test('eval runs every case of a version from its frozen copy, original first, and records cases it could not run as failures', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t);
+  // Only the fixture's own cases: the copied role also carries the real ones.
+  for (const id of ['xingjian-showroom', 'dreammate-network', 'dreammate-visualizer']) await rm(join(f.role, 'cases', id), { recursive: true, force: true });
+  const variant = (id: string, repo: string, features: string | null) => mkdir(join(f.role, 'cases', id), { recursive: true }).then(() =>
+    writeFile(join(f.role, 'cases', id, 'case.json'), JSON.stringify({ schemaVersion: 1, id, kind: 'variant', locked: true,
+      input: { repo, commit: f.commit, exclude: [], audience: '开发者' }, features, accepted: null })));
+  await variant('a-unconfirmed', 'example/other', null);
+  await variant('b-no-clone', 'example/missing', 'features.json');
+  await cp(join(f.role, 'cases', 'demo', 'features.json'), join(f.role, 'cases', 'b-no-clone', 'features.json'));
+  const calls: { method: string; params: any }[] = [];
+  const version = await evaluateVersion({ roleId: 'product-intro-outline', version: 'v2', projects: { 'example/demo': f.project },
+    workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
+    invoke: async (method, params: any) => {
+      calls.push({ method, params });
+      if (method === 'rsi_version_list') return { versions: [{ version: 'v2', status: 'proposed', snapshot: { directory: f.role } }] };
+      if (method === 'execution_submit') {
+        await writeFile(join(params.input.cwd, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        return { jobId: 'job-eval' };
+      }
+      if (method === 'rsi_version_evaluation') return { version: 'v2', evaluation: params.evaluation };
+      return { executionStatus: 'completed' };
+    } });
+  const results = version.evaluation!.results;
+  assert.deepEqual(results.map(r => [r.caseId, r.kind, r.passed, r.failedItems]), [
+    ['demo', 'original', true, []],
+    ['a-unconfirmed', 'variant', false, ['features-unconfirmed']],
+    ['b-no-clone', 'variant', false, ['project-unavailable']],
+  ]);
+  assert.equal(results[0]!.jobId, 'job-eval'); assert.match(results[0]!.outlineSha256!, /^[a-f0-9]{64}$/);
+  const submit = calls.find(call => call.method === 'execution_submit')!.params;
+  assert.ok(submit.input.cwd.startsWith(join(f.root, 'runs')), 'each case runs in a fresh work directory');
+  assert.equal(calls.filter(call => call.method === 'execution_submit').length, 1, 'cases that cannot run dispatch nothing');
 });

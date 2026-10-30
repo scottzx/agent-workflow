@@ -66,6 +66,18 @@ export interface AcpBusinessAcceptance {
     reviewStatus: 'pending' | 'accepted' | 'changes_requested';
     note?: string;
     recordedAt: string;
+    /** Present when a person decided on the workbench page. */
+    actor?: { id: string; displayName?: string; source: '1agents-web' };
+}
+
+/** A person's verdict on a task's current result, made on this page. */
+export interface AcpAcceptanceInput {
+    clientRequestId: string;
+    attemptId: string;
+    resultRevision: string;
+    resultDigest: string;
+    reviewStatus: 'accepted' | 'changes_requested';
+    note?: string;
 }
 
 export interface AcpTaskList {
@@ -100,6 +112,7 @@ export interface AcpAttempt {
     result?: {
         resultSummary?: string;
         resultRevision?: string;
+        resultDigest?: string;
         artifactLinks?: AcpArtifact[];
         resultAvailable?: boolean;
     };
@@ -270,4 +283,25 @@ export interface AcpChatPage {
     hasMore: boolean;
     nextCursor?: string;
     total: number;
+}
+
+/** One frozen copy of a role directory, as the release gate shows it. */
+export interface AcpRoleVersion {
+    roleId: string;
+    version: string;
+    parent?: string;
+    status: 'proposed' | 'published' | 'superseded';
+    preset?: { id: string; locked: true };
+    changes: { added: string[]; modified: string[]; removed: string[] };
+    checklistChanged: boolean;
+    proposal: { summary: string; proposedAt: string };
+    evaluation?: {
+        evaluatedAt: string;
+        results: { caseId: string; kind: 'original' | 'variant'; jobId?: string; passed: boolean; rounds: number; failedItems: string[] }[];
+    };
+    decision?: { by: string; displayName?: string; at: string; note?: string };
+}
+
+export interface AcpRoleVersions {
+    roles: { roleId: string; published?: string; versions: AcpRoleVersion[] }[];
 }

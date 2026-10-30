@@ -2,6 +2,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpAgentCatalog, AcpAgentOption, AcpAgentRow, AcpTaskSummary } from './types';
 import { EmptyState, ErrorState, text } from './ui';
+import { RoleVersions } from './RoleVersions';
 
 const emptyCatalog: AcpAgentCatalog = { developing: [], published: [] };
 
@@ -327,6 +328,7 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                     )}
                 </div>
             </div>
+            <RoleVersions refreshKey={refreshKey} />
         </div>
     );
 }

@@ -1,10 +1,13 @@
 import type {
+    AcpAcceptanceInput,
     AcpAgentCatalog,
     AcpAgentDraftInput,
     AcpChatPage,
     AcpDecisionInput,
     AcpDshSession,
     AcpProcessAnswerInput,
+    AcpRoleVersions,
+    AcpRoleVersion,
     AcpTaskDetail,
     AcpTaskFilter,
     AcpTaskList,
@@ -72,10 +75,17 @@ export const acpTaskService = {
         post(`/tasks/${encodeURIComponent(jobId)}/reviews/${encodeURIComponent(reviewId)}/decisions`, input),
     answerProcessRequest: (jobId: string, requestId: string, input: AcpProcessAnswerInput): Promise<AcpTaskDetail> =>
         post(`/tasks/${encodeURIComponent(jobId)}/process-requests/${encodeURIComponent(requestId)}/answers`, input),
+    accept: (jobId: string, input: AcpAcceptanceInput): Promise<AcpTaskDetail> => post(`/tasks/${encodeURIComponent(jobId)}/acceptance`, input),
     listAgents: (): Promise<AcpAgentCatalog> => call('/agents'),
     createAgent: (input: AcpAgentDraftInput): Promise<AcpAgentCatalog & { draft: { agentId: string } }> => post('/agents', input),
     updateAgent: (agentId: string, input: AcpAgentDraftInput): Promise<AcpAgentCatalog> =>
         post(`/agents/${encodeURIComponent(agentId)}/settings`, input),
     publishAgent: (agentId: string, input: { releaseName: string; replace?: boolean }): Promise<AcpAgentCatalog> =>
         post(`/agents/${encodeURIComponent(agentId)}/publish`, input),
+    /** Present only when the gateway keeps role versions. */
+    listRoleVersions: (): Promise<AcpRoleVersions> => call('/rsi'),
+    roleVersionDiff: (roleId: string, version: string): Promise<{ diff: string }> =>
+        call(`/rsi/roles/${encodeURIComponent(roleId)}/versions/${encodeURIComponent(version)}/diff`),
+    publishRoleVersion: (roleId: string, version: string, input: { note?: string }): Promise<AcpRoleVersions & { published: AcpRoleVersion }> =>
+        post(`/rsi/roles/${encodeURIComponent(roleId)}/versions/${encodeURIComponent(version)}/publish`, input),
 };

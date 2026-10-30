@@ -377,6 +377,47 @@ test('only the page publishes and decides reviews; bearer callers need the page 
   assert.equal((await onPage.json() as any).reviews[0].history.length, 1);
 });
 
+/** A completed generic task with a recorded result revision and digest, as an A2A host reports it. */
+function completedTask(f: Awaited<ReturnType<typeof fixture>>, extra: { purpose?: string; development?: unknown } = {}) {
+  const ledger = f.gateway.ledger;
+  const prepared = ledger.prepare({ originSessionId: 'allowed-root', title: '产品介绍大纲', input: { prompt: 'outline' },
+    targetSnapshot: { targetId: 'dsh-host', provider: 'a2a', ...(extra.development ? { development: extra.development } : {}) },
+    ...(extra.purpose ? { purpose: extra.purpose } : {}) });
+  ledger.markDispatching(prepared.attempt.attemptId);
+  ledger.accept(prepared.attempt.attemptId, { taskId: `task-${prepared.attempt.attemptId}` }, { executionStatus: 'working' });
+  ledger.observe(prepared.attempt.attemptId, { executionStatus: 'completed', resultSummary: 'outline.json', resultRevision: 'result-1', resultDigest: 'd'.repeat(64) });
+  return { jobId: prepared.job.jobId, attemptId: prepared.attempt.attemptId,
+    verdict: (reviewStatus: string, note?: string) => ({ clientRequestId: `accept-${reviewStatus}`, attemptId: prepared.attempt.attemptId,
+      resultRevision: 'result-1', resultDigest: 'd'.repeat(64), reviewStatus, ...(note ? { note } : {}) }) };
+}
+
+test('a person accepts or sends back a generic task on the page; bearer callers and stale results are refused', async t => {
+  const f = await fixture(t), item = completedTask(f), path = `/workbench/tasks/${item.jobId}/acceptance`;
+  const refused = await f.request(path, post(item.verdict('accepted')));
+  assert.equal(refused.status, 403, 'bearer callers cannot record a verdict');
+  assert.equal((await f.request(path, relayed({ ...item.verdict('changes_requested') }))).status, 400, 'a change request needs a note');
+  assert.equal((await f.request(path, relayed({ ...item.verdict('accepted'), resultDigest: 'e'.repeat(64) }))).status, 409, 'the verdict binds to the shown result');
+
+  const sentBack = await f.request(path, relayed(item.verdict('changes_requested', '功能清单漏了导出能力')));
+  assert.equal(sentBack.status, 200);
+  const detail = await sentBack.json() as any;
+  assert.equal(detail.businessAcceptance.reviewStatus, 'changes_requested');
+  assert.equal(detail.businessAcceptance.note, '功能清单漏了导出能力');
+  assert.deepEqual(detail.businessAcceptance.actor, { id: 'local-owner', displayName: '本机用户', source: '1agents-web' });
+  assert.equal((await f.request(path, relayed(item.verdict('changes_requested', '功能清单漏了导出能力')))).status, 200, 'a replay is idempotent');
+  assert.equal((await f.request(path, relayed(item.verdict('changes_requested', '换了说法')))).status, 409, 'a changed replay conflicts');
+  assert.equal(f.gateway.ledger.snapshot().acceptances[item.jobId]!.length, 1);
+});
+
+test('execution_review cannot accept RSI training runs or trial tasks; other tasks keep it', async t => {
+  const f = await fixture(t);
+  const review = (item: ReturnType<typeof completedTask>) => f.gateway.invoke('execution_review', { originSessionId: 'allowed-root', jobId: item.jobId,
+    attemptId: item.attemptId, resultRevision: 'result-1', resultDigest: 'd'.repeat(64), reviewStatus: 'accepted' });
+  await assert.rejects(review(completedTask(f, { purpose: 'rsi:product-intro-outline:xingjian-showroom' })), /workbench page/);
+  await assert.rejects(review(completedTask(f, { development: { channel: 'trial', phase: 'developing', agentId: 'agt-12345678', name: '大纲草稿' } })), /workbench page/);
+  assert.equal((await review(completedTask(f)) as any).reviewStatus, 'accepted');
+});
+
 test('workbench chat pages the stored A2A history newest-first inside the same scope as the task', async t => {
   const f = await fixture(t);
   const { jobId } = await f.seed('allowed-root', '对话任务'), hidden = await f.seed('private-root', '隐藏对话');

@@ -138,7 +138,8 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
 
   const role = await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8');
   const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.targetId,
-    title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`,
+    // The purpose marks a training run: a person accepts it on the workbench page, never through execution_review.
+    title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`, purpose: `rsi:${roleId}:${kase.id}`,
     input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(role, kase, work, python) } });
   const jobId = String(submitted.jobId);
   const rounds: OutlineRound[] = [];
