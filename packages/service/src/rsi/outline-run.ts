@@ -2,9 +2,11 @@
  * One product-intro outline run on a role's case: the executor writes outline.json in a prepared
  * work directory, the role's program checks (P1–P7) run on it, and a failed check goes back to the
  * same session with its evidence. No model judges the result here; people accept it on the workbench.
+ * The checked bytes are recorded by sha256, and a delivered copy in the job's artifact folder must match them.
  */
 import { spawn } from 'node:child_process';
-import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -19,7 +21,7 @@ const featuresSchema = z.object({ repo: z.string(), commit: z.string(), confirma
 const resultsSchema = z.array(z.object({ itemId: z.string(), pass: z.boolean(), evidence: z.array(z.unknown()) }).strict());
 
 export type CheckResult = z.infer<typeof resultsSchema>[number];
-export interface OutlineRound { round: number; jobId: string; executionStatus: string; passed: boolean; results: CheckResult[] }
+export interface OutlineRound { round: number; jobId: string; executionStatus: string; passed: boolean; results: CheckResult[]; outlineSha256?: string }
 export interface OutlineRunReport {
   roleId: string; caseId: string; repo: string; commit: string; workDirectory: string; outlinePath: string;
   featuresConfirmed: boolean; rounds: OutlineRound[]; passed: boolean; startedAt: string; finishedAt: string;
@@ -78,13 +80,26 @@ function bouncePrompt(results: CheckResult[], round: number): string {
   return `宿主程序检查没有通过（第 ${round} 轮），下面是未通过的检查项和证据：\n\n${failed}\n\n请在同一个 outline.json 上修改，用任务里给的 Python 再运行自查，P1 到 P7 全部通过后结束，最终答复给出文件路径。`;
 }
 
-async function check(work: string, python: string): Promise<CheckResult[]> {
+const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+
+async function check(work: string, python: string, jobId: string): Promise<{ results: CheckResult[]; outlineSha256?: string }> {
   const outline = path.join(work, 'outline.json');
-  const present = await stat(outline).then(info => info.isFile(), () => false);
-  if (!present) return [{ itemId: 'P0', pass: false, evidence: [{ message: 'outline.json 不存在或不是普通文件' }] }];
+  const bytes = await readFile(outline).catch(() => undefined);
+  if (!bytes) return { results: [{ itemId: 'P0', pass: false, evidence: [{ message: 'outline.json 不存在或不是普通文件' }] }] };
+  const outlineSha256 = sha256(bytes);
   const result = await run(python, ['-I', path.join(work, 'checks', 'check_outline.py'), outline, path.join(work, 'features.json'), path.join(work, 'project')], { cwd: work });
-  try { return resultsSchema.parse(JSON.parse(result.stdout)); }
-  catch { return [{ itemId: 'P0', pass: false, evidence: [{ message: 'outline.json 不是可读的 JSON，或检查程序出错', stderr: result.stderr.slice(-2000) }] }]; }
+  let results: CheckResult[];
+  try { results = resultsSchema.parse(JSON.parse(result.stdout)); }
+  catch { results = [{ itemId: 'P0', pass: false, evidence: [{ message: 'outline.json 不是可读的 JSON，或检查程序出错', stderr: result.stderr.slice(-2000) }] }]; }
+  // The host delivers the copy in the job's artifact folder, so it must be the very bytes that were checked.
+  const delivered = path.join(work, '.1agents', 'jobs', jobId, 'outline.json');
+  const copy = await readFile(delivered).catch(() => undefined);
+  if (copy) {
+    const copySha256 = sha256(copy);
+    results.push({ itemId: 'D1', pass: copySha256 === outlineSha256, evidence: copySha256 === outlineSha256 ? [] : [{ path: path.relative(work, delivered),
+      message: `产物目录里的 outline.json（sha256 ${copySha256}）和工作目录的 outline.json（sha256 ${outlineSha256}）字节不一致，请让两份完全相同` }] });
+  }
+  return { results, outlineSha256 };
 }
 
 export async function runOutlineCase(options: OutlineRunOptions): Promise<OutlineRunReport> {
@@ -129,9 +144,9 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const rounds: OutlineRound[] = [];
   for (let round = 1; ; round++) {
     const executionStatus = await wait(jobId);
-    const results = executionStatus === 'completed' ? await check(work, python) : [];
-    const passed = executionStatus === 'completed' && results.every(result => result.pass);
-    rounds.push({ round, jobId, executionStatus, passed, results });
+    const checked = executionStatus === 'completed' ? await check(work, python, jobId) : { results: [] };
+    const results = checked.results, passed = executionStatus === 'completed' && results.every(result => result.pass);
+    rounds.push({ round, jobId, executionStatus, passed, results, ...(checked.outlineSha256 ? { outlineSha256: checked.outlineSha256 } : {}) });
     log(`第 ${round} 轮：${passed ? '检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
     if (passed || executionStatus !== 'completed' || round > maxBounces) break;
     await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId,

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -78,6 +79,42 @@ test('a failed program check goes back to the same task with its evidence, and t
   assert.ok(await stat(join(work, 'project', 'README.md')));
   await assert.rejects(stat(join(work, 'project', 'internal')), 'excluded paths are not in the copy');
   assert.equal(JSON.parse(await readFile(join(work, 'run.json'), 'utf8')).passed, true);
+  assert.equal(report.rounds[1]!.outlineSha256, createHash('sha256').update(await readFile(join(work, 'outline.json'))).digest('hex'));
+  assert.ok(!report.rounds[1]!.results.some(r => r.itemId === 'D1'), 'no delivered copy, nothing to compare');
+});
+
+test('a delivered copy that differs from the checked outline fails and goes back; matching bytes pass', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t);
+  let work = '', prompt = '';
+  const good = JSON.stringify(outline('example/demo', f.commit));
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
+    invoke: async (method, params: any) => {
+      const delivered = join(work, '.1agents', 'jobs', 'job-5');
+      if (method === 'execution_submit') {
+        work = params.input.cwd;
+        await mkdir(join(work, '.1agents', 'jobs', 'job-5'), { recursive: true });
+        await writeFile(join(work, 'outline.json'), good);
+        // Same content as JSON, other bytes: what a stale copy from an earlier round looks like.
+        await writeFile(join(work, '.1agents', 'jobs', 'job-5', 'outline.json'), JSON.stringify(JSON.parse(good), null, 2));
+        return { jobId: 'job-5' };
+      }
+      if (method === 'execution_continue') {
+        prompt = params.input.prompt;
+        await cp(join(work, 'outline.json'), join(delivered, 'outline.json'));
+        return { jobId: 'job-5' };
+      }
+      return { executionStatus: 'completed' };
+    } });
+  const first = report.rounds[0]!;
+  assert.equal(first.passed, false);
+  assert.deepEqual(first.results.filter(r => !r.pass).map(r => r.itemId), ['D1'], 'P1–P7 pass; only the copy differs');
+  assert.match(JSON.stringify(first.results.find(r => r.itemId === 'D1')!.evidence), /\.1agents\/jobs\/job-5\/outline\.json/);
+  assert.match(prompt, /D1/);
+  const second = report.rounds[1]!;
+  assert.equal(report.passed, true);
+  assert.equal(second.results.find(r => r.itemId === 'D1')!.pass, true);
+  assert.equal(second.outlineSha256, createHash('sha256').update(good).digest('hex'));
 });
 
 test('without bounces left a failed check ends the run, and a failed task is not checked', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
