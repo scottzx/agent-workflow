@@ -17,6 +17,7 @@
 
 - `project.repo` 和 `project.commit` 按任务消息填写，提交号写完整的 40 位。
 - 章节按大纲模板排列：`positioning`、`features`、`architecture`、`getting_started`、`screenshots`。项目确实没有某一部分（例如协议包没有界面）时，把该章标为 `not_applicable` 并写明原因，不要硬凑。
+- 受众不是技术人员（例如销售、设计团队、客户）时，`architecture` 可以标为 `not_applicable`，原因写“受众不需要技术实现细节”；确实要讲，就压成一页、标题以“附录”开头，放在全稿最后。`getting_started` 写受众怎么开始用（在线演示、下载哪个文件、找谁），不写开发命令。
 - 每条要点都写出处：相对于 `project/` 的文件路径，能定位时带行号（如 `"lines": "12-18"`）。写不出出处的说法不要写。
 - 配色优先取项目自己的品牌色，并写明出处文件；项目没有品牌色时用 `#285B4D`、`#F7F4EB`、`#CBB078`、`#202D29`，出处写 `README.md`。字体用微软雅黑，字号用整数。
 - 每页的 `layout` 必须出现在 `style.layouts` 里。

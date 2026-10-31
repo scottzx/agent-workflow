@@ -3,10 +3,11 @@
  * work directory, the role's program checks run on it, and a failed check goes back to the
  * same session with its evidence. No model judges the result here; people accept it on the workbench.
  * The checked bytes are recorded by sha256, and a delivered copy in the job's artifact folder must match them.
+ * Each run appends a line to the role's ledger, which the gate reads to decide when development is done.
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -29,6 +30,8 @@ const reviewSchema = z.object({
   /** On a re-review: what became of each issue from the previous review. */
   previous: z.array(z.object({ where: z.string().trim().min(1).max(300), status: z.enum(['fixed', 'partly', 'not_fixed', 'disagreed']),
     note: z.string().trim().max(2000).optional() }).strict()).max(30).optional(),
+  /** Changes to the role itself: a program check, the executor's or QA's instructions, or a locked item only a person can change. */
+  proposals: z.array(z.object({ kind: z.enum(['check', 'role', 'qa', 'locked']), text: z.string().trim().min(1).max(2000) }).strict()).max(10).optional(),
 }).passthrough().refine(review => review.verdict === 'pass' || review.issues.length > 0, { message: 'A revise verdict needs at least one issue' });
 
 export type CheckResult = z.infer<typeof resultsSchema>[number];
@@ -36,16 +39,29 @@ export type QualityReview = z.infer<typeof reviewSchema>;
 /** One QA pass over a frozen copy of the outline, in its own session. */
 export interface ReviewRecord { jobId?: string; executionStatus: string; outlineCopy: string; review?: QualityReview; error?: string }
 export interface OutlineRound { round: number; jobId: string; executionStatus: string; passed: boolean; results: CheckResult[]; outlineSha256?: string; review?: ReviewRecord }
+export type Phase = 'dev' | 'test';
+export type StopReason = 'passed' | 'max_bounces' | 'max_revisions' | 'stalled' | 'needs_human' | 'not_completed' | 'review_failed';
+/** The role version is the last commit that touched the role directory; uncommitted changes make a run unattributable. */
+export interface RoleVersion { commit?: string; dirty: boolean }
 export interface OutlineRunReport {
-  roleId: string; caseId: string; repo: string; commit: string; workDirectory: string; outlinePath: string;
-  featuresConfirmed: boolean; rounds: OutlineRound[]; passed: boolean; startedAt: string; finishedAt: string;
+  roleId: string; caseId: string; phase: Phase; role: RoleVersion; repo: string; commit: string; workDirectory: string; outlinePath: string;
+  featuresConfirmed: boolean; rounds: OutlineRound[]; passed: boolean; stopReason: StopReason; startedAt: string; finishedAt: string;
+}
+/** One line of `<workspace>/<role>/ledger.jsonl`. */
+export interface LedgerEntry {
+  startedAt: string; phase: Phase; caseId: string; caseKind: 'original' | 'variant'; role: RoleVersion; passed: boolean; stopReason: StopReason;
+  /** The executor's first outline passed every program check without a bounce. */
+  firstDraftPassed: boolean; bounces: number; revisions: number; scores: Record<string, number>[];
+  mustIssues: number; proposals: NonNullable<QualityReview['proposals']>; workDirectory: string;
 }
 export interface OutlineRunOptions {
   roleDirectory: string; caseId: string; projectPath: string; workspace: string;
+  /** A test run needs a committed role directory and QA; development runs take whatever is on disk. */
+  phase?: Phase;
   targetId: string; agentPreset: string; originSessionId: string;
   /** Times a failed check goes back to the executor. The design default is one. */
   maxBounces?: number; pollMs?: number; timeoutMs?: number; python?: string;
-  /** A QA agent reviews each outline that passes the program checks and may send it back for revision. */
+  /** A QA agent reviews each outline that passes the program checks and may send it back for revision, by default up to three times. */
   qa?: { agentPreset?: string; targetId?: string; maxRevisions?: number };
   invoke: (method: string, params: Record<string, unknown>) => Promise<any>;
   log?: (line: string) => void; now?: () => Date;
@@ -96,6 +112,24 @@ function bouncePrompt(results: CheckResult[], round: number): string {
   return `宿主程序检查没有通过（第 ${round} 轮），下面是未通过的检查项和证据：\n\n${failed}\n\n请在同一个 outline.json 上修改，用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。`;
 }
 
+export async function roleVersion(roleDirectory: string): Promise<RoleVersion> {
+  const last = await run('git', ['-C', roleDirectory, 'log', '-1', '--format=%H', '--', '.']);
+  const status = await run('git', ['-C', roleDirectory, 'status', '--porcelain', '--untracked-files=all', '--', '.']);
+  const commit = last.code === 0 && last.stdout.trim() ? last.stdout.trim() : undefined;
+  return { ...(commit ? { commit } : {}), dirty: !commit || status.code !== 0 || status.stdout.trim() !== '' };
+}
+
+export const ledgerPath = (workspace: string, roleId: string) => path.join(path.resolve(workspace), roleId, 'ledger.jsonl');
+
+/** More revisions stop helping when the same issue survives two re-reviews in a row, or the total score has not risen twice running. */
+function stalled(reviews: QualityReview[]): boolean {
+  const open = (review?: QualityReview) => new Set((review?.previous ?? []).filter(p => p.status === 'not_fixed' || p.status === 'partly').map(p => p.where));
+  const before = open(reviews.at(-2));
+  if ([...open(reviews.at(-1))].some(where => before.has(where))) return true;
+  const totals = reviews.map(review => Object.values(review.scores).reduce((sum, score) => sum + score, 0));
+  return totals.length >= 3 && totals.at(-1)! <= totals.at(-2)! && totals.at(-2)! <= totals.at(-3)!;
+}
+
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 
 function reviewPrompt(qaRole: string, kase: z.infer<typeof caseSchema>, work: string, copy: string, output: string): string {
@@ -143,6 +177,9 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   if (!kase.features) throw new Error(`Case ${kase.id} has no confirmed feature list yet`);
   const features = featuresSchema.parse(JSON.parse(await readFile(path.join(caseDirectory, kase.features), 'utf8')));
   if (features.repo !== kase.input.repo || features.commit !== kase.input.commit) throw new Error('The feature list belongs to another repository or commit');
+  const phase = options.phase ?? 'dev', role = await roleVersion(roleDirectory);
+  if (phase === 'test' && role.dirty) throw new Error('A test run needs the role directory committed with no local changes');
+  if (phase === 'test' && !options.qa) throw new Error('A test run needs the QA review');
 
   const stamp = startedAt.replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
   const work = path.join(path.resolve(options.workspace), roleId, `${kase.id}-${stamp}`);
@@ -152,6 +189,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   await cp(path.join(roleDirectory, 'checks'), path.join(work, 'checks'), { recursive: true });
   await cp(path.join(caseDirectory, kase.features), path.join(work, 'features.json'));
   log(`工作目录：${work}`);
+  log(`阶段：${phase === 'dev' ? '开发' : '测试'}，角色版本：${role.commit?.slice(0, 8) ?? '未提交'}${role.commit && role.dirty ? '（有未提交的改动）' : ''}`);
   if (!features.confirmation) log('注意：这份功能清单还没有经人确认。');
 
   const wait = async (jobId: string): Promise<string> => {
@@ -166,7 +204,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     }
   };
 
-  const role = await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8');
+  const roleText = await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8');
   const qaRole = options.qa ? await readFile(path.join(roleDirectory, 'QA.md'), 'utf8') : '';
   const outlinePath = path.join(work, 'outline.json');
   /**
@@ -198,10 +236,11 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   };
   const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.targetId,
     title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`,
-    input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(role, kase, work, python) } });
+    input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(roleText, kase, work, python) } });
   const jobId = String(submitted.jobId);
   const rounds: OutlineRound[] = [];
-  let bounces = 0, revisions = 0;
+  const reviews: QualityReview[] = [];
+  let bounces = 0, revisions = 0, stopReason: StopReason = 'passed';
   for (let round = 1; ; round++) {
     const executionStatus = await wait(jobId);
     const checked = executionStatus === 'completed' ? await check(work, python, jobId) : { results: [] };
@@ -209,26 +248,40 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     const record: OutlineRound = { round, jobId, executionStatus, passed: programPassed, results, ...(checked.outlineSha256 ? { outlineSha256: checked.outlineSha256 } : {}) };
     rounds.push(record);
     log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
-    if (executionStatus !== 'completed') break;
+    if (executionStatus !== 'completed') { stopReason = 'not_completed'; break; }
     let feedback: string;
     if (!programPassed) {
-      if (bounces >= maxBounces) break;
+      if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
       bounces++; feedback = bouncePrompt(results, round);
     } else if (options.qa) {
       record.review = await review(round);
       const verdict = record.review.review?.verdict;
       record.passed = verdict === 'pass';
       log(`第 ${round} 轮质检：${verdict ? `${verdict === 'pass' ? '通过' : '需要修改'}，${JSON.stringify(record.review.review!.scores)}` : record.review.error}`);
-      if (verdict !== 'revise' || revisions >= (options.qa.maxRevisions ?? 1)) break;
+      if (!verdict) { stopReason = 'review_failed'; break; }
+      if (verdict === 'pass') break;
+      reviews.push(record.review.review!);
+      if (stalled(reviews)) { stopReason = 'stalled'; log('质检意见连续两轮没有改到位，或分数连续两轮没有提高，停止修改'); break; }
+      if (revisions >= (options.qa.maxRevisions ?? 3)) { stopReason = 'max_revisions'; break; }
       revisions++; feedback = revisePrompt(record.review.review!, round);
     } else break;
     await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId,
       clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${round + 1}`, input: { prompt: feedback } });
     log(`已打回执行者（第 ${round + 1} 轮）`);
   }
-  const report: OutlineRunReport = { roleId, caseId: kase.id, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work,
+  const last = rounds.at(-1)!, lastReview = last.review?.review;
+  // Revising further cannot help when QA says a locked item is in the way; only a person can change it.
+  if ((stopReason === 'stalled' || stopReason === 'max_revisions') && lastReview?.proposals?.some(p => p.kind === 'locked')) stopReason = 'needs_human';
+  const report: OutlineRunReport = { roleId, caseId: kase.id, phase, role, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work,
     outlinePath, featuresConfirmed: Boolean(features.confirmation), rounds,
-    passed: rounds.at(-1)!.passed, startedAt, finishedAt: now().toISOString() };
+    passed: last.passed, stopReason, startedAt, finishedAt: now().toISOString() };
   await writeFile(path.join(work, 'run.json'), JSON.stringify(report, null, 2) + '\n');
+  const first = rounds[0]!;
+  const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed: report.passed, stopReason,
+    firstDraftPassed: first.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
+    scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
+    mustIssues: lastReview?.issues.filter(issue => issue.severity === 'must').length ?? 0, proposals: lastReview?.proposals ?? [], workDirectory: work };
+  await appendFile(ledgerPath(options.workspace, roleId), JSON.stringify(entry) + '\n');
+  log(`停止原因：${stopReason}`);
   return report;
 }

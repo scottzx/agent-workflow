@@ -5,7 +5,8 @@ import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
-import { runOutlineCase } from '../src/rsi/outline-run.js';
+import { checkGate } from '../src/rsi/gate.js';
+import { type LedgerEntry, runOutlineCase } from '../src/rsi/outline-run.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
 const checksAvailable = spawnSync('python3', ['-I', '-c', 'import jsonschema']).status === 0;
@@ -235,4 +236,87 @@ test('P8-P11 catch the deterministic problems QA used to find, and leave legitim
   assert.equal((await run(bad)).P11!.pass, true, 'a hard-coded version is fine when every record agrees');
   bad.sections[3].slides[0].points.at(-1).text = '下载 demo-v2.0.0-web.zip';
   assert.match(JSON.stringify((await run(bad)).P11!.evidence), /says 2\.0\.0/);
+});
+
+/** A run whose QA agent answers each review with the next scripted one; the executor just touches the outline. */
+async function scriptedQaRun(f: Awaited<ReturnType<typeof fixture>>, workspace: string, script: (n: number) => unknown, extra: Record<string, unknown> = {}) {
+  let work = '', reviews = 0, edits = 0;
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {}, ...extra,
+    invoke: async (method, params: any) => {
+      const qa = async () => { reviews++; await writeFile(join(work, 'reviews', `review-r${reviews}.json`), JSON.stringify(script(reviews))); return { jobId: 'qa-1' }; };
+      if (method === 'execution_submit' && params.title.startsWith('质检')) return qa();
+      if (method === 'execution_continue' && params.jobId === 'qa-1') return qa();
+      if (method === 'execution_submit' || method === 'execution_continue') {
+        if (method === 'execution_submit') work = params.input.cwd;
+        const doc = outline('example/demo', f.commit); doc.project.oneLiner = `第 ${++edits} 版`;
+        await writeFile(join(work, 'outline.json'), JSON.stringify(doc)); return { jobId: 'job-1' };
+      }
+      return { executionStatus: 'completed' };
+    } });
+  return { report, reviews };
+}
+
+const qaReview = (total: number, previous?: unknown[], proposals?: unknown[]) => ({ verdict: 'revise', summary: '还要改',
+  scores: { 吸引力: total - 15, 具体: 3, 受众: 3, 结构: 3, 可信: 3, 行动: 3 },
+  issues: [{ where: 'project/oneLiner', problem: '太空泛', suggestion: '写场景加结果', severity: 'must' }],
+  ...(previous ? { previous } : {}), ...(proposals ? { proposals } : {}) });
+
+test('revisions continue up to three by default, stop early when the same issue survives two re-reviews, and every run lands in the ledger', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t), workspace = join(f.root, 'runs');
+  const rising = await scriptedQaRun(f, workspace, n => qaReview(16 + n, n > 1 ? [{ where: 'project/oneLiner', status: 'fixed' }] : undefined));
+  assert.equal(rising.report.stopReason, 'max_revisions');
+  assert.equal(rising.reviews, 4, 'one review plus three re-reviews');
+
+  const partly = [{ where: 'project/oneLiner', status: 'partly', note: '只改了一半' }];
+  const stuck = await scriptedQaRun(f, workspace, n => qaReview(16 + n, n > 1 ? partly : undefined, [{ kind: 'check', text: '同组出处跨页提示重复' }]));
+  assert.equal(stuck.report.stopReason, 'stalled');
+  assert.equal(stuck.reviews, 3, 'partly in two re-reviews in a row stops before the third revision');
+
+  const flat = await scriptedQaRun(f, workspace, n => qaReview(18, n > 1 ? [{ where: 'project/oneLiner', status: 'fixed' }] : undefined,
+    [{ kind: 'locked', text: '模板锁定的技术架构章挡住了受众分' }]));
+  assert.equal(flat.reviews, 3, 'no score gain twice running stops too');
+  assert.equal(flat.report.stopReason, 'needs_human', 'QA says a locked item is in the way');
+  assert.deepEqual(flat.report.role, { dirty: true }, 'a role directory outside git has no version');
+
+  const ledger = (await readFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as LedgerEntry);
+  assert.deepEqual(ledger.map(e => e.stopReason), ['max_revisions', 'stalled', 'needs_human']);
+  assert.deepEqual(ledger.map(e => e.revisions), [3, 2, 2]);
+  assert.deepEqual(ledger[0]!.scores.map(s => Object.values(s).reduce((a, b) => a + b, 0)), [17, 18, 19, 20]);
+  assert.equal(ledger[1]!.firstDraftPassed, true); assert.equal(ledger[1]!.mustIssues, 1);
+  assert.deepEqual(ledger[1]!.proposals, [{ kind: 'check', text: '同组出处跨页提示重复' }]);
+  assert.equal(ledger[2]!.phase, 'dev'); assert.equal(ledger[2]!.caseKind, 'original');
+});
+
+test('the gate opens only after consecutive clean passes on the committed role version, and a test run needs a committed role', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t), workspace = join(f.root, 'runs');
+  const git = (...args: string[]) => execFileSync('git', ['-C', f.role, ...args], { encoding: 'utf8' }).trim();
+  git('init', '-q'); git('add', '.'); git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'role v1');
+  const commit = git('rev-parse', 'HEAD');
+  const entry = (over: Partial<LedgerEntry> = {}): LedgerEntry => ({ startedAt: '2026-10-31T00:00:00.000Z', phase: 'dev', caseId: 'demo', caseKind: 'original',
+    role: { commit, dirty: false }, passed: true, stopReason: 'passed', firstDraftPassed: true, bounces: 0, revisions: 1,
+    scores: [{ 吸引力: 3 }, { 吸引力: 4 }], mustIssues: 0, proposals: [], workDirectory: '/w', ...over });
+  const ledger = join(workspace, 'product-intro-outline', 'ledger.jsonl');
+  const write = (entries: LedgerEntry[]) => mkdir(join(workspace, 'product-intro-outline'), { recursive: true })
+    .then(() => writeFile(ledger, entries.map(e => JSON.stringify(e)).join('\n') + '\n'));
+  const gate = () => checkGate({ roleDirectory: f.role, workspace });
+
+  await write([entry()]);
+  assert.match((await gate()).reasons.join('\n'), /1 次运行，需要连续 2 次通过/);
+  await write([entry(), entry({ firstDraftPassed: false, proposals: [{ kind: 'locked', text: '模板' }, { kind: 'role', text: '开头' }] })]);
+  const blocked = await gate();
+  assert.equal(blocked.ready, false);
+  assert.match(blocked.reasons.join('\n'), /初稿没有一次通过/); assert.match(blocked.reasons.join('\n'), /1 条提议要处理（locked）/);
+  await write([entry({ passed: false, stopReason: 'stalled' }), entry(), entry({ proposals: [{ kind: 'role', text: '开头' }] }),
+    entry({ role: { commit: 'f'.repeat(40), dirty: false } }), entry({ phase: 'test', caseId: 'demo' })]);
+  const open = await gate();
+  assert.equal(open.ready, true, 'the two newest dev runs on this version are clean; an older failure and another version do not count');
+  assert.deepEqual(open.testCases.find(c => c.caseId === 'demo'), { caseId: 'demo', kind: 'original', result: 'passed' });
+  assert.equal(open.testCases.find(c => c.caseId === 'dreammate-network')!.result, 'not_run');
+
+  await writeFile(join(f.role, 'ROLE.md'), '# 改了一句\n', { flag: 'a' });
+  const dirty = await gate();
+  assert.equal(dirty.ready, false); assert.match(dirty.reasons.join('\n'), /未提交的改动/);
+  await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace, phase: 'test', qa: {},
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, invoke: async () => ({}) }), /committed with no local changes/);
 });
