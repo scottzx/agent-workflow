@@ -2,6 +2,7 @@
   "name": "@1agents/dsh-ppt-beautifier",
   "version": "0.4.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "PPT 美化大师常驻角色：由 A2A 派单，默认采用AI价值主线报告模板与可追溯原生图形，交付可编辑 PPTX。",
   "dsh": {

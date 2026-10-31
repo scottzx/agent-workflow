@@ -11,9 +11,13 @@ import { invokeTicket, pendingItems, type Ticket } from '../src/execution/ticket
 import { type LedgerEntry, runOutlineCase, type OutlineRunOptions } from '../src/rsi/outline-run.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
-/** The role checks need a Python with jsonschema; RSI_PYTHON names one when python3 on PATH has none. Without it these tests fail, never skip. */
+/**
+ * The role checks validate with Draft 2020-12, so they need a jsonschema that has it; RSI_PYTHON names such a Python
+ * when python3 on PATH has none. Without one these tests fail, never skip.
+ */
 const PYTHON = process.env.RSI_PYTHON ?? 'python3';
-if (spawnSync(PYTHON, ['-I', '-c', 'import jsonschema']).status !== 0) throw new Error(`The rsi tests need a Python with jsonschema; ${PYTHON} has none. Set RSI_PYTHON to one that does.`);
+if (spawnSync(PYTHON, ['-I', '-c', 'from jsonschema import Draft202012Validator']).status !== 0)
+  throw new Error(`The rsi tests need a Python whose jsonschema has Draft202012Validator; ${PYTHON} has none. Set RSI_PYTHON to one that does.`);
 
 function outline(repo: string, commit: string, font = '微软雅黑') {
   const slide = (title: string, featureIds?: string[]) => ({ title, layout: 'title-bullets',

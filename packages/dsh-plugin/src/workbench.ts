@@ -60,7 +60,7 @@ export function workbenchHandler(ctx: Context, options: WorkbenchProxyOptions) {
       const taskId = decodeURIComponent(task[1]!);
       if (taskId.length > 256) return json(res, 400, { error: 'Invalid task id' });
       const host = options.host(), sessionId = host?.taskSession(taskId);
-      const available = sessionId !== undefined && await ctx.sessionController.inspect(sessionId as SessionId).then(found => found != null, () => false);
+      const available = sessionId !== undefined && await ctx.sessionController.inspect(sessionId as SessionId).then((found: unknown) => found != null, () => false);
       if (!available) return json(res, 200, { available: false });
       const current = host!.sessionTask(sessionId);
       return json(res, 200, { available, sessionId, ...(current ? { task: current } : {}) });
