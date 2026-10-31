@@ -46,6 +46,8 @@ export interface LedgerEntry {
   /** The executor's first outline passed every program check without a bounce. */
   firstDraftPassed: boolean; bounces: number; revisions: number; scores: Record<string, number>[];
   mustIssues: number; proposals: NonNullable<QualityReview['proposals']>; workDirectory: string; ticketPath: string;
+  /** The executor's job, which carries the ticket; the gate reads the proposals' current state from it. */
+  jobId?: string; originSessionId?: string;
 }
 export interface OutlineRunOptions {
   roleDirectory: string; caseId: string; projectPath: string; workspace: string;
@@ -310,7 +312,8 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed: report.passed, stopReason,
     firstDraftPassed: first.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
     scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
-    mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath };
+    mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath,
+    jobId, originSessionId: options.originSessionId };
   await appendFile(ledgerPath(options.workspace, roleId), JSON.stringify(entry) + '\n');
   log(`停止原因：${stopReason}`);
   return report;

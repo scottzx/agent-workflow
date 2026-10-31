@@ -368,13 +368,33 @@ test('the gate opens only after consecutive clean passes on the committed role v
   await write([entry(), entry({ firstDraftPassed: false, proposals: [{ kind: 'locked', text: '模板' }, { kind: 'role', text: '开头' }] })]);
   const blocked = await gate();
   assert.equal(blocked.ready, false);
-  assert.match(blocked.reasons.join('\n'), /初稿没有一次通过/); assert.match(blocked.reasons.join('\n'), /1 条提议要处理（locked）/);
+  assert.match(blocked.reasons.join('\n'), /初稿没有一次通过/); assert.match(blocked.reasons.join('\n'), /1 条提议还没人处理（#1 locked）/);
   await write([entry({ passed: false, stopReason: 'stalled' }), entry(), entry({ proposals: [{ kind: 'role', text: '开头' }] }),
     entry({ role: { commit: 'f'.repeat(40), dirty: false } }), entry({ phase: 'test', caseId: 'demo' })]);
   const open = await gate();
   assert.equal(open.ready, true, 'the two newest dev runs on this version are clean; an older failure and another version do not count');
   assert.deepEqual(open.testCases.find(c => c.caseId === 'demo'), { caseId: 'demo', kind: 'original', result: 'passed' });
   assert.equal(open.testCases.find(c => c.caseId === 'dreammate-network')!.result, 'not_run');
+
+  await write([entry(), entry({ passed: false, stopReason: 'review_failed', startedAt: '2026-10-31T01:00:00.000Z' }), entry()]);
+  const quota = await gate();
+  assert.equal(quota.ready, true, 'a run whose QA task never finished says nothing about the role');
+  assert.deepEqual(quota.unfinished.map(run => run.stopReason), ['review_failed']);
+
+  // Proposals are read live from the ticket: open ones block, settled ones do not.
+  let state = 'open';
+  const proposals = [{ kind: 'check' as const, text: '收尾页要有完整地址' }];
+  const live = (jobId: string) => entry({ jobId, originSessionId: 'rsi-test', proposals });
+  const invoke = async (method: string, params: any) => {
+    assert.equal(method, 'ticket_get'); assert.equal(params.originSessionId, 'rsi-test');
+    return { proposals: [{ id: 'R1-1', ...proposals[0], raisedInRound: 1, state }] };
+  };
+  await write([live('job-a'), live('job-b')]);
+  const waiting = await checkGate({ roleDirectory: f.role, workspace, invoke });
+  assert.equal(waiting.ready, false);
+  assert.match(waiting.reasons.join('\n'), /1 条提议还没人处理（R1-1 check），用 acp-service ticket proposal --job job-b --id <编号>/);
+  state = 'rejected';
+  assert.equal((await checkGate({ roleDirectory: f.role, workspace, invoke })).ready, true, 'a person settled the proposal on the ticket');
 
   await writeFile(join(f.role, 'ROLE.md'), '# 改了一句\n', { flag: 'a' });
   const dirty = await gate();

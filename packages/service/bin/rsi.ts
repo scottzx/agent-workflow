@@ -5,7 +5,7 @@ import { checkGate } from '../src/rsi/gate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 
 const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [options]
-       acp-service rsi gate --role DIR [--workspace DIR] [--required N]
+       acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
 executor, runs the role's program checks and sends failures back to the same session.
@@ -16,7 +16,9 @@ the run directory's ticket.json is a read-only export (see acp-service ticket --
 
 rsi gate reads the ledger and says whether the committed role version may leave development:
 N development runs in a row passed (default 2), each first draft passed the program checks,
-and QA left no must-fix issue and no proposal to codify or to raise with a person.
+QA left no must-fix issue, and every proposal to codify a check or change a locked item has
+been settled on the ticket (acp-service ticket proposal). Runs whose executor or QA task did
+not finish are not counted.
 
 Options:
   --target ID            agent_host target on the gateway (default legacy:ppt-beautifier)
@@ -60,7 +62,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   if (!values.role || !values.case || !values.project) throw new Error('--role, --case and --project are required');
   if (values.phase !== 'dev' && values.phase !== 'test') throw new Error('--phase is dev or test');
   if (values.phase === 'test') {
-    const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!) });
+    const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!), invoke: gatewayInvoke(values.url!) });
     if (!gate.ready) throw new Error(`The role has not left development yet:\n- ${gate.reasons.join('\n- ')}`);
   }
   const invoke = gatewayInvoke(values.url!);
@@ -77,14 +79,17 @@ export async function runRsiCli(argv: string[]): Promise<void> {
 async function runGate(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, workspace: { type: 'string', default: '.1agents/runtime/rsi' }, required: { type: 'string', default: '2' },
+    url: { type: 'string', default: 'http://127.0.0.1:36814' },
   } });
   if (!values.role) throw new Error('--role is required');
-  const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!), required: Number(values.required) });
+  const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!), required: Number(values.required),
+    invoke: gatewayInvoke(values.url!) });
   console.log(`角色 ${gate.roleId}，版本 ${gate.role.commit?.slice(0, 8) ?? '未提交'}${gate.role.commit && gate.role.dirty ? '（有未提交的改动）' : ''}`);
   for (const run of gate.devRuns) {
     const totals = run.scores.map(scores => Object.values(scores).reduce((sum, score) => sum + score, 0)).join('→');
     console.log(`  开发 ${run.startedAt} ${run.caseId}：${run.passed ? '通过' : '未通过'}（${run.stopReason}），打回 ${run.bounces}，修改 ${run.revisions}，总分 ${totals || '无'}`);
   }
+  if (gate.unfinished.length) console.log(`  另有 ${gate.unfinished.length} 次运行没跑完（${gate.unfinished.map(run => `${run.startedAt} ${run.stopReason}`).join('、')}），不计入`);
   console.log(gate.ready ? '可以进入测试。' : `还不能进入测试：\n- ${gate.reasons.join('\n- ')}`);
   for (const kase of gate.testCases) console.log(`  测试 ${kase.caseId}（${kase.kind === 'original' ? '原题' : '变体题'}）：${{ passed: '通过', failed: '未通过', not_run: '未跑' }[kase.result]}`);
   if (!gate.ready) process.exitCode = 1;
