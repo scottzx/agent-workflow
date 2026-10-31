@@ -62,7 +62,12 @@ test('tool permission requests carry the tool and allow approve, reject or cance
   const stopped = answerProcessRequest(request, { clientRequestId: 'wb-stop', outcome: 'rejected', note: 'Do not run scripts here', stopTask: true }, at).request;
   assert.equal(stopped.answer?.note, 'Do not run scripts here'); assert.equal(stopped.answer?.stopTask, true);
   assert.throws(() => answerProcessRequest(stopped, { clientRequestId: 'wb-stop', outcome: 'rejected', note: 'Other reason', stopTask: true }, at), (error: ProcessRequestError) => error.code === 'idempotency_conflict');
-  assert.throws(() => answerProcessRequest(request, { clientRequestId: 'wb-note', outcome: 'approved', note: 'Fine' }, at), (error: ProcessRequestError) => error.code === 'invalid');
+  assert.throws(() => answerProcessRequest(request, { clientRequestId: 'wb-note', outcome: 'approved', note: 'Fine' }, at), (error: ProcessRequestError) => error.code === 'invalid',
+    'a person approves without a reason');
+  const coach = { kind: 'coach' as const, agent: 'claude-code', sessionId: 'coach-session' };
+  const byCoach = answerProcessRequest(request, { clientRequestId: 'cli-allow', outcome: 'approved', note: '角色要求的自查命令，只读工作目录', decidedBy: coach }, at).request;
+  assert.deepEqual([byCoach.answer?.outcome, byCoach.answer?.note, byCoach.answer?.decidedBy], ['approved', '角色要求的自查命令，只读工作目录', coach], 'the coach approves with its reason and is named');
+  assert.throws(() => answerProcessRequest(request, { clientRequestId: 'cli-bad', outcome: 'approved', decidedBy: { kind: 'person', sessionId: 'x' } }, at), /Only a coach names an agent session/);
   assert.throws(() => answerProcessRequest(request, { clientRequestId: 'wb-stop-cancel', outcome: 'cancelled', stopTask: true }, at), (error: ProcessRequestError) => error.code === 'invalid');
   assert.equal(Date.parse(createProcessRequest(permission, at, 30 * 60_000).deadlineAt) - at.getTime(), 30 * 60_000);
   assert.throws(() => createProcessRequest({ ...permission, toolTitle: undefined }, at));

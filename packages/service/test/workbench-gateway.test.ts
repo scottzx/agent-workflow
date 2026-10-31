@@ -274,6 +274,25 @@ test('the deadline follows the configured timeout and reject-and-stop cancels th
   assert.equal((await f.request(`${path}/prc-tool/answers`, post({ clientRequestId: 'wb-stop', outcome: 'rejected', note: '不要删除构建目录', stopTask: true }))).status, 200);
 });
 
+test('the coach lists a task’s process requests and answers one through the gateway, recorded as the coach with its reason', async t => {
+  const f = await fixture(t);
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '训练任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId, scope = { originSessionId: 'allowed-root', jobId };
+  await f.request(`/workbench/tasks/${jobId}/process-requests`, post({ requestId: 'prc-check', jobId, attemptId: prepared.attempt.attemptId, sessionId: 'dsh-1',
+    kind: 'permission', toolTitle: 'Run python3 -I checks/check_outline.py', toolDetail: '{}' }));
+  const listed = await f.gateway.invoke('execution_process_requests', scope) as any;
+  assert.deepEqual(listed.requests.map((request: any) => [request.requestId, request.status]), [['prc-check', 'pending']]);
+  await assert.rejects(f.gateway.invoke('execution_process_requests', { originSessionId: 'outsider', jobId }), /not found/, 'only the task’s own origin reads them');
+  const coach = { kind: 'coach', agent: 'claude-code', sessionId: 'coach-session' };
+  const answered = await f.gateway.invoke('execution_process_answer', { ...scope, requestId: 'prc-check', clientRequestId: 'cli-1', outcome: 'approved',
+    note: '角色要求的自查命令', decidedBy: coach }) as any;
+  assert.deepEqual([answered.status, answered.answer.outcome, answered.answer.note, answered.answer.decidedBy], ['answered', 'approved', '角色要求的自查命令', coach]);
+  assert.equal(f.gateway.workbenchTask(jobId).processRequests[0]!.answer!.decidedBy!.kind, 'coach', 'the page reads the same record');
+  await assert.rejects(f.gateway.invoke('execution_process_answer', { ...scope, requestId: 'prc-check', clientRequestId: 'cli-2', outcome: 'rejected' }), /no longer pending/);
+});
+
 test('abandoning through human review closes further child dispatch admission', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '人工放弃任务'), internals = f.gateway as any;
   internals.advanceDelivery = Object.getPrototypeOf(f.gateway).advanceDelivery;

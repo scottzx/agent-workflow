@@ -66,8 +66,8 @@ export interface OutlineRunOptions {
   targetId: string; agentPreset: string; originSessionId: string;
   /** Times a failed check goes back to the executor. The design default is one. */
   maxBounces?: number; pollMs?: number; timeoutMs?: number; python?: string;
-  /** How the executor runs the ticket CLI from its shell when it has neither the DSH tools nor the MCP server. */
-  ticketCli?: { command: string; url: string };
+  /** How to run acp-service: the executor's ticket commands, and the coach's answer to a process request. */
+  cli?: { command: string; url: string };
   /** A QA agent reviews each outline that passes the program checks and may send it back for revision, by default up to three times. */
   qa?: { agentPreset?: string; targetId?: string; maxRevisions?: number };
   invoke: (method: string, params: Record<string, unknown>) => Promise<any>;
@@ -117,7 +117,8 @@ async function checkInterpreter(name: string): Promise<string> {
 /** The three ticket operations as tools and, when the host gave a CLI, as commands for an executor without the tools. */
 type TicketSteps = (ticket: Ticket) => string;
 function ticketSteps(jobId: string, cli?: { command: string; url: string }): TicketSteps {
-  const commands = cli ? `\n\nACP 智能体里这三个工具由 \`1agents-review\` MCP 服务提供。找不到这些工具时，在终端里用命令做同样的事：\n\n- 查看：\`${cli.command} pending --job ${jobId} --url ${cli.url}\`\n- 标记：\`${cli.command} mark --job ${jobId} --url ${cli.url} --id 编号 --state done --note '怎么改的'\`\n- 提交：\`${cli.command} submit --job ${jobId} --url ${cli.url}\`` : '';
+  const ticket = cli && `${cli.command} ticket`;
+  const commands = cli ? `\n\nACP 智能体里这三个工具由 \`1agents-review\` MCP 服务提供。找不到这些工具时，在终端里用命令做同样的事：\n\n- 查看：\`${ticket} pending --job ${jobId} --url ${cli.url}\`\n- 标记：\`${ticket} mark --job ${jobId} --url ${cli.url} --id 编号 --state done --note '怎么改的'\`\n- 提交：\`${ticket} submit --job ${jobId} --url ${cli.url}\`` : '';
   return ticket => {
     const pending = pendingItems(ticket);
     return `任务单上有 ${pending.length} 条待处理（${pending.filter(item => item.severity === 'must').length} 条必须改）：\n\n1. 调用 \`ticket_show\` 工具查看待处理的意见和证据。\n2. 在同一个 outline.json 上逐条修改。改完一条就调用 \`ticket_mark\`：\`id\` 填编号，\`state\` 填 \`done\`，\`note\` 写怎么改的；不同意的 \`state\` 填 \`disputed\`，\`note\` 写理由。\n3. 全部处理完，调用 \`ticket_submit\`。\n4. 用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。${commands}\n\n任务单只能用这三个工具${cli ? '或这三条命令' : ''}处理；工作目录里的 ticket.json 是只读导出，改它没有用。`;
@@ -215,6 +216,8 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   log(`执行者：${options.agentPreset}，训练的层：${layers.map(layer => LAYERS[layer]).join('、')}`);
   if (!features.confirmation) log('注意：这份功能清单还没有经人确认。');
 
+  /** Process requests already reported, so each is said once. */
+  const reported = new Set<string>();
   const wait = async (jobId: string): Promise<string> => {
     const deadline = Date.now() + timeoutMs; let last = '';
     for (;;) {
@@ -222,6 +225,14 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       const status = String(view.executionStatus ?? 'unknown');
       if (status !== last) { log(`任务 ${jobId}：${status}${status === 'input_required' ? '（等待人在工作台处理）' : ''}`); last = status; }
       if (terminal.has(status)) return status;
+      // A request beyond the executor's preset leaves the task working while it waits; the coach answers it by default.
+      const requests = (await options.invoke('execution_process_requests', { originSessionId: options.originSessionId, jobId }).catch(() => undefined) as
+        { requests?: { requestId: string; status: string; kind: string; toolTitle?: string }[] } | undefined)?.requests ?? [];
+      for (const request of requests.filter(item => item.status === 'pending' && !reported.has(item.requestId))) {
+        reported.add(request.requestId);
+        const asked = request.kind === 'permission' ? `工具「${request.toolTitle}」待批准` : request.kind === 'plan' ? '计划待批准' : '有提问待回答';
+        log(`任务 ${jobId} 的过程请求 ${request.requestId}：${asked}。${request.kind === 'question' ? '在工作台回答' : `教练处理：${options.cli ? `${options.cli.command} process` : 'acp-service process'} answer --job ${jobId} --id ${request.requestId} approve|reject --note 理由${options.cli ? ` --url ${options.cli.url}` : ''}`}`);
+      }
       if (Date.now() > deadline) { log(`任务 ${jobId}：${Math.round(timeoutMs / 60_000)} 分钟内没有结束，停止等待`); return 'timed_out'; }
       await new Promise(resolve => setTimeout(resolve, pollMs));
     }
@@ -268,7 +279,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     return await options.invoke('ticket_get', scope) as Ticket;
   };
   let ticket = await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath });
-  const steps = ticketSteps(jobId, options.ticketCli);
+  const steps = ticketSteps(jobId, options.cli);
   const rounds: OutlineRound[] = [];
   const reviews: QualityReview[] = [];
   let bounces = 0, revisions = 0, stopReason: StopReason = 'passed';

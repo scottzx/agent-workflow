@@ -135,9 +135,15 @@ test('an ACP executor runs a role that trains only its first message, is told th
   let work = '';
   const options = { roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'oneagents-acp-grok', originSessionId: 'rsi-test', pollMs: 1,
-    ticketCli: { command: '/bin/node /x/acp-service.js ticket', url: 'http://127.0.0.1:36814' } };
-  const report = await runOutlineCase({ ...options, invoke: gw.invoke(async (method, params: any) => {
+    cli: { command: '/bin/node /x/acp-service.js', url: 'http://127.0.0.1:36814' } };
+  // The executor's self-check waits on a tool approval for two polls before it finishes.
+  let polls = 0;
+  const lines: string[] = [];
+  const pending = { requestId: 'prc-check', status: 'pending', kind: 'permission', toolTitle: 'Run python3 -I checks/check_outline.py' };
+  const report = await runOutlineCase({ ...options, log: line => lines.push(line), invoke: gw.invoke(async (method, params: any) => {
     f.calls.push({ method, params });
+    if (method === 'execution_get' && params.jobId === 'job-1' && polls < 2) { polls++; return { executionStatus: 'working' }; }
+    if (method === 'execution_process_requests') return { requests: polls < 2 ? [pending] : [{ ...pending, status: 'answered' }] };
     if (method === 'execution_submit') {
       work = params.input.cwd;
       await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit, 'Arial')));
@@ -156,6 +162,8 @@ test('an ACP executor runs a role that trains only its first message, is told th
   assert.match(bounce, /`1agents-review` MCP 服务/);
   assert.ok(bounce.includes('`/bin/node /x/acp-service.js ticket mark --job job-1 --url http://127.0.0.1:36814 --id 编号 --state done'), 'the commands name the executor’s own job');
   assert.match(bounce, /只能用这三个工具或这三条命令处理/);
+  assert.deepEqual(lines.filter(line => line.includes('prc-check')), ['任务 job-1 的过程请求 prc-check：工具「Run python3 -I checks/check_outline.py」待批准。教练处理：/bin/node /x/acp-service.js process answer --job job-1 --id prc-check approve|reject --note 理由 --url http://127.0.0.1:36814'],
+    'a pending request is reported once, with the coach’s command');
 
   const profile = JSON.parse(await readFile(join(f.role, 'profile.json'), 'utf8'));
   const refuse = async (training: unknown, pattern: RegExp) => {

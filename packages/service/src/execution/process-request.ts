@@ -22,8 +22,11 @@ export const processRequestAnswerSchema = z.object({
   clientRequestId: id,
   outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']),
   answers: z.record(z.string().trim().min(1).max(4000), answerValue).optional(),
-  /** Why a person rejected; shown on the page and, when the task is stopped, in the notice to the origin session. */
+  /** Why it was decided so: a person's reason for a rejection, or the coach's for either. Shown on the page and, when the task is stopped, in the notice to the origin session. */
   note: plain(2000).pipe(z.string().trim().min(1)).optional(),
+  /** Who decided. The page answers as a person; the coach answers through the gateway and names its agent session. */
+  decidedBy: z.object({ kind: z.enum(['person', 'coach']), agent: id.optional(), sessionId: id.optional() }).strict()
+    .refine(by => by.kind === 'coach' || (!by.agent && !by.sessionId), 'Only a coach names an agent session').optional(),
   /** Reject and cancel the task, so the agent cannot retry the tool another way. */
   stopTask: z.literal(true).optional(),
 }).strict();
@@ -125,7 +128,8 @@ export function createProcessRequest(input: ProcessRequestCreateInput, at = new 
 }
 
 function assertAnswer(request: ProcessRequest, input: ProcessRequestAnswerInput): void {
-  if ((input.note || input.stopTask) && input.outcome !== 'rejected') throw new ProcessRequestError('invalid', 'Only a rejection carries a note or stops the task');
+  if (input.stopTask && input.outcome !== 'rejected') throw new ProcessRequestError('invalid', 'Only a rejection stops the task');
+  if (input.note && input.outcome !== 'rejected' && input.decidedBy?.kind !== 'coach') throw new ProcessRequestError('invalid', 'Only a rejection, or the coach, gives a reason');
   if (request.kind === 'question') {
     if (input.outcome !== 'accepted' && input.outcome !== 'cancelled') throw new ProcessRequestError('invalid', 'Question answers must be accepted or cancelled');
     if (input.outcome === 'cancelled' && input.answers && Object.keys(input.answers).length) throw new ProcessRequestError('invalid', 'A cancelled question has no answers');

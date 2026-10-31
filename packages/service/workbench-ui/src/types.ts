@@ -194,7 +194,8 @@ export interface AcpProcessRequest {
     status: 'pending' | 'answered' | 'cancelled' | 'expired';
     deadlineAt: string;
     canAnswer?: boolean;
-    answer?: { clientRequestId: string; outcome: string; answers?: Record<string, string | string[]>; note?: string; stopTask?: true };
+    answer?: { clientRequestId: string; outcome: string; answers?: Record<string, string | string[]>; note?: string; stopTask?: true;
+        decidedBy?: { kind: 'person' | 'coach'; agent?: string; sessionId?: string } };
 }
 export interface AcpAgentOption {
     id: string;

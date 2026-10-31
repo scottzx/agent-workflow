@@ -118,6 +118,10 @@ const executionEventsSchema = z.object({ ...originFields, jobId: string.optional
   limit: z.number().int().min(1).max(500).default(100) }).strict();
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
   reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
+/** The coach answers an executor's process request: the same answer as the workbench page, naming who decided and why. */
+const processAnswerSchema = executionJobSchema.extend({ requestId: string, clientRequestId: string,
+  outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']), note: string.optional(), stopTask: z.literal(true).optional(),
+  decidedBy: z.object({ kind: z.enum(['person', 'coach']), agent: string.optional(), sessionId: string.optional() }).strict().optional() }).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
@@ -128,6 +132,8 @@ const EXECUTION_METHODS = {
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
   execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
   execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
+  execution_process_requests: { description: '读取任务上的过程请求（执行者的工具审批、提问、计划），含已回答的和谁回答的。', parameters: z.toJSONSchema(executionJobSchema) },
+  execution_process_answer: { description: '回答任务上的一条过程请求，和工作台页面同一记录；decidedBy 写明是人还是教练（教练写明所在的智能体会话），note 写理由。', parameters: z.toJSONSchema(processAnswerSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
   ...TICKET_METHODS,
@@ -1067,6 +1073,16 @@ export class RemoteAgentGateway {
       return this.ledger.acceptance(originSessionId, jobId, review);
     }
     if (Object.hasOwn(TICKET_METHODS, method)) return invokeTicket(this.ledger, method, params);
+    if (method === 'execution_process_requests') {
+      const input = executionJobSchema.parse(params);
+      this.ledger.get(input.originSessionId, input.jobId);
+      return { requests: this.workbenchTask(input.jobId).processRequests };
+    }
+    if (method === 'execution_process_answer') {
+      const { originSessionId, jobId, requestId, ...answer } = processAnswerSchema.parse(params);
+      this.ledger.get(originSessionId, jobId);
+      return (await this.answerProcessRequest(jobId, requestId, answer)).processRequests.find(request => request.requestId === requestId);
+    }
     if (method === 'execution_inbox') {
       const { originSessionId } = inboxSchema.parse(params);
       return { notices: this.state.executionNotices!.filter(item => item.originSessionId === originSessionId && !item.processedAt)
