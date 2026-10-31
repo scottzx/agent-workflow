@@ -42,6 +42,8 @@ export interface LedgerAttempt {
   backendRunRef?: BackendRunRef; submissionStatus: SubmissionStatus; executionStatus: ExecutionStatus;
   providerState?: string; phase?: string; cancellationRequestedAt?: string; checkedAt?: string; stale: boolean;
   createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult; resultHistory?: LedgerResult[];
+  /** The origin stopped waiting on this round before it ended (it timed out, or the caller itself failed); it may still run or have finished unseen. */
+  unwatched?: { at: string; reason: string };
 }
 export interface LedgerJob {
   sourceId: string; jobId: string; title?: string; originSessionId: string; accessScopeRef: string;
@@ -388,6 +390,21 @@ export class JobLedger {
     const attempt = Object.values(this.state.attempts).find(item => this.state.jobs[item.jobId]?.originSessionId === originSessionId
       && Object.entries(ref).every(([key, value]) => value === undefined || item.backendRunRef?.[key] === value));
     return attempt ? clone({ job: this.state.jobs[attempt.jobId]!, attempt }) : undefined;
+  }
+  /**
+   * The origin stopped waiting on the job's current round while it was still running. The round itself is unchanged:
+   * the workbench lists the job as abnormal until a re-query finds the round ended.
+   */
+  unwatch(originSessionId: string, jobId: string, reason: string): LedgerAttempt {
+    return this.mutate(state => {
+      const job = this.job(state, originSessionId, jobId), attempt = this.attempt(state, job.currentAttemptId);
+      nonempty(reason, 'reason');
+      if (!terminal.has(attempt.executionStatus) && !attempt.unwatched) {
+        attempt.unwatched = { at: now(), reason };
+        this.event(state, job, attempt.attemptId, 'attempt.unwatched', { reason });
+      }
+      return clone(attempt);
+    });
   }
   acceptance(originSessionId: string, jobId: string, input: Omit<BusinessAcceptance, 'recordedAt'>): BusinessAcceptance {
     return this.mutate(state => {

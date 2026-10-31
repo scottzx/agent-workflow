@@ -70,6 +70,8 @@ export const acpTaskService = {
     },
     decide: (jobId: string, reviewId: string, input: AcpDecisionInput): Promise<unknown> =>
         post(`/tasks/${encodeURIComponent(jobId)}/reviews/${encodeURIComponent(reviewId)}/decisions`, input),
+    /** Asks the execution host for the task's latest state now, e.g. after its caller stopped waiting on it. */
+    refresh: (jobId: string): Promise<AcpTaskDetail> => post(`/tasks/${encodeURIComponent(jobId)}/refresh`, {}),
     answerProcessRequest: (jobId: string, requestId: string, input: AcpProcessAnswerInput): Promise<AcpTaskDetail> =>
         post(`/tasks/${encodeURIComponent(jobId)}/process-requests/${encodeURIComponent(requestId)}/answers`, input),
     listAgents: (): Promise<AcpAgentCatalog> => call('/agents'),

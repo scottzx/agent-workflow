@@ -293,6 +293,23 @@ test('the coach lists a task’s process requests and answers one through the ga
   await assert.rejects(f.gateway.invoke('execution_process_answer', { ...scope, requestId: 'prc-check', clientRequestId: 'cli-2', outcome: 'rejected' }), /no longer pending/);
 });
 
+test('a caller that stops waiting marks the task abnormal, and a re-query from the workbench reads the host again', async t => {
+  const f = await fixture(t);
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '训练任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId;
+  await assert.rejects(f.gateway.invoke('execution_unwatch', { originSessionId: 'outsider', jobId, reason: '超时' }), /not found/i);
+  await f.gateway.invoke('execution_unwatch', { originSessionId: 'allowed-root', jobId, reason: 'rsi run 等了 25 分钟没有结束' });
+  assert.equal(f.gateway.workbenchTask(jobId).displayStatus, 'unwatched');
+  assert.equal(f.gateway.workbenchList({ filter: 'failed' }).items.some((item: any) => item.jobId === jobId), true, 'listed under 异常');
+  const refreshed: string[] = [];
+  (f.gateway as any).refresh = async () => { refreshed.push(jobId); f.gateway.ledger.observe(prepared.attempt.attemptId, { executionStatus: 'completed' }); };
+  (f.gateway as any).state.jobs.push({ ledgerJobId: jobId, attemptId: prepared.attempt.attemptId, taskId: 'task-1' });
+  const requeried = await (await f.request(`/workbench/tasks/${jobId}/refresh`, { method: 'POST' })).json() as any;
+  assert.deepEqual([refreshed, requeried.displayStatus], [[jobId], 'completed'], 'the task finished unseen and is found ended');
+});
+
 test('abandoning through human review closes further child dispatch admission', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '人工放弃任务'), internals = f.gateway as any;
   internals.advanceDelivery = Object.getPrototypeOf(f.gateway).advanceDelivery;

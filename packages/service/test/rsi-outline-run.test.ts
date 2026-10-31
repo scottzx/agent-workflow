@@ -236,11 +236,23 @@ test('without bounces left a failed check ends the run, and a failed task is not
   assert.equal(failed.passed, false);
   assert.deepEqual(failed.rounds, [{ round: 1, jobId: 'job-3', executionStatus: 'failed', passed: false, results: [] }]);
 
+  const unwatched: unknown[] = [], lines: string[] = [];
+  let polls = 0;
   const stuck = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-3'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 5,
-    invoke: ticketGateway().invoke(async method => method === 'execution_submit' ? { jobId: 'job-4' } : { executionStatus: 'working' }) });
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 5, log: line => lines.push(line),
+    invoke: ticketGateway().invoke(async (method, params) => {
+      if (method === 'execution_submit') return { jobId: 'job-4' };
+      if (method === 'execution_unwatch') { unwatched.push(params); return {}; }
+      // One status query fails, as a slow gateway's would; the next ones answer.
+      if (method === 'execution_get' && ++polls === 1) throw new Error('The operation was aborted due to timeout');
+      return { executionStatus: 'working' };
+    }) });
   assert.equal(stuck.passed, false);
   assert.equal(stuck.rounds[0]!.executionStatus, 'timed_out', 'a task that never finishes is recorded, not thrown');
+  assert.equal(stuck.stopReason, 'not_completed', 'a failed status query is retried, not a host error');
+  assert.ok(polls > 1);
+  assert.ok(lines.includes('任务 job-4：查询状态失败（The operation was aborted due to timeout），继续等待'));
+  assert.deepEqual(unwatched, [{ originSessionId: 'rsi-test', jobId: 'job-4', reason: 'rsi run 等了 0 分钟没有结束' }], 'the gateway is told the run stopped waiting');
 });
 
 test('with QA on, a QA agent in its own session reviews a frozen copy, its issues go back to the executor, and the same QA session re-reviews the revision', async t => {
@@ -312,11 +324,12 @@ test('a QA agent that edits the outline itself is undone, its edit of the export
 });
 
 test('a host error mid-run still closes the ticket, writes run.json and the ledger line, then rethrows; the gate does not count the run', async t => {
-  const f = await fixture(t), workspace = join(f.root, 'runs'), gw = ticketGateway();
+  const f = await fixture(t), workspace = join(f.root, 'runs'), gw = ticketGateway(), unwatched: unknown[] = [];
   let work = '';
   await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {},
     invoke: gw.invoke(async (method, params: any) => {
+      if (method === 'execution_unwatch') { unwatched.push(params); return {}; }
       if (method === 'execution_submit' && params.title.startsWith('质检')) throw new Error('fetch failed: gateway went away');
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
       return { executionStatus: 'completed' };
@@ -327,6 +340,8 @@ test('a host error mid-run still closes the ticket, writes run.json and the ledg
   assert.deepEqual([ticket.status, ticket.stopReason], ['stopped', 'host_error'], 'the ticket is not left in review');
   const ledger = (await readFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as LedgerEntry);
   assert.deepEqual(ledger.map(entry => [entry.stopReason, entry.firstDraftPassed]), [['host_error', true]]);
+  assert.deepEqual(unwatched, [{ originSessionId: 'rsi-test', jobId: 'job-1', reason: 'rsi run 出错：fetch failed: gateway went away' }],
+    'the executor job is handed to the workbench as no longer watched');
 });
 
 test('P8-P11 catch the deterministic problems QA used to find, and leave legitimate text alone', async t => {

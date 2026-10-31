@@ -221,11 +221,16 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
 
   /** Process requests already reported, so each is said once. */
   const reported = new Set<string>();
+  /** Tells the gateway this run no longer waits on a job that may still run, so the workbench lists it for a later re-query. */
+  const unwatch = (jobId: string, reason: string) => options.invoke('execution_unwatch', { originSessionId: options.originSessionId, jobId, reason })
+    .catch(error => log(`任务 ${jobId}：没能记下停止等待（${error instanceof Error ? error.message : String(error)}）`));
   const wait = async (jobId: string): Promise<string> => {
     const deadline = Date.now() + timeoutMs; let last = '';
     for (;;) {
-      const view = await options.invoke('execution_get', { originSessionId: options.originSessionId, jobId });
-      const status = String(view.executionStatus ?? 'unknown');
+      // The query only reads; a slow or failed one is retried until the round's time is up.
+      const view = await options.invoke('execution_get', { originSessionId: options.originSessionId, jobId })
+        .catch(error => { log(`任务 ${jobId}：查询状态失败（${error instanceof Error ? error.message : String(error)}），继续等待`); return undefined; });
+      const status = view ? String(view.executionStatus ?? 'unknown') : last;
       if (status !== last) { log(`任务 ${jobId}：${status}${status === 'input_required' ? '（等待人在工作台处理）' : ''}`); last = status; }
       if (terminal.has(status)) return status;
       // A request beyond the executor's preset leaves the task working while it waits; the coach answers it by default.
@@ -236,7 +241,11 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
         const asked = request.kind === 'permission' ? `工具「${request.toolTitle}」待批准` : request.kind === 'plan' ? '计划待批准' : '有提问待回答';
         log(`任务 ${jobId} 的过程请求 ${request.requestId}：${asked}。${request.kind === 'question' ? '在工作台回答' : `教练处理：${options.cli ? `${options.cli.command} process` : 'acp-service process'} answer --job ${jobId} --id ${request.requestId} approve|reject --note 理由${options.cli ? ` --url ${options.cli.url}` : ''}`}`);
       }
-      if (Date.now() > deadline) { log(`任务 ${jobId}：${Math.round(timeoutMs / 60_000)} 分钟内没有结束，停止等待`); return 'timed_out'; }
+      if (Date.now() > deadline) {
+        log(`任务 ${jobId}：${Math.round(timeoutMs / 60_000)} 分钟内没有结束，停止等待`);
+        await unwatch(jobId, `rsi run 等了 ${Math.round(timeoutMs / 60_000)} 分钟没有结束`);
+        return 'timed_out';
+      }
       await new Promise(resolve => setTimeout(resolve, pollMs));
     }
   };
@@ -337,6 +346,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   } } catch (error) {
     hostError = error; stopReason = 'host_error';
     log(`宿主出错，停止运行：${error instanceof Error ? error.message : String(error)}`);
+    for (const id of [jobId, qaJobId]) if (id) await unwatch(id, `rsi run 出错：${error instanceof Error ? error.message : String(error)}`);
   }
   const last = rounds.at(-1), passed = !hostError && Boolean(last?.passed);
   // Revising further cannot help when QA says a locked item is in the way; only a person can change it.

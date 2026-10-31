@@ -172,7 +172,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-status-working, .acp-status-submitted, .acp-status-processing, .acp-status-resuming { background: var(--accent-bg); color: var(--accent); }
 .acp-status-completed, .acp-status-approved, .acp-status-applied { background: var(--success-bg); color: var(--success); }
 .acp-status-waiting_human, .acp-status-awaiting_human, .acp-status-pending, .acp-status-input_required, .acp-status-changes_requested { background: var(--warning-bg); color: var(--warning); }
-.acp-status-failed, .acp-status-rejected, .acp-status-canceled { background: var(--danger-bg); color: var(--danger); }
+.acp-status-failed, .acp-status-rejected, .acp-status-canceled, .acp-status-unwatched { background: var(--danger-bg); color: var(--danger); }
 
 .acp-detail {
   min-width: 0;
