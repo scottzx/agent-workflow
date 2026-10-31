@@ -37,8 +37,16 @@ jobs:
           name: runtime-tests
           path: runtime-tests.tgz
           retention-days: 7
+      # The workbench page bundles these two workspace packages, so they are built first.
+      - run: pnpm --filter @1agents/file-preview build
+      - run: pnpm --filter @1agents/chat-view build
       - run: pnpm --filter @1agents/acp-service build
       - run: pnpm --filter @1agents/acp-service typecheck
+      # The RSI role checks run check_outline.py, which needs a jsonschema with Draft 2020-12.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'jsonschema>=4.18'
       - run: pnpm --filter @1agents/acp-service test:only
       - name: Archive service build with executable permissions
         run: tar -czf service-build.tgz -C packages/service dist vendor
@@ -83,7 +91,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      DSH_REF: 21638c56315ae6a2b552d6091945d3144c9af32e
+      # dsh-v0.2.1-rc.2, the version the plugin is deployed on; 0.2.0-rc.1 has no ctx.tools.register.
+      DSH_REF: 687f282e8625c6b8d11ff58211a90524be2e4317
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
