@@ -4,7 +4,7 @@
  * program checks, and every proposal QA made to codify a check or change a locked item has been settled by a
  * person (accepted, rejected or done on the ticket). Any change to the role directory is a new version, so the
  * count starts again. Runs that never reached a verdict (the executor or QA task did not finish, e.g. the model
- * quota ran out) say nothing about the role and are left out.
+ * quota ran out, or the host itself failed) say nothing about the role and are left out.
  */
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -12,7 +12,7 @@ import { z } from 'zod';
 import type { Ticket } from '../execution/ticket.js';
 import { type LedgerEntry, ledgerPath, roleVersion, type RoleVersion, type StopReason } from './outline-run.js';
 
-const UNFINISHED: StopReason[] = ['not_completed', 'review_failed'];
+const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 
 export interface GateReport {
   roleId: string; role: RoleVersion; ready: boolean; reasons: string[]; required: number;

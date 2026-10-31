@@ -203,7 +203,8 @@ const closeSchema = jobSchema.extend({ status: z.enum(['closed', 'stopped']), st
 /**
  * The executor names the attempt it is running and its session, never an origin or a role. The DSH tools and the ACP
  * agents' MCP server resolve both from the calling session; the CLI runs in the executor's shell, knows only the job,
- * and acts for the job's current attempt. `via` records which of the three the call came through.
+ * and acts for the job's current attempt. `via` records which of the three the call came through. Nothing attests who
+ * ran the CLI, so its events carry no session and say the caller is unverified rather than borrowing the executor's.
  */
 const executorBase = z.object({ jobId: id, attemptId: id.optional(), sessionId: id.optional(), via: z.enum(['dsh', 'mcp', 'cli']).optional() }).strict();
 const attested = (input: z.infer<typeof executorBase>) => input.via === 'cli' ? !input.attemptId && !input.sessionId : Boolean(input.attemptId && input.sessionId);
@@ -258,8 +259,9 @@ export function invokeTicket(ledger: JobLedger, method: string, params: unknown)
       const attemptId = current?.attemptId ?? input.attemptId!, sessionId = current ? current.sessionId : input.sessionId;
       const origin = ledger.executorOrigin(input.jobId, attemptId, sessionId ?? '');
       if (method === 'ticket_show') return ledger.ticket(origin, input.jobId);
-      return change(origin, input.jobId, ticket => mark ? markItem(ticket, mark.itemId, mark.state, mark.note) : submitTicket(ticket),
-        { attemptId, ...(sessionId !== undefined ? { sessionId } : {}), ...(input.via ? { via: input.via } : {}) });
+      const caller = current ? { attemptId, via: 'cli', callerUnverified: true }
+        : { attemptId, ...(sessionId !== undefined ? { sessionId } : {}), ...(input.via ? { via: input.via } : {}) };
+      return change(origin, input.jobId, ticket => mark ? markItem(ticket, mark.itemId, mark.state, mark.note) : submitTicket(ticket), caller);
     }
     default: throw new Error(`Unknown ticket method: ${method}`);
   }

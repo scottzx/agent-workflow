@@ -11,7 +11,9 @@ import { invokeTicket, pendingItems, type Ticket } from '../src/execution/ticket
 import { type LedgerEntry, runOutlineCase, type OutlineRunOptions } from '../src/rsi/outline-run.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
-const checksAvailable = spawnSync('python3', ['-I', '-c', 'import jsonschema']).status === 0;
+/** The role checks need a Python with jsonschema; RSI_PYTHON names one when python3 on PATH has none. Without it these tests fail, never skip. */
+const PYTHON = process.env.RSI_PYTHON ?? 'python3';
+if (spawnSync(PYTHON, ['-I', '-c', 'import jsonschema']).status !== 0) throw new Error(`The rsi tests need a Python with jsonschema; ${PYTHON} has none. Set RSI_PYTHON to one that does.`);
 
 function outline(repo: string, commit: string, font = '微软雅黑') {
   const slide = (title: string, featureIds?: string[]) => ({ title, layout: 'title-bullets',
@@ -78,11 +80,11 @@ async function fixture(t: TestContext) {
   return { root, project, role, commit, calls };
 }
 
-test('a failed program check goes back to the same task with its evidence, and the next round passes', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('a failed program check goes back to the same task with its evidence, and the next round passes', async t => {
   const f = await fixture(t), gw = ticketGateway();
   let work = '';
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1,
     invoke: gw.invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       if (method === 'execution_submit') {
@@ -130,11 +132,11 @@ test('a failed program check goes back to the same task with its evidence, and t
   assert.ok(!report.rounds[1]!.results.some(r => r.itemId === 'D1'), 'no delivered copy, nothing to compare');
 });
 
-test('an ACP executor runs a role that trains only its first message, is told the ticket commands for its job, and a role that trains tools or names its presets refuses it', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('an ACP executor runs a role that trains only its first message, is told the ticket commands for its job, and a role that trains tools or names its presets refuses it', async t => {
   const f = await fixture(t), gw = ticketGateway();
   let work = '';
   const options = { roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'oneagents-acp-grok', originSessionId: 'rsi-test', pollMs: 1,
+    targetId: 'dsh-host', agentPreset: 'oneagents-acp-grok', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1,
     cli: { command: '/bin/node /x/acp-service.js', url: 'http://127.0.0.1:36814' } };
   // The executor's self-check waits on a tool approval for two polls before it finishes.
   let polls = 0;
@@ -175,12 +177,12 @@ test('an ACP executor runs a role that trains only its first message, is told th
   await refuse({ layers: ['skills'] }, /layers must include prompt/);
 });
 
-test('a delivered copy that differs from the checked outline fails and goes back; matching bytes pass',{ skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('a delivered copy that differs from the checked outline fails and goes back; matching bytes pass', async t => {
   const f = await fixture(t), gw = ticketGateway();
   let work = '', prompt = '';
   const good = JSON.stringify(outline('example/demo', f.commit));
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1,
     invoke: gw.invoke(async (method, params: any) => {
       const delivered = join(work, '.1agents', 'jobs', 'job-5');
       if (method === 'execution_submit') {
@@ -211,10 +213,10 @@ test('a delivered copy that differs from the checked outline fails and goes back
   assert.equal(second.outlineSha256, createHash('sha256').update(good).digest('hex'));
 });
 
-test('without bounces left a failed check ends the run, and a failed task is not checked', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('without bounces left a failed check ends the run, and a failed task is not checked', async t => {
   const f = await fixture(t);
   const bad = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, maxBounces: 0,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, maxBounces: 0,
     invoke: ticketGateway().invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       if (method === 'execution_submit') return { jobId: 'job-2' };
@@ -225,26 +227,26 @@ test('without bounces left a failed check ends the run, and a failed task is not
   assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
 
   const failed = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-2'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1,
     invoke: ticketGateway().invoke(async method => method === 'execution_submit' ? { jobId: 'job-3' } : { executionStatus: 'failed' }) });
   assert.equal(failed.passed, false);
   assert.deepEqual(failed.rounds, [{ round: 1, jobId: 'job-3', executionStatus: 'failed', passed: false, results: [] }]);
 
   const stuck = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-3'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, timeoutMs: 5,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 5,
     invoke: ticketGateway().invoke(async method => method === 'execution_submit' ? { jobId: 'job-4' } : { executionStatus: 'working' }) });
   assert.equal(stuck.passed, false);
   assert.equal(stuck.rounds[0]!.executionStatus, 'timed_out', 'a task that never finishes is recorded, not thrown');
 });
 
-test('with QA on, a QA agent in its own session reviews a frozen copy, its issues go back to the executor, and the same QA session re-reviews the revision', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('with QA on, a QA agent in its own session reviews a frozen copy, its issues go back to the executor, and the same QA session re-reviews the revision', async t => {
   const f = await fixture(t), gw = ticketGateway();
   let work = '', reviews = 0;
   const first = outline('example/demo', f.commit), revised = { ...first, project: { ...first.project, oneLiner: '一行命令生成产品介绍' } };
   const review = (verdict: string, issues: unknown[]) => ({ verdict, summary: verdict === 'pass' ? '可以了' : '开头太空泛', issues,
     scores: { 吸引力: verdict === 'pass' ? 4 : 2, 具体: 4, 受众: 4, 结构: 4, 可信: 5, 行动: 4 } });
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: { agentPreset: 'qa-preset' },
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: { agentPreset: 'qa-preset' },
     invoke: gw.invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       const qaReview = async () => {
@@ -284,11 +286,11 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
   assert.equal(JSON.parse(await readFile(join(work, 'reviews', 'outline-r2.json'), 'utf8')).project.oneLiner, '一行命令生成产品介绍');
 });
 
-test('a QA agent that edits the outline itself is undone, its edit of the exported ticket changes nothing, and a run without a readable review stops without sending anything back', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('a QA agent that edits the outline itself is undone, its edit of the exported ticket changes nothing, and a run without a readable review stops without sending anything back', async t => {
   const f = await fixture(t);
   let work = '';
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {},
     invoke: ticketGateway().invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       if (method === 'execution_submit' && params.title.startsWith('质检')) {
@@ -305,7 +307,25 @@ test('a QA agent that edits the outline itself is undone, its edit of the export
   assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
 });
 
-test('P8-P11 catch the deterministic problems QA used to find, and leave legitimate text alone', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('a host error mid-run still closes the ticket, writes run.json and the ledger line, then rethrows; the gate does not count the run', async t => {
+  const f = await fixture(t), workspace = join(f.root, 'runs'), gw = ticketGateway();
+  let work = '';
+  await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {},
+    invoke: gw.invoke(async (method, params: any) => {
+      if (method === 'execution_submit' && params.title.startsWith('质检')) throw new Error('fetch failed: gateway went away');
+      if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
+      return { executionStatus: 'completed' };
+    }) }), /gateway went away/);
+  const run = JSON.parse(await readFile(join(work, 'run.json'), 'utf8'));
+  assert.deepEqual([run.passed, run.stopReason, run.error, run.rounds.length], [false, 'host_error', 'fetch failed: gateway went away', 1]);
+  const ticket = await readTicket(work);
+  assert.deepEqual([ticket.status, ticket.stopReason], ['stopped', 'host_error'], 'the ticket is not left in review');
+  const ledger = (await readFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as LedgerEntry);
+  assert.deepEqual(ledger.map(entry => [entry.stopReason, entry.firstDraftPassed]), [['host_error', true]]);
+});
+
+test('P8-P11 catch the deterministic problems QA used to find, and leave legitimate text alone', async t => {
   const f = await fixture(t), dir = join(f.root, 'checks-case'), project = join(dir, 'project');
   await mkdir(project, { recursive: true });
   await writeFile(join(project, 'README.md'), '# 示例\n\n一个命令行工具。\n');
@@ -314,7 +334,7 @@ test('P8-P11 catch the deterministic problems QA used to find, and leave legitim
   await writeFile(join(dir, 'features.json'), await readFile(join(f.role, 'cases', 'demo', 'features.json')));
   const run = async (doc: unknown) => {
     await writeFile(join(dir, 'outline.json'), JSON.stringify(doc));
-    const out = spawnSync('python3', ['-I', join(f.role, 'checks', 'check_outline.py'), join(dir, 'outline.json'), join(dir, 'features.json'), project], { encoding: 'utf8' });
+    const out = spawnSync(PYTHON, ['-I', join(f.role, 'checks', 'check_outline.py'), join(dir, 'outline.json'), join(dir, 'features.json'), project], { encoding: 'utf8' });
     return Object.fromEntries((JSON.parse(out.stdout) as { itemId: string; pass: boolean; evidence: any[] }[]).map(r => [r.itemId, r]));
   };
   const point = (text: string) => ({ text, sources: [{ path: 'README.md' }] });
@@ -346,7 +366,7 @@ async function scriptedQaRun(f: Awaited<ReturnType<typeof fixture>>, workspace: 
   let work = '', reviews = 0, edits = 0;
   const gw = ticketGateway();
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {}, ...extra,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {}, ...extra,
     invoke: gw.invoke(async (method, params: any) => {
       const qa = async () => { reviews++; await writeFile(join(work, 'reviews', `review-r${reviews}.json`), JSON.stringify(script(reviews))); return { jobId: 'qa-1' }; };
       if (method === 'execution_submit' && params.title.startsWith('质检')) return qa();
@@ -368,7 +388,7 @@ const qaReview = (total: number, previous?: unknown[], proposals?: unknown[]) =>
   issues: [{ where: 'project/oneLiner', problem: '太空泛', suggestion: '写场景加结果', severity: 'must' }],
   ...(previous ? { previous } : {}), ...(proposals ? { proposals } : {}) });
 
-test('revisions continue up to three by default, stop early when the same issue survives two re-reviews, and every run lands in the ledger', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('revisions continue up to three by default, stop early when the same issue survives two re-reviews, and every run lands in the ledger', async t => {
   const f = await fixture(t), workspace = join(f.root, 'runs');
   const fixedLast = (n: number) => n > 1 ? [{ id: `Q${n - 1}-1`, status: 'fixed' }] : undefined;
   const rising = await scriptedQaRun(f, workspace, n => qaReview(16 + n, fixedLast(n)));
@@ -395,7 +415,7 @@ test('revisions continue up to three by default, stop early when the same issue 
   assert.equal(ledger[2]!.phase, 'dev'); assert.equal(ledger[2]!.caseKind, 'original');
 });
 
-test('the gate opens only after consecutive clean passes on the committed role version, and a test run needs a committed role', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('the gate opens only after consecutive clean passes on the committed role version, and a test run needs a committed role', async t => {
   const f = await fixture(t), workspace = join(f.root, 'runs');
   const git = (...args: string[]) => execFileSync('git', ['-C', f.role, ...args], { encoding: 'utf8' }).trim();
   git('init', '-q'); git('add', '.'); git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'role v1');
@@ -421,10 +441,11 @@ test('the gate opens only after consecutive clean passes on the committed role v
   assert.deepEqual(open.testCases.find(c => c.caseId === 'demo'), { caseId: 'demo', kind: 'original', result: 'passed' });
   assert.equal(open.testCases.find(c => c.caseId === 'dreammate-network')!.result, 'not_run');
 
-  await write([entry(), entry({ passed: false, stopReason: 'review_failed', startedAt: '2026-10-31T01:00:00.000Z' }), entry()]);
+  await write([entry(), entry({ passed: false, stopReason: 'review_failed', startedAt: '2026-10-31T01:00:00.000Z' }),
+    entry({ passed: false, stopReason: 'host_error', startedAt: '2026-10-31T02:00:00.000Z' }), entry()]);
   const quota = await gate();
-  assert.equal(quota.ready, true, 'a run whose QA task never finished says nothing about the role');
-  assert.deepEqual(quota.unfinished.map(run => run.stopReason), ['review_failed']);
+  assert.equal(quota.ready, true, 'a run whose QA task never finished, or whose host failed, says nothing about the role');
+  assert.deepEqual(quota.unfinished.map(run => run.stopReason), ['review_failed', 'host_error']);
 
   // Proposals are read live from the ticket: open ones block, settled ones do not.
   let state = 'open';
@@ -445,10 +466,10 @@ test('the gate opens only after consecutive clean passes on the committed role v
   const dirty = await gate();
   assert.equal(dirty.ready, false); assert.match(dirty.reasons.join('\n'), /未提交的改动/);
   await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace, phase: 'test', qa: {},
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, invoke: async () => ({}) }), /committed with no local changes/);
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, invoke: async () => ({}) }), /committed with no local changes/);
 });
 
-test('an executor that ends its round without submitting the ticket is sent back once with the reason', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('an executor that ends its round without submitting the ticket is sent back once with the reason', async t => {
   const f = await fixture(t), gw = ticketGateway();
   let work = '', continues = 0;
   const first = outline('example/demo', f.commit);
@@ -456,7 +477,7 @@ test('an executor that ends its round without submitting the ticket is sent back
     issues: verdict === 'pass' ? [] : [{ where: 'project/oneLiner', problem: '太空泛', suggestion: '写场景', severity: 'must' }],
     ...(verdict === 'pass' ? { previous: [{ id: 'Q1-1', status: 'fixed' }] } : {}) });
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {},
     invoke: gw.invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       const qa = (verdict: string) => writeFile(join(work, 'reviews', `review-r${verdict === 'pass' ? 3 : 1}.json`), JSON.stringify(review(verdict))).then(() => ({ jobId: 'qa-1' }));
@@ -482,7 +503,7 @@ test('an executor that ends its round without submitting the ticket is sent back
   assert.equal(gw.ledger.events('rsi-test', gw.job('job-1')).filter(e => e.type === 'ticket.revision_started').length, 2);
 
   const once = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-2'),
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {},
     invoke: ticketGateway().invoke(async (method, params: any) => {
       if (method === 'execution_submit' && params.title.startsWith('质检')) return qa1();
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
@@ -493,7 +514,7 @@ test('an executor that ends its round without submitting the ticket is sent back
   assert.equal((await readTicket(work)).stopReason, 'max_bounces');
 });
 
-test('P12-P15: the closing slide comes last and links what it offers, a title that counts its points is right, and the same sources are not paraphrased twice', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('P12-P15: the closing slide comes last and links what it offers, a title that counts its points is right, and the same sources are not paraphrased twice', async t => {
   const f = await fixture(t), dir = join(f.root, 'checks-case'), project = join(dir, 'project');
   await mkdir(project, { recursive: true });
   await writeFile(join(project, 'README.md'), '# 示例\n\n一个命令行工具。\n');
@@ -501,7 +522,7 @@ test('P12-P15: the closing slide comes last and links what it offers, a title th
   await writeFile(join(dir, 'features.json'), await readFile(join(f.role, 'cases', 'demo', 'features.json')));
   const run = async (doc: unknown) => {
     await writeFile(join(dir, 'outline.json'), JSON.stringify(doc));
-    const out = spawnSync('python3', ['-I', join(f.role, 'checks', 'check_outline.py'), join(dir, 'outline.json'), join(dir, 'features.json'), project], { encoding: 'utf8' });
+    const out = spawnSync(PYTHON, ['-I', join(f.role, 'checks', 'check_outline.py'), join(dir, 'outline.json'), join(dir, 'features.json'), project], { encoding: 'utf8' });
     return Object.fromEntries((JSON.parse(out.stdout) as { itemId: string; pass: boolean; evidence: any[] }[]).map(r => [r.itemId, r]));
   };
   const point = (text: string, path = 'README.md') => ({ text, sources: [{ path }] });

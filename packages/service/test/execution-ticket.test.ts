@@ -113,9 +113,10 @@ test('the CLI names only the job and acts for its current round, and every execu
   await runExecutorTicket(invoke, { jobId: f.jobId, attemptId: f.attempt(), sessionId: 'session' }, 'mcp', 'ticket_mark', { id: 'P1-P5', state: 'disputed', note: '仓库里就是这么写的' });
   assert.deepEqual((await cli('ticket_submit')).text, '任务单已提交（第 2 轮），等待宿主检查。');
   const marks = f.events().slice(before).filter(event => event.type !== 'ticket.revision_started');
-  assert.deepEqual(marks.map(event => [event.type, (event.data as any).via, (event.data as any).attemptId, (event.data as any).sessionId]), [
-    ['ticket.item_marked', 'cli', f.attempt(), 'session'], ['ticket.item_marked', 'mcp', f.attempt(), 'session'], ['ticket.submitted', 'cli', f.attempt(), 'session']],
-  'the CLI is recorded against the round it acted for and the session that runs it');
+  assert.deepEqual(marks.map(event => [event.type, (event.data as any).via, (event.data as any).attemptId, (event.data as any).sessionId, (event.data as any).callerUnverified]), [
+    ['ticket.item_marked', 'cli', f.attempt(), undefined, true], ['ticket.item_marked', 'mcp', f.attempt(), 'session', undefined],
+    ['ticket.submitted', 'cli', f.attempt(), undefined, true]],
+  'the CLI is recorded against the round it acted for, as an unverified caller, never under the executor’s session');
   f.revise();
   f.ledger.observe(f.attempt(), { executionStatus: 'completed' });
   assert.match((await cli('ticket_show')).text, /任务单操作被拒绝：这一轮执行已经结束/, 'nor once the executor’s round is over');

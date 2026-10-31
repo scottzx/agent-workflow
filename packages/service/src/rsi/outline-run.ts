@@ -43,12 +43,15 @@ export interface OutlineRound {
   ticketErrors?: string[];
 }
 export type Phase = 'dev' | 'test';
-export type StopReason = 'passed' | 'max_bounces' | 'max_revisions' | 'stalled' | 'needs_human' | 'not_completed' | 'review_failed';
+/** `host_error`: the host itself failed mid-run (the gateway went away, a call threw); the run is recorded and the error rethrown. */
+export type StopReason = 'passed' | 'max_bounces' | 'max_revisions' | 'stalled' | 'needs_human' | 'not_completed' | 'review_failed' | 'host_error';
 /** The role version is the last commit that touched the role directory; uncommitted changes make a run unattributable. */
 export interface RoleVersion { commit?: string; dirty: boolean }
 export interface OutlineRunReport {
   roleId: string; caseId: string; phase: Phase; role: RoleVersion; repo: string; commit: string; workDirectory: string; outlinePath: string; ticketPath: string;
   featuresConfirmed: boolean; rounds: OutlineRound[]; passed: boolean; stopReason: StopReason; startedAt: string; finishedAt: string;
+  /** The host error that stopped the run. */
+  error?: string;
 }
 /** One line of `<workspace>/<role>/ledger.jsonl`. */
 export interface LedgerEntry {
@@ -289,7 +292,9 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${round + 1}`, input: { prompt: feedback(ticket) } });
     log(`已打回执行者（第 ${round + 1} 轮）`);
   };
-  for (let round = 1; ; round++) {
+  // Whatever stops the run, the ticket is closed and the run is recorded; a host error is rethrown afterwards.
+  let hostError: unknown;
+  try { for (let round = 1; ; round++) {
     const executionStatus = await wait(jobId);
     if (round > 1 && executionStatus === 'completed') {
       ticket = await ticketCall('ticket_get');
@@ -329,22 +334,28 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       revisions++; feedback = current => revisePrompt(steps, current, accepted, round); note = '质检要求修改';
     } else break;
     await sendBack(round, feedback, note);
+  } } catch (error) {
+    hostError = error; stopReason = 'host_error';
+    log(`宿主出错，停止运行：${error instanceof Error ? error.message : String(error)}`);
   }
-  const last = rounds.at(-1)!;
+  const last = rounds.at(-1), passed = !hostError && Boolean(last?.passed);
   // Revising further cannot help when QA says a locked item is in the way; only a person can change it.
   if ((stopReason === 'stalled' || stopReason === 'max_revisions') && ticket.proposals.some(p => p.kind === 'locked')) stopReason = 'needs_human';
-  ticket = await ticketCall('ticket_close', { status: last.passed ? 'closed' : 'stopped', stopReason });
+  try { ticket = await ticketCall('ticket_close', { status: passed ? 'closed' : 'stopped', stopReason }); }
+  catch (error) { if (!hostError) throw error; } // The gateway may be what failed; the ledger line below still records the run.
   const report: OutlineRunReport = { roleId, caseId: kase.id, phase, role, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work,
     outlinePath, ticketPath, featuresConfirmed: Boolean(features.confirmation), rounds,
-    passed: last.passed, stopReason, startedAt, finishedAt: now().toISOString() };
+    passed, stopReason, startedAt, finishedAt: now().toISOString(),
+    ...(hostError ? { error: hostError instanceof Error ? hostError.message : String(hostError) } : {}) };
   await writeFile(path.join(work, 'run.json'), JSON.stringify(report, null, 2) + '\n');
-  const first = rounds[0]!;
-  const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed: report.passed, stopReason,
-    firstDraftPassed: first.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
+  const first = rounds[0];
+  const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed, stopReason,
+    firstDraftPassed: first?.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
     scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
     mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath,
     jobId, originSessionId: options.originSessionId };
   await appendFile(ledgerPath(options.workspace, roleId), JSON.stringify(entry) + '\n');
   log(`停止原因：${stopReason}`);
+  if (hostError) throw hostError;
   return report;
 }
