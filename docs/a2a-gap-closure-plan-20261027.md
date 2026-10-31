@@ -386,7 +386,7 @@ G8 不排进 P0–P3。
 | 事项 | 状态 | 下一步 |
 | --- | --- | --- |
 | 释放确认 | 已修复并部署（2026-10-31 16:14） | 见 §5.1。旧的 8 个 `closing` 不回头改 |
-| A2A 可用进程名额 | 断点，待决定 | 4 个名额里 `user-opened` 和 `prewarm` 占 3 个。三条路：调用方按 §8 传 one-shot；网关加一个让 `oneagents-acp-*` 默认 one-shot 的开关；调高上限。不为腾名额回收用户自己打开的会话 |
+| A2A 可用进程名额 | 已放宽（2026-10-31 16:40） | 硬件估算的 4/8 偏保守。dsh-web 和 a2a-gateway 两个 plist 都加了 `ACP_CAPACITY_SOFT_LIMIT=8`、`ACP_CAPACITY_HARD_LIMIT=12`，`policy.json` 已改写为 8/12；任务名额也随 soft 变成 8。内存检查不变。调用方传 one-shot、网关默认 one-shot 两项暂不做 |
 | DSH 完全访问下 ACP 工具被拒 | 已部署（2026-10-31 16:14），线上未复现验证，未推送 | `76125a84`：会话切到 `danger-full-access` 后审批策略变成 never，Grok 的 `terminal/create` 在 1 毫秒内被记成 rejected。修复后插件看到该沙箱模式直接放行 |
 | 上线后 24 小时观察 | 未做，可以开始 | 从 2026-10-31 16:14 起按 §6 的指标采集。`processReleasePending` 看相对 8 的增量 |
 | P2 真机检查 | 已通过 | 见 §5.1。要不要据此改技能里「不保证模型记得上文」的说法，单独决定 |
