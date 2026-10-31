@@ -1424,6 +1424,10 @@ export class RemoteAgentGateway {
     } catch (error) {
       if (error instanceof RemoteAgentError && error.code === 'UNSUPPORTED') this.automaticCloseStopped.add(job.remote);
       else this.closeFailures += 1;
+      // The host has no such session, so there is nothing left to close. Record it once; retrying every reconcile never succeeds.
+      if (error instanceof RemoteAgentError && error.code === 'SESSION_NOT_FOUND') {
+        this.markClosed(this.jobsForClose({ originSessionId: job.originSessionId, remote: job.remote, contextId: job.contextId }), 'one-shot', 'pending');
+      }
       console.warn(`A2A session close failed session=${job.sessionId ?? ''} context=${job.contextId} task=${job.taskId} code=${error instanceof RemoteAgentError ? error.code : 'REMOTE_UNAVAILABLE'}`);
     }
   }

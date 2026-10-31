@@ -381,6 +381,31 @@ test('one-shot closes after complete, failure, or cancel and leaves other work o
   await assert.rejects(() => gateway.invoke('remote_agent_close', { ...locate, taskId: acp.taskId, contextId: acp.contextId }), (error: unknown) => error instanceof RemoteAgentError && error.code === 'SESSION_CONFLICT');
 });
 
+test('a one-shot close the host cannot find is recorded once instead of retried every reconcile', { timeout: 20_000 }, async t => {
+  // The follow-up lands on a fresh host session, so the gateway's recorded session no longer matches the host target.
+  class Rebinding extends ClosingBackend {
+    override async prepare(input: A2APrepareInput): Promise<A2ATarget> { return { ...await super.prepare(input), sessionId: `session-${Math.random()}` }; }
+  }
+  const backend = new Rebinding();
+  const f = await fixture(t, backend);
+  const gateway = f.gateway();
+  t.after(() => gateway.close());
+  const locate = { remote: 'wsl', originSessionId: 'parent-lost-session' };
+  const first = await gateway.invoke('remote_agent_spawn', { ...spawn, ...locate, agentPreset: 'oneagents-acp-codex' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 1);
+  backend.runs[0]!.finish({ outcome: 'completed', text: 'done' });
+  await until(() => gateway.invoke('remote_agent_get', { ...locate, taskId: first.taskId }) as Promise<Record<string, unknown>>, value => value.sessionState === 'closing');
+  const next = await gateway.invoke('remote_agent_message', { ...locate, taskId: first.taskId, prompt: 'again' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 2);
+  await gateway.invoke('remote_agent_cancel', { ...locate, taskId: next.taskId });
+  const lost = await until(() => gateway.invoke('remote_agent_get', { ...locate, taskId: next.taskId }) as Promise<Record<string, unknown>>,
+    value => value.state === 'TASK_STATE_CANCELED' && value.sessionState === 'closing');
+  assert.equal(lost.processReleased, 'pending');
+  await pause(500);
+  assert.equal(gateway.lifecycleReport().closeFailures, 1);
+  assert.equal(backend.closes.length, 1);
+});
+
 test('a task without lifecycle is one-shot and its follow-up keeps that policy; jobs saved without one stay persistent', { timeout: 20_000 }, async t => {
   assert.equal(normalizeLifecycle(undefined).mode, 'one-shot');
   assert.equal(normalizeLifecycle({ idleTtlSeconds: 60 }).mode, 'one-shot');
