@@ -25,7 +25,7 @@ description: 作为教练智能体训练一个领域角色（执行者 + 质检�
 ├── ROLE.md             # 执行者的做法（可训练）
 ├── QA.md               # 质检的评分标准和复审规则（可训练）
 ├── checklist.json      # 检查项清单，locked: true 的项你不能改
-├── checks/             # 程序检查 check_outline.py、任务单工具 ticket.py（锁定）
+├── checks/             # 程序检查，例如 check_outline.py（锁定）
 └── cases/<case-id>/    # 用例：固定提交的仓库、受众、功能清单（人维护）；kind 为 original（原题）或 variant（变体题）
 ```
 
@@ -38,14 +38,22 @@ acp-service rsi run --role .1agents/roles/<role-id> --case <case-id> \
 
 流程：执行者产出 → 程序检查（不过就打回执行者原会话）→ 质检审稿（同一任务只开一个质检会话，复审接着原会话，先核对上一轮意见）→ 需要修改就打回执行者 → 再检查、再复审。默认程序打回 1 次、质检修改最多 3 轮（`--max-bounces`、`--qa-max-revisions`）。同一条质检意见连续两次复审都没改到位，或总分连续两轮没有提高，就提前停下：再改也不会更好。
 
-所有打回都走工作目录里的任务单 `ticket.json`，不靠对话里贴意见：
+所有打回都走任务单，不靠对话里贴意见。任务单挂在执行者的任务上，存在网关的执行台账里，每次变化都是一条 `ticket.*` 台账事件，记着操作者和轮次：
 
 - 程序检查没过的项、质检的意见，都写成带编号的条目（如 `P1-P2`、`Q1-3`），每条记着谁提的、谁处理、谁确认。
-- 执行者用 `checks/ticket.py` 把条目标成 `done` 或 `disputed` 并写说明，再 `submit`。它不能核实自己的修改，也不能关单；越权改动会被宿主恢复并打回。
-- 程序项由宿主重跑检查核实；质检意见由质检在复审的 `previous` 里按编号核实（`fixed`、`partly`、`not_fixed`、`withdrawn`），没改到位的会被重新打开。质检的 `issues` 只写新问题。
+- 执行者用 DSH 工具 `ticket_show`、`ticket_mark`、`ticket_submit` 把条目标成 `done` 或 `disputed` 并写说明，再提交。操作者由调用的方法认定，执行者的会话只能操作自己任务的任务单。它不能核实自己的修改，也不能关单；违规的请求网关直接拒绝。
+- 程序项由宿主重跑检查核实；质检意见由质检在复审的 `previous` 里按编号核实（`fixed`、`partly`、`not_fixed`、`withdrawn`），宿主合并进任务单，没改到位的会被重新打开。质检没有写任务单的方法，`issues` 只写新问题。
 - 质检通过就关单，否则记下停止原因。
 
-结果在工作目录：`run.json`（每轮的检查结果和质检记录，以及停止原因 `stopReason` 和角色版本）、`ticket.json`（每条意见的处理记录和质检的改进提议）、`reviews/outline-rN.json`（每轮被审的版本）、`reviews/review-rN.json`（质检的分数、意见、`previous` 核对和 `proposals`）。每次运行还会在 `<workspace>/<role-id>/ledger.jsonl` 追加一行，门禁就读这本账。
+你和人用命令行看任务单、处理提议（`--job` 是 run.json 里执行者的 jobId）：
+
+```sh
+acp-service ticket show --job <jobId>
+acp-service ticket events --job <jobId>
+acp-service ticket proposal --job <jobId> --id <提议编号> accept|reject|done --note "理由"
+```
+
+结果在工作目录：`run.json`（每轮的检查结果和质检记录，以及停止原因 `stopReason` 和角色版本）、`ticket.json`（网关写出的任务单只读导出）、`reviews/outline-rN.json`（每轮被审的版本）、`reviews/review-rN.json`（质检的分数、意见、`previous` 核对和 `proposals`）。每次运行还会在 `<workspace>/<role-id>/ledger.jsonl` 追加一行，门禁就读这本账。
 
 停止原因：`passed` 通过；`max_bounces` 程序打回用完；`max_revisions` 质检修改轮数用完；`stalled` 改不动了；`needs_human` 改不动了且质检提了锁定项提议；`not_completed`、`review_failed` 执行者或质检没跑完。
 
@@ -54,7 +62,7 @@ acp-service rsi run --role .1agents/roles/<role-id> --case <case-id> \
 每轮跑完，按这个顺序看：
 
 1. **程序检查失败项**：执行者为什么没自查出来？通常是 ROLE.md 没写清规则，补进 ROLE.md。
-2. **质检的改进提议**（`ticket.json` 的 `proposals`）：质检审稿时按类别提出该怎么改角色，逐条处理。
+2. **质检的改进提议**（任务单的 `proposals`）：质检审稿时按类别提出该怎么改角色，逐条处理，处理完用 `acp-service ticket proposal` 标成采纳、不采纳或已完成，并写理由。
    - **`check`，确定性的、能写成程序的**：写成新的程序检查，加进 checks/ 和 checklist.json，再在 ROLE.md 里告诉执行者、在 QA.md 里告诉质检“这项程序已经查了”。这是最有价值的沉淀。checks/ 和已锁定的项要由人确认后改。
    - **`role`，做法上的**（开头要场景加结果、技术细节放附录）：写进 ROLE.md。
    - **`qa`，评判标准上的**（质检打分忽松忽紧、复审加码）：写进 QA.md。
