@@ -91,7 +91,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      DSH_REF: 21638c56315ae6a2b552d6091945d3144c9af32e
+      # dsh-v0.2.1-rc.2, the version the plugin is deployed on; 0.2.0-rc.1 has no ctx.tools.register.
+      DSH_REF: 687f282e8625c6b8d11ff58211a90524be2e4317
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
