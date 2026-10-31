@@ -31,6 +31,8 @@ pnpm build && pnpm test
 
 （未链接 DSH 时，`packages/dsh-plugin` 用 `types/dsh-host.d.ts` 中的宿主类型声明做类型检查；要用真实类型，先运行 `pnpm link:dsh /path/to/DSH`；未链接时，需要真实 DSH 运行时的 8 个插件测试文件和 2 个 “real Cordis” 用例会被跳过并在输出中列出。第三方依赖许可证见 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)。）
 
+参与贡献请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## Install in DSH
 
 Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
