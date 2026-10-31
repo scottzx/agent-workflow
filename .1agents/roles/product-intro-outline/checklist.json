@@ -39,7 +39,9 @@
     { "id": "P13", "type": "program", "source": "norm", "severity": "block", "locked": true,
       "rule": "页标题里数本页条目的写法（“四个动作”“三步”）和本页要点条数一致；序数（“第一步”“下一步”）和描述对象的数量（“六个演示场景”）不算" },
     { "id": "P14", "type": "program", "source": "norm", "severity": "block", "locked": true,
-      "rule": "不同页的两条要点引用同一组出处文件时，不能有连续 8 个以上相同的汉字（换了说法的重复）；英文词、命令和链接不算" }
+      "rule": "不同页的两条要点引用同一组出处文件时，不能有连续 8 个以上相同的汉字（换了说法的重复）；英文词、命令和链接不算" },
+    { "id": "P15", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "收尾页里提到“下载”“源码”“附件”的要点，必须带一个完整的 http(s) 地址" }
   ],
   "program": { "run": "checks/check_outline.py", "schema": "checks/outline.schema.json" }
 }

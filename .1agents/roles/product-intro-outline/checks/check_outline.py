@@ -1,4 +1,4 @@
-"""Program checks P1-P14 for a product intro outline.
+"""Program checks P1-P15 for a product intro outline.
 
 Usage: check_outline.py <outline.json> <features.json> <project-copy-dir>
 
@@ -29,6 +29,9 @@ SELF_COUNT = re.compile(r'(?<![第下进每\d])([二两三四五六七八九十]
 # same thing twice. Shared English words, commands and links do not count.
 SHARED_RUN = 8
 HAN = re.compile(r'[\u4e00-\u9fff]+')
+# On the closing slide, a point that sends the reader to download something must carry the link itself.
+FETCH = re.compile(r'下载|源码|附件')
+LINK = re.compile(r'https?://\S+')
 
 
 def reader_text(outline):
@@ -180,6 +183,11 @@ def main(outline_path: str, features_path: str, project: str) -> int:
                 p14.append({'path': here, 'message': f"cites the same files as {there} and repeats “{key[run.a:run.a + run.size]}”; say it once"})
                 break
     report('P14', p14)
+
+    closing_slide = order[-1] if order and order[-1][1]['layout'] == 'closing' else None
+    report('P15', [] if not closing_slide else [
+        {'path': f"{closing_slide[0]}/points/{j}", 'message': f"mentions {FETCH.search(point['text']).group(0)} without an http(s) link: {point['text']}"}
+        for j, point in enumerate(closing_slide[1]['points']) if FETCH.search(point['text']) and not LINK.search(point['text'])])
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 0 if all(r['pass'] for r in results) else 1

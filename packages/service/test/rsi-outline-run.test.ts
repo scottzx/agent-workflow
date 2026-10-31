@@ -493,7 +493,7 @@ test('an executor that ends its round without submitting the ticket is sent back
   assert.equal((await readTicket(work)).stopReason, 'max_bounces');
 });
 
-test('P12-P14: the closing slide comes last, a title that counts its points is right, and the same sources are not paraphrased twice', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('P12-P15: the closing slide comes last and links what it offers, a title that counts its points is right, and the same sources are not paraphrased twice', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
   const f = await fixture(t), dir = join(f.root, 'checks-case'), project = join(dir, 'project');
   await mkdir(project, { recursive: true });
   await writeFile(join(project, 'README.md'), '# 示例\n\n一个命令行工具。\n');
@@ -529,4 +529,14 @@ test('P12-P14: the closing slide comes last, a title that counts its points is r
   moved.sections[1].slides.push(moved.sections[3].slides.pop());
   const p12 = (await run(moved)).P12!;
   assert.match(JSON.stringify(p12.evidence), /features\/slides\/1.*not the last slide.*getting_started\/slides\/0.*must use the closing layout/);
+
+  // P15: on the closing slide, sending the reader to download something needs the link itself.
+  const ending = structuredClone(ok);
+  ending.sections[3].slides[1].points = [point('下载离线包：https://github.com/example/demo/releases/latest'), point('想要演示请联系销售同事'),
+    point('到仓库 Releases 页下载最新附件'), point('拿源码：源码归档由 GitHub 自动提供')];
+  ending.sections[1].slides[0].points.push(point('方案可以下载成图片'));
+  const p15 = (await run(ending)).P15!;
+  assert.deepEqual(p15.evidence.map((e: any) => e.path), ['sections/getting_started/slides/1/points/2', 'sections/getting_started/slides/1/points/3'],
+    'a link, a point without a download, and a download mentioned on another slide all pass');
+  assert.equal((await run(ok)).P15!.pass, true);
 });
