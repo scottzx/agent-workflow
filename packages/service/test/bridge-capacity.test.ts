@@ -165,4 +165,20 @@ test('bridge cancels pending session launches, including profile keys and late s
       assert.equal(bridge.activeSessions.has('pending-capacity-id-2'), false);
     } finally { await occupied.release(); }
   });
+
+  await t.test('close confirms the release once the agent exited and its lease is gone', async () => {
+    const ws = peer();
+    const sessionId = 'release-confirmation';
+    await deadline(bridge.dispatchCommand(ws, { action: 'ensure_session', sessionId, workspacePath: directory,
+      agentType: 'codex', responsePolicy: 'summary' }));
+    assert.ok(ws.events.some(event => event.event === 'session_ready'));
+    const pid = (await options.sessionStore.load(bridge.activeSessions.get(sessionId).handle.acpxRecordId))?.pid;
+    assert.equal(typeof pid, 'number');
+    assert.equal((await governor.snapshot('process')).used, 1);
+    await deadline(bridge.dispatchCommand(ws, { action: 'close_session', sessionId }));
+    assert.deepEqual(ws.events.filter(event => event.event === 'session_released'),
+      [{ event: 'session_released', sessionId, processReleased: true }]);
+    assert.throws(() => process.kill(pid, 0));
+    assert.equal((await governor.snapshot('process')).used, 0);
+  });
 });

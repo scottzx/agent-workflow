@@ -343,6 +343,22 @@ async function cancelInitializingSession(sessionId, expectedSignal) {
   return true;
 }
 
+/**
+ * Close confirmation: the agent process recorded before close is gone and no process lease
+ * still names it. An unknown pid or a lease that outlives the wait stays unconfirmed.
+ */
+async function confirmProcessReleased(pid, timeoutMs = 5_000) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let alive = true;
+    try { process.kill(pid, 0); } catch (err) { alive = err?.code === "EPERM"; }
+    if (!alive && !(await processCapacity.holdsChild(pid))) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
 // Map of Agent UUID -> Client Session ID (for permission callbacks)
 const agentSessionToClientSession = new Map();
 
@@ -2414,6 +2430,7 @@ export async function dispatchCommand(ws, payload) {
           if (session) {
             console.log(`[acpx-server] Closing session: ${sessionId}`);
             unregisterAgentSessionMapping(session.handle);
+            const pid = (await loadActiveSessionRecord(runtime, session.handle))?.pid;
             try {
               if (session.activeTurn) {
                 await session.activeTurn.cancel({ reason: "Session closed" });
@@ -2426,6 +2443,7 @@ export async function dispatchCommand(ws, payload) {
             }
             activeSessions.delete(sessionId);
             sessionBackgroundTasks.delete(sessionId);
+            ws.send(JSON.stringify({ event: "session_released", sessionId, processReleased: await confirmProcessReleased(pid) }));
           }
           clearSessionHistoryPush(sessionId);
           break;

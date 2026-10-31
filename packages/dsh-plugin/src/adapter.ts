@@ -452,11 +452,14 @@ export class AcpAdapter implements LlmAdapter {
     const binding = this.state.get(agent.id);
     const pending = this.links.get(agent.id);
     const link = pending ? await pending.catch(() => undefined) : undefined;
+    let processReleased: true | 'pending' = 'pending';
     if (link && binding?.sessionId) {
       try {
-        await link.rpc.request('session/close', { sessionId: binding.sessionId }, {
+        const result = await link.rpc.request('session/close', { sessionId: binding.sessionId }, {
           cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]),
-        });
+        }) as { _meta?: Record<string, { processReleased?: unknown } | undefined> } | undefined;
+        // The service confirms only after it saw the agent exit and its process lease disappear.
+        if (result?._meta?.['1agents']?.processReleased === true) processReleased = true;
       } catch (error) {
         const message = error instanceof Error ? error.message : '';
         if (!/not found|Session not found|-32001/i.test(message)) {
@@ -468,7 +471,7 @@ export class AcpAdapter implements LlmAdapter {
       link.close();
       if (this.links.get(agent.id) === pending) this.links.delete(agent.id);
     }
-    return { processReleased: 'pending', acp: true };
+    return { processReleased, acp: true };
   }
   /**
    * Controlled delete. ACP session/delete closes the process and marks the record deleted.

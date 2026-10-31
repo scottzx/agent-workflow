@@ -72,7 +72,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         closedSessions.push(params.sessionId);
         await streamConfig.beforeClose?.();
         if (streamConfig.closeError) throw new RequestError(streamConfig.closeError.code, streamConfig.closeError.message, streamConfig.closeError.data);
-        return {};
+        return streamConfig.closeResult ?? {};
       })
       .onRequest('session/delete', ({ params }) => { deletedSessions.push(params.sessionId); return {}; })
       .onRequest('session/load', async ({ params }) => {
@@ -1086,4 +1086,11 @@ test('release keeps the binding and delete reaches a detached session without re
   assert.deepEqual(f.deletedSessions, ['remote-1']);
   assert.equal(f.attaches.length, attaches);
   await assert.rejects(f.adapter.deleteSession('missing'), error => error.code === 'SESSION_NOT_FOUND');
+});
+
+test('release reports the process released only when the service confirms it', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], { closeResult: { _meta: { '1agents': { processReleased: true } } } });
+  await collect(f.adapter, f.options('message-1'));
+  assert.deepEqual(await f.adapter.releaseSession('dsh-session'), { processReleased: true, acp: true });
+  assert.deepEqual(f.closedSessions, ['remote-1']);
 });
