@@ -1,0 +1,6 @@
+{
+  "//": "Used when DeepSeek Harness packages are not linked (node_modules/@deepseek-ai missing). Type-checks against loose host shims in types/dsh-host.d.ts.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noImplicitAny": false, "strict": false },
+  "include": ["src/**/*.ts", "types/dsh-host.d.ts"]
+}
