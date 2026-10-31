@@ -6,6 +6,7 @@ import test from 'node:test';
 import { settler } from '../bin/ticket.js';
 import { JobLedger, type LedgerState } from '../src/execution/ledger.js';
 import { invokeTicket, TICKET_METHODS, type Ticket } from '../src/execution/ticket.js';
+import { runExecutorTicket } from '../src/execution/ticket-executor.js';
 
 const origin = 'root', target = { targetId: 'dsh-host' };
 const review = (over: Record<string, unknown> = {}) => ({ verdict: 'revise', summary: '还要改', scores: { 吸引力: 3 },
@@ -94,6 +95,30 @@ test('the executor may only mark its pending items with a note and submit when n
   assert.throws(() => invokeTicket(f.ledger, 'ticket_checks', { jobId: f.jobId, attemptId: f.attempt(), sessionId: 'session', results: [] }), /originSessionId|Unrecognized/,
     'the executor’s identity reaches no host method');
   assert.equal(f.events().length, before + 2, 'a rejected call records nothing; the mark and the revision did');
+});
+
+test('the CLI names only the job and acts for its current round, and every executor event records the channel it came through', async () => {
+  const f = fixture();
+  f.call('ticket_open', { roleId: 'role', caseId: 'demo' });
+  f.call('ticket_checks', { results: [{ itemId: 'P2', pass: false, evidence: [] }, { itemId: 'P5', pass: false, evidence: [] }] });
+  f.revise();
+  const before = f.events().length;
+  assert.throws(() => invokeTicket(f.ledger, 'ticket_show', { jobId: f.jobId }), /attemptId and sessionId are required/, 'the tools still name their attempt and session');
+  assert.throws(() => invokeTicket(f.ledger, 'ticket_show', { jobId: f.jobId, attemptId: f.attempt(), sessionId: 'session', via: 'cli' }), /except from the CLI/);
+  const invoke = async (method: string, params: Record<string, unknown>) => invokeTicket(f.ledger, method, params);
+  const cli = (tool: 'ticket_show' | 'ticket_mark' | 'ticket_submit', args = {}) => runExecutorTicket(invoke, { jobId: f.jobId }, 'cli', tool, args);
+  assert.match((await cli('ticket_show')).text, /P1-P2 \[必须改\][\s\S]*待处理 2 条，任务单状态 in_revision，第 2 轮/);
+  assert.deepEqual(await cli('ticket_mark', { id: 'P1-P2', state: 'done', note: '字体改了' }), { text: 'P1-P2 已标为 done，还剩 1 条待处理。' });
+  assert.deepEqual(await cli('ticket_submit'), { text: '任务单操作被拒绝：还有 1 条没处理：P1-P5', refused: true });
+  await runExecutorTicket(invoke, { jobId: f.jobId, attemptId: f.attempt(), sessionId: 'session' }, 'mcp', 'ticket_mark', { id: 'P1-P5', state: 'disputed', note: '仓库里就是这么写的' });
+  assert.deepEqual((await cli('ticket_submit')).text, '任务单已提交（第 2 轮），等待宿主检查。');
+  const marks = f.events().slice(before).filter(event => event.type !== 'ticket.revision_started');
+  assert.deepEqual(marks.map(event => [event.type, (event.data as any).via, (event.data as any).attemptId, (event.data as any).sessionId]), [
+    ['ticket.item_marked', 'cli', f.attempt(), 'session'], ['ticket.item_marked', 'mcp', f.attempt(), 'session'], ['ticket.submitted', 'cli', f.attempt(), 'session']],
+  'the CLI is recorded against the round it acted for and the session that runs it');
+  f.revise();
+  f.ledger.observe(f.attempt(), { executionStatus: 'completed' });
+  assert.match((await cli('ticket_show')).text, /任务单操作被拒绝：这一轮执行已经结束/, 'nor once the executor’s round is over');
 });
 
 test('the host merges checks only after a submission, reviews only in review, and nothing changes a closed ticket but proposals', () => {

@@ -23,6 +23,16 @@ const caseSchema = z.object({
 const featuresSchema = z.object({ repo: z.string(), commit: z.string(), confirmation: z.unknown(),
   features: z.array(z.object({ id: z.string().min(1), name: z.string().min(1) }).passthrough()).min(1) }).passthrough();
 const resultsSchema = z.array(checkResultSchema);
+/**
+ * What training may change in the executor besides the first user message, which carries the role and is always
+ * trained; the agent's own system prompt and persona are never replaced. Tools and skills are only controlled on
+ * DSH's own presets, so a role that trains them cannot run on an ACP agent; `presets` narrows the executors further.
+ */
+const LAYERS = { prompt: '第一条消息', skills: '技能', tools: '工具和权限', model: '模型和模式' } as const;
+const profileSchema = z.object({ id: z.string().min(1), training: z.object({
+  layers: z.array(z.enum(Object.keys(LAYERS) as [keyof typeof LAYERS, ...(keyof typeof LAYERS)[]])).refine(layers => layers.includes('prompt'), 'layers must include prompt'),
+  presets: z.array(z.string().min(1)).min(1).optional() }).strict().optional() }).passthrough();
+const acpPreset = (preset: string) => preset.startsWith('oneagents-acp-');
 
 export type { CheckResult, QualityReview };
 /** One QA pass over a frozen copy of the outline, in its own session. */
@@ -56,6 +66,8 @@ export interface OutlineRunOptions {
   targetId: string; agentPreset: string; originSessionId: string;
   /** Times a failed check goes back to the executor. The design default is one. */
   maxBounces?: number; pollMs?: number; timeoutMs?: number; python?: string;
+  /** How the executor runs the ticket CLI from its shell when it has neither the DSH tools nor the MCP server. */
+  ticketCli?: { command: string; url: string };
   /** A QA agent reviews each outline that passes the program checks and may send it back for revision, by default up to three times. */
   qa?: { agentPreset?: string; targetId?: string; maxRevisions?: number };
   invoke: (method: string, params: Record<string, unknown>) => Promise<any>;
@@ -92,7 +104,7 @@ async function exportProject(repository: string, commit: string, destination: st
 }
 
 function taskPrompt(role: string, kase: z.infer<typeof caseSchema>, work: string, python: string): string {
-  return `${role}\n\n## 本次任务\n\n- 工作目录：${work}\n- 仓库：${kase.input.repo}\n- 提交：${kase.input.commit}\n- 受众：${kase.input.audience}\n- 自查用的 Python：\`${python}\`（已装好 jsonschema）\n\n读 \`project/\`，按 \`features.json\` 和 \`checks/outline.schema.json\` 写出 \`${path.join(work, 'outline.json')}\`。自查：\`${python} -I checks/check_outline.py outline.json features.json project\`。通过后结束，最终答复给出文件路径。\n\n这次任务的任务单记在系统里，宿主维护。被打回时，意见都在任务单上，按打回消息里的步骤用 \`ticket_show\`、\`ticket_mark\`、\`ticket_submit\` 工具处理；工作目录里的 \`ticket.json\` 只是只读导出。`;
+  return `${role}\n\n## 本次任务\n\n- 工作目录：${work}\n- 仓库：${kase.input.repo}\n- 提交：${kase.input.commit}\n- 受众：${kase.input.audience}\n- 自查用的 Python：\`${python}\`（已装好 jsonschema）\n\n读 \`project/\`，按 \`features.json\` 和 \`checks/outline.schema.json\` 写出 \`${path.join(work, 'outline.json')}\`。自查：\`${python} -I checks/check_outline.py outline.json features.json project\`。通过后结束，最终答复给出文件路径。\n\n这次任务的任务单记在系统里，宿主维护。被打回时，意见都在任务单上，按打回消息里的步骤用 \`ticket_show\`、\`ticket_mark\`、\`ticket_submit\` 工具（或打回消息里给的命令）处理；工作目录里的 \`ticket.json\` 只是只读导出。`;
 }
 
 /** The checks need jsonschema, so the interpreter is resolved once and handed to the executor by absolute path. */
@@ -102,17 +114,22 @@ async function checkInterpreter(name: string): Promise<string> {
   return found.stdout.trim();
 }
 
-function ticketSteps(ticket: Ticket): string {
-  const pending = pendingItems(ticket);
-  return `任务单上有 ${pending.length} 条待处理（${pending.filter(item => item.severity === 'must').length} 条必须改）：\n\n1. 调用 \`ticket_show\` 工具查看待处理的意见和证据。\n2. 在同一个 outline.json 上逐条修改。改完一条就调用 \`ticket_mark\`：\`id\` 填编号，\`state\` 填 \`done\`，\`note\` 写怎么改的；不同意的 \`state\` 填 \`disputed\`，\`note\` 写理由。\n3. 全部处理完，调用 \`ticket_submit\`。\n4. 用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。\n\n任务单只能用这三个工具处理；工作目录里的 ticket.json 是只读导出，改它没有用。`;
+/** The three ticket operations as tools and, when the host gave a CLI, as commands for an executor without the tools. */
+type TicketSteps = (ticket: Ticket) => string;
+function ticketSteps(jobId: string, cli?: { command: string; url: string }): TicketSteps {
+  const commands = cli ? `\n\nACP 智能体里这三个工具由 \`1agents-review\` MCP 服务提供。找不到这些工具时，在终端里用命令做同样的事：\n\n- 查看：\`${cli.command} pending --job ${jobId} --url ${cli.url}\`\n- 标记：\`${cli.command} mark --job ${jobId} --url ${cli.url} --id 编号 --state done --note '怎么改的'\`\n- 提交：\`${cli.command} submit --job ${jobId} --url ${cli.url}\`` : '';
+  return ticket => {
+    const pending = pendingItems(ticket);
+    return `任务单上有 ${pending.length} 条待处理（${pending.filter(item => item.severity === 'must').length} 条必须改）：\n\n1. 调用 \`ticket_show\` 工具查看待处理的意见和证据。\n2. 在同一个 outline.json 上逐条修改。改完一条就调用 \`ticket_mark\`：\`id\` 填编号，\`state\` 填 \`done\`，\`note\` 写怎么改的；不同意的 \`state\` 填 \`disputed\`，\`note\` 写理由。\n3. 全部处理完，调用 \`ticket_submit\`。\n4. 用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。${commands}\n\n任务单只能用这三个工具${cli ? '或这三条命令' : ''}处理；工作目录里的 ticket.json 是只读导出，改它没有用。`;
+  };
 }
 
-function bouncePrompt(ticket: Ticket, round: number): string {
-  return `宿主程序检查没有通过（第 ${round} 轮），未通过的检查项和证据已写进任务单。${ticketSteps(ticket)}`;
+function bouncePrompt(steps: TicketSteps, ticket: Ticket, round: number): string {
+  return `宿主程序检查没有通过（第 ${round} 轮），未通过的检查项和证据已写进任务单。${steps(ticket)}`;
 }
 
-function ticketBouncePrompt(ticket: Ticket, problems: string[]): string {
-  return `任务单没有按规定处理：\n\n${problems.map(problem => `- ${problem}`).join('\n')}\n\n${ticketSteps(ticket)}`;
+function ticketBouncePrompt(steps: TicketSteps, ticket: Ticket, problems: string[]): string {
+  return `任务单没有按规定处理：\n\n${problems.map(problem => `- ${problem}`).join('\n')}\n\n${steps(ticket)}`;
 }
 
 export async function roleVersion(roleDirectory: string): Promise<RoleVersion> {
@@ -144,8 +161,8 @@ function reReviewPrompt(copy: string, output: string, ticketPath: string, round:
   return `执行者按任务单改了大纲（第 ${round} 轮）。新版本：\`${copy}\`。任务单记在系统里，只读导出在 \`${ticketPath}\`；执行者在上面把你的每条意见标了 done（已改）或 disputed（不同意），并写了说明。\n\n按 QA.md 的复审要求：先在 previous 里用任务单编号逐条核对执行者处理过的质检意见，再用同样的标准打分，issues 只写新问题。把结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
 }
 
-function revisePrompt(ticket: Ticket, review: QualityReview, round: number): string {
-  return `质检审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n质检的意见已写进任务单，没改到位的旧意见已重新打开。${ticketSteps(ticket)}`;
+function revisePrompt(steps: TicketSteps, ticket: Ticket, review: QualityReview, round: number): string {
+  return `质检审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n质检的意见已写进任务单，没改到位的旧意见已重新打开。${steps(ticket)}`;
 }
 
 async function check(work: string, python: string, jobId: string): Promise<{ results: CheckResult[]; outlineSha256?: string }> {
@@ -173,7 +190,10 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const pollMs = options.pollMs ?? 10_000, timeoutMs = options.timeoutMs ?? 30 * 60_000, maxBounces = options.maxBounces ?? 1;
   const python = await checkInterpreter(options.python ?? 'python3'), startedAt = now().toISOString();
   const roleDirectory = path.resolve(options.roleDirectory);
-  const roleId = z.object({ id: z.string().min(1) }).passthrough().parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))).id;
+  const profile = profileSchema.parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))), roleId = profile.id;
+  const layers = profile.training?.layers ?? ['prompt'];
+  if (profile.training?.presets && !profile.training.presets.includes(options.agentPreset)) throw new Error(`This role runs only on ${profile.training.presets.join(', ')}, not ${options.agentPreset}`);
+  if (acpPreset(options.agentPreset) && (layers.includes('tools') || layers.includes('skills'))) throw new Error(`This role trains ${layers.filter(layer => layer === 'tools' || layer === 'skills').join(' and ')}, which only DSH's own presets control; ${options.agentPreset} is an ACP agent`);
   const caseDirectory = path.join(roleDirectory, 'cases', options.caseId);
   const kase = caseSchema.parse(JSON.parse(await readFile(path.join(caseDirectory, 'case.json'), 'utf8')));
   if (!kase.features) throw new Error(`Case ${kase.id} has no confirmed feature list yet`);
@@ -192,6 +212,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   await cp(path.join(caseDirectory, kase.features), path.join(work, 'features.json'));
   log(`工作目录：${work}`);
   log(`阶段：${phase === 'dev' ? '开发' : '测试'}，角色版本：${role.commit?.slice(0, 8) ?? '未提交'}${role.commit && role.dirty ? '（有未提交的改动）' : ''}`);
+  log(`执行者：${options.agentPreset}，训练的层：${layers.map(layer => LAYERS[layer]).join('、')}`);
   if (!features.confirmation) log('注意：这份功能清单还没有经人确认。');
 
   const wait = async (jobId: string): Promise<string> => {
@@ -247,6 +268,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     return await options.invoke('ticket_get', scope) as Ticket;
   };
   let ticket = await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath });
+  const steps = ticketSteps(jobId, options.ticketCli);
   const rounds: OutlineRound[] = [];
   const reviews: QualityReview[] = [];
   let bounces = 0, revisions = 0, stopReason: StopReason = 'passed';
@@ -266,7 +288,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
         log(`第 ${round} 轮：任务单没有按规定处理（${problems.join('；')}）`);
         if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
         bounces++;
-        await sendBack(round, current => ticketBouncePrompt(current, problems), '执行者没有提交任务单');
+        await sendBack(round, current => ticketBouncePrompt(steps, current, problems), '执行者没有提交任务单');
         continue;
       }
     }
@@ -280,7 +302,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     let feedback: (ticket: Ticket) => string, note: string;
     if (!programPassed) {
       if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
-      bounces++; feedback = current => bouncePrompt(current, round); note = '程序检查没有通过';
+      bounces++; feedback = current => bouncePrompt(steps, current, round); note = '程序检查没有通过';
     } else if (options.qa) {
       record.review = await review(round);
       const verdict = record.review.review?.verdict;
@@ -293,7 +315,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       reviews.push(accepted);
       if (stalled(reviews)) { stopReason = 'stalled'; log('质检意见连续两轮没有改到位，或分数连续两轮没有提高，停止修改'); break; }
       if (revisions >= (options.qa.maxRevisions ?? 3)) { stopReason = 'max_revisions'; break; }
-      revisions++; feedback = current => revisePrompt(current, accepted, round); note = '质检要求修改';
+      revisions++; feedback = current => revisePrompt(steps, current, accepted, round); note = '质检要求修改';
     } else break;
     await sendBack(round, feedback, note);
   }

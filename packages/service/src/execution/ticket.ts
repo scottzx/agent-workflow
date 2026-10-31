@@ -200,9 +200,16 @@ const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).option
 const proposalSchema = jobSchema.extend({ proposalId: id, state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional(),
   by: settlerSchema.optional() }).strict();
 const closeSchema = jobSchema.extend({ status: z.enum(['closed', 'stopped']), stopReason: id.optional() }).strict();
-/** The executor names the attempt it is running and its session, never an origin or a role. */
-const executorSchema = z.object({ jobId: id, attemptId: id, sessionId: id }).strict();
-const markSchema = executorSchema.extend({ itemId: id, state: z.enum(['done', 'disputed']), note: z.string().max(4000) }).strict();
+/**
+ * The executor names the attempt it is running and its session, never an origin or a role. The DSH tools and the ACP
+ * agents' MCP server resolve both from the calling session; the CLI runs in the executor's shell, knows only the job,
+ * and acts for the job's current attempt. `via` records which of the three the call came through.
+ */
+const executorBase = z.object({ jobId: id, attemptId: id.optional(), sessionId: id.optional(), via: z.enum(['dsh', 'mcp', 'cli']).optional() }).strict();
+const attested = (input: z.infer<typeof executorBase>) => input.via === 'cli' ? !input.attemptId && !input.sessionId : Boolean(input.attemptId && input.sessionId);
+const attestation = 'attemptId and sessionId are required, except from the CLI, which names only the job';
+const executorSchema = executorBase.refine(attested, attestation);
+const markSchema = executorBase.extend({ itemId: id, state: z.enum(['done', 'disputed']), note: z.string().max(4000) }).strict().refine(attested, attestation);
 
 export const TICKET_METHODS = {
   ticket_get: { description: '读取执行者任务上的任务单（意见、状态、轮次、提议、历史）。每次改动都在 execution_events 里留有 ticket.* 事件。', parameters: z.toJSONSchema(jobSchema) },
@@ -210,7 +217,7 @@ export const TICKET_METHODS = {
   ticket_checks: { description: '宿主：执行者交稿后合并本轮程序检查结果。未通过的项成为或重开意见，通过的核实；全部通过则进入审阅。', parameters: z.toJSONSchema(checksSchema) },
   ticket_review: { description: '宿主：审阅中合并质检结果（previous 按意见编号 fixed/partly/not_fixed/withdrawn、新意见、去重后的提议），记录质检任务 qaJobId。质检自己不能改任务单。', parameters: z.toJSONSchema(reviewSchema) },
   ticket_revise: { description: '宿主：把任务单打回执行者，进入下一轮修改。', parameters: z.toJSONSchema(reviseSchema) },
-  ticket_show: { description: '执行者：用正在执行的 jobId、attemptId 和 sessionId 读取自己的任务单。', parameters: z.toJSONSchema(executorSchema) },
+  ticket_show: { description: '执行者：用正在执行的 jobId、attemptId 和 sessionId 读取自己的任务单；命令行只给 jobId，via 为 cli，按该任务当前这一轮执行。', parameters: z.toJSONSchema(executorSchema) },
   ticket_mark: { description: '执行者：修改中把本轮 open 或 reopened 的意见标为 done 或 disputed，必须写说明；只能由正在执行当前轮次的会话调用。', parameters: z.toJSONSchema(markSchema) },
   ticket_submit: { description: '执行者：没有待处理意见时提交任务单，等待宿主检查。', parameters: z.toJSONSchema(executorSchema) },
   ticket_proposal: { description: '人或教练：把一条提议标为 accepted、rejected 或 done，可写说明；运行结束后也可以。by 说明是人还是教练（教练写明所在的智能体会话），缺省为人。', parameters: z.toJSONSchema(proposalSchema) },
@@ -221,9 +228,10 @@ export const TICKET_METHODS = {
  * The gateway's ticket methods. The method decides the actor: the host opens, merges checks and reviews, sends back
  * and closes; a person settles proposals; the executor shows, marks and submits. The executor's call names its
  * running attempt and session, and the ledger checks that the attempt is the job's current, unfinished one and,
- * once the host has reported which session runs it, that the session matches. Nothing here proves the call came
- * from that session's agent: the DSH plugin's tools resolve the session themselves, and this MVP does not defend
- * against a local caller that bypasses them with the right IDs.
+ * once the host has reported which session runs it, that the session matches; a CLI call names only the job and acts
+ * for its current attempt. Nothing here proves the call came from that session's agent: the DSH tools and the MCP
+ * server resolve the session themselves, the CLI is trusted to run in the executor's shell, and this MVP does not
+ * defend against a local caller that bypasses them with the right IDs.
  */
 export function invokeTicket(ledger: JobLedger, method: string, params: unknown): Ticket {
   const change = (origin: string, jobId: string, operation: (ticket: Ticket) => TicketChange[], caller: Record<string, unknown> = {}) => {
@@ -246,10 +254,12 @@ export function invokeTicket(ledger: JobLedger, method: string, params: unknown)
     case 'ticket_close': { const input = closeSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => closeTicket(ticket, input.status, input.stopReason)); }
     case 'ticket_show': case 'ticket_mark': case 'ticket_submit': {
       const mark = method === 'ticket_mark' ? markSchema.parse(params) : undefined, input = mark ?? executorSchema.parse(params);
-      const origin = ledger.executorOrigin(input.jobId, input.attemptId, input.sessionId);
+      const current = input.via === 'cli' ? ledger.currentAttempt(input.jobId) : undefined;
+      const attemptId = current?.attemptId ?? input.attemptId!, sessionId = current ? current.sessionId : input.sessionId;
+      const origin = ledger.executorOrigin(input.jobId, attemptId, sessionId ?? '');
       if (method === 'ticket_show') return ledger.ticket(origin, input.jobId);
       return change(origin, input.jobId, ticket => mark ? markItem(ticket, mark.itemId, mark.state, mark.note) : submitTicket(ticket),
-        { attemptId: input.attemptId, sessionId: input.sessionId });
+        { attemptId, ...(sessionId !== undefined ? { sessionId } : {}), ...(input.via ? { via: input.via } : {}) });
     }
     default: throw new Error(`Unknown ticket method: ${method}`);
   }

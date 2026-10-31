@@ -15,6 +15,8 @@ export { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetad
 export type { A2AResultContract, A2AVerifiedArtifact, A2AResultMetadata } from './result-metadata.js';
 export { RemoteAgentGateway, serveA2AGateway, REMOTE_AGENT_METHODS } from './gateway.js';
 export type { A2AGatewayConfig, RemoteAgentNotice } from './gateway.js';
+export { runExecutorTicket } from '../execution/ticket-executor.js';
+export type { ExecutorTicketArgs, ExecutorTicketChannel, ExecutorTicketScope, ExecutorTicketTool } from '../execution/ticket-executor.js';
 export { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 export { A2AAutomation } from './automation.js';
 export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';

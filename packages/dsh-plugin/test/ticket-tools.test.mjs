@@ -27,14 +27,14 @@ test('the tools resolve the session to the job and attempt it runs, and show pen
   t.after(() => unbindA2AExecution('exec-session'));
   const gateway = fakeGateway();
   const shown = await runTicketTool(gateway, 'exec-session', 'ticket_show');
-  assert.deepEqual(gateway.calls[0], { method: 'ticket_show', params: { jobId: 'job-exec', attemptId: 'attempt-2', sessionId: 'exec-session' } });
+  assert.deepEqual(gateway.calls[0], { method: 'ticket_show', params: { jobId: 'job-exec', attemptId: 'attempt-2', sessionId: 'exec-session', via: 'dsh' } });
   assert.match(shown, /P1-P2 \[必须改\] style\/font：程序检查 P2 未通过\n {2}证据：\[\{"path":"style\/font","message":"Arial"\}\]\n {2}上一次：executor done：改成了微软雅黑/);
   assert.match(shown, /Q1-1 \[建议改\] project\/oneLiner：太空泛\n {2}建议：写场景/);
   assert.doesNotMatch(shown, /Q1-2/, 'settled items are not pending');
   assert.match(shown, /待处理 2 条，任务单状态 in_revision，第 2 轮/);
 
   assert.match(await runTicketTool(gateway, 'exec-session', 'ticket_mark', { id: 'Q1-1', state: 'done', note: '改了' }), /Q1-1 已标为 done，还剩 2 条待处理/);
-  assert.deepEqual(gateway.calls[1].params, { jobId: 'job-exec', attemptId: 'attempt-2', sessionId: 'exec-session', itemId: 'Q1-1', state: 'done', note: '改了' });
+  assert.deepEqual(gateway.calls[1].params, { jobId: 'job-exec', attemptId: 'attempt-2', sessionId: 'exec-session', via: 'dsh', itemId: 'Q1-1', state: 'done', note: '改了' });
   assert.match(await runTicketTool(gateway, 'exec-session', 'ticket_submit'), /任务单已提交（第 2 轮）/);
 
   const refusing = fakeGateway(async () => { throw new Error('还有 2 条没处理：P1-P2、Q1-1'); });

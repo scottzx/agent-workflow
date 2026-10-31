@@ -1,14 +1,25 @@
-/** People's and the coach's view of a task ticket on the gateway, and their one change: settling a proposal. */
+/**
+ * People's and the coach's view of a task ticket on the gateway and their one change, settling a proposal; and the
+ * executor's three operations for an agent that has a shell but neither the DSH tools nor the MCP server.
+ */
 import { parseArgs } from 'node:util';
 import type { Ticket } from '../src/execution/ticket.js';
+import { runExecutorTicket } from '../src/execution/ticket-executor.js';
 import { gatewayInvoke } from './rsi.js';
 
 const USAGE = `Usage: acp-service ticket show --job ID [--origin ID] [--url URL]
        acp-service ticket events --job ID [--origin ID] [--url URL]
        acp-service ticket proposal --job ID --id R1-2 accept|reject|done [--note TEXT] [--origin ID] [--url URL]
 
+The executor, from its own shell while its round is running:
+       acp-service ticket pending --job ID [--url URL]
+       acp-service ticket mark --job ID --id Q1-3 --state done|disputed --note TEXT [--url URL]
+       acp-service ticket submit --job ID [--url URL]
+
 The task ticket lives on the executor's job in the gateway's execution ledger; every change is a
-ticket.* event. The job ID is the executor's jobId in the run's run.json.
+ticket.* event. The job ID is the executor's jobId in the run's run.json. The executor's commands
+act for the job's current round, the same operations as its ticket_show, ticket_mark and
+ticket_submit tools, and are recorded as coming from the CLI.
 
 Options:
   --origin ID   originSessionId the job was submitted under (default rsi-cli)
@@ -28,13 +39,21 @@ export function settler(env: NodeJS.ProcessEnv = process.env): { kind: 'person' 
 
 export async function runTicketCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
-  if (!['show', 'events', 'proposal'].includes(argv[0]!)) throw new Error('Unknown ticket command; use ticket --help');
+  if (!['show', 'events', 'proposal', 'pending', 'mark', 'submit'].includes(argv[0]!)) throw new Error('Unknown ticket command; use ticket --help');
   const { values, positionals } = parseArgs({ args: argv.slice(1), strict: true, allowPositionals: true, options: {
-    job: { type: 'string' }, id: { type: 'string' }, note: { type: 'string' },
+    job: { type: 'string' }, id: { type: 'string' }, note: { type: 'string' }, state: { type: 'string' },
     origin: { type: 'string', default: 'rsi-cli' }, url: { type: 'string', default: 'http://127.0.0.1:36814' },
   } });
   if (!values.job) throw new Error('--job is required');
   const invoke = gatewayInvoke(values.url!), scope = { originSessionId: values.origin!, jobId: values.job };
+  if (argv[0] === 'pending' || argv[0] === 'mark' || argv[0] === 'submit') {
+    if (argv[0] === 'mark' && (!values.id || !values.state || values.note === undefined)) throw new Error('Use: ticket mark --job ID --id Q1-3 --state done|disputed --note TEXT');
+    const result = await runExecutorTicket(invoke, { jobId: values.job }, 'cli', argv[0] === 'pending' ? 'ticket_show' : `ticket_${argv[0]}`,
+      { id: values.id, state: values.state, note: values.note });
+    console.log(result.text);
+    if (result.refused) process.exitCode = 1;
+    return;
+  }
   if (argv[0] === 'show') return print(await invoke('ticket_get', scope) as unknown as Ticket);
   if (argv[0] === 'events') {
     for (let after = 0; ;) {

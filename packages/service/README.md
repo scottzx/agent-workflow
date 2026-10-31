@@ -378,7 +378,7 @@ A2A 网关增加版本化执行目标目录和任务台账。父任务与子任�
 - `remote_agent_*` 保留原参数、Task 和通知/ack，返回附加 jobId/attemptId；旧 Task 各迁移为独立任务，不按 context 合并。
 - 可选 `binding.driver=ppt_delivery` 使用独立领域模块推进项目脚本、制作、确定性校验、独立事实/逐页视觉复核及有限返工。父任务等待时仍为 working；它不把阶段调度加入通用台账。
 - `execution_inbox/ack` 处理领域交付通知，`execution_review` 独立记录绑定具体轮次、结果版本与 digest 的业务接受。角色通知使用独立 `execution-notice:` 标识，不伪造远端 A2A Task。
-- `ticket_*` 是执行者任务上的任务单，存在台账里，每次改动追加一条 `ticket.*` 事件（`execution_events` 可读）。宿主用 `ticket_open/checks/review/revise/close`，人用 `ticket_proposal`，执行者只能经 DSH 插件的 `ticket_show/ticket_mark/ticket_submit` 工具按本会话正在执行的轮次操作；越权调用直接被拒绝。命令行：`acp-service ticket show|events|proposal --job ID`。
+- `ticket_*` 是执行者任务上的任务单，存在台账里，每次改动追加一条 `ticket.*` 事件（`execution_events` 可读）。宿主用 `ticket_open/checks/review/revise/close`，人或教练用 `ticket_proposal`，执行者用 `ticket_show/ticket_mark/ticket_submit` 按正在执行的轮次操作；越权调用直接被拒绝。执行者有三条路，走同一套逻辑，事件里的 `via` 记下走的哪条：DSH 原生工具（`dsh`）；DSH 给 ACP 智能体（Grok、Codex）的会话级 MCP 服务 `1agents-review`（`mcp`）；在执行者自己终端里跑的 `acp-service ticket pending|mark|submit --job ID`（`cli`，只给 jobId，按该任务当前这一轮执行）。人和教练的命令行：`acp-service ticket show|events|proposal --job ID`。角色的 `profile.json` 可以写 `training.layers`（`prompt` 必有，另可选 `skills`、`tools`、`model`）和 `training.presets`；训练 `tools` 或 `skills` 的角色不能用 ACP 预设跑 `rsi run`。
 
 通用 A2A 结果完成后，账本自动生成执行轮次内的 `resultRevision`（`result-1`、`result-2`…）和 `resultDigest`，由 `execution_get` 与 `remote_agent_get` 返回。digest 是规范化 JSON 的 SHA256，覆盖结果正文、结构化回执引用、产物链接和宿主返回的文件大小/SHA256 清单 `resultArtifacts`，不包含查询时间。没有文件清单时只绑定已返回的结果与链接，不能据此声称校验了文件字节。PPT 交付保留其领域生成的版本与 digest。
 

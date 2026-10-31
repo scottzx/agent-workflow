@@ -1,5 +1,6 @@
 /** Coach-facing runs of a role's cases through the local A2A gateway. Publishing and acceptance stay on the workbench page. */
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { checkGate } from '../src/rsi/gate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
@@ -70,6 +71,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
     workspace: resolve(values.workspace!), phase: values.phase, targetId: values.target!, agentPreset: values.preset!, originSessionId: values.origin!,
     maxBounces: Number(values['max-bounces']), timeoutMs: Number(values['timeout-minutes']) * 60_000, python: values.python!,
     ...(values.qa ? { qa: { ...(values['qa-preset'] ? { agentPreset: values['qa-preset'] } : {}), maxRevisions: Number(values['qa-max-revisions']) } } : {}),
+    ticketCli: { command: `${process.execPath} ${fileURLToPath(new URL('./acp-service.js', import.meta.url))} ticket`, url: values.url! },
     invoke, log: line => console.log(line) });
   console.log(`${report.passed ? '通过' : '未通过'}（${report.stopReason}）：${report.rounds.length} 轮，大纲 ${report.outlinePath}，记录 ${report.workDirectory}/run.json`);
   if (!report.passed) process.exitCode = 1;

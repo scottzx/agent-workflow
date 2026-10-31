@@ -130,7 +130,44 @@ test('a failed program check goes back to the same task with its evidence, and t
   assert.ok(!report.rounds[1]!.results.some(r => r.itemId === 'D1'), 'no delivered copy, nothing to compare');
 });
 
-test('a delivered copy that differs from the checked outline fails and goes back; matching bytes pass', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('an ACP executor runs a role that trains only its first message, is told the ticket commands for its job, and a role that trains tools or names its presets refuses it', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t), gw = ticketGateway();
+  let work = '';
+  const options = { roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
+    targetId: 'dsh-host', agentPreset: 'oneagents-acp-grok', originSessionId: 'rsi-test', pollMs: 1,
+    ticketCli: { command: '/bin/node /x/acp-service.js ticket', url: 'http://127.0.0.1:36814' } };
+  const report = await runOutlineCase({ ...options, invoke: gw.invoke(async (method, params: any) => {
+    f.calls.push({ method, params });
+    if (method === 'execution_submit') {
+      work = params.input.cwd;
+      await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit, 'Arial')));
+      return { jobId: 'job-1' };
+    }
+    if (method === 'execution_continue') {
+      await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+      handleTicket(gw.round('job-1'));
+      return { jobId: 'job-1' };
+    }
+    return { executionStatus: 'completed' };
+  }) });
+  assert.equal(report.passed, true);
+  assert.equal(f.calls.find(call => call.method === 'execution_submit')!.params.input.agentPreset, 'oneagents-acp-grok');
+  const bounce = f.calls.find(call => call.method === 'execution_continue')!.params.input.prompt as string;
+  assert.match(bounce, /`1agents-review` MCP 服务/);
+  assert.ok(bounce.includes('`/bin/node /x/acp-service.js ticket mark --job job-1 --url http://127.0.0.1:36814 --id 编号 --state done'), 'the commands name the executor’s own job');
+  assert.match(bounce, /只能用这三个工具或这三条命令处理/);
+
+  const profile = JSON.parse(await readFile(join(f.role, 'profile.json'), 'utf8'));
+  const refuse = async (training: unknown, pattern: RegExp) => {
+    await writeFile(join(f.role, 'profile.json'), JSON.stringify({ ...profile, training }));
+    await assert.rejects(runOutlineCase({ ...options, invoke: async () => assert.fail('nothing is dispatched') }), pattern);
+  };
+  await refuse({ layers: ['prompt', 'tools'] }, /trains tools, which only DSH's own presets control/);
+  await refuse({ layers: ['prompt'], presets: ['standard'] }, /runs only on standard, not oneagents-acp-grok/);
+  await refuse({ layers: ['skills'] }, /layers must include prompt/);
+});
+
+test('a delivered copy that differs from the checked outline fails and goes back; matching bytes pass',{ skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
   const f = await fixture(t), gw = ticketGateway();
   let work = '', prompt = '';
   const good = JSON.stringify(outline('example/demo', f.commit));

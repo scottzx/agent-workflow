@@ -15,10 +15,11 @@ import { createWorkbenchProcessClient } from './process-requests.js';
 import { registerNativeApprovals } from './native-approvals.js';
 import type {} from '@deepseek-ai/dsh-tools';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { WORKBENCH_UI_PATH, currentA2AExecution } from '@1agents/acp-service/a2a';
+import { WORKBENCH_UI_PATH, currentA2AExecution, type ExecutorTicketArgs } from '@1agents/acp-service/a2a';
 import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
 import { workbenchHandler } from './workbench.js';
-import { createTicketGateway, ticketTools } from './ticket-tools.js';
+import { createTicketGateway, runTicketTool, ticketTools } from './ticket-tools.js';
+import { TICKET_PATH } from './ticket-spec.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
@@ -100,7 +101,13 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       },
     })));
     // The executor's task ticket lives on the gateway; native agents handle it through these tools.
-    if (input.a2a.workbench) for (const tool of ticketTools(createTicketGateway(input.a2a.workbench))) ctx.effect(() => ctx.tools.register(tool));
+    if (input.a2a.workbench) {
+      const gateway = createTicketGateway(input.a2a.workbench);
+      for (const tool of ticketTools(gateway)) ctx.effect(() => ctx.tools.register(tool));
+      // ACP agents call the same tools through their session's MCP server, which comes back here.
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: TICKET_PATH,
+        handler: review.ticketHandler((sessionId, tool, args) => runTicketTool(gateway, sessionId, tool, args as ExecutorTicketArgs, 'mcp')) }));
+    }
     // ACP agents reach the same hand-back through a per-session MCP server, offered only to A2A task sessions.
     const origin = `${(ctx.webServer as { protocol?: string }).protocol ?? 'http:'}//127.0.0.1:${ctx.webServer.port}`;
     adapter.mcpServersFor = sessionId => review.host && (currentA2AExecution(sessionId) || review.host.sessionTask(sessionId))

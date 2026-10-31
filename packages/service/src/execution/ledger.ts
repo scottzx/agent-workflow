@@ -435,6 +435,13 @@ export class JobLedger {
     if (recorded !== undefined && recorded !== sessionId) throw new TicketError('调用的会话不是执行这一轮的会话');
     return job.originSessionId;
   }
+  /** Trusted adapter use only: the job's current attempt and the session the host reported for it, for a caller that names only the job. */
+  currentAttempt(jobId: string): { attemptId: string; sessionId?: string } {
+    const job = Object.hasOwn(this.state.jobs, jobId) ? this.state.jobs[jobId] : undefined;
+    const attempt = job && Object.hasOwn(this.state.attempts, job.currentAttemptId) ? this.state.attempts[job.currentAttemptId] : undefined;
+    if (!attempt) throw new TicketError('没有这个任务');
+    return { attemptId: attempt.attemptId, ...(attempt.backendRunRef?.sessionId !== undefined ? { sessionId: attempt.backendRunRef.sessionId } : {}) };
+  }
   /** Each old Task gets one legacy Job; matching context IDs never merge jobs. */
   migrateLegacy(records: LegacyLedgerRecord[]): Array<{ remote: string; taskId: string; jobId: string; attemptId: string }> {
     return this.mutate(state => records.map(record => {
