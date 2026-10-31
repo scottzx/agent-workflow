@@ -104,7 +104,7 @@ P1 必须同时包含第 1 行和第 2 行。只做关闭、不拆 60 秒时，�
 
 | 决定 | 选择 | 原因 |
 | --- | --- | --- |
-| 已关闭会话再收到 `remote_agent_message` | 默认沿用现有 message：DSH 按保存的 binding 做 `session/load` 或 `session/resume`，返回 `resumed: true` 和实际 `restoreMethod`。`autoResume: false` 时网关在调用远端前返回 `SESSION_CLOSED`，不发 `session/new` | 恢复已经在 runtime 和适配器里。网关只决定是否放行，并标明这次是重新附着 |
+| 已关闭会话再收到 `remote_agent_message` | 默认沿用现有 message：DSH 按保存的 binding 做 `session/load` 或 `session/resume`，返回 `resumed: true` 和实际 `restoreMethod`（2026-10-31 起对外合并为 `resumed`，`restoreMethod` 换成 `historyReplayed`，见 §8）。`autoResume: false` 时网关在调用远端前返回 `SESSION_CLOSED`，不发 `session/new` | 恢复已经在 runtime 和适配器里。网关只决定是否放行，并标明这次是重新附着 |
 | 网关 one-shot 的实现 | 终态后调用普通 `session/close`，也就是 runtime 的 release。继续使用 `ensureSession({ mode: "persistent" })`。不传 `discardPersistentState`，不调用 `prepareFreshSession`，不调用 `session/delete` | runtime 的 `oneshot` 会新建记录。本方案要的是关掉进程后仍能接回同一 ACP 会话 |
 | one-shot 何时关闭 | 默认进入 `COMPLETED`、`FAILED` 或 `CANCELED` 后关闭。`INPUT_REQUIRED` 不关。需要等主会话 ack 的调用显式传 `closeAfter: "ack"` | 容量被占的原因就是终态后进程还在。ack 可能很晚或不到。关闭后仍可按原 sessionId 附着 |
 | 默认生命周期 | **2026-10-31 改为：不传 `lifecycle` 就是 one-shot**，persistent 要显式传；之前保存、没有 lifecycle 的旧任务仍按 persistent（见 §8）。原决定：不传 `lifecycle` 仍是 persistent，不改成 one-shot。persistent 在回合结束并确认空闲后，默认再等 600 秒没有后续就普通 close。`idleTtlSeconds: 0` 不自动回收；正数覆盖 600 秒 | 多轮会话结束后也不能一直占名额。10 分钟留给同一次任务的追问。正在执行、等待输入、状态未知的不关。必须常驻的会话显式写 0 |
@@ -406,6 +406,7 @@ G8 不排进 P0–P3。
 - `standard` 预设不必传 one-shot。它没有 ACP 子进程，传了也只返回 `acp: false`。G9 部署后可以在 spawn 传 `provider`、`model` 指定模型，回执里看实际使用的模型；不传仍用 DSH 当时的默认模型。不要把模型名写进 prompt。
 - 进程必须留着等追问的，显式传 `lifecycle: { "mode": "persistent" }`。回合结束并空闲满 10 分钟后自动关闭；10 分钟内的追问仍在原进程上。用完也可以立刻 `remote_agent_close`。必须常驻的写 `idleTtlSeconds: 0`。
 - 追问已关闭会话直接 `remote_agent_message`，看 `resumed`。grok-build 两次真机检查里模型都记得上文（§5.1），但样本少；结论必须可靠时仍从文件接续。
+- 接回只有一个概念：`resumed: true`。`session/load` 与 `session/resume` 走同一个接回函数，区别只是宿主要不要把历史重新推给它的客户端，所以 get 里给的是 `historyReplayed`，`/health` 只给一个 `resumes` 计数（2026-10-31 起，替代 `restoreMethod` 和 `restoreMethods`）。模型能不能记得上文取决于 agent 端会话被加载回来，与这个字段无关。
 - 不用 cancel 释放已完成任务，也不为腾容量重启 DSH。
 
 本方案不修改生产配置、不派模型任务、不重启 a2a-gateway 或 DSH。

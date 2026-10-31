@@ -510,7 +510,9 @@ test('a closed session message reattaches the same session and a jumped idle clo
   const follow = await gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId, taskId: first.taskId, prompt: 'continue after idle' }) as Record<string, unknown>;
   const view = await until(() => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId, taskId: follow.taskId }) as Promise<Record<string, any>>, value => value.state === 'TASK_STATE_COMPLETED' && value.resumed === true);
   assert.equal(view.sessionId, 'dsh-kept');
-  assert.equal(view.restoreMethod, 'session/load');
+  assert.equal(view.restoreMethod, undefined);
+  assert.equal(view.historyReplayed, true);
+  assert.equal(gateway.lifecycleReport().resumes, 1);
   assert.equal(backend.prepares[1]?.sessionId, 'dsh-kept');
   assert.equal(backend.runs.length, 2);
   assert.equal(classifyColdAttach({ enqueued: true, attach: 'done', turnStarted: true, activeTurn: false }), 'activeTurn');

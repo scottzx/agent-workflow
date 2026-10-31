@@ -145,7 +145,7 @@ export const REMOTE_AGENT_METHODS = {
   remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，任务上返回 resumed: true；historyReplayed 只说明宿主是否把历史重新推给了它的客户端，不影响接回本身。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
   remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。mode 为 delete 时还删除 ACP 会话记录，之后不能接回；仅在网关配置 sessionLifecycle.allowDelete 时接受，否则返回 DELETE_DISABLED，不删除 DSH 会话历史。', parameters: z.toJSONSchema(closeSchema) },
   remote_agent_sessions: { description: '按 prewarm、job、user-opened 和未标注列出本机进程租约，并给出 taskSlot 与 processSlot。只读，不关闭、不补标已经在跑的进程。', parameters: z.toJSONSchema(sessionsSchema) },
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
@@ -858,7 +858,8 @@ export class RemoteAgentGateway {
       ...(meta?.taskSlot ? { taskSlot: meta.taskSlot } : {}),
       ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
       ...(meta?.resumed === true ? { resumed: true } : {}),
-      ...(meta?.restoreMethod === 'session/load' || meta?.restoreMethod === 'session/resume' ? { restoreMethod: meta.restoreMethod } : {}),
+      // Load and resume are one reattach; they differ only in whether the host replayed the transcript to its client.
+      ...(meta?.resumed === true && (meta.restoreMethod === 'session/load' || meta.restoreMethod === 'session/resume') ? { historyReplayed: meta.restoreMethod === 'session/load' } : {}),
       ...(typeof meta?.provider === 'string' && typeof meta.model === 'string' ? { provider: meta.provider, model: meta.model } : {}),
       ...(job.lifecycle ? { lifecycle: job.lifecycle } : {}),
       ...(job.sessionState ? { sessionState: job.sessionState } : {}),
@@ -1388,23 +1389,20 @@ export class RemoteAgentGateway {
       contexts.set(key, [...(contexts.get(key) ?? []), job]);
     }
     const closeReasons: Record<CloseReason, number> = { explicit: 0, 'one-shot': 0, 'idle-ttl': 0 };
-    const restoreMethods = { 'session/load': 0, 'session/resume': 0 };
+    let resumes = 0;
     let busy = 0, processReleasePending = 0;
     for (const jobs of contexts.values()) {
       if (jobs.some(job => !terminal.has(taskState(job)))) busy += 1;
       const last = jobs.at(-1)!;
       if (last.closeReason) closeReasons[last.closeReason] += 1;
       if (last.processReleased === 'pending') processReleasePending += 1;
-      for (const job of jobs) {
-        const method: unknown = Task.fromJSON(job.task).metadata?.['1agents']?.restoreMethod;
-        if (method === 'session/load' || method === 'session/resume') restoreMethods[method] += 1;
-      }
+      for (const job of jobs) if (Task.fromJSON(job.task).metadata?.['1agents']?.resumed === true) resumes += 1;
     }
     const current = [...this.inputRequiredAlerts.entries()].filter(([key]) => {
       const job = this.state.jobs.find(item => item.taskId === key.split('\0')[0]);
       return job !== undefined && taskState(job) === 'TASK_STATE_INPUT_REQUIRED' && Task.fromJSON(job.task).status?.timestamp === key.split('\0')[1];
     }).map(([, alert]) => alert);
-    return { busy, inputRequiredAlerts: current, closeReasons, restoreMethods, closeFailures: this.closeFailures, processReleasePending };
+    return { busy, inputRequiredAlerts: current, closeReasons, resumes, closeFailures: this.closeFailures, processReleasePending };
   }
   private taskAcknowledged(job: Job, state: string): boolean {
     return this.state.notices.some(record => record.acknowledged === true && record.notice.taskId === job.taskId

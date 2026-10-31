@@ -87,7 +87,7 @@ DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`p
 | `remote_agent_preflight` | `remote, originSessionId, cwd`；可选任务目录、必需输入和运行时依赖，仅检查、不创建会话 |
 | `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract, clientRequestId, roleId, roleLockPath, lifecycle, provider, model`；新建远端任务/上下文/DSH 会话。省略 `lifecycle` 为 one-shot（2026-10-31 起）。`provider`、`model` 见下文「standard 选模型」 |
 | `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale。进程名额排队时仍是 submitted，并带 `capacity`、`taskSlot` 和 `processSlot`。指定过模型的 `standard` 任务带实际使用的 `provider`、`model` |
-| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath, autoResume, lifecycle, provider, model`；复用远端会话，创建新 taskId；已有角色/锁不能更换。已关闭会话默认接回，get 返回 `resumed: true` 和实际 `restoreMethod`（`session/load` 或绑定里的 `session/resume`）。`autoResume: false` 不向远端发送，返回 `SESSION_CLOSED` |
+| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath, autoResume, lifecycle, provider, model`；复用远端会话，创建新 taskId；已有角色/锁不能更换。已关闭会话默认接回，get 返回 `resumed: true`。`historyReplayed` 只说明宿主有没有把历史重新推给它的客户端（`session/load` 推，导入会话的 `session/resume` 不推），两者都是同一种接回。`autoResume: false` 不向远端发送，返回 `SESSION_CLOSED` |
 | `remote_agent_cancel` | 任务定位字段；只取消这项任务自己的执行，不能释放已经完成的会话进程 |
 | `remote_agent_close` | `remote, originSessionId`，以及 `taskId`、`contextId`、`sessionId` 三选一；可选 `force`。普通关闭 ACP 进程，保留会话记录和绑定，不删除。进行中返回 `SESSION_BUSY`；`force: true` 先取消再关闭。宿主没有关闭能力时返回 `UNSUPPORTED`，且不把任务记成已关闭。`standard` 不发送 `session/close`。可选 `mode: "delete"` 还删除 ACP 会话记录，之后 message 返回 `SESSION_DELETED`；仅在网关 `sessionLifecycle.allowDelete: true` 时接受，否则返回 `DELETE_DISABLED`。不删 DSH 会话历史 |
 | `remote_agent_sessions` | 无业务参数。按 `prewarm`、`job`、`user-opened` 和未标注列进程租约，并给出两本账。只读，不关闭，也不给已经在跑且没有来源的进程补标签 |
@@ -129,7 +129,7 @@ JSON
 
 `lifecycle` 省略或 `mode: "one-shot"` 时，任务完成、失败或取消后由网关普通关闭进程，之后 message 经 `session/load` 接回；2026-10-31 之前保存、没有 lifecycle 的旧任务仍按 persistent。`closeAfter: "ack"` 要等这条通知被 ack。`INPUT_REQUIRED` 不关闭。one-shot 在 runtime 里仍调用 `ensureSession({ mode: "persistent" })`，关闭只 release，不 delete，也不改 runtime 模式。`remote_agent_get` 在进程名额排队时仍是 submitted，并带 `capacity.position` 与 `capacity.waitedMs`；60 秒握手时限从出队之后才开始计。本技能不保证模型在进程关闭后仍记得上文。
 
-persistent 要显式传 `lifecycle: { "mode": "persistent" }`。这类 `oneagents-acp-*` 会话在最后一轮结束、远端 `status` 确认已附着且没有进行中的回合，并且空闲超过时限后，由网关普通关闭，原因 `idle-ttl`，之后 message 仍可接回。时限缺省取网关配置 `sessionLifecycle.persistentIdleTtlSeconds`（600 秒），`lifecycle.idleTtlSeconds` 覆盖它，`0` 不回收。进行中、`INPUT_REQUIRED`、状态查不到的不关。`INPUT_REQUIRED` 超过 `sessionLifecycle.inputRequiredAlertSeconds`（7200 秒）只告警，不关进程。`/health` 的 `sessions` 给出 busy、告警、按原因的关闭数、恢复方式、关闭失败数和 `processReleasePending`。
+persistent 要显式传 `lifecycle: { "mode": "persistent" }`。这类 `oneagents-acp-*` 会话在最后一轮结束、远端 `status` 确认已附着且没有进行中的回合，并且空闲超过时限后，由网关普通关闭，原因 `idle-ttl`，之后 message 仍可接回。时限缺省取网关配置 `sessionLifecycle.persistentIdleTtlSeconds`（600 秒），`lifecycle.idleTtlSeconds` 覆盖它，`0` 不回收。进行中、`INPUT_REQUIRED`、状态查不到的不关。`INPUT_REQUIRED` 超过 `sessionLifecycle.inputRequiredAlertSeconds`（7200 秒）只告警，不关进程。`/health` 的 `sessions` 给出 busy、告警、按原因的关闭数、接回次数 `resumes`、关闭失败数和 `processReleasePending`。
 
 ## 原会话排队投递（本次新增）
 
