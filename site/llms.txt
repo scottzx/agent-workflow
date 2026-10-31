@@ -1,15 +1,15 @@
-# 1ACP
+# agent-workflow
 
-1ACP connects native coding Agents to applications through the Agent Client Protocol.
+agent-workflow connects native coding Agents to applications through the Agent Client Protocol. It is part of 一芥天地 (DreamMate World) by 一芥智能. npm package names are unchanged.
 
-- Homepage: https://scottzx.github.io/1acp/
-- Source: https://github.com/scottzx/1acp
+- Homepage: https://scottzx.github.io/agent-workflow/
+- Source: https://github.com/scottzx/agent-workflow
 - Public npm package: @1agents/acp-service
 - Current source release: __VERSION__
-- Service, CLI and SDK documentation: https://github.com/scottzx/1acp/blob/main/packages/service/README.md
-- DSH plugin guide: https://github.com/scottzx/1acp/blob/main/packages/dsh-plugin/README.md
-- Automation guide: https://github.com/scottzx/1acp/blob/main/docs/activepieces-automation.md
-- GitHub releases: https://github.com/scottzx/1acp/releases
+- Service, CLI and SDK documentation: https://github.com/scottzx/agent-workflow/blob/main/packages/service/README.md
+- DSH plugin guide: https://github.com/scottzx/agent-workflow/blob/main/packages/dsh-plugin/README.md
+- Automation guide: https://github.com/scottzx/agent-workflow/blob/main/docs/activepieces-automation.md
+- GitHub releases: https://github.com/scottzx/1acp/releases (assets not yet copied to scottzx/agent-workflow)
 
 Install: npm install -g @1agents/acp-service
 DSH: dsh plugin --profile web add @1agents/acp-service

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { resolveCapacityDirectory } from '../src/capacity.js';
 import { serveA2AGateway, type A2AGatewayConfig } from '../src/a2a/gateway.js';
 
 export async function runA2ACli(args: string[]): Promise<void> {
@@ -16,7 +17,7 @@ export async function runA2ACli(args: string[]): Promise<void> {
 invoke reads a JSON parameters object from stdin. Credentials stay in the
 gateway config file (chmod 600), outside tool arguments. Remote cwd is absolute.
 Methods: remote_agent_preflight, remote_agent_spawn, remote_agent_get, remote_agent_message,
-         remote_agent_cancel, remote_agent_list, remote_agent_inbox, remote_agent_ack,
+         remote_agent_cancel, remote_agent_close, remote_agent_sessions, remote_agent_list, remote_agent_inbox, remote_agent_ack,
          session_bind, session_send, session_delivery_get, session_delivery_resolve,
          execution_project_scan, execution_project_list,
          execution_discovery_config_get, execution_discovery_config_update
@@ -32,6 +33,7 @@ execution targets or starting tasks. Optional interval mode runs in the gateway.
     const stat = fs.statSync(file);
     if (process.platform !== 'win32' && (stat.mode & 0o077)) throw new Error('Gateway config contains credentials; set chmod 600');
     const config = JSON.parse(fs.readFileSync(file, 'utf8')) as A2AGatewayConfig;
+    if (!config.capacityDirectory) config.capacityDirectory = resolveCapacityDirectory();
     const host = await serveA2AGateway(config, { report: !args.includes('--no-report') });
     const registration = host.registration?.ok ?? false;
     const reason = host.registration && !host.registration.ok ? ` reason=${host.registration?.reason ?? 'unknown reason'}` : '';

@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "product-intro-outline/v1",
+  "title": "产品介绍大纲",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "project", "audience", "style", "sections"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "commit", "name", "oneLiner"],
+      "properties": {
+        "repo": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "name": { "type": "string", "minLength": 1 },
+        "oneLiner": { "type": "string", "minLength": 1, "maxLength": 60 }
+      }
+    },
+    "audience": { "type": "string", "minLength": 1 },
+    "style": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slideSize", "font", "colors", "layouts"],
+      "properties": {
+        "slideSize": { "enum": ["16:9", "4:3"] },
+        "font": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["family", "sizes"],
+          "properties": {
+            "family": { "type": "string" },
+            "sizes": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["title", "subtitle", "body", "caption"],
+              "properties": {
+                "title": { "$ref": "#/$defs/fontSize" },
+                "subtitle": { "$ref": "#/$defs/fontSize" },
+                "body": { "$ref": "#/$defs/fontSize" },
+                "caption": { "$ref": "#/$defs/fontSize" }
+              }
+            }
+          }
+        },
+        "colors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["primary", "background", "accent", "text", "source"],
+          "properties": {
+            "primary": { "$ref": "#/$defs/hex" },
+            "background": { "$ref": "#/$defs/hex" },
+            "accent": { "$ref": "#/$defs/hex" },
+            "text": { "$ref": "#/$defs/hex" },
+            "source": { "$ref": "#/$defs/source" }
+          }
+        },
+        "layouts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["cover", "title-bullets", "two-column", "image-right", "table", "closing"] }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "title", "status", "slides"],
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string", "minLength": 1 },
+              "status": { "const": "present" },
+              "slides": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/slide" } }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "status", "reason"],
+            "properties": {
+              "id": { "type": "string" },
+              "status": { "const": "not_applicable" },
+              "reason": { "type": "string", "minLength": 1 }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "fontSize": { "type": "integer", "minimum": 8, "maximum": 96 },
+    "hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "lines": { "type": "string", "pattern": "^[1-9][0-9]*(-[1-9][0-9]*)?$" }
+      }
+    },
+    "slide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "layout", "points"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "layout": { "type": "string" },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "sources"],
+            "properties": {
+              "text": { "type": "string", "minLength": 1 },
+              "featureIds": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+              "sources": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/source" } }
+            }
+          }
+        },
+        "visual": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "source"],
+          "properties": {
+            "kind": { "enum": ["screenshot", "diagram", "table"] },
+            "source": { "$ref": "#/$defs/source" }
+          }
+        }
+      }
+    }
+  }
+}

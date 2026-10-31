@@ -19,9 +19,9 @@ Host callbacks (`onAskUserQuestion` / `onExitPlanMode`) return canned outcomes; 
 
 ### Artifacts
 
-- [`SUMMARY.json`](https://github.com/scottzx/1acp/blob/main/packages/runtime/docs/proof-2026-07-18-grok-ext-methods/SUMMARY.json) — machine-readable pass/fail + request/response highlights
-- [`live-transcript.jsonl`](https://github.com/scottzx/1acp/blob/main/packages/runtime/docs/proof-2026-07-18-grok-ext-methods/live-transcript.jsonl) — full event log (session updates + host callbacks)
-- [`console.log`](https://github.com/scottzx/1acp/blob/main/packages/runtime/docs/proof-2026-07-18-grok-ext-methods/console.log) — stdout capture of the proof run
+- [`SUMMARY.json`](https://github.com/scottzx/agent-workflow/blob/main/packages/runtime/docs/proof-2026-07-18-grok-ext-methods/SUMMARY.json) — machine-readable pass/fail + request/response highlights
+- [`live-transcript.jsonl`](https://github.com/scottzx/agent-workflow/blob/main/packages/runtime/docs/proof-2026-07-18-grok-ext-methods/live-transcript.jsonl) — full event log (session updates + host callbacks)
+- [`console.log`](https://github.com/scottzx/agent-workflow/blob/main/packages/runtime/docs/proof-2026-07-18-grok-ext-methods/console.log) — stdout capture of the proof run
 
 ### How to re-run
 

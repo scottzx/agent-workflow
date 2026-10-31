@@ -2,6 +2,8 @@
 
 Updated: **2026-10-11 19:09 Asia/Shanghai**. Submission does not mean acceptance or public availability.
 
+The repository is now [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow). Links below are the 2026-10-09 submission record and still name `scottzx/1acp`, the repository that was submitted. Receipts and evidence files are unchanged.
+
 Public package: **`@1agents/acp-service@0.6.0`**. Source package: [`packages/service`](../../packages/service). The repository root and `packages/dsh-plugin` are private development modules, not the advertised installation targets.
 
 ## Published materials

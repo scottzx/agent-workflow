@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "dreammate-network",
+  "kind": "variant",
+  "locked": true,
+  "input": {
+    "repo": "scottzx/dreammate-network",
+    "commit": "1523624d6d26e77a21ad2c72f3766f597f84d76c",
+    "exclude": [],
+    "audience": "要在自己的设备或服务上接入能力网络的开发者"
+  },
+  "features": null,
+  "accepted": null
+}

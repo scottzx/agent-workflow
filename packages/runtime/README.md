@@ -1,13 +1,15 @@
-# acpx 🤝 — Agents talking to agents, minus the terminal séance
+# agent-workflow runtime
+
+The agent-workflow runtime, based on [acpx](https://github.com/openclaw/acpx): agents talking to agents, minus the terminal séance. Copyright (c) 2025 OpenClaw Team, MIT; the full text is in [LICENSE](LICENSE). The npm package name remains `@scottzx/1acp`. The `1acp` and `acpx` commands stay. In this repository the runtime is private source embedded in `@1agents/acp-service`.
 
 <p align="center">
   <img src="acpx_banner.svg" alt="acpx banner" width="100%" />
 </p>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/scottzx/1acp/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/scottzx/1acp/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/scottzx/agent-workflow/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/scottzx/agent-workflow/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40scottzx%2F1acp?style=flat-square)](https://www.npmjs.com/package/@scottzx/1acp)
 [![Node.js](https://img.shields.io/node/v/%40scottzx%2F1acp?style=flat-square)](https://nodejs.org/)
-[![License](https://img.shields.io/github/license/scottzx/1acp?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/github/license/scottzx/agent-workflow?style=flat-square)](LICENSE)
 [![npm downloads](https://img.shields.io/npm/dm/%40scottzx%2F1acp?style=flat-square)](https://www.npmjs.com/package/@scottzx/1acp)
 
 `acpx` is a headless command-line client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com). It gives agents, orchestrators, and developers one structured interface for persistent sessions, one-shot runs, permissions, and machine-readable output across ACP-compatible coding agents.
@@ -112,4 +114,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and review guidance.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. Copyright (c) 2025 OpenClaw Team. See [LICENSE](LICENSE). Repository attribution for this derived runtime is in the workspace [NOTICE](../../NOTICE).

@@ -1,0 +1,82 @@
+{
+  "repo": "scottzx/xingjian-showroom",
+  "commit": "40ed6130143215aa5c60826da72e8be6d2020de6",
+  "confirmation": null,
+  "features": [
+    {
+      "id": "F1",
+      "name": "六个行业场景的三维展示",
+      "sources": [
+        {
+          "path": "README.md",
+          "lines": "15-24"
+        }
+      ]
+    },
+    {
+      "id": "F2",
+      "name": "按区域配置材质",
+      "sources": [
+        {
+          "path": "src/catalog/catalog.ts"
+        }
+      ]
+    },
+    {
+      "id": "F3",
+      "name": "方案链接分享与本机保存",
+      "sources": [
+        {
+          "path": "src/features/sharing/plan.ts"
+        }
+      ]
+    },
+    {
+      "id": "F4",
+      "name": "CAD 图纸对照",
+      "sources": [
+        {
+          "path": "src/pages/CadInspectionPanel.tsx"
+        },
+        {
+          "path": "docs/model-assets.md"
+        }
+      ]
+    },
+    {
+      "id": "F5",
+      "name": "图片与 GLB 导出",
+      "sources": [
+        {
+          "path": "src/utils/exportPng.ts"
+        },
+        {
+          "path": "README.md",
+          "lines": "19"
+        }
+      ]
+    },
+    {
+      "id": "F6",
+      "name": "二维图案工作台",
+      "sources": [
+        {
+          "path": "src/editor/WrapDesignerPage.tsx"
+        }
+      ]
+    },
+    {
+      "id": "F7",
+      "name": "静态部署到 GitHub Pages 或任意子目录",
+      "sources": [
+        {
+          "path": ".github/workflows/pages.yml"
+        },
+        {
+          "path": "README.md",
+          "lines": "53-58"
+        }
+      ]
+    }
+  ]
+}

@@ -98,8 +98,86 @@ async function fixture(t: TestContext, outcome: A2ARunResult['outcome'] = 'compl
     assert.ok('id' in result);
     return client.getTask(GetTaskRequest.fromJSON({ id: result.id }), auth);
   };
-  return { root, calls, send, client, auth };
+  return { root, calls, send, client, auth, origin, host };
 }
+
+test('a taken-over session hands its result back as a newer completed snapshot with re-verified artifacts', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const notes = join(f.root, 'notes.md'), extra = join(f.root, 'extra.md'), manifest = join(f.root, 'artifacts.json');
+  await writeFile(notes, '# draft');
+  await writeFile(manifest, JSON.stringify({ artifacts: [{ path: notes, mediaType: 'text/markdown' }] }));
+  const task = await f.send({ preflight: { jobDirectory: f.root }, resultContract: { jobId: 'takeover', artifactManifestPath: manifest } });
+  const sessionId = (task.metadata?.['1agents'] as { sessionId: string }).sessionId;
+  assert.deepEqual(f.host.sessionTask(sessionId), { taskId: task.id, contextId: task.contextId, jobId: 'takeover', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true });
+  assert.equal(f.host.sessionTask('elsewhere'), undefined);
+  assert.equal(f.host.taskSession(task.id), sessionId);
+  assert.equal(f.host.taskSession('unknown-task'), undefined);
+  await assert.rejects(f.host.resubmit({ sessionId: 'elsewhere', summary: 'done' }), { code: 'NOT_A2A_SESSION' });
+  await assert.rejects(f.host.resubmit({ sessionId, summary: '  ' }), { code: 'INVALID_SUMMARY' });
+  // The person edited the draft and added a file during takeover.
+  await writeFile(notes, '# final'); await writeFile(extra, 'appendix');
+  await writeFile(manifest, JSON.stringify({ artifacts: [{ path: notes, mediaType: 'text/markdown' }, { path: extra }] }));
+  const submitted = await f.host.resubmit({ sessionId, summary: '人工修订完成' });
+  assert.equal(submitted.jobId, 'takeover');
+  assert.deepEqual(submitted.artifacts.map(item => item.sha256), [createHash('sha256').update('# final').digest('hex'), createHash('sha256').update('appendix').digest('hex')]);
+  const stored = await f.client.getTask(GetTaskRequest.fromJSON({ id: task.id }), f.auth);
+  const meta = stored.metadata?.['1agents'] as { result: A2AResultMetadata; manualSubmissions: number };
+  assert.equal(stored.status?.state, TaskState.TASK_STATE_COMPLETED);
+  assert.ok(Date.parse(stored.status!.timestamp!) >= Date.parse(task.status!.timestamp!));
+  assert.equal(stored.artifacts[0]!.parts[0]!.content?.value, '人工修订完成');
+  assert.equal(meta.manualSubmissions, 1);
+  assert.equal(meta.result.lineage?.jobId, 'takeover');
+  assert.equal(JSON.parse(await readFile(meta.result.recordPath!, 'utf8')).artifacts.length, 2);
+  // The artifact route now serves the re-verified bytes.
+  const served = await fetch(`${f.origin}/a2a/artifacts/content`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-token' },
+    body: JSON.stringify({ taskId: task.id, path: notes, sha256: submitted.artifacts[0]!.sha256 }) });
+  assert.equal(await served.text(), '# final');
+  // A manifest pointing outside the job directory is refused and the stored snapshot stays as it was.
+  const outside = await directory(t), stray = join(outside, 'stray.md');
+  await writeFile(stray, 'stray');
+  await writeFile(manifest, JSON.stringify({ artifacts: [{ path: stray }] }));
+  await assert.rejects(f.host.resubmit({ sessionId, summary: 'again' }), { code: 'ARTIFACTS_INVALID' });
+  const unchanged = await f.client.getTask(GetTaskRequest.fromJSON({ id: task.id }), f.auth);
+  assert.equal((unchanged.metadata?.['1agents'] as { manualSubmissions: number }).manualSubmissions, 1);
+});
+
+test('only completed or input-required tasks can be handed back; an answered question no longer waits on A2A', { timeout: 10000 }, async t => {
+  const failed = await fixture(t);
+  const broken = await failed.send({ preflight: { jobDirectory: failed.root }, resultContract: { jobId: 'broken', artifactManifestPath: join(failed.root, 'missing.json') } });
+  assert.equal(broken.status?.state, TaskState.TASK_STATE_FAILED);
+  const brokenSession = (broken.metadata?.['1agents'] as { sessionId: string }).sessionId;
+  assert.equal(failed.host.sessionTask(brokenSession)?.resubmittable, false);
+  await assert.rejects(failed.host.resubmit({ sessionId: brokenSession, summary: 'fixed by hand' }), { code: 'TASK_NOT_RESUBMITTABLE' });
+  const paused = await fixture(t, 'input-required');
+  const task = await paused.send({ preflight: { jobDirectory: paused.root }, resultContract: { jobId: 'paused' } });
+  const sessionId = (task.metadata?.['1agents'] as { sessionId: string }).sessionId;
+  await paused.host.resubmit({ sessionId, summary: 'answered in the session' });
+  const stored = await paused.client.getTask(GetTaskRequest.fromJSON({ id: task.id }), paused.auth);
+  assert.equal(stored.status?.state, TaskState.TASK_STATE_COMPLETED);
+  // Nothing is left awaiting input, so A2A can no longer cancel it as a paused task.
+  await assert.rejects(paused.client.cancelTask(CancelTaskRequest.fromJSON({ id: task.id }), paused.auth));
+});
+
+test('the host serves back only verified artifact bytes for a task, and refuses anything changed or unregistered', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const artifact = join(f.root, 'notes.md'), other = join(f.root, 'secret.txt'), manifest = join(f.root, 'artifacts.json');
+  await writeFile(artifact, '# notes'); await writeFile(other, 'not registered');
+  await writeFile(manifest, JSON.stringify({ artifacts: [{ path: artifact, mediaType: 'text/markdown' }] }));
+  const task = await f.send({ preflight: { jobDirectory: f.root }, resultContract: { jobId: 'read', artifactManifestPath: manifest } });
+  const { sha256 } = (task.metadata?.['1agents'] as { result: A2AResultMetadata }).result.artifacts[0]!;
+  const read = (body: Record<string, unknown>, token = 'test-token') => fetch(`${f.origin}/a2a/artifacts/content`, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+  const served = await read({ taskId: task.id, path: artifact, sha256 });
+  assert.equal(served.status, 200);
+  assert.equal(await served.text(), '# notes');
+  assert.equal((await read({ taskId: task.id, path: artifact, sha256 }, 'wrong')).status, 401);
+  const otherHash = createHash('sha256').update('not registered').digest('hex');
+  assert.equal((await read({ taskId: task.id, path: other, sha256: otherHash })).status, 404);
+  assert.equal((await read({ taskId: 'missing', path: artifact, sha256 })).status, 404);
+  assert.equal((await read({ taskId: task.id, path: artifact, sha256: 'not-a-hash' })).status, 400);
+  await writeFile(artifact, '# edited');
+  assert.equal((await read({ taskId: task.id, path: artifact, sha256 })).status, 409);
+});
 
 test('completed tasks and same-context continuations keep real IDs, verified URLs, and independent records', { timeout: 10000 }, async t => {
   const f = await fixture(t);

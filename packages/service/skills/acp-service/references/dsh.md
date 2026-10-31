@@ -35,6 +35,8 @@ ACP 会话的 prompt 直接交给原生 Agent。原生 Agent 拥有其模型、�
 
 ACP 会话里的 `/model`、模式与“ACP 设置”使用 Agent 公布的选项：模型/思考强度走 `session/set_config_option`，模式走 `session/set_mode`。缺失的选项不会自动生成；执行中拒绝修改配置。
 
+ACP 设置里被 Agent 接受的值，按工作区绝对路径和 Agent 名称记在插件状态目录的 `agent-session-settings.json`。Grok Build 与 Codex 各自保存自己的 mode id 和配置 id。之后同一工作区、同一 Agent 的新建会话会在首条 prompt 前回放：模型在前，其余选项对照每次返回的新目录，模式最后。目录缺少当初的 id 或值时，在 prompt 前失败。已有会话保持原设置。没有试跑记录时，新会话仍只套用 `sessionPolicies.initialModeId`。调用参数不增加这些字段。
+
 普通 DSH 会话仍选择 DSH provider/model。检查实际模型时，以模型目录和会话请求记录为准；例如部署默认 MiniMax 时标准预设会使用它，换部署不能假定仍是 MiniMax。
 
 需要工具审批、问题回答时，使用 DSH 的现有交互 UI。浏览器刷新不取消 Host 请求；停止 DSH 当前轮会发送 ACP 取消。当前插件接入支持文本 prompt，不能承诺 DSH 附件也已转发给外部 Agent。

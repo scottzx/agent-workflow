@@ -1,8 +1,13 @@
 /** Shared A2A 1.0 server, persistent state and host-independent executor interfaces. */
 export { createA2AServer } from './server.js';
 export type { A2AServerOptions } from './server.js';
+export { A2AResubmitError } from './resubmit.js';
+export { WORKBENCH_UI_PATH, isAgentRequest, sameOriginBrowser, serveWorkbenchPage } from './workbench-ui.js';
+export type { A2AResubmission, A2AResubmitCode, A2ASessionTask } from './resubmit.js';
 export { FileA2AStore } from './store.js';
-export type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport, A2ARoleSkills } from './types.js';
+export type { A2ABackend, A2ACloseResult, A2APrepareInput, A2ARunResult, A2ASessionStatus, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport, A2ARoleSkills } from './types.js';
+export { bindA2AExecution, currentA2AExecution, unbindA2AExecution } from './execution-binding.js';
+export type { A2AExecutionRef } from './execution-binding.js';
 export { a2aRoleSkillsSchema } from './types.js';
 export type { A2AExecutionOptions } from './executor.js';
 export { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema, A2APreflightError, runA2APreflight } from './preflight.js';

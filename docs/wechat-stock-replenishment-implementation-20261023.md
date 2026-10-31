@@ -23,7 +23,7 @@
 | AP | 单条正式流程、三步动作。私有 Piece 保管加密连接，CODE 只计算库存规则 |
 | 受限业务桥接 | `.1agents/runtime/wechat-stock-replenisher/` 保存状态、动作与发布包；按 AP 请求推进，没有自己的调度器 |
 | 老板 IP 工作台 | 完整刷新真实飞书八表，稳定制作键幂等登记成品，使用现有版本与人工审核机制 |
-| 1ACP | 复用已有 `execution_submit/get/review` 和通知确认，不增加通用自动调度 API |
+| agent-workflow | 复用已有 `execution_submit/get/review` 和通知确认，不增加通用自动调度 API |
 | 公众号系列编辑 | 固定目标 `wechat-series-editor`，沿用现有宿主、模型策略、网络技能与任务锁 |
 
 源码及部署方法见[示例目录](../examples/activepieces/wechat-stock/README.md)。AP 流程角色使用 [ROLE.md](../.1agents/roles/wechat-stock-replenisher/ROLE.md) 与 `role.example.json` 声明，不假装成模型宿主原生 profile，也不登记尚不支持的 workflow Provider。
@@ -50,7 +50,7 @@
 
 动作键由规则、内容池、篇目、原文摘要及显式修订号生成。AP 运行 ID、观察时间与随机观察编号不参与去重。单服务租约及串行事务防止并发领取；完整请求、占位和批次先原子保存，再提交网关。响应丢失时恢复同一个 `clientRequestId`，不另建任务。
 
-现有 `resultContract.jobId` 是调用方声明的稳定业务合同 ID。真实账本 Job/Attempt 来自网关回执，分别保存；无需修改现有 1ACP 通用契约或重启共享宿主。交付核验绑定真实 Job/Attempt/Task、宿主 producer、角色、技能锁、结果 revision/digest 和每个最终文件的大小与 SHA256。
+现有 `resultContract.jobId` 是调用方声明的稳定业务合同 ID。真实账本 Job/Attempt 来自网关回执，分别保存；无需修改现有 agent-workflow 通用契约或重启共享宿主。交付核验绑定真实 Job/Attempt/Task、宿主 producer、角色、技能锁、结果 revision/digest 和每个最终文件的大小与 SHA256。
 
 核验包括原文未变、完整可见文本、百字内摘要、1920×1080 封面、无模板占位、手机不横向溢出、实际读图记录与最终 HTML 摘要。历史首期读图摘要绑定 `article.wechat.html`，兼容其真实记录；新合同要求显式 `article_file`。
 

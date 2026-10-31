@@ -1,4 +1,4 @@
-# Private 1acp Activepieces piece
+# Private agent-workflow Activepieces piece
 
 This local package is uploaded to an existing Activepieces installation; it is not published to npm. Its CustomAuth connection stores `gatewayUrl` and the SecretText `automationToken` in Activepieces' encrypted connection storage.
 

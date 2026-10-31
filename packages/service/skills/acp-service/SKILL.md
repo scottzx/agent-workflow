@@ -5,6 +5,8 @@ description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通�
 
 # ACP Service
 
+本技能属于 **agent-workflow**（一芥天地 / DreamMate World，一芥智能）。npm 包名仍是 `@1agents/acp-service`，命令名仍是 `acp-service`。
+
 `@1agents/acp-service` 将 Agent runtime、CLI、ACP 服务、DSH 插件和 A2A 实现打进同一个 npm 包。原生 Agent 的可执行文件、登录凭据和模型配置由执行主机提供。
 
 ## 选择调用入口
@@ -90,7 +92,7 @@ acp-service --skill install acp-service --agent codex --scope repo
 | `agentPreset` | 选择 DSH Agent 的组成；gateway 可省略并使用远端 A2A 默认值 |
 | 标准 DSH 模型 | `standard` 使用该 DSH 部署的默认 provider/model，不固定为某一厂商 |
 | ACP Agent 模型/模式 | 由原生 Agent 提供，通过其公布的配置选项或模式切换 |
-| A2A `modelId` / `modeId` | 当前 spawn 和 `metadata.1agents` **没有这些参数**；不能凭空传入或把模型名称写进 prompt 当作配置 |
+| A2A `modelId` / `modeId` | spawn 和 `metadata.1agents` 没有这些参数。模型名称写进 prompt 不会改 ACP 配置。试跑时在 DSH 的 ACP 设置里被该 Agent 接受的值，按工作区和 Agent 记在插件里，之后该 Agent 的新建会话会自动回放 |
 
 例如某部署默认配置为 `minimax-cn / MiniMax-M3` 时，`standard` 会调用它。应读取 DSH 模型目录/配置，并用会话实际请求记录中的 provider/model 核对；Agent 自述身份不足以证明模型路由。
 

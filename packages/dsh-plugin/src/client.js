@@ -3,11 +3,12 @@ import { createElement as h, useEffect, useRef, useState, useSyncExternalStore }
 import { toolConversationDefinition } from './tool-conversation.js';
 import { installTranscriptView } from './transcript-view.js';
 
-export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation', 'conversation'];
+export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation', 'conversation', 'uiWorkspace'];
+const WORKBENCH_PANEL = 'oneagents-a2a-workbench';
 
 const dictionaries = {
-  zh: { toolGroup: '已调用 {count} 个工具', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', loadingModels: '正在加载模型…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。' },
-  en: { toolGroup: '{count} tool calls', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', loadingModels: 'Loading models…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.' },
+  zh: { toolGroup: '已调用 {count} 个工具', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', loadingModels: '正在加载模型…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。', workbench: 'A2A 工作台', a2aRunning: 'A2A 任务正在此会话执行，结束后可人工接管。' },
+  en: { toolGroup: '{count} tool calls', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', loadingModels: 'Loading models…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.', workbench: 'A2A Workbench', a2aRunning: 'An A2A task is running in this session; you can take over once it ends.' },
 };
 
 /** Preserve Agent-owned group labels and option ids. */
@@ -60,10 +61,23 @@ export function apply(ctx) {
     return selected;
   };
   const isAcp = id => String(presetOf(id) ?? '').startsWith('oneagents-acp-');
-  const block = (id, reason) => {
-    if (disposed || (!reason && !blockedSessions.has(id))) return;
+  // One composer block per session: an ACP connection reason wins over a running A2A turn.
+  const acpBlocks = new Map();
+  const a2aBlocks = new Map();
+  const applyBlock = id => {
+    const reason = acpBlocks.get(id) ?? a2aBlocks.get(id);
     if (reason) blockedSessions.add(id); else blockedSessions.delete(id);
     ctx.conversation.blocks.set(id, reason ? { reason } : undefined);
+  };
+  const block = (id, reason) => {
+    if (disposed || (!reason && !blockedSessions.has(id))) return;
+    if (reason) acpBlocks.set(id, reason); else acpBlocks.delete(id);
+    applyBlock(id);
+  };
+  const blockA2A = (id, reason) => {
+    if (disposed || reason === a2aBlocks.get(id)) return;
+    if (reason) a2aBlocks.set(id, reason); else a2aBlocks.delete(id);
+    applyBlock(id);
   };
   const notify = id => { for (const fn of listeners.get(id) ?? []) fn(); };
   ctx.effect(() => () => {
@@ -174,6 +188,19 @@ export function apply(ctx) {
       const timer = setInterval(() => { if (document.visibilityState === 'visible') void refresh(); }, 5000);
       return () => clearInterval(timer);
     }, [external, sessionId, presetId]);
+    // Typing would race a running A2A turn; manual takeover opens once that turn ends.
+    useEffect(() => {
+      let live = true, timer;
+      const check = () => fetch(`/workbench/ui/api/dsh/sessions/${encodeURIComponent(sessionId)}`, { credentials: 'same-origin' })
+        .then(response => response.ok ? response.json() : undefined).then(value => {
+          if (!live) return;
+          const task = value?.task;
+          blockA2A(sessionId, task?.running ? t('a2aRunning') : undefined);
+          if (task && timer === undefined) timer = setInterval(() => { if (document.visibilityState === 'visible') void check(); }, 5000);
+        }, () => {});
+      void check();
+      return () => { live = false; if (timer !== undefined) clearInterval(timer); blockA2A(sessionId, undefined); };
+    }, [sessionId]);
     const change = async action => {
       const operation = ++changeSequence.current;
       const revision = revisionOf(sessionId);
@@ -213,6 +240,27 @@ export function apply(ctx) {
   }
 
   ctx.slots.inject('conversation.input.model', () => ctx.slots.register({ name: 'conversation.input.model', inject: sessionId => ({ sessionId }) }, ModelControls));
+
+  // The gateway task workbench, served same-origin by the host plugin; its take-over button asks to open a session here.
+  function WorkbenchPanel() {
+    const frame = useRef(null);
+    useEffect(() => {
+      const onMessage = event => {
+        if (event.origin !== location.origin || event.source !== frame.current?.contentWindow) return;
+        const { type, sessionId } = event.data ?? {};
+        if (type === '1agents:open-session' && typeof sessionId === 'string' && sessionId) ctx.uiWorkspace.openSession(sessionId);
+      };
+      window.addEventListener('message', onMessage);
+      return () => window.removeEventListener('message', onMessage);
+    }, []);
+    return h('iframe', { ref: frame, src: '/workbench/ui/', title: t('workbench'), style: { display: 'block', width: '100%', height: '100%', border: 0 } });
+  }
+  function WorkbenchIcon({ size }) {
+    return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.75, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+      h('rect', { x: 3, y: 4, width: 18, height: 16, rx: 2 }), h('path', { d: 'M9 4v16M13 9h5M13 13h5' }));
+  }
+  ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: WORKBENCH_PANEL }, WorkbenchPanel));
+  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: WORKBENCH_PANEL, order: 20, label: () => t('workbench') }, WorkbenchIcon));
   ctx.effect(() => ctx.commandUi.register({
     name: 'model', description: () => t('description'),
     available: session => ctx.sessions.subagentAddress(session.sessionId) === undefined,
