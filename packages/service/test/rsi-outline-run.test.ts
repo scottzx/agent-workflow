@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { checkGate } from '../src/rsi/gate.js';
 import { type LedgerEntry, runOutlineCase } from '../src/rsi/outline-run.js';
+import { executorChanges, type Ticket } from '../src/rsi/ticket.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
 const checksAvailable = spawnSync('python3', ['-I', '-c', 'import jsonschema']).status === 0;
@@ -26,6 +27,17 @@ function outline(repo: string, commit: string, font = '微软雅黑') {
       { id: 'screenshots', status: 'not_applicable', reason: '命令行工具，没有界面' },
     ] };
 }
+
+/** What a well-behaved executor does with the ticket: mark every pending item done through ticket.py, then submit. */
+function handleTicket(work: string, note = '已按意见修改') {
+  const tool = (...args: string[]) => {
+    const out = spawnSync('python3', ['-I', join(work, 'checks', 'ticket.py'), join(work, 'ticket.json'), ...args], { encoding: 'utf8' });
+    assert.equal(out.status, 0, out.stderr); return out.stdout;
+  };
+  for (const line of tool('show').split('\n')) { const id = /^([PQ]\d+-\S+) \[/.exec(line)?.[1]; if (id) tool('mark', id, 'done', '--note', note); }
+  tool('submit');
+}
+const readTicket = async (work: string) => JSON.parse(await readFile(join(work, 'ticket.json'), 'utf8')) as Ticket;
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), 'rsi-outline-'));
@@ -62,6 +74,7 @@ test('a failed program check goes back to the same task with its evidence, and t
       }
       if (method === 'execution_continue') {
         await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        handleTicket(work, '字体改成微软雅黑');
         return { jobId: 'job-1' };
       }
       return { executionStatus: 'completed' };
@@ -76,7 +89,14 @@ test('a failed program check goes back to the same task with its evidence, and t
   assert.match(submit.input.prompt, /自查用的 Python：`\/[^`]+`/, 'the executor gets the checker interpreter by absolute path');
   const bounce = f.calls.find(call => call.method === 'execution_continue')!.params;
   assert.equal(bounce.jobId, 'job-1');
-  assert.match(bounce.input.prompt, /P2/); assert.match(bounce.input.prompt, /Arial/);
+  assert.match(bounce.input.prompt, /ticket\.py ticket\.json show/, 'the executor is pointed at the ticket, not given the evidence as text');
+  assert.doesNotMatch(bounce.input.prompt, /Arial/);
+  const ticket = await readTicket(work);
+  assert.equal(ticket.status, 'closed');
+  const item = ticket.items.find(i => i.id === 'P1-P2')!;
+  assert.match(JSON.stringify(item.evidence), /Arial/);
+  assert.deepEqual([item.state, item.log.map(e => `${e.round}:${e.by}:${e.action}`)], ['verified', ['1:host:raised', '2:executor:done', '2:host:verified']]);
+  assert.equal(item.log[1]!.note, '字体改成微软雅黑');
   assert.ok(await stat(join(work, 'project', 'README.md')));
   await assert.rejects(stat(join(work, 'project', 'internal')), 'excluded paths are not in the copy');
   assert.equal(JSON.parse(await readFile(join(work, 'run.json'), 'utf8')).passed, true);
@@ -103,6 +123,7 @@ test('a delivered copy that differs from the checked outline fails and goes back
       if (method === 'execution_continue') {
         prompt = params.input.prompt;
         await cp(join(work, 'outline.json'), join(delivered, 'outline.json'));
+        handleTicket(work);
         return { jobId: 'job-5' };
       }
       return { executionStatus: 'completed' };
@@ -111,7 +132,8 @@ test('a delivered copy that differs from the checked outline fails and goes back
   assert.equal(first.passed, false);
   assert.deepEqual(first.results.filter(r => !r.pass).map(r => r.itemId), ['D1'], 'P1–P7 pass; only the copy differs');
   assert.match(JSON.stringify(first.results.find(r => r.itemId === 'D1')!.evidence), /\.1agents\/jobs\/job-5\/outline\.json/);
-  assert.match(prompt, /D1/);
+  assert.match(prompt, /1 条待处理/);
+  assert.equal((await readTicket(work)).items.find(i => i.checkId === 'D1')!.state, 'verified');
   const second = report.rounds[1]!;
   assert.equal(report.passed, true);
   assert.equal(second.results.find(r => r.itemId === 'D1')!.pass, true);
@@ -158,13 +180,13 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
         reviews++;
         await writeFile(join(work, 'reviews', `review-r${reviews}.json`), JSON.stringify(reviews === 1
           ? review('revise', [{ where: 'project/oneLiner', problem: '示例项目四个字说明不了任何事', suggestion: '改成“一行命令生成产品介绍”', severity: 'must' }])
-          : { ...review('pass', []), previous: [{ where: 'project/oneLiner', status: 'fixed', note: '已改' }] }));
+          : { ...review('pass', []), previous: [{ id: 'Q1-1', status: 'fixed', note: '已改' }] }));
         return { jobId: 'qa-1' };
       };
       if (method === 'execution_submit' && params.title.startsWith('质检')) return qaReview();
       if (method === 'execution_continue' && params.jobId === 'qa-1') return qaReview();
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
-      if (method === 'execution_continue') { await writeFile(join(work, 'outline.json'), JSON.stringify(revised)); return { jobId: 'job-1' }; }
+      if (method === 'execution_continue') { await writeFile(join(work, 'outline.json'), JSON.stringify(revised)); handleTicket(work, '改成一行命令生成产品介绍'); return { jobId: 'job-1' }; }
       return { executionStatus: 'completed' };
     } });
   assert.equal(report.passed, true);
@@ -172,7 +194,12 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
   assert.equal(f.calls.filter(call => call.method === 'execution_submit' && call.params.title.startsWith('质检')).length, 1, 'one QA session per task');
   const reReview = f.calls.find(call => call.method === 'execution_continue' && call.params.jobId === 'qa-1')!.params;
   assert.match(reReview.input.prompt, /reviews\/outline-r2\.json/); assert.match(reReview.input.prompt, /previous/);
-  assert.deepEqual(report.rounds[1]!.review!.review!.previous, [{ where: 'project/oneLiner', status: 'fixed', note: '已改' }]);
+  assert.deepEqual(report.rounds[1]!.review!.review!.previous, [{ id: 'Q1-1', status: 'fixed', note: '已改' }]);
+  assert.match(reReview.input.prompt, /ticket\.json/);
+  const ticket = await readTicket(work);
+  assert.equal(ticket.status, 'closed');
+  assert.deepEqual(ticket.items.map(i => [i.id, i.state, i.log.map(e => `${e.by}:${e.action}`).join(',')]), [['Q1-1', 'verified', 'qa:raised,executor:done,qa:fixed']]);
+  assert.deepEqual(ticket.history.filter(h => h.by === 'qa').map(h => h.verdict), ['revise', 'pass']);
   assert.equal(report.rounds[1]!.review!.jobId, 'qa-1');
   const qaSubmit = f.calls.find(call => call.method === 'execution_submit' && call.params.title.startsWith('质检'))!.params;
   assert.equal(qaSubmit.input.agentPreset, 'qa-preset');
@@ -180,7 +207,7 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
   assert.match(qaSubmit.input.prompt, /reviews\/outline-r1\.json/, 'QA reviews a frozen copy');
   const back = f.calls.find(call => call.method === 'execution_continue' && call.params.jobId === 'job-1')!.params;
   assert.equal(back.jobId, 'job-1', 'the issues go back to the executor session');
-  assert.match(back.input.prompt, /\[必须改\] project\/oneLiner/); assert.match(back.input.prompt, /一行命令生成产品介绍/);
+  assert.match(back.input.prompt, /1 条待处理（1 条必须改）/); assert.doesNotMatch(back.input.prompt, /一行命令生成产品介绍/, 'the issue itself lives on the ticket');
   assert.equal(JSON.parse(await readFile(join(work, 'reviews', 'outline-r1.json'), 'utf8')).project.oneLiner, '示例项目', 'the pre-QA version is kept');
   assert.equal(JSON.parse(await readFile(join(work, 'reviews', 'outline-r2.json'), 'utf8')).project.oneLiner, '一行命令生成产品介绍');
 });
@@ -192,12 +219,15 @@ test('a QA agent that edits the outline itself is undone, and a run without a re
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
     invoke: async (method, params: any) => {
       f.calls.push({ method, params });
-      if (method === 'execution_submit' && params.title.startsWith('质检')) { await writeFile(join(work, 'outline.json'), '{"tampered":true}'); return { jobId: 'qa-1' }; }
+      if (method === 'execution_submit' && params.title.startsWith('质检')) {
+        await writeFile(join(work, 'outline.json'), '{"tampered":true}'); await writeFile(join(work, 'ticket.json'), '{}'); return { jobId: 'qa-1' };
+      }
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
       return { executionStatus: 'completed' };
     } });
   assert.equal(report.passed, false);
-  assert.match(report.rounds[0]!.review!.error!, /改动了 outline\.json，已恢复.*读不出来/);
+  assert.match(report.rounds[0]!.review!.error!, /改动了 outline\.json，已恢复.*改动了 ticket\.json，已恢复.*读不出来/);
+  assert.equal((await readTicket(work)).status, 'stopped', 'the restored ticket records how the run ended');
   assert.equal(JSON.parse(await readFile(join(work, 'outline.json'), 'utf8')).schemaVersion, 1, "the executor's outline is restored");
   assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
 });
@@ -250,7 +280,9 @@ async function scriptedQaRun(f: Awaited<ReturnType<typeof fixture>>, workspace: 
       if (method === 'execution_submit' || method === 'execution_continue') {
         if (method === 'execution_submit') work = params.input.cwd;
         const doc = outline('example/demo', f.commit); doc.project.oneLiner = `第 ${++edits} 版`;
-        await writeFile(join(work, 'outline.json'), JSON.stringify(doc)); return { jobId: 'job-1' };
+        await writeFile(join(work, 'outline.json'), JSON.stringify(doc));
+        if (method === 'execution_continue') handleTicket(work);
+        return { jobId: 'job-1' };
       }
       return { executionStatus: 'completed' };
     } });
@@ -264,16 +296,17 @@ const qaReview = (total: number, previous?: unknown[], proposals?: unknown[]) =>
 
 test('revisions continue up to three by default, stop early when the same issue survives two re-reviews, and every run lands in the ledger', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
   const f = await fixture(t), workspace = join(f.root, 'runs');
-  const rising = await scriptedQaRun(f, workspace, n => qaReview(16 + n, n > 1 ? [{ where: 'project/oneLiner', status: 'fixed' }] : undefined));
+  const fixedLast = (n: number) => n > 1 ? [{ id: `Q${n - 1}-1`, status: 'fixed' }] : undefined;
+  const rising = await scriptedQaRun(f, workspace, n => qaReview(16 + n, fixedLast(n)));
   assert.equal(rising.report.stopReason, 'max_revisions');
   assert.equal(rising.reviews, 4, 'one review plus three re-reviews');
 
-  const partly = [{ where: 'project/oneLiner', status: 'partly', note: '只改了一半' }];
+  const partly = [{ id: 'Q1-1', status: 'partly', note: '只改了一半' }];
   const stuck = await scriptedQaRun(f, workspace, n => qaReview(16 + n, n > 1 ? partly : undefined, [{ kind: 'check', text: '同组出处跨页提示重复' }]));
   assert.equal(stuck.report.stopReason, 'stalled');
   assert.equal(stuck.reviews, 3, 'partly in two re-reviews in a row stops before the third revision');
 
-  const flat = await scriptedQaRun(f, workspace, n => qaReview(18, n > 1 ? [{ where: 'project/oneLiner', status: 'fixed' }] : undefined,
+  const flat = await scriptedQaRun(f, workspace, n => qaReview(18, fixedLast(n),
     [{ kind: 'locked', text: '模板锁定的技术架构章挡住了受众分' }]));
   assert.equal(flat.reviews, 3, 'no score gain twice running stops too');
   assert.equal(flat.report.stopReason, 'needs_human', 'QA says a locked item is in the way');
@@ -283,7 +316,7 @@ test('revisions continue up to three by default, stop early when the same issue 
   assert.deepEqual(ledger.map(e => e.stopReason), ['max_revisions', 'stalled', 'needs_human']);
   assert.deepEqual(ledger.map(e => e.revisions), [3, 2, 2]);
   assert.deepEqual(ledger[0]!.scores.map(s => Object.values(s).reduce((a, b) => a + b, 0)), [17, 18, 19, 20]);
-  assert.equal(ledger[1]!.firstDraftPassed, true); assert.equal(ledger[1]!.mustIssues, 1);
+  assert.equal(ledger[1]!.firstDraftPassed, true); assert.equal(ledger[1]!.mustIssues, 3, 'Q1-1 reopened, Q2-1 done but unconfirmed, Q3-1 open');
   assert.deepEqual(ledger[1]!.proposals, [{ kind: 'check', text: '同组出处跨页提示重复' }]);
   assert.equal(ledger[2]!.phase, 'dev'); assert.equal(ledger[2]!.caseKind, 'original');
 });
@@ -295,7 +328,7 @@ test('the gate opens only after consecutive clean passes on the committed role v
   const commit = git('rev-parse', 'HEAD');
   const entry = (over: Partial<LedgerEntry> = {}): LedgerEntry => ({ startedAt: '2026-10-31T00:00:00.000Z', phase: 'dev', caseId: 'demo', caseKind: 'original',
     role: { commit, dirty: false }, passed: true, stopReason: 'passed', firstDraftPassed: true, bounces: 0, revisions: 1,
-    scores: [{ 吸引力: 3 }, { 吸引力: 4 }], mustIssues: 0, proposals: [], workDirectory: '/w', ...over });
+    scores: [{ 吸引力: 3 }, { 吸引力: 4 }], mustIssues: 0, proposals: [], workDirectory: '/w', ticketPath: '/w/ticket.json', ...over });
   const ledger = join(workspace, 'product-intro-outline', 'ledger.jsonl');
   const write = (entries: LedgerEntry[]) => mkdir(join(workspace, 'product-intro-outline'), { recursive: true })
     .then(() => writeFile(ledger, entries.map(e => JSON.stringify(e)).join('\n') + '\n'));
@@ -319,4 +352,55 @@ test('the gate opens only after consecutive clean passes on the committed role v
   assert.equal(dirty.ready, false); assert.match(dirty.reasons.join('\n'), /未提交的改动/);
   await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace, phase: 'test', qa: {},
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, invoke: async () => ({}) }), /committed with no local changes/);
+});
+
+test('the executor can only mark pending items done or disputed with a note and submit; anything else is undone and sent back', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const before: Ticket = { schemaVersion: 1, roleId: 'r', caseId: 'c', outline: 'outline.json', status: 'in_revision', round: 2, proposals: [], history: [],
+    items: [{ id: 'Q1-1', source: 'qa', raisedInRound: 1, severity: 'must', where: 'project/oneLiner', problem: '太空泛', state: 'open', log: [{ round: 1, by: 'qa', action: 'raised' }] },
+      { id: 'Q1-2', source: 'qa', raisedInRound: 1, severity: 'should', where: 'x', problem: 'y', state: 'verified', log: [] }] };
+  const edit = (change: (ticket: any) => void) => { const copy = structuredClone(before) as any; change(copy); return executorChanges(before, JSON.stringify(copy)); };
+  const done = (ticket: any, note = '改了') => { ticket.items[0].state = 'done'; ticket.items[0].log.push({ round: 2, by: 'executor', action: 'done', note }); };
+  const submit = (ticket: any) => { ticket.status = 'ready_for_review'; ticket.history.push({ round: 2, by: 'executor', action: 'submitted' }); };
+  assert.deepEqual(edit(ticket => { done(ticket); submit(ticket); }).illegal, []);
+  assert.deepEqual(edit(ticket => { done(ticket); submit(ticket); }).incomplete, []);
+  assert.match(edit(done).incomplete.join(), /还没有提交/);
+  assert.match(edit(ticket => { ticket.items[0].state = 'verified'; ticket.items[0].log.push({ round: 2, by: 'executor', action: 'verified', note: '好了' }); }).illegal.join(), /Q1-1/);
+  assert.match(edit(ticket => done(ticket, ' ')).illegal.join(), /说明/);
+  assert.match(edit(ticket => { ticket.items[0].severity = 'should'; }).illegal.join(), /不能改意见本身/);
+  assert.match(edit(ticket => { ticket.items.pop(); }).illegal.join(), /增删/);
+  assert.match(edit(ticket => { ticket.items[1].state = 'done'; ticket.items[1].log.push({ round: 2, by: 'executor', action: 'done', note: 'x' }); }).illegal.join(), /Q1-2/);
+  assert.match(edit(ticket => { ticket.status = 'closed'; }).illegal.join(), /不能改成 closed/);
+  assert.match(edit(ticket => { ticket.proposals.push({ id: 'R1-1' }); }).illegal.join(), /提议/);
+  assert.match(executorChanges(before, '{').illegal.join(), /不是可读的 JSON/);
+
+  const f = await fixture(t);
+  let work = '', continues = 0;
+  const first = outline('example/demo', f.commit);
+  const review = (verdict: string) => ({ verdict, summary: '…', scores: { 吸引力: 4, 具体: 4, 受众: 4, 结构: 4, 可信: 4, 行动: 4 },
+    issues: verdict === 'pass' ? [] : [{ where: 'project/oneLiner', problem: '太空泛', suggestion: '写场景', severity: 'must' }],
+    ...(verdict === 'pass' ? { previous: [{ id: 'Q1-1', status: 'fixed' }] } : {}) });
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
+    invoke: async (method, params: any) => {
+      f.calls.push({ method, params });
+      const qa = (verdict: string) => writeFile(join(work, 'reviews', `review-r${verdict === 'pass' ? 3 : 1}.json`), JSON.stringify(review(verdict))).then(() => ({ jobId: 'qa-1' }));
+      if (method === 'execution_submit' && params.title.startsWith('质检')) return qa('revise');
+      if (method === 'execution_continue' && params.jobId === 'qa-1') return qa('pass');
+      if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
+      if (method === 'execution_continue' && ++continues === 1) {
+        // Straight to verified, by editing the file: not the executor's call.
+        const ticket = await readTicket(work); ticket.items[0]!.state = 'verified'; ticket.status = 'ready_for_review';
+        await writeFile(join(work, 'ticket.json'), JSON.stringify(ticket)); return { jobId: 'job-1' };
+      }
+      if (method === 'execution_continue') { handleTicket(work, '开头改成场景加结果'); return { jobId: 'job-1' }; }
+      return { executionStatus: 'completed' };
+    } });
+  assert.equal(report.passed, true);
+  assert.match(report.rounds[1]!.ticketErrors!.join(), /Q1-1：执行者只能/);
+  const bounce = f.calls.filter(call => call.method === 'execution_continue' && call.params.jobId === 'job-1')[1]!.params.input.prompt;
+  assert.match(bounce, /任务单没有按规定处理/); assert.match(bounce, /越权的改动已经恢复/);
+  const ticket = await readTicket(work);
+  assert.deepEqual(ticket.items[0]!.log.map(e => `${e.round}:${e.by}:${e.action}`), ['1:qa:raised', '3:executor:done', '3:qa:fixed']);
+  assert.ok(ticket.history.some(h => h.by === 'host' && h.action === 'reverted'), 'the undone change stays on record');
+  assert.equal(ticket.status, 'closed');
 });
