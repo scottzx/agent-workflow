@@ -240,16 +240,13 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`,
     input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(roleText, kase, work, python) } });
   const jobId = String(submitted.jobId);
-  /** Each change goes through the gateway, which records it on the job; the work directory gets a read-only copy. */
+  /** Each change goes through the gateway, which records it on the job and rewrites the read-only copy in the work directory. */
   const ticketCall = async (method: string, params: Record<string, unknown> = {}): Promise<Ticket> => {
     const scope = { originSessionId: options.originSessionId, jobId };
     if (method !== 'ticket_get') await options.invoke(method, { ...scope, ...params });
-    const current = await options.invoke('ticket_get', scope) as Ticket;
-    await rm(ticketPath, { force: true });
-    await writeFile(ticketPath, JSON.stringify(current, null, 2) + '\n', { mode: 0o444 });
-    return current;
+    return await options.invoke('ticket_get', scope) as Ticket;
   };
-  let ticket = await ticketCall('ticket_open', { roleId, caseId: kase.id });
+  let ticket = await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath });
   const rounds: OutlineRound[] = [];
   const reviews: QualityReview[] = [];
   let bounces = 0, revisions = 0, stopReason: StopReason = 'passed';

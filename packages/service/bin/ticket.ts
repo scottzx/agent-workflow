@@ -16,6 +16,16 @@ Options:
 
 const states = { accept: 'accepted', reject: 'rejected', done: 'done' } as const;
 
+/**
+ * Who settles a proposal, read from the environment the command runs in rather than from a flag: a coach agent's
+ * harness marks its own shell with the session it runs in (Claude Code sets CLAUDECODE and CLAUDE_CODE_SESSION_ID);
+ * anyone else is a person. Like the executor's tools, this does not defend against a caller faking that environment.
+ */
+export function settler(env: NodeJS.ProcessEnv = process.env): { kind: 'person' | 'coach'; agent?: string; sessionId?: string } {
+  if (env.CLAUDECODE === '1' && env.CLAUDE_CODE_SESSION_ID) return { kind: 'coach', agent: 'claude-code', sessionId: env.CLAUDE_CODE_SESSION_ID };
+  return { kind: 'person' };
+}
+
 export async function runTicketCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
   if (!['show', 'events', 'proposal'].includes(argv[0]!)) throw new Error('Unknown ticket command; use ticket --help');
@@ -39,7 +49,7 @@ export async function runTicketCli(argv: string[]): Promise<void> {
   }
   const state = states[positionals[0] as keyof typeof states];
   if (!values.id || !state || positionals.length !== 1) throw new Error('Use: ticket proposal --job ID --id R1-2 accept|reject|done [--note TEXT]');
-  print(await invoke('ticket_proposal', { ...scope, proposalId: values.id, state, ...(values.note ? { note: values.note } : {}) }) as unknown as Ticket);
+  print(await invoke('ticket_proposal', { ...scope, proposalId: values.id, state, ...(values.note ? { note: values.note } : {}), by: settler() }) as unknown as Ticket);
 }
 
 function print(ticket: Ticket): void {
@@ -48,5 +58,8 @@ function print(ticket: Ticket): void {
     console.log(`  ${item.id} [${item.severity === 'must' ? '必须改' : '建议改'}] ${item.state}  ${item.where}：${item.problem}`);
     for (const entry of item.log) console.log(`      第 ${entry.round} 轮 ${entry.by} ${entry.action}${entry.note ? `：${entry.note}` : ''}`);
   }
-  for (const proposal of ticket.proposals) console.log(`  ${proposal.id} 提议（${proposal.kind}）${proposal.state}：${proposal.text}${proposal.note ? `  ——${proposal.note}` : ''}`);
+  for (const proposal of ticket.proposals) {
+    const by = proposal.by ? `（${proposal.by.kind === 'coach' ? `教练 ${proposal.by.agent ?? ''} ${proposal.by.sessionId ?? ''}`.trim() : '人'}）` : '';
+    console.log(`  ${proposal.id} 提议（${proposal.kind}）${proposal.state}${by}：${proposal.text}${proposal.note ? `  ——${proposal.note}` : ''}`);
+  }
 }

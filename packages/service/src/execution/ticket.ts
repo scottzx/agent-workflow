@@ -3,7 +3,10 @@
  * The ledger keeps it with the job; each operation here belongs to one actor and returns the changes it made,
  * which the ledger appends as `ticket.*` events, so who did what is recorded by the system rather than declared.
  * Failed program checks become items the host verifies by re-running them; the host merges QA's review.
+ * When the ticket names an export path, every change also rewrites that read-only copy for people to read.
  */
+import { rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
 import type { JobLedger } from './ledger.js';
 
@@ -23,7 +26,9 @@ export const qualityReviewSchema = z.object({
 export type CheckResult = z.infer<typeof checkResultSchema>;
 export type QualityReview = z.infer<typeof qualityReviewSchema>;
 
-export type TicketActor = 'executor' | 'qa' | 'host' | 'person';
+export type TicketActor = 'executor' | 'qa' | 'host' | 'person' | 'coach';
+/** Who settled a proposal: a person, or a coach agent identified by the harness session it runs in. */
+export interface ProposalSettler { kind: 'person' | 'coach'; agent?: string; sessionId?: string }
 export type ItemState = 'open' | 'done' | 'disputed' | 'verified' | 'reopened' | 'withdrawn';
 export type TicketStatus = 'drafting' | 'in_revision' | 'ready_for_review' | 'in_review' | 'closed' | 'stopped';
 export interface TicketLog { round: number; by: TicketActor; action: string; note?: string }
@@ -33,12 +38,14 @@ export interface TicketItem {
 }
 export interface TicketProposal {
   id: string; kind: NonNullable<QualityReview['proposals']>[number]['kind']; text: string; raisedInRound: number;
-  state: 'open' | 'accepted' | 'rejected' | 'done'; note?: string;
+  state: 'open' | 'accepted' | 'rejected' | 'done'; note?: string; by?: ProposalSettler;
 }
 export interface Ticket {
   schemaVersion: 1; roleId: string; caseId: string; outline: 'outline.json'; status: TicketStatus;
   /** The executor round now under way; executor log entries carry it. */
   round: number; stopReason?: string;
+  /** The read-only copy rewritten on every change, usually <work>/ticket.json. */
+  exportPath?: string;
   items: TicketItem[]; proposals: TicketProposal[];
   history: { round: number; by: TicketActor; action: string; verdict?: string; scores?: Record<string, number>; summary?: string; note?: string }[];
 }
@@ -57,8 +64,9 @@ const expect = (ticket: Ticket, allowed: TicketStatus[], what: string) => {
   if (!allowed.includes(ticket.status)) fail(`任务单状态是 ${ticket.status}，${what}`);
 };
 
-export function openTicket(roleId: string, caseId: string): { ticket: Ticket; changes: TicketChange[] } {
-  return { ticket: { schemaVersion: 1, roleId, caseId, outline: 'outline.json', status: 'drafting', round: 1, items: [], proposals: [], history: [] },
+export function openTicket(roleId: string, caseId: string, exportPath?: string): { ticket: Ticket; changes: TicketChange[] } {
+  return { ticket: { schemaVersion: 1, roleId, caseId, outline: 'outline.json', status: 'drafting', round: 1, ...(exportPath ? { exportPath } : {}),
+    items: [], proposals: [], history: [] },
     changes: [{ type: 'ticket.opened', data: { actor: 'host', round: 1, roleId, caseId } }] };
 }
 
@@ -153,11 +161,22 @@ export function submitTicket(ticket: Ticket): TicketChange[] {
 }
 
 /** Person or coach: what became of a proposal. Allowed after the run ends, which is when the coach reads them. */
-export function setProposal(ticket: Ticket, proposalId: string, state: 'accepted' | 'rejected' | 'done', note?: string): TicketChange[] {
+export function setProposal(ticket: Ticket, proposalId: string, state: 'accepted' | 'rejected' | 'done', note?: string,
+  by: ProposalSettler = { kind: 'person' }): TicketChange[] {
   const proposal = ticket.proposals.find(entry => entry.id === proposalId) ?? fail(`任务单上没有提议 ${proposalId}`);
-  proposal.state = state;
+  proposal.state = state; proposal.by = by;
   if (note) proposal.note = note;
-  return [{ type: 'ticket.proposal_marked', data: { actor: 'person', round: ticket.round, proposalId, state, ...(note ? { note } : {}) } }];
+  const { kind, ...who } = by;
+  return [{ type: 'ticket.proposal_marked', data: { actor: kind, round: ticket.round, proposalId, state, ...(note ? { note } : {}), ...who } }];
+}
+
+/** The read-only copy; the ledger stays the record, so a copy that cannot be written does not undo the change. */
+function writeExport(ticket: Ticket): void {
+  if (!ticket.exportPath) return;
+  try {
+    rmSync(ticket.exportPath, { force: true });
+    writeFileSync(ticket.exportPath, JSON.stringify(ticket, null, 2) + '\n', { mode: 0o444 });
+  } catch { /* The next change, or ticket_get, has the current ticket. */ }
 }
 
 /** Host: the run is over, passed (closed) or not (stopped). */
@@ -171,11 +190,15 @@ export function closeTicket(ticket: Ticket, status: 'closed' | 'stopped', stopRe
 
 const id = z.string().trim().min(1).max(512);
 const jobSchema = z.object({ originSessionId: id, jobId: id }).strict();
-const openSchema = jobSchema.extend({ roleId: id, caseId: id }).strict();
+const openSchema = jobSchema.extend({ roleId: id, caseId: id,
+  exportPath: z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && value.endsWith('.json'), 'exportPath must be an absolute .json path').optional() }).strict();
+const settlerSchema = z.object({ kind: z.enum(['person', 'coach']), agent: id.optional(), sessionId: id.optional() }).strict()
+  .refine(by => by.kind === 'coach' || (!by.agent && !by.sessionId), 'Only a coach names an agent session');
 const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200) }).strict();
 const reviewSchema = jobSchema.extend({ review: qualityReviewSchema, qaJobId: id.optional() }).strict();
 const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).optional() }).strict();
-const proposalSchema = jobSchema.extend({ proposalId: id, state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional() }).strict();
+const proposalSchema = jobSchema.extend({ proposalId: id, state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional(),
+  by: settlerSchema.optional() }).strict();
 const closeSchema = jobSchema.extend({ status: z.enum(['closed', 'stopped']), stopReason: id.optional() }).strict();
 /** The executor names the attempt it is running and its session, never an origin or a role. */
 const executorSchema = z.object({ jobId: id, attemptId: id, sessionId: id }).strict();
@@ -183,14 +206,14 @@ const markSchema = executorSchema.extend({ itemId: id, state: z.enum(['done', 'd
 
 export const TICKET_METHODS = {
   ticket_get: { description: '读取执行者任务上的任务单（意见、状态、轮次、提议、历史）。每次改动都在 execution_events 里留有 ticket.* 事件。', parameters: z.toJSONSchema(jobSchema) },
-  ticket_open: { description: '宿主：在执行者任务上开任务单，一个任务一张。', parameters: z.toJSONSchema(openSchema) },
+  ticket_open: { description: '宿主：在执行者任务上开任务单，一个任务一张。exportPath 为只读导出的绝对路径，之后每次改动都会重写。', parameters: z.toJSONSchema(openSchema) },
   ticket_checks: { description: '宿主：执行者交稿后合并本轮程序检查结果。未通过的项成为或重开意见，通过的核实；全部通过则进入审阅。', parameters: z.toJSONSchema(checksSchema) },
   ticket_review: { description: '宿主：审阅中合并质检结果（previous 按意见编号 fixed/partly/not_fixed/withdrawn、新意见、去重后的提议），记录质检任务 qaJobId。质检自己不能改任务单。', parameters: z.toJSONSchema(reviewSchema) },
   ticket_revise: { description: '宿主：把任务单打回执行者，进入下一轮修改。', parameters: z.toJSONSchema(reviseSchema) },
   ticket_show: { description: '执行者：用正在执行的 jobId、attemptId 和 sessionId 读取自己的任务单。', parameters: z.toJSONSchema(executorSchema) },
   ticket_mark: { description: '执行者：修改中把本轮 open 或 reopened 的意见标为 done 或 disputed，必须写说明；只能由正在执行当前轮次的会话调用。', parameters: z.toJSONSchema(markSchema) },
   ticket_submit: { description: '执行者：没有待处理意见时提交任务单，等待宿主检查。', parameters: z.toJSONSchema(executorSchema) },
-  ticket_proposal: { description: '人或教练：把一条提议标为 accepted、rejected 或 done，可写说明；运行结束后也可以。', parameters: z.toJSONSchema(proposalSchema) },
+  ticket_proposal: { description: '人或教练：把一条提议标为 accepted、rejected 或 done，可写说明；运行结束后也可以。by 说明是人还是教练（教练写明所在的智能体会话），缺省为人。', parameters: z.toJSONSchema(proposalSchema) },
   ticket_close: { description: '宿主：运行结束时关单，通过为 closed，否则为 stopped 并写停止原因。', parameters: z.toJSONSchema(closeSchema) },
 };
 
@@ -203,18 +226,23 @@ export const TICKET_METHODS = {
  * against a local caller that bypasses them with the right IDs.
  */
 export function invokeTicket(ledger: JobLedger, method: string, params: unknown): Ticket {
-  const change = (origin: string, jobId: string, operation: (ticket: Ticket) => TicketChange[], caller: Record<string, unknown> = {}) =>
-    ledger.changeTicket(origin, jobId, ticket => ({ ticket: ticket ?? fail('这个任务还没有任务单'), changes: operation(ticket!) }), caller);
+  const change = (origin: string, jobId: string, operation: (ticket: Ticket) => TicketChange[], caller: Record<string, unknown> = {}) => {
+    const ticket = ledger.changeTicket(origin, jobId, current => ({ ticket: current ?? fail('这个任务还没有任务单'), changes: operation(current!) }), caller);
+    writeExport(ticket);
+    return ticket;
+  };
   switch (method) {
     case 'ticket_get': { const input = jobSchema.parse(params); return ledger.ticket(input.originSessionId, input.jobId); }
     case 'ticket_open': {
       const input = openSchema.parse(params);
-      return ledger.changeTicket(input.originSessionId, input.jobId, ticket => ticket ? fail('这个任务已经有任务单') : openTicket(input.roleId, input.caseId));
+      const ticket = ledger.changeTicket(input.originSessionId, input.jobId, current => current ? fail('这个任务已经有任务单') : openTicket(input.roleId, input.caseId, input.exportPath));
+      writeExport(ticket);
+      return ticket;
     }
     case 'ticket_checks': { const input = checksSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyChecks(ticket, input.results)); }
     case 'ticket_review': { const input = reviewSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyReview(ticket, input.review, input.qaJobId)); }
     case 'ticket_revise': { const input = reviseSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => startRevision(ticket, input.note)); }
-    case 'ticket_proposal': { const input = proposalSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => setProposal(ticket, input.proposalId, input.state, input.note)); }
+    case 'ticket_proposal': { const input = proposalSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => setProposal(ticket, input.proposalId, input.state, input.note, input.by)); }
     case 'ticket_close': { const input = closeSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => closeTicket(ticket, input.status, input.stopReason)); }
     case 'ticket_show': case 'ticket_mark': case 'ticket_submit': {
       const mark = method === 'ticket_mark' ? markSchema.parse(params) : undefined, input = mark ?? executorSchema.parse(params);
