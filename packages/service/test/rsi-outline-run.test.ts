@@ -11,7 +11,8 @@ import { invokeTicket, pendingItems, type Ticket } from '../src/execution/ticket
 import { type LedgerEntry, runOutlineCase, type OutlineRunOptions } from '../src/rsi/outline-run.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
-const checksAvailable = spawnSync('python3', ['-I', '-c', 'import jsonschema']).status === 0;
+// The role checks validate with Draft 2020-12; an older system jsonschema cannot run them.
+const checksAvailable = spawnSync('python3', ['-I', '-c', 'from jsonschema import Draft202012Validator']).status === 0;
 
 function outline(repo: string, commit: string, font = '微软雅黑') {
   const slide = (title: string, featureIds?: string[]) => ({ title, layout: 'title-bullets',
