@@ -18,12 +18,12 @@ function outline(repo: string, commit: string, font = '微软雅黑') {
   return { schemaVersion: 1, project: { repo, commit, name: '示例', oneLiner: '示例项目' }, audience: '开发者',
     style: { slideSize: '16:9', font: { family: font, sizes: { title: 32, subtitle: 24, body: 18, caption: 12 } },
       colors: { primary: '#285B4D', background: '#F7F4EB', accent: '#CBB078', text: '#202D29', source: { path: 'README.md' } },
-      layouts: ['title-bullets'] },
+      layouts: ['title-bullets', 'closing'] },
     sections: [
       { id: 'positioning', title: '定位', status: 'present', slides: [slide('定位')] },
       { id: 'features', title: '功能', status: 'present', slides: [slide('功能', ['F1'])] },
       { id: 'architecture', title: '架构', status: 'present', slides: [slide('架构')] },
-      { id: 'getting_started', title: '上手', status: 'present', slides: [slide('上手')] },
+      { id: 'getting_started', title: '上手', status: 'present', slides: [slide('上手'), { ...slide('下一步'), layout: 'closing' }] },
       { id: 'screenshots', status: 'not_applicable', reason: '命令行工具，没有界面' },
     ] };
 }
@@ -403,4 +403,42 @@ test('the executor can only mark pending items done or disputed with a note and 
   assert.deepEqual(ticket.items[0]!.log.map(e => `${e.round}:${e.by}:${e.action}`), ['1:qa:raised', '3:executor:done', '3:qa:fixed']);
   assert.ok(ticket.history.some(h => h.by === 'host' && h.action === 'reverted'), 'the undone change stays on record');
   assert.equal(ticket.status, 'closed');
+});
+
+test('P12-P14: the closing slide comes last, a title that counts its points is right, and the same sources are not paraphrased twice', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t), dir = join(f.root, 'checks-case'), project = join(dir, 'project');
+  await mkdir(project, { recursive: true });
+  await writeFile(join(project, 'README.md'), '# 示例\n\n一个命令行工具。\n');
+  await writeFile(join(project, 'GUIDE.md'), '# 指南\n');
+  await writeFile(join(dir, 'features.json'), await readFile(join(f.role, 'cases', 'demo', 'features.json')));
+  const run = async (doc: unknown) => {
+    await writeFile(join(dir, 'outline.json'), JSON.stringify(doc));
+    const out = spawnSync('python3', ['-I', join(f.role, 'checks', 'check_outline.py'), join(dir, 'outline.json'), join(dir, 'features.json'), project], { encoding: 'utf8' });
+    return Object.fromEntries((JSON.parse(out.stdout) as { itemId: string; pass: boolean; evidence: any[] }[]).map(r => [r.itemId, r]));
+  };
+  const point = (text: string, path = 'README.md') => ({ text, sources: [{ path }] });
+  const ok = outline('example/demo', f.commit) as any;
+  ok.sections[3].slides[0].title = '第一步：装好就能用';
+  ok.sections[2].slides[0].title = '六个演示场景';
+  ok.sections[1].slides[0].points.push(point('运行 npm run dev 打开 TypeScript 项目'), point('客户打开链接就能看到演示'));
+  ok.sections[3].slides[0].points.push(point('运行 npm run dev 再看 TypeScript 报错'), point('打开链接就能看到演示', 'GUIDE.md'), point('客户打开链接就能看到演示'));
+  ok.sections[3].slides[0].points.pop();
+  ok.sections[3].slides[1].title = '下一步：三步开始';
+  ok.sections[3].slides[1].points = [point('一'), point('二'), point('三')].map((p, i) => ({ ...p, text: `第${p.text}步` + '子'.repeat(i) }));
+  const good = await run(ok);
+  assert.deepEqual(['P12', 'P13', 'P14'].map(id => [id, good[id]!.pass, good[id]!.evidence]), [['P12', true, []], ['P13', true, []], ['P14', true, []]],
+    'ordinals, counts of things, shared English words and the same text from other sources are fine');
+
+  const bad = structuredClone(ok);
+  bad.sections[3].slides[1].title = '下一步：四个动作';
+  bad.sections[1].slides[0].points.push(point('演示站可以放到公司自己的服务器或内网'));
+  bad.sections[3].slides[0].points.push(point('交给 IT 放到公司自己的服务器或内网即可'));
+  const r = await run(bad);
+  assert.match(JSON.stringify(r.P13!.evidence), /slides\/1\/title.*四个动作.*3 points/);
+  assert.match(JSON.stringify(r.P14!.evidence), /getting_started\/slides\/0\/points\/\d.*features\/slides\/0\/points\/\d.*放到公司自己的服务器或内网/);
+
+  const moved = structuredClone(ok);
+  moved.sections[1].slides.push(moved.sections[3].slides.pop());
+  const p12 = (await run(moved)).P12!;
+  assert.match(JSON.stringify(p12.evidence), /features\/slides\/1.*not the last slide.*getting_started\/slides\/0.*must use the closing layout/);
 });

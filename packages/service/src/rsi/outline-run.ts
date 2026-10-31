@@ -313,9 +313,9 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     } else break;
     await sendBack(round, feedback);
   }
-  const last = rounds.at(-1)!, lastReview = last.review?.review;
+  const last = rounds.at(-1)!;
   // Revising further cannot help when QA says a locked item is in the way; only a person can change it.
-  if ((stopReason === 'stalled' || stopReason === 'max_revisions') && lastReview?.proposals?.some(p => p.kind === 'locked')) stopReason = 'needs_human';
+  if ((stopReason === 'stalled' || stopReason === 'max_revisions') && ticket.proposals.some(p => p.kind === 'locked')) stopReason = 'needs_human';
   if (last.passed) ticket.status = 'closed';
   else { ticket.status = 'stopped'; ticket.stopReason = stopReason; }
   ticket.history.push({ round: last.round, by: 'host', action: ticket.status, note: stopReason });
@@ -328,7 +328,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed: report.passed, stopReason,
     firstDraftPassed: first.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
     scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
-    mustIssues: unsettledMust(ticket).length, proposals: lastReview?.proposals ?? [], workDirectory: work, ticketPath };
+    mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath };
   await appendFile(ledgerPath(options.workspace, roleId), JSON.stringify(entry) + '\n');
   log(`停止原因：${stopReason}`);
   return report;

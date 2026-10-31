@@ -1,4 +1,4 @@
-"""Program checks P1-P11 for a product intro outline.
+"""Program checks P1-P14 for a product intro outline.
 
 Usage: check_outline.py <outline.json> <features.json> <project-copy-dir>
 
@@ -10,6 +10,7 @@ any item fails.
 import json
 import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import jsonschema
@@ -20,6 +21,14 @@ MAX_POINTS = 5
 PLACEHOLDER = re.compile(r'待补|待填|占位|TODO|TBD|FIXME|XXX')
 RELEASE_FILE = re.compile(r'[\w.-]*?v?(\d+\.\d+\.\d+)[\w.-]*?\.(?:zip|tar\.gz|tgz|dmg|exe|pkg|msi|apk|deb|rpm)\b')
 VERSION = re.compile(r'v?(\d+\.\d+\.\d+)')
+# A title counting its own points ("四个动作", "三步"). Ordinals ("第一步", "下一步") and counts of things
+# described ("六个演示场景") are not; neither is a count of one.
+NUMERALS = {'二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+SELF_COUNT = re.compile(r'(?<![第下进每\d])([二两三四五六七八九十]|[2-9]|10)\s*(?:个|大)?(?:动作|步骤|步|件事|条?要点)')
+# Points on different slides that cite the same files and share this many Chinese characters in a row say the
+# same thing twice. Shared English words, commands and links do not count.
+SHARED_RUN = 8
+HAN = re.compile(r'[\u4e00-\u9fff]+')
 
 
 def reader_text(outline):
@@ -141,6 +150,36 @@ def main(outline_path: str, features_path: str, project: str) -> int:
             elif records and stated not in records.values():
                 p11.append({'path': where, 'message': f'{m.group(0)} says {stated}, the project declares {records}'})
     report('P11', p11)
+
+    order = [(f"sections/{sec['id']}/slides/{i}", slide) for sec in outline['sections'] if sec['status'] == 'present' for i, slide in enumerate(sec['slides'])]
+    closing = [where for where, slide in order if slide['layout'] == 'closing']
+    p12 = [] if closing == [order[-1][0]] else [{'path': where, 'message': 'a closing slide that is not the last slide'} for where in closing if where != order[-1][0]]
+    if not order or order[-1][1]['layout'] != 'closing':
+        p12.append({'path': order[-1][0] if order else 'sections', 'message': 'the last slide must use the closing layout'})
+    report('P12', p12)
+
+    p13 = []
+    for where, slide in order:
+        for m in SELF_COUNT.finditer(slide['title']):
+            stated = int(m.group(1)) if m.group(1).isdigit() else NUMERALS[m.group(1)]
+            if stated != len(slide['points']):
+                p13.append({'path': f'{where}/title', 'message': f"title says {m.group(0)} but the slide has {len(slide['points'])} points"})
+    report('P13', p13)
+
+    points = [(f'{where}/points/{j}', where, point) for where, slide in order for j, point in enumerate(slide['points'])]
+    p14 = []
+    for n, (here, slide, point) in enumerate(points):
+        files = {src['path'] for src in point['sources']}
+        for there, other_slide, other in points[:n]:
+            if other_slide == slide or files != {src['path'] for src in other['sources']}:
+                continue
+            # Separators differ per side so a match never spans two runs of Chinese text.
+            key, other_key = '\0'.join(HAN.findall(point['text'])), '\1'.join(HAN.findall(other['text']))
+            run = SequenceMatcher(None, key, other_key, autojunk=False).find_longest_match(0, len(key), 0, len(other_key))
+            if run.size >= SHARED_RUN and key != other_key:
+                p14.append({'path': here, 'message': f"cites the same files as {there} and repeats “{key[run.a:run.a + run.size]}”; say it once"})
+                break
+    report('P14', p14)
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 0 if all(r['pass'] for r in results) else 1

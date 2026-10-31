@@ -33,7 +33,13 @@
     { "id": "P10", "type": "program", "source": "norm", "severity": "block", "locked": true,
       "rule": "同一条要点（去掉空白和标点后至少 12 个字）不在多页逐字重复" },
     { "id": "P11", "type": "program", "source": "norm", "severity": "block", "locked": true,
-      "rule": "发布文件名里写死的版本号，要和项目所有版本记录（package.json、RELEASE_NOTES.md、CHANGELOG.md 的首个标题）一致；记录本身不一致时不得写死版本号" }
+      "rule": "发布文件名里写死的版本号，要和项目所有版本记录（package.json、RELEASE_NOTES.md、CHANGELOG.md 的首个标题）一致；记录本身不一致时不得写死版本号" },
+    { "id": "P12", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "全稿最后一页用 closing 版式，且只有这一页用 closing" },
+    { "id": "P13", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "页标题里数本页条目的写法（“四个动作”“三步”）和本页要点条数一致；序数（“第一步”“下一步”）和描述对象的数量（“六个演示场景”）不算" },
+    { "id": "P14", "type": "program", "source": "norm", "severity": "block", "locked": true,
+      "rule": "不同页的两条要点引用同一组出处文件时，不能有连续 8 个以上相同的汉字（换了说法的重复）；英文词、命令和链接不算" }
   ],
   "program": { "run": "checks/check_outline.py", "schema": "checks/outline.schema.json" }
 }

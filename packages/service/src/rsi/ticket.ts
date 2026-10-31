@@ -13,7 +13,7 @@ export interface TicketItem {
   id: string; source: 'qa' | 'program'; raisedInRound: number; severity: 'must' | 'should'; where: string; problem: string;
   suggestion?: string; checkId?: string; evidence?: unknown[]; state: ItemState; log: TicketLog[];
 }
-export interface TicketProposal { id: string; kind: string; text: string; raisedInRound: number; state: 'open' | 'accepted' | 'rejected' | 'done' }
+export interface TicketProposal { id: string; kind: NonNullable<QualityReview['proposals']>[number]['kind']; text: string; raisedInRound: number; state: 'open' | 'accepted' | 'rejected' | 'done' }
 export interface Ticket {
   schemaVersion: 1; roleId: string; caseId: string; outline: 'outline.json'; status: TicketStatus;
   /** The executor round now under way; executor log entries carry it. */
@@ -61,8 +61,11 @@ export function applyReview(ticket: Ticket, round: number, review: QualityReview
   }
   review.issues.forEach((issue, index) => ticket.items.push({ id: `Q${round}-${index + 1}`, source: 'qa', raisedInRound: round, severity: issue.severity,
     where: issue.where, problem: issue.problem, suggestion: issue.suggestion, state: 'open', log: [{ round, by: 'qa', action: 'raised' }] }));
-  (review.proposals ?? []).forEach((proposal, index) => ticket.proposals.push({ id: `R${round}-${index + 1}`, kind: proposal.kind, text: proposal.text,
-    raisedInRound: round, state: 'open' }));
+  // A proposal QA repeats word for word is already on the ticket.
+  (review.proposals ?? []).forEach((proposal, index) => {
+    if (ticket.proposals.some(known => known.kind === proposal.kind && known.text === proposal.text)) return;
+    ticket.proposals.push({ id: `R${round}-${index + 1}`, kind: proposal.kind, text: proposal.text, raisedInRound: round, state: 'open' });
+  });
   ticket.history.push({ round, by: 'qa', action: 'reviewed', verdict: review.verdict, scores: review.scores, summary: review.summary });
 }
 
