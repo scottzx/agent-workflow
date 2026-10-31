@@ -378,6 +378,9 @@ A2A 网关增加版本化执行目标目录和任务台账。父任务与子任�
 - `remote_agent_*` 保留原参数、Task 和通知/ack，返回附加 jobId/attemptId；旧 Task 各迁移为独立任务，不按 context 合并。
 - 可选 `binding.driver=ppt_delivery` 使用独立领域模块推进项目脚本、制作、确定性校验、独立事实/逐页视觉复核及有限返工。父任务等待时仍为 working；它不把阶段调度加入通用台账。
 - `execution_inbox/ack` 处理领域交付通知，`execution_review` 独立记录绑定具体轮次、结果版本与 digest 的业务接受。角色通知使用独立 `execution-notice:` 标识，不伪造远端 A2A Task。
+- `ticket_*` 是执行者任务上的任务单，存在台账里，每次改动追加一条 `ticket.*` 事件（`execution_events` 可读）。宿主用 `ticket_open/checks/review/revise/close`，人或教练用 `ticket_proposal`，执行者用 `ticket_show/ticket_mark/ticket_submit` 按正在执行的轮次操作；越权调用直接被拒绝。执行者有三条路，走同一套逻辑，事件里的 `via` 记下走的哪条：DSH 原生工具（`dsh`）；DSH 给 ACP 智能体（Grok、Codex）的会话级 MCP 服务 `1agents-review`（`mcp`）；在执行者自己终端里跑的 `acp-service ticket pending|mark|submit --job ID`（`cli`，只给 jobId，按该任务当前这一轮执行）。人和教练的命令行：`acp-service ticket show|events|proposal --job ID`。角色的 `profile.json` 可以写 `training.layers`（`prompt` 必有，另可选 `skills`、`tools`、`model`）和 `training.presets`；训练 `tools` 或 `skills` 的角色不能用 ACP 预设跑 `rsi run`。
+- `execution_process_requests` / `execution_process_answer` 读取和回答任务上的过程请求（执行者超出预设的工具审批、计划），和工作台页面是同一条记录；`decidedBy` 记下是人还是教练（教练写明智能体会话），`note` 写理由。命令行：`acp-service process list|answer --job ID`，在教练智能体的终端里（Claude Code）运行就记成教练。`rsi run` 等待执行者时发现待处理的过程请求，会立刻在日志里写出编号、请求内容和教练回答用的命令。
+- `execution_unwatch` 记下发起方不再等待任务当前这一轮（等待超时，或发起方自己出错），执行轮次本身不变。工作台把这样的任务显示为“发起方已停止等待”，列在异常里，详情页有“重新查询”按钮，向执行宿主再查一次；任务其实已经结束的，就按结束后的状态显示。`rsi run` 查询状态失败时记一行日志并继续轮询，到这一轮的时限才停止等待，停止时（以及运行中途出错时）会调用它。
 
 通用 A2A 结果完成后，账本自动生成执行轮次内的 `resultRevision`（`result-1`、`result-2`…）和 `resultDigest`，由 `execution_get` 与 `remote_agent_get` 返回。digest 是规范化 JSON 的 SHA256，覆盖结果正文、结构化回执引用、产物链接和宿主返回的文件大小/SHA256 清单 `resultArtifacts`，不包含查询时间。没有文件清单时只绑定已返回的结果与链接，不能据此声称校验了文件字节。PPT 交付保留其领域生成的版本与 digest。
 

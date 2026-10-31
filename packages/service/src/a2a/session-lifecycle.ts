@@ -2,7 +2,7 @@
 import { z } from 'zod';
 
 export const sessionLifecycleSchema = z.object({
-  mode: z.enum(['persistent', 'one-shot']).default('persistent'),
+  mode: z.enum(['persistent', 'one-shot']).default('one-shot'),
   /** Omitted means 600 seconds. Zero disables idle close. Positive values override 600. */
   idleTtlSeconds: z.number().int().min(0).max(30 * 24 * 60 * 60).optional(),
   closeAfter: z.enum(['terminal', 'ack']).optional(),
@@ -31,13 +31,18 @@ export function normalizeLifecycle(value: unknown, defaultIdleTtlSeconds = 600):
   };
 }
 
+/** Jobs saved before one-shot became the default carry no lifecycle. They keep the persistent policy they ran under. */
+export function legacyLifecycle(defaultIdleTtlSeconds = 600): SessionLifecycle {
+  return { mode: 'persistent', idleTtlSeconds: defaultIdleTtlSeconds, closeAfter: 'terminal' };
+}
+
 export function isAcpAgentPreset(preset: string | undefined): boolean {
   return typeof preset === 'string' && preset.startsWith('oneagents-acp-');
 }
 
 /** One-shot only. Persistent idle close is the gateway's P3 scan, which also confirms remote status. */
 export function oneShotShouldClose(lifecycle: SessionLifecycle | undefined, state: string, acknowledged: boolean): boolean {
-  const policy = lifecycle ?? normalizeLifecycle(undefined);
+  const policy = lifecycle ?? legacyLifecycle();
   if (policy.mode !== 'one-shot' || !ONE_SHOT_TERMINAL_STATES.has(state)) return false;
   return policy.closeAfter === 'ack' ? acknowledged : true;
 }

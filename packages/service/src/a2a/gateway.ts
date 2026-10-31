@@ -20,13 +20,14 @@ import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
 import { artifactInstructions, defaultJobDirectory, defaultManifestPath } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
-import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
+import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
+import { invokeTicket, TICKET_METHODS } from '../execution/ticket.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
@@ -117,6 +118,11 @@ const executionEventsSchema = z.object({ ...originFields, jobId: string.optional
   limit: z.number().int().min(1).max(500).default(100) }).strict();
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
   reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
+const executionUnwatchSchema = executionJobSchema.extend({ reason: string }).strict();
+/** The coach answers an executor's process request: the same answer as the workbench page, naming who decided and why. */
+const processAnswerSchema = executionJobSchema.extend({ requestId: string, clientRequestId: string,
+  outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']), note: string.optional(), stopTask: z.literal(true).optional(),
+  decidedBy: z.object({ kind: z.enum(['person', 'coach']), agent: string.optional(), sessionId: string.optional() }).strict().optional() }).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
@@ -127,17 +133,21 @@ const EXECUTION_METHODS = {
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
   execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
   execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
+  execution_unwatch: { description: '发起方不再等待任务当前这一轮（等待超时，或自己出错），reason 写原因。执行轮次本身不变；工作台把它列为异常，可以之后重新查询执行宿主。', parameters: z.toJSONSchema(executionUnwatchSchema) },
+  execution_process_requests: { description: '读取任务上的过程请求（执行者的工具审批、提问、计划），含已回答的和谁回答的。', parameters: z.toJSONSchema(executionJobSchema) },
+  execution_process_answer: { description: '回答任务上的一条过程请求，和工作台页面同一记录；decidedBy 写明是人还是教练（教练写明所在的智能体会话），note 写理由。', parameters: z.toJSONSchema(processAnswerSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
+  ...TICKET_METHODS,
 };
 
 export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时保持 persistent；one-shot 在完成、失败或取消后普通关闭进程，runtime 仍是 persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，任务上返回 resumed: true；historyReplayed 只说明宿主是否把历史重新推给了它的客户端，不影响接回本身。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
   remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。mode 为 delete 时还删除 ACP 会话记录，之后不能接回；仅在网关配置 sessionLifecycle.allowDelete 时接受，否则返回 DELETE_DISABLED，不删除 DSH 会话历史。', parameters: z.toJSONSchema(closeSchema) },
   remote_agent_sessions: { description: '按 prewarm、job、user-opened 和未标注列出本机进程租约，并给出 taskSlot 与 processSlot。只读，不关闭、不补标已经在跑的进程。', parameters: z.toJSONSchema(sessionsSchema) },
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
@@ -850,7 +860,8 @@ export class RemoteAgentGateway {
       ...(meta?.taskSlot ? { taskSlot: meta.taskSlot } : {}),
       ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
       ...(meta?.resumed === true ? { resumed: true } : {}),
-      ...(meta?.restoreMethod === 'session/load' || meta?.restoreMethod === 'session/resume' ? { restoreMethod: meta.restoreMethod } : {}),
+      // Load and resume are one reattach; they differ only in whether the host replayed the transcript to its client.
+      ...(meta?.resumed === true && (meta.restoreMethod === 'session/load' || meta.restoreMethod === 'session/resume') ? { historyReplayed: meta.restoreMethod === 'session/load' } : {}),
       ...(typeof meta?.provider === 'string' && typeof meta.model === 'string' ? { provider: meta.provider, model: meta.model } : {}),
       ...(job.lifecycle ? { lifecycle: job.lifecycle } : {}),
       ...(job.sessionState ? { sessionState: job.sessionState } : {}),
@@ -1063,6 +1074,22 @@ export class RemoteAgentGateway {
     if (method === 'execution_review') {
       const { originSessionId, jobId, ...review } = executionReviewSchema.parse(params);
       return this.ledger.acceptance(originSessionId, jobId, review);
+    }
+    if (Object.hasOwn(TICKET_METHODS, method)) return invokeTicket(this.ledger, method, params);
+    if (method === 'execution_unwatch') {
+      const input = executionUnwatchSchema.parse(params);
+      this.ledger.unwatch(input.originSessionId, input.jobId, input.reason);
+      return this.ledgerView(input.originSessionId, input.jobId);
+    }
+    if (method === 'execution_process_requests') {
+      const input = executionJobSchema.parse(params);
+      this.ledger.get(input.originSessionId, input.jobId);
+      return { requests: this.workbenchTask(input.jobId).processRequests };
+    }
+    if (method === 'execution_process_answer') {
+      const { originSessionId, jobId, requestId, ...answer } = processAnswerSchema.parse(params);
+      this.ledger.get(originSessionId, jobId);
+      return (await this.answerProcessRequest(jobId, requestId, answer)).processRequests.find(request => request.requestId === requestId);
     }
     if (method === 'execution_inbox') {
       const { originSessionId } = inboxSchema.parse(params);
@@ -1307,8 +1334,9 @@ export class RemoteAgentGateway {
     await this.cancelExecution(stop.origin, jobId, undefined, stop.reason);
     return this.workbenchTask(jobId);
   }
-  private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle | undefined {
-    if (value === undefined) return previous;
+  /** A follow-up keeps its session's policy. A new task without one is one-shot. */
+  private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle {
+    if (value === undefined && previous) return previous;
     return normalizeLifecycle(value, this.config.sessionLifecycle.persistentIdleTtlSeconds);
   }
   /**
@@ -1331,7 +1359,7 @@ export class RemoteAgentGateway {
       if (jobs.some(job => !terminal.has(taskState(job)))) continue;
       const job = jobs.at(-1)!;
       if (!isAcpAgentPreset(job.agentPreset) || !job.sessionId || job.sessionState === 'closed' || job.sessionState === 'closing' || job.sessionState === 'deleted') continue;
-      const lifecycle = job.lifecycle ?? normalizeLifecycle(undefined, policy.persistentIdleTtlSeconds);
+      const lifecycle = job.lifecycle ?? legacyLifecycle(policy.persistentIdleTtlSeconds);
       if (lifecycle.mode !== 'persistent' || lifecycle.idleTtlSeconds === 0) continue;
       const ttlMs = lifecycle.idleTtlSeconds * 1000;
       const endedAt = Date.parse(Task.fromJSON(job.task).status?.timestamp ?? '');
@@ -1368,23 +1396,20 @@ export class RemoteAgentGateway {
       contexts.set(key, [...(contexts.get(key) ?? []), job]);
     }
     const closeReasons: Record<CloseReason, number> = { explicit: 0, 'one-shot': 0, 'idle-ttl': 0 };
-    const restoreMethods = { 'session/load': 0, 'session/resume': 0 };
+    let resumes = 0;
     let busy = 0, processReleasePending = 0;
     for (const jobs of contexts.values()) {
       if (jobs.some(job => !terminal.has(taskState(job)))) busy += 1;
       const last = jobs.at(-1)!;
       if (last.closeReason) closeReasons[last.closeReason] += 1;
       if (last.processReleased === 'pending') processReleasePending += 1;
-      for (const job of jobs) {
-        const method: unknown = Task.fromJSON(job.task).metadata?.['1agents']?.restoreMethod;
-        if (method === 'session/load' || method === 'session/resume') restoreMethods[method] += 1;
-      }
+      for (const job of jobs) if (Task.fromJSON(job.task).metadata?.['1agents']?.resumed === true) resumes += 1;
     }
     const current = [...this.inputRequiredAlerts.entries()].filter(([key]) => {
       const job = this.state.jobs.find(item => item.taskId === key.split('\0')[0]);
       return job !== undefined && taskState(job) === 'TASK_STATE_INPUT_REQUIRED' && Task.fromJSON(job.task).status?.timestamp === key.split('\0')[1];
     }).map(([, alert]) => alert);
-    return { busy, inputRequiredAlerts: current, closeReasons, restoreMethods, closeFailures: this.closeFailures, processReleasePending };
+    return { busy, inputRequiredAlerts: current, closeReasons, resumes, closeFailures: this.closeFailures, processReleasePending };
   }
   private taskAcknowledged(job: Job, state: string): boolean {
     return this.state.notices.some(record => record.acknowledged === true && record.notice.taskId === job.taskId
@@ -1406,6 +1431,10 @@ export class RemoteAgentGateway {
     } catch (error) {
       if (error instanceof RemoteAgentError && error.code === 'UNSUPPORTED') this.automaticCloseStopped.add(job.remote);
       else this.closeFailures += 1;
+      // The host has no such session, so there is nothing left to close. Record it once; retrying every reconcile never succeeds.
+      if (error instanceof RemoteAgentError && error.code === 'SESSION_NOT_FOUND') {
+        this.markClosed(this.jobsForClose({ originSessionId: job.originSessionId, remote: job.remote, contextId: job.contextId }), 'one-shot', 'pending');
+      }
       console.warn(`A2A session close failed session=${job.sessionId ?? ''} context=${job.contextId} task=${job.taskId} code=${error instanceof RemoteAgentError ? error.code : 'REMOTE_UNAVAILABLE'}`);
     }
   }

@@ -1,7 +1,7 @@
 # A2A 缺口收口方案
 
 - 日期：2026-10-27（Asia/Shanghai）。
-- 状态（2026-10-28 更新）：**P0、P1、P1.5、P3（含默认关闭的受控 delete）、G3 和 G9 已提交，并随 `workbench-a2a-e2e-20261027` 分支的构建部署到本机测试环境：网关 `com.1agents.a2a-gateway` 和 DSH web（`com.1agents.dsh-web`）里的插件都在跑这份代码。P2 的两项真机检查和上线后 24 小时观察还没做，分支未合并 main、未推送。G4、G5、G6、G8 未开始。** 进度见 §5.1，剩余事项见 §7。
+- 状态（2026-10-31 更新）：**P0–P3、G3 和 G9 已合进 `main` 和 `develop` 并推送，P2 的两项真机检查已通过。本机测试环境的网关 `com.1agents.a2a-gateway` 和 DSH web（`com.1agents.dsh-web`）在 2026-10-31 11:53 用当天 11:51 的 `develop` 构建重启过。当天 16:14 又换了 DSH web 的插件，补上关闭后的释放确认，并带上 `76125a84`。还剩一处断点：A2A 派单能用的进程名额太少。24 小时观察从 16:14 起才有意义。G4、G5、G6、G8 未开始。** 进度见 §5.1，剩余事项见 §7。
 - 依据：文档里仍写着未完成的 A2A 缺口，并在当日源码上核对过仍成立的部分。会话关闭的代码位置见 [2026-10-26 核对记录](a2a-session-lifecycle-close-resume-20261026.md)。该文第九节的待决定项以本文为准。补充结论来自 `packages/runtime` 的 `ensureSession`、`close` 和 `connectAndLoadSession`，以及 ACP 服务与 DSH 适配器的现有调用。
 - 源码基线：仓库 `@1agents/acp-service` **0.9.0**。2026-10-28 起本机测试环境运行的是这个版本号的本地构建（提交 `b3dc615`），不再是 0.8.3。
 
@@ -65,7 +65,7 @@ DSH 适配器已经接在这条路上。绑定保存 `sessionId`；链路不在�
 
 ## 2.2 persistent：从进程启动到这一轮答完
 
-这里只写 `oneagents-acp-*` 且网关生命周期为 persistent 的路径。`standard` 在准备阶段只建一条空白 DSH 会话，不启动 grok。grok-build 预热是另一条 `ensureSession`，不属于这次任务。下面前 10 步是当前 0.9.0 源码；答完之后的空闲关闭仍是方案，还没有写进代码。
+这里只写 `oneagents-acp-*` 且网关生命周期为 persistent 的路径。`standard` 在准备阶段只建一条空白 DSH 会话，不启动 grok。grok-build 预热是另一条 `ensureSession`，不属于这次任务。下面前 10 步是 2026-10-27 的 0.9.0 源码；答完之后的空闲关闭当时还是方案，已由 P3 实现（§5.1）。
 
 1. 网关收到 spawn。不传 `lifecycle` 就是 persistent。这一步不启动 grok。
 2. 任务名额在 `prepare()` 之前申请。不够时任务停在 `TASK_STATE_SUBMITTED`，调用方看到 Pending。任务名额和进程名额是两本账。
@@ -104,10 +104,10 @@ P1 必须同时包含第 1 行和第 2 行。只做关闭、不拆 60 秒时，�
 
 | 决定 | 选择 | 原因 |
 | --- | --- | --- |
-| 已关闭会话再收到 `remote_agent_message` | 默认沿用现有 message：DSH 按保存的 binding 做 `session/load` 或 `session/resume`，返回 `resumed: true` 和实际 `restoreMethod`。`autoResume: false` 时网关在调用远端前返回 `SESSION_CLOSED`，不发 `session/new` | 恢复已经在 runtime 和适配器里。网关只决定是否放行，并标明这次是重新附着 |
+| 已关闭会话再收到 `remote_agent_message` | 默认沿用现有 message：DSH 按保存的 binding 做 `session/load` 或 `session/resume`，返回 `resumed: true` 和实际 `restoreMethod`（2026-10-31 起对外合并为 `resumed`，`restoreMethod` 换成 `historyReplayed`，见 §8）。`autoResume: false` 时网关在调用远端前返回 `SESSION_CLOSED`，不发 `session/new` | 恢复已经在 runtime 和适配器里。网关只决定是否放行，并标明这次是重新附着 |
 | 网关 one-shot 的实现 | 终态后调用普通 `session/close`，也就是 runtime 的 release。继续使用 `ensureSession({ mode: "persistent" })`。不传 `discardPersistentState`，不调用 `prepareFreshSession`，不调用 `session/delete` | runtime 的 `oneshot` 会新建记录。本方案要的是关掉进程后仍能接回同一 ACP 会话 |
 | one-shot 何时关闭 | 默认进入 `COMPLETED`、`FAILED` 或 `CANCELED` 后关闭。`INPUT_REQUIRED` 不关。需要等主会话 ack 的调用显式传 `closeAfter: "ack"` | 容量被占的原因就是终态后进程还在。ack 可能很晚或不到。关闭后仍可按原 sessionId 附着 |
-| 默认生命周期 | 不传 `lifecycle` 仍是 persistent，不改成 one-shot。persistent 在回合结束并确认空闲后，默认再等 600 秒没有后续就普通 close。`idleTtlSeconds: 0` 不自动回收；正数覆盖 600 秒 | 多轮会话结束后也不能一直占名额。10 分钟留给同一次任务的追问。正在执行、等待输入、状态未知的不关。必须常驻的会话显式写 0 |
+| 默认生命周期 | **2026-10-31 改为：不传 `lifecycle` 就是 one-shot**，persistent 要显式传；之前保存、没有 lifecycle 的旧任务仍按 persistent（见 §8）。原决定：不传 `lifecycle` 仍是 persistent，不改成 one-shot。persistent 在回合结束并确认空闲后，默认再等 600 秒没有后续就普通 close。`idleTtlSeconds: 0` 不自动回收；正数覆盖 600 秒 | 多轮会话结束后也不能一直占名额。10 分钟留给同一次任务的追问。正在执行、等待输入、状态未知的不关。必须常驻的会话显式写 0 |
 | 适用预设 | 只关闭 `oneagents-acp-*` 拉起的 ACP 子进程。`standard` 收到 close 或 one-shot 时返回 `processReleased: true`、`acp: false`，不向 DSH 原生会话发 `session/close` | `standard` 没有 ACP 子进程。对它发 close 会关错对象 |
 | 容量排队时提前回收未到 TTL 的闲置会话 | 关闭 | 容量文档禁止为腾空间强杀。提前回收和强杀只差在「进程已空闲」，仍会打断调用方以为还在的会话 |
 | `delete` | 第一期接口不接受 `mode: "delete"`。后面要做时，网关配置 `sessionLifecycle.allowDelete` 默认 false，且不删除 DSH 原生会话历史 | 删除不能恢复。容量问题用 close 就够 |
@@ -338,16 +338,16 @@ P3 给 `INPUT_REQUIRED` 单独计时，初值 2 小时。到时写一条带 sess
 
 G8 不排进 P0–P3。
 
-### 5.1 实施进度（2026-10-28 更新）
+### 5.1 实施进度（2026-10-31 更新）
 
-全部改动已提交到分支 `workbench-a2a-e2e-20261027`（由 `a2a-gap-closure-20261027` 和 `a2a-g9-standard-model-20261027` 合入），未合并 main，未推送。
+改动先提交在分支 `workbench-a2a-e2e-20261027`（由 `a2a-gap-closure-20261027` 和 `a2a-g9-standard-model-20261027` 合入），之后合进 `main` 和 `develop`，均已推送到 `origin`（`scottzx/agent-workflow`）。两条线现在分叉：`develop` 上有 9 个提交不在 `main`（RSI 一串和 `76125a84`），`main` 上有 PR #3、#7 的合并提交不在 `develop`。`76125a84` 还没推送。
 
 | 期 | 状态 | 提交 | 说明 |
 | --- | --- | --- | --- |
 | P0 | 已提交、已部署 | `21acef5` | `retryCallbackBind` 只重试 `EADDRNOTAVAIL`；`/health` 带 `callback: "pending"`。2026-10-28 线上 `/health` 没有 pending，回调已绑定 |
 | P1 | 已提交、已部署 | `21acef5` | `remote_agent_close`、spawn/message 的 `lifecycle`、one-shot 终态关闭；宿主 `/sessions/close`、`/sessions/status`；DSH 适配器普通 `session/close`；进程名额等待移出 60 秒，任务保持 `CAPACITY_PENDING` |
 | P1.5 | 已提交、已部署 | `21acef5` | `taskSlot`、`processSlot.headWaitMs`；`remote_agent_sessions` 按来源列租约 |
-| P2 | 测试已覆盖，真机未查 | `21acef5` | 关闭后 message 接回同一会话并返回 `resumed`、`restoreMethod`；`autoResume: false`；删除与冲突不替换；满额时保持 Pending。`classifyColdAttach` 只记卡点。**真机的模型记忆检查和闲置数小时检查还没做** |
+| P2 | 已提交、已部署，真机检查通过 | `21acef5` | 关闭后 message 接回同一会话并返回 `resumed`、`restoreMethod`；`autoResume: false`；删除与冲突不替换；满额时保持 Pending。`classifyColdAttach` 只记卡点。真机检查见下文「P2 真机检查」 |
 | P3 | 已提交、已部署 | `21acef5`、`7e855ca` | 网关按 `sessionLifecycle.idleScanIntervalMs`（默认 60 秒）扫描。只处理 `oneagents-acp-*` 且整个 context 都已终态的会话；`status` 必须返回已附着且没有进行中的回合，查不到就不关。空闲从最后一轮的终态时间算起。时限：job 的 `idleTtlSeconds` 优先，否则 `sessionLifecycle.persistentIdleTtlSeconds`（默认 600）。`INPUT_REQUIRED` 超过 `inputRequiredAlertSeconds`（默认 7200）每轮只告警一次。`/health.sessions` 给出 busy、告警、按原因的关闭数、`restoreMethod` 计数、关闭失败数、`processReleasePending`。one-shot 补关沿用每次 reconcile 的重试，没有另设 30 秒。受控 delete：`remote_agent_close` 加 `mode: "delete"`，网关 `sessionLifecycle.allowDelete` 默认 false，未打开时返回 `DELETE_DISABLED` 且不联系远端。宿主 `/sessions/delete` 调 ACP `session/delete`，把 target 标成 `deleted`。进程已关时适配器只建裸连接发 delete，不重新附着、不拉起 agent。DSH 原生会话历史不删。之后 message 返回 `SESSION_DELETED`，网关和宿主两层都拒绝 |
 | G3 | 已提交、已部署 | `4fbc500` | 人审预览按文字稿实际页数校验，不再固定 6 页。原计划不并进本轮，实际已单独提交 |
 | G9 | 已提交、已部署 | `d7ad911` | 见 §4.10 末尾。spawn、message 可传 `provider`、`model`，仅限 `standard` 等非 ACP 预设；目录里没有则任务失败；不传保持宿主默认；回执带实际模型。DSH `selectModel` 会顺带改宿主默认模型 |
@@ -356,7 +356,20 @@ G8 不排进 P0–P3。
 
 网关配置里没有 `sessionLifecycle`，全部用默认值：空闲 600 秒回收，`INPUT_REQUIRED` 超过 7200 秒告警，`allowDelete` 关闭。
 
-2026-10-28 的一次 `/health` 读数（只是一次快照，不是观察结论）：`processSlot` 4 个用了 2 个，按空闲回收关闭 4 次、显式和 one-shot 关闭 0 次，`closeFailures` 0，`processReleasePending` 4。`processReleasePending` 不为 0 需要在 24 小时观察里跟进。
+2026-10-31 的部署：网关和 DSH web 里的包与当天 11:51 的本地构建逐字节一致，两个服务在 11:53、11:54 重启。15:24 提交的 `76125a84`（DSH 完全访问下放行 ACP 工具审批）晚于这次构建；16:14 只换 DSH web 的插件、重启 `com.1agents.dsh-web`，把它和释放确认一起带上。网关没有重新部署，它已有把 `true` 记成 `closed` 的逻辑。
+
+**P2 真机检查**（DSH web 插件，预设 `oneagents-acp-grok-build`，工作区 `ppt-beautifier`；两次都是只让模型记暗号、不调工具的任务，不回写生产任务）：
+
+| 日期 | 生命周期 | 过程 | 结果 |
+| --- | --- | --- | --- |
+| 2026-10-28 20:21 | one-shot | 任务完成后立即普通关闭，grok 进程退出，进程租约消失；随后 message | `resumed: true`、`restoreMethod: session/load`，答对暗号 |
+| 2026-10-29 | persistent，默认 600 秒 | 11:26 完成，11:37 按 `idle-ttl` 关闭，进程与租约在 2 秒内消失；11:38 追问接回后，新进程 11:49 再次按空闲关闭；14:50 追问，此时已关闭约 3 小时 | 同一 context 和 DSH 会话，`resumed: true`、`restoreMethod: session/load`，约 40 秒答对暗号；追问用上了预热进程 |
+
+结论：grok-build 在普通 close 后经 `session/load` 接回，模型记得上文，闲置 3 小时也一样；没有复现凉会话卡住，`ATTACH_STALLED` 暂不需要。样本只有这两次，技能 `references/a2a.md` 里「不保证模型在进程关闭后仍记得上文」的说法尚未改。
+
+**释放确认（2026-10-31 16:14 修复并部署）。** 修复前 DSH 适配器 `releaseSession` 在 ACP 会话上固定返回 `processReleased: 'pending'`，网关只有拿到 `true` 才把 `closing` 记成 `closed`，之后也不再复查：10-28 部署后检查过的 12 个 `oneagents-acp-*` 任务里，关闭的 11 个全部停在 `closing`，`/health` 的 `processReleasePending` 等于关闭总数（8）。现在 bridge 的 `close_session` 在关闭前读出运行时记录里的 agent pid，关闭后最多等 5 秒，确认进程已退出且没有进程租约再指向它，就回 `session_released`；`session/close` 据此在 `_meta['1agents']` 带 `processReleased: true`，插件原样交给网关。pid 未知或 5 秒内确认不了仍是 `pending`。部署后的一次 one-shot 任务（job `2427ffb0`）在答完约 2 秒内记成 `closed`、`processReleased: true`；追问经 `session/load` 接回、答对暗号，再次关闭也是 `closed`。`processReleasePending` 停在 8 没有再涨：这 8 个旧会话不会被回头改成 `closed`，往后看的是它的增量。
+
+**进程名额。** 2026-10-31 的 `/health`：`processSlot` 4 个用了 3 个，租约来源是 2 个 `user-opened`、1 个 `prewarm`，A2A 派单只剩 1 个名额。网关按设计不回收这两类。调用方也还没按 §8 传 one-shot：上面 12 个任务里只有 2 个是 one-shot，都是这次真机检查；其余靠 600 秒空闲回收，每个任务答完后多占一个名额 10 分钟。
 
 测试：2026-10-28 `packages/service` 412 项中 411 项通过。失败的「gateway shutdown cancels an in-flight Reader…」单独连跑 3 次都通过，属于负载下的时序抖动。插件 `service-process.test.mjs` 的「real Cordis startup failure」在本机仍失败，原因是正在运行的 DSH 占着默认 A2A 存储目录的租约，与这批改动无关。两者都会让 `pnpm test:integration` 退出码非 0。
 
@@ -368,13 +381,16 @@ G8 不排进 P0–P3。
 - 顺序是先换 DSH 插件并重启 DSH，再换网关并重启网关。重启 DSH 会停掉当时正在跑的会话。窗口选在口播批次的空档，重启前单独确认。本文不执行这次重启。
 - 上线后看 24 小时：闲置 attached 数、`process_release_pending`、进程名额 FIFO 队首等待、`taskSlot` 与 `processSlot`，以及停在 `INPUT_REQUIRED` 超过 2 小时的数量。这些数没有采集前，不宣称容量问题已经消失。封面投递不在这次观察里。
 
-## 7. 还没完成的事（2026-10-28 更新）
+## 7. 还没完成的事（2026-10-31 更新）
 
 | 事项 | 状态 | 下一步 |
 | --- | --- | --- |
-| P2 真机检查 | 未做 | 关闭后接回同一会话，确认模型记得之前的上下文；闲置数小时后再接回一次 |
-| 上线后 24 小时观察 | 未做 | 按 §6 的指标采集，重点看 `processReleasePending`。没有数据前不宣称容量问题已经消失 |
-| 合并与发布 | 未合并 main、未推送 | 分支上还有工作台的提交，以及另一会话提交的 `2ad0486`（chat-view、file-preview），合并前一起核对 |
+| 释放确认 | 已修复并部署（2026-10-31 16:14） | 见 §5.1。旧的 8 个 `closing` 不回头改 |
+| A2A 可用进程名额 | 已放宽（2026-10-31 16:40） | 硬件估算的 4/8 偏保守。dsh-web 和 a2a-gateway 两个 plist 都加了 `ACP_CAPACITY_SOFT_LIMIT=8`、`ACP_CAPACITY_HARD_LIMIT=12`，`policy.json` 已改写为 8/12；任务名额也随 soft 变成 8。内存检查不变。调用方传 one-shot、网关默认 one-shot 两项暂不做 |
+| DSH 完全访问下 ACP 工具被拒 | 已部署（2026-10-31 16:14），线上未复现验证，未推送 | `76125a84`：会话切到 `danger-full-access` 后审批策略变成 never，Grok 的 `terminal/create` 在 1 毫秒内被记成 rejected。修复后插件看到该沙箱模式直接放行 |
+| 上线后 24 小时观察 | 未做，可以开始 | 从 2026-10-31 16:14 起按 §6 的指标采集。`processReleasePending` 看相对 8 的增量 |
+| P2 真机检查 | 已通过 | 见 §5.1。要不要据此改技能里「不保证模型记得上文」的说法，单独决定 |
+| 合并与发布 | 已合进 `main`、`develop` 并推送 | `main` 与 `develop` 已分叉，下一次合并时互相合回。`76125a84` 未推送 |
 | G4 报告交付与通用交付接点 | 未开始 | 扩展计划 P1–P2。G3 已修，PPT 人审这道前置可以重新评估 |
 | G5 workflow Provider、DAG、AP 投影 | 保持未实现 | 账本方案已把它们标成可选，现有派单不依赖它们 |
 | G6 一键 cwd 与自动登记 | 保持手填 | 若要做，只填本次任务 cwd，不登记目标、不导入历史会话 |
@@ -385,11 +401,12 @@ G8 不排进 P0–P3。
 
 ## 8. 调用约定（P1 上线之后）
 
-- 使用 `oneagents-acp-*` 的口播、报告、单次检查，在 spawn 时传 `lifecycle: { "mode": "one-shot" }`，并使用默认的 `closeAfter: "terminal"`。口播验收看文件，返工在本地重渲染，不依赖模型还记得上文。不改成 `ack`：漏掉 ack 时进程会继续占名额。
+- 2026-10-31 起不传 `lifecycle` 就是 one-shot（`closeAfter: "terminal"`）：答完立即普通关闭进程、释放名额，追问经 `session/load` 接回。口播、报告、单次检查不用再传。口播验收看文件，返工在本地重渲染，不依赖模型还记得上文。不改成 `ack`：漏掉 ack 时进程会继续占名额。
 - 这只安排终态后的普通 close，runtime 仍是 `persistent`。
-- `standard` 预设不必传 one-shot。它没有 ACP 子进程，传了也只返回 `acp: false`。G9 部署后可以在 spawn 传 `provider`、`model` 指定模型，回执里看实际使用的模型；不传仍用 DSH 当时的默认模型。不要把模型名写进 prompt。部署前这条派单仍选不到 DeepSeek。
-- 需要多轮追问的用 persistent。回合结束并空闲满 10 分钟后自动关闭；10 分钟内的追问仍在原进程上。用完也可以立刻 `remote_agent_close`。必须常驻的写 `idleTtlSeconds: 0`。P3 源码已实现这 10 分钟回收，但在部署前不会生效，用完仍要自己 close。
-- 追问已关闭会话直接 `remote_agent_message`，看 `resumed`。必须确认模型还记得上文时，先看技能里的实测结论；没有结论就从文件接续。
+- `standard` 预设不必传 one-shot。它没有 ACP 子进程，传了也只返回 `acp: false`。G9 部署后可以在 spawn 传 `provider`、`model` 指定模型，回执里看实际使用的模型；不传仍用 DSH 当时的默认模型。不要把模型名写进 prompt。
+- 进程必须留着等追问的，显式传 `lifecycle: { "mode": "persistent" }`。回合结束并空闲满 10 分钟后自动关闭；10 分钟内的追问仍在原进程上。用完也可以立刻 `remote_agent_close`。必须常驻的写 `idleTtlSeconds: 0`。
+- 追问已关闭会话直接 `remote_agent_message`，看 `resumed`。grok-build 两次真机检查里模型都记得上文（§5.1），但样本少；结论必须可靠时仍从文件接续。
+- 接回只有一个概念：`resumed: true`。`session/load` 与 `session/resume` 走同一个接回函数，区别只是宿主要不要把历史重新推给它的客户端，所以 get 里给的是 `historyReplayed`，`/health` 只给一个 `resumes` 计数（2026-10-31 起，替代 `restoreMethod` 和 `restoreMethods`）。模型能不能记得上文取决于 agent 端会话被加载回来，与这个字段无关。
 - 不用 cancel 释放已完成任务，也不为腾容量重启 DSH。
 
 本方案不修改生产配置、不派模型任务、不重启 a2a-gateway 或 DSH。

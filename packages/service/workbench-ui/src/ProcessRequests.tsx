@@ -245,6 +245,7 @@ export function ProcessRequestPanel({
                                 {request.kind === 'permission' && request.answer?.outcome === 'approved' && ` · ${text('已允许', 'Allowed')}`}
                                 {request.kind === 'permission' && request.answer?.outcome === 'rejected' &&
                                     ` · ${request.answer.stopTask ? text('已拒绝并停止任务', 'Rejected and stopped the task') : text('已拒绝', 'Rejected')}`}
+                                {request.answer?.decidedBy?.kind === 'coach' && ` · ${text('教练决定', 'Decided by the coach')}`}
                                 {request.answer?.note && ` · ${request.answer.note}`}
                             </small>
                         )}

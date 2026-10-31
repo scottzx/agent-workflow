@@ -186,22 +186,24 @@ test('startup estimates expire without expiring live leases or unknown pending p
     writeFileSync(path, JSON.stringify(record));
   }
   assert.equal((await governor.snapshot('task')).used, 1);
+  // Only the process that never registered a child keeps its startup estimate; the task holds none.
   assert.equal((await governor.snapshot('task')).memory.startupReservedBytes, 100);
   assert.equal((await governor.snapshot('process')).used, 2);
   assert.equal((await governor.snapshot('process')).memory.startupReservedBytes, 100);
   await Promise.all([taskLease.release(), spawned.release(), pending.release()]);
 });
 
-test('startup memory is shared across task and process ledgers without cross-kind overspending', async t => {
+test('a task start holds no startup memory, so its ACP process is not charged twice', async t => {
   const { governor } = fixture(t, { softLimit: 4, hardLimit: 5, memoryReserveBytes: 100, estimatedInstanceBytes: 300,
     memoryProvider: () => ({ totalBytes: 1000, availableBytes: 400 }) });
-  const results = await Promise.allSettled([governor.acquire(auto('task', 'task')), governor.acquire(auto('process', 'process'))]);
-  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
-  const rejected = results.find(result => result.status === 'rejected') as PromiseRejectedResult;
-  assert.ok(code('ACP_CAPACITY_MEMORY_LIMIT')(rejected.reason));
-  const acquired = results.find(result => result.status === 'fulfilled') as PromiseFulfilledResult<Awaited<ReturnType<CapacityGovernor['acquire']>>>;
-  await acquired.value.release();
-  const next = await governor.acquire(auto('process', 'later-process')); await next.release();
+  const task = await governor.acquire(auto('task', 'task'));
+  assert.equal((await governor.snapshot('process')).memory.startupReservedBytes, 0);
+  const child = await governor.acquire(auto('process', 'its-process'));
+  assert.equal((await governor.snapshot('task')).memory.startupReservedBytes, 300);
+  // Process starts still share one budget: a second start in the window has no memory left.
+  await assert.rejects(governor.acquire(auto('process', 'another-process')), code('ACP_CAPACITY_MEMORY_LIMIT'));
+  await assert.rejects(governor.acquire(auto('task', 'another-task')), code('ACP_CAPACITY_MEMORY_LIMIT'));
+  await Promise.all([task.release(), child.release()]);
 });
 
 test('active host policy cannot be raised or changed by another governor and can change after draining', async t => {

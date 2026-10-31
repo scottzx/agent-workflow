@@ -72,7 +72,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         closedSessions.push(params.sessionId);
         await streamConfig.beforeClose?.();
         if (streamConfig.closeError) throw new RequestError(streamConfig.closeError.code, streamConfig.closeError.message, streamConfig.closeError.data);
-        return {};
+        return streamConfig.closeResult ?? {};
       })
       .onRequest('session/delete', ({ params }) => { deletedSessions.push(params.sessionId); return {}; })
       .onRequest('session/load', async ({ params }) => {
@@ -386,6 +386,15 @@ test('main session streams ACP output, surfaces approval, and retains remote ide
   await collect(f.adapter, f.options('message-2'));
   assert.deepEqual(f.counts(), { creations: 1, executions: 2, permissions: 2 });
   await assert.rejects(collect(f.adapter, { ...f.options('message-3'), model: 'grok-build' }), /matching Agent preset/);
+});
+
+test('full access allows ACP tool permissions without asking DSH approval', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  const stateOf = f.ctx.sessionProjections.stateOf;
+  f.ctx.sessionProjections.stateOf = (session, key) => key === 'sandboxMode' ? 'danger-full-access' : stateOf(session, key);
+  await collect(f.adapter, f.options('message-1'));
+  assert.deepEqual(f.permissionResults, [{ outcome: 'selected', optionId: 'once' }]);
+  assert.equal(f.counts().permissions, 0);
 });
 
 test('reconnect replays missing output and reuses the prompt id without duplicate execution', { timeout: 5000 }, async t => {
@@ -1077,4 +1086,11 @@ test('release keeps the binding and delete reaches a detached session without re
   assert.deepEqual(f.deletedSessions, ['remote-1']);
   assert.equal(f.attaches.length, attaches);
   await assert.rejects(f.adapter.deleteSession('missing'), error => error.code === 'SESSION_NOT_FOUND');
+});
+
+test('release reports the process released only when the service confirms it', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], { closeResult: { _meta: { '1agents': { processReleased: true } } } });
+  await collect(f.adapter, f.options('message-1'));
+  assert.deepEqual(await f.adapter.releaseSession('dsh-session'), { processReleased: true, acp: true });
+  assert.deepEqual(f.closedSessions, ['remote-1']);
 });

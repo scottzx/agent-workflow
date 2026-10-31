@@ -205,6 +205,12 @@ export class CapacityQueue {
     };
   }
 
+  /** True while a process lease still names this child pid. */
+  async holdsChild(pid: number): Promise<boolean> {
+    const { sessions } = await this.governor.inspect();
+    return Object.values(sessions).some(rows => rows.some(row => row.childPid === pid));
+  }
+
   /** Drop this process's queued entry. A lease already returned to the caller is not released here. */
   async cancel(request: { id: string; kind: CapacityRequest['kind'] }): Promise<boolean> {
     if (typeof request.id !== 'string' || !request.id.trim() || request.id.length > 4096) throw new Error('Invalid ACP capacity request');

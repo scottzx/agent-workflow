@@ -319,7 +319,7 @@ test('one-shot closes after complete, failure, or cancel and leaves other work o
   await pause(200);
   assert.equal(backend.closes.length, 1);
 
-  const kept = await gateway.invoke('remote_agent_spawn', { ...spawn, originSessionId: 'parent-close-keep', agentPreset: 'oneagents-acp-codex' }) as Record<string, unknown>;
+  const kept = await gateway.invoke('remote_agent_spawn', { ...spawn, originSessionId: 'parent-close-keep', agentPreset: 'oneagents-acp-codex', lifecycle: { mode: 'persistent' } }) as Record<string, unknown>;
   await until(async () => backend.runs.length, value => value === 3);
   backend.runs[2]!.finish({ outcome: 'completed', text: 'stay open' });
   await until(() => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-close-keep', taskId: kept.taskId }) as Promise<Record<string, unknown>>, value => value.state === 'TASK_STATE_COMPLETED');
@@ -379,6 +379,56 @@ test('one-shot closes after complete, failure, or cancel and leaves other work o
     return true;
   });
   await assert.rejects(() => gateway.invoke('remote_agent_close', { ...locate, taskId: acp.taskId, contextId: acp.contextId }), (error: unknown) => error instanceof RemoteAgentError && error.code === 'SESSION_CONFLICT');
+});
+
+test('a one-shot close the host cannot find is recorded once instead of retried every reconcile', { timeout: 20_000 }, async t => {
+  // The follow-up lands on a fresh host session, so the gateway's recorded session no longer matches the host target.
+  class Rebinding extends ClosingBackend {
+    override async prepare(input: A2APrepareInput): Promise<A2ATarget> { return { ...await super.prepare(input), sessionId: `session-${Math.random()}` }; }
+  }
+  const backend = new Rebinding();
+  const f = await fixture(t, backend);
+  const gateway = f.gateway();
+  t.after(() => gateway.close());
+  const locate = { remote: 'wsl', originSessionId: 'parent-lost-session' };
+  const first = await gateway.invoke('remote_agent_spawn', { ...spawn, ...locate, agentPreset: 'oneagents-acp-codex' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 1);
+  backend.runs[0]!.finish({ outcome: 'completed', text: 'done' });
+  await until(() => gateway.invoke('remote_agent_get', { ...locate, taskId: first.taskId }) as Promise<Record<string, unknown>>, value => value.sessionState === 'closing');
+  const next = await gateway.invoke('remote_agent_message', { ...locate, taskId: first.taskId, prompt: 'again' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 2);
+  await gateway.invoke('remote_agent_cancel', { ...locate, taskId: next.taskId });
+  const lost = await until(() => gateway.invoke('remote_agent_get', { ...locate, taskId: next.taskId }) as Promise<Record<string, unknown>>,
+    value => value.state === 'TASK_STATE_CANCELED' && value.sessionState === 'closing');
+  assert.equal(lost.processReleased, 'pending');
+  await pause(500);
+  assert.equal(gateway.lifecycleReport().closeFailures, 1);
+  assert.equal(backend.closes.length, 1);
+});
+
+test('a task without lifecycle is one-shot and its follow-up keeps that policy; jobs saved without one stay persistent', { timeout: 20_000 }, async t => {
+  assert.equal(normalizeLifecycle(undefined).mode, 'one-shot');
+  assert.equal(normalizeLifecycle({ idleTtlSeconds: 60 }).mode, 'one-shot');
+  assert.equal(oneShotShouldClose(undefined, 'TASK_STATE_COMPLETED', true), false);
+  const backend = new ClosingBackend();
+  const f = await fixture(t, backend);
+  const gateway = f.gateway();
+  t.after(() => gateway.close());
+  const locate = { remote: 'wsl', originSessionId: 'parent-default-one-shot' };
+  const first = await gateway.invoke('remote_agent_spawn', { ...spawn, ...locate, agentPreset: 'oneagents-acp-codex' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 1);
+  backend.runs[0]!.finish({ outcome: 'completed', text: 'done' });
+  const closed = await until(() => gateway.invoke('remote_agent_get', { ...locate, taskId: first.taskId }) as Promise<Record<string, unknown>>,
+    value => value.state === 'TASK_STATE_COMPLETED' && value.sessionState === 'closing');
+  assert.equal((closed.lifecycle as { mode: string }).mode, 'one-shot');
+  assert.equal(backend.closes.length, 1);
+  const next = await gateway.invoke('remote_agent_message', { ...locate, taskId: first.taskId, prompt: 'again' }) as Record<string, unknown>;
+  await until(async () => backend.runs.length, value => value === 2);
+  backend.runs[1]!.finish({ outcome: 'completed', text: 'again done' });
+  const again = await until(() => gateway.invoke('remote_agent_get', { ...locate, taskId: next.taskId }) as Promise<Record<string, unknown>>,
+    value => value.state === 'TASK_STATE_COMPLETED' && value.sessionState === 'closing');
+  assert.equal((again.lifecycle as { mode: string }).mode, 'one-shot');
+  assert.equal(backend.closes.length, 2);
 });
 
 test('a host without close stays open and reports UNSUPPORTED', { timeout: 20_000 }, async t => {
@@ -485,7 +535,9 @@ test('a closed session message reattaches the same session and a jumped idle clo
   const follow = await gateway.invoke('remote_agent_message', { remote: 'wsl', originSessionId, taskId: first.taskId, prompt: 'continue after idle' }) as Record<string, unknown>;
   const view = await until(() => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId, taskId: follow.taskId }) as Promise<Record<string, any>>, value => value.state === 'TASK_STATE_COMPLETED' && value.resumed === true);
   assert.equal(view.sessionId, 'dsh-kept');
-  assert.equal(view.restoreMethod, 'session/load');
+  assert.equal(view.restoreMethod, undefined);
+  assert.equal(view.historyReplayed, true);
+  assert.equal(gateway.lifecycleReport().resumes, 1);
   assert.equal(backend.prepares[1]?.sessionId, 'dsh-kept');
   assert.equal(backend.runs.length, 2);
   assert.equal(classifyColdAttach({ enqueued: true, attach: 'done', turnStarted: true, activeTurn: false }), 'activeTurn');
@@ -554,7 +606,8 @@ test('persistent ACP sessions close after a confirmed idle TTL and stay open oth
   f.gateways.add(gateway);
   const finish = async (originSessionId: string, extra: Record<string, unknown> = {}, outcome: A2ARunResult = { outcome: 'completed', text: 'done' }) => {
     const count = backend.runs.length;
-    const task = await gateway.invoke('remote_agent_spawn', { ...spawn, originSessionId, agentPreset: 'oneagents-acp-codex', ...extra }) as Record<string, unknown>;
+    // Persistent is opt-in since one-shot became the default.
+    const task = await gateway.invoke('remote_agent_spawn', { ...spawn, originSessionId, agentPreset: 'oneagents-acp-codex', lifecycle: { mode: 'persistent' }, ...extra }) as Record<string, unknown>;
     await until(async () => backend.runs.length, value => value === count + 1);
     backend.runs[count]!.finish(outcome);
     await until(() => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId, taskId: task.taskId }) as Promise<Record<string, unknown>>,

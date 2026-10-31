@@ -1,8 +1,9 @@
 /**
  * Manual takeover hand-back. A person finishes an A2A task in its DSH session; when they are satisfied the
  * agent calls submit_to_review, the host re-verifies the job's artifacts and the gateway records a new result
- * revision awaiting business acceptance. Native DSH agents get a tool; ACP agents get a one-tool stdio MCP
- * server whose calls come back here over loopback, each bound to its own session by an HMAC token.
+ * revision awaiting business acceptance. Native DSH agents get a tool; ACP agents get a stdio MCP server whose
+ * calls come back here over loopback, each bound to its own session by an HMAC token. The same server carries the
+ * executor's ticket tools for an A2A task session, so an ACP executor handles its ticket like a native one.
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
@@ -12,6 +13,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { McpServerStdio } from '@agentclientprotocol/sdk';
 import type { A2AHostControls } from './a2a.js';
+import { TICKET_PATH, TICKET_TOOLS, type TicketTool } from './ticket-spec.js';
 
 export const SUBMIT_TOOL = 'submit_to_review';
 export const SUBMIT_DESCRIPTION = '仅用于从 A2A 工作台接管的会话：用户明确确认成果没问题后调用，把本会话 A2A 任务的交付总结与作业目录 artifacts.json 清单中的产物重新提交回工作流，生成新的结果版本并进入业务验收。调用前先把产物写入作业目录并更新清单；用户未确认时不要调用。';
@@ -60,30 +62,38 @@ export class ReviewHandBack {
 
   private token(sessionId: string): string { return createHmac('sha256', this.secret).update(sessionId).digest('base64url'); }
 
-  /** The stdio MCP server an ACP agent starts for one session; the token only submits that session. */
+  /** The stdio MCP server an ACP agent starts for one session; the token only acts for that session. */
   mcpServer(sessionId: string, origin: string): McpServerStdio {
     return { name: '1agents-review', command: process.execPath, args: [MCP_SCRIPT], env: [
       { name: 'ONEAGENTS_REVIEW_URL', value: new URL(REVIEW_SUBMIT_PATH, origin).href },
+      { name: 'ONEAGENTS_TICKET_URL', value: new URL(TICKET_PATH, origin).href },
       { name: 'ONEAGENTS_REVIEW_SESSION', value: sessionId },
       { name: 'ONEAGENTS_REVIEW_TOKEN', value: this.token(sessionId) },
     ] };
   }
 
-  /** Loopback callback from the MCP server. */
-  readonly handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    const reply = (status: number, body: unknown) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
-    if (req.method !== 'POST') return reply(405, { error: 'Method not allowed' });
-    if (!loopback(req.socket.remoteAddress) || req.headers.origin) return reply(403, { error: 'Forbidden' });
+  /** A loopback call from the MCP server, checked against its session's token; replies itself and returns nothing when refused. */
+  private async authorized(req: IncomingMessage, reply: (status: number, body: unknown) => void): Promise<{ sessionId: string; body: Record<string, unknown> } | undefined> {
+    if (req.method !== 'POST') return void reply(405, { error: 'Method not allowed' });
+    if (!loopback(req.socket.remoteAddress) || req.headers.origin) return void reply(403, { error: 'Forbidden' });
     const sessionId = req.headers['x-oneagents-session'], authorization = req.headers.authorization;
-    if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 256 || !authorization?.startsWith('Bearer ')) return reply(401, { error: 'Unauthorized' });
+    if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 256 || !authorization?.startsWith('Bearer ')) return void reply(401, { error: 'Unauthorized' });
     const expected = Buffer.from(this.token(sessionId)), given = Buffer.from(authorization.slice(7));
-    if (expected.length !== given.length || !timingSafeEqual(expected, given)) return reply(401, { error: 'Unauthorized' });
-    let summary: unknown;
+    if (expected.length !== given.length || !timingSafeEqual(expected, given)) return void reply(401, { error: 'Unauthorized' });
     try {
       let body = '';
       for await (const chunk of req) { body += String(chunk); if (body.length > 96 * 1024) throw new Error('too large'); }
-      summary = (JSON.parse(body) as { summary?: unknown }).summary;
-    } catch { return reply(400, { error: 'Invalid request' }); }
+      const parsed: unknown = JSON.parse(body);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+      return { sessionId, body: parsed as Record<string, unknown> };
+    } catch { return void reply(400, { error: 'Invalid request' }); }
+  }
+
+  /** Loopback callback from the MCP server. */
+  readonly handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const reply = replier(res), call = await this.authorized(req, reply);
+    if (!call) return;
+    const { sessionId } = call, summary = call.body.summary;
     if (typeof summary !== 'string') return reply(400, { error: 'summary must be a string' });
     try { reply(200, { text: await this.submit(sessionId, summary) }); }
     catch (error) {
@@ -91,4 +101,20 @@ export class ReviewHandBack {
       reply(typeof code === 'string' ? 409 : 500, { error: error instanceof Error ? error.message : String(error), ...(typeof code === 'string' ? { code } : {}) });
     }
   };
+
+  /** The MCP server's ticket tools for its session; `run` is the same call DSH's native tools make. */
+  ticketHandler(run: (sessionId: string, tool: TicketTool, args: Record<string, unknown>) => Promise<string>) {
+    return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const reply = replier(res), call = await this.authorized(req, reply);
+      if (!call) return;
+      const tool = TICKET_TOOLS.find(spec => spec.name === call.body.tool)?.name, args = call.body.arguments ?? {};
+      if (!tool || typeof args !== 'object' || Array.isArray(args)) return reply(400, { error: 'Unknown ticket tool or invalid arguments' });
+      try { reply(200, { text: await run(call.sessionId, tool, args as Record<string, unknown>) }); }
+      catch (error) { reply(409, { error: error instanceof Error ? error.message : String(error) }); }
+    };
+  }
 }
+
+const replier = (res: ServerResponse) => (status: number, body: unknown) => {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body));
+};

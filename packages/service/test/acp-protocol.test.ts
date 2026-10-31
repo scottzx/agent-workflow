@@ -60,7 +60,7 @@ async function fixture(t: test.TestContext) {
         const session = sessions.get(id)!; session.activeTurn = null;
         emit({ event: 'done', stopped: true }); pending.delete(id);
       } else if (command.action === 'close_session') {
-        sessions.delete(id);
+        if (sessions.delete(id)) emit({ event: 'session_released', processReleased: !String(records.get(id)?.cwd).includes('unconfirmed-') });
       }
     },
   };
@@ -110,7 +110,14 @@ test('official ACP client creates, prompts, replays and resumes without replay',
   await assert.rejects(b.connection.agent.request('session/prompt', { sessionId, prompt: [] }), /not attached/);
   const wrong = await f.connect(undefined, 'grok-build');
   await assert.rejects(wrong.connection.agent.request('session/resume', { sessionId, cwd: '/tmp', mcpServers: [] }), { code: -32602 });
-  await c.connection.agent.request('session/close', { sessionId });
+  assert.deepEqual(await c.connection.agent.request('session/close', { sessionId }), { _meta: { '1agents': { processReleased: true } } });
+});
+
+test('session/close carries no release confirmation when the bridge could not confirm it', async t => {
+  const f = await fixture(t); const a = await f.connect();
+  const cwd = mkdtempSync(join(tmpdir(), 'unconfirmed-')); t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd, mcpServers: [] });
+  assert.deepEqual(await a.connection.agent.request('session/close', { sessionId }), {});
 });
 
 test('tool observations preserve ACP titles, structured output and sparse update semantics through replay', async t => {

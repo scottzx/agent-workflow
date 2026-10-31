@@ -532,3 +532,29 @@ test('every task is told where to put artifacts, per job and per attempt, unless
   const got = await until(() => gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: first.taskId }) as Promise<any>, item => item.state === 'TASK_STATE_COMPLETED');
   assert.deepEqual(got.resultMetadata.artifacts, [], 'no manifest means no artifacts, and the task still completes');
 });
+
+test('the task ticket lives on the job: the gateway enforces each actor at the call and execution_events shows every step', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const job = await gateway.invoke('execution_submit', submit) as any, scope = { originSessionId: 'root', jobId: job.jobId };
+  await until(async () => f.backend.runs.length, count => count === 1);
+  await gateway.invoke('ticket_open', { ...scope, roleId: 'role', caseId: 'demo' });
+  await gateway.invoke('ticket_checks', { ...scope, results: [{ itemId: 'P2', pass: false, evidence: [] }] });
+  await gateway.invoke('ticket_revise', scope);
+  const executor = { jobId: job.jobId, attemptId: job.attemptId, sessionId: job.sessionId };
+  await assert.rejects(gateway.invoke('ticket_mark', { ...executor, sessionId: 'another-session', itemId: 'P1-P2', state: 'done', note: '改了' }), /不是执行这一轮的会话/,
+    'the session the host reported for the attempt is the only one that may act as its executor');
+  await assert.rejects(gateway.invoke('ticket_submit', executor), /还有 1 条没处理/);
+  await gateway.invoke('ticket_mark', { ...executor, itemId: 'P1-P2', state: 'done', note: '改了' });
+  assert.equal((await gateway.invoke('ticket_submit', executor) as any).status, 'ready_for_review');
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'done' });
+  await until(() => gateway.invoke('execution_get', scope) as Promise<any>, item => item.executionStatus === 'completed');
+  await assert.rejects(gateway.invoke('ticket_show', executor), /已经结束/, 'a finished round no longer acts on the ticket');
+  await assert.rejects(gateway.invoke('ticket_get', { originSessionId: 'outsider', jobId: job.jobId }), /not found/);
+  const events = (await gateway.invoke('execution_events', scope) as any).events.filter((event: any) => event.type.startsWith('ticket.'));
+  assert.deepEqual(events.map((event: any) => event.type), ['ticket.opened', 'ticket.item_raised', 'ticket.checked', 'ticket.revision_started', 'ticket.item_marked', 'ticket.submitted']);
+  assert.deepEqual([events[4].data.actor, events[4].data.sessionId, events[4].attemptId], ['executor', job.sessionId, job.attemptId]);
+  await gateway.close();
+  const restarted = f.gateway();
+  assert.equal((await restarted.invoke('ticket_get', scope) as any).status, 'ready_for_review', 'the ticket is persisted with the ledger');
+  assert.equal((await restarted.invoke('ticket_close', { ...scope, status: 'closed', stopReason: 'passed' }) as any).status, 'closed');
+});

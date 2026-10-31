@@ -8,6 +8,9 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { workbenchHandler } from '../dist/workbench.js';
 import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_TOOL } from '../dist/review.js';
+import { TICKET_PATH } from '../dist/ticket-spec.js';
+import { runTicketTool } from '../dist/ticket-tools.js';
+import { bindA2AExecution, unbindA2AExecution } from '@1agents/acp-service/a2a';
 
 async function listen(t, handler) {
   const server = createServer((req, res) => { void Promise.resolve(handler(req, res)).catch(error => { res.writeHead(500); res.end(String(error)); }); });
@@ -93,7 +96,7 @@ test('an ACP agent hands its session back through the stdio MCP server, bound to
   const rpc = async (id, method, params) => { child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`); return JSON.parse((await lines.next()).value); };
   assert.equal((await rpc(1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } })).result.protocolVersion, '2025-06-18');
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
-  assert.deepEqual((await rpc(2, 'tools/list')).result.tools.map(tool => tool.name), [SUBMIT_TOOL]);
+  assert.deepEqual((await rpc(2, 'tools/list')).result.tools.map(tool => tool.name), [SUBMIT_TOOL, 'ticket_show', 'ticket_mark', 'ticket_submit']);
   const called = await rpc(3, 'tools/call', { name: SUBMIT_TOOL, arguments: { summary: '人工修订完成' } });
   assert.equal(called.result.isError, undefined);
   assert.match(called.result.content[0].text, /job-1/);
@@ -114,4 +117,37 @@ test('an ACP agent hands its session back through the stdio MCP server, bound to
   // The secret survives a host restart, so a running agent's token stays valid.
   const reopened = await ReviewHandBack.open(join(directory, 'review.secret'));
   assert.equal(reopened.mcpServer('session-1', dsh).env.find(item => item.name === 'ONEAGENTS_REVIEW_TOKEN').value, token);
+});
+
+test('an ACP executor handles its ticket through the same MCP server, as its own session and recorded as MCP', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'review-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const review = await ReviewHandBack.open(join(directory, 'review.secret'));
+  const calls = [], gateway = { invoke: async (method, params) => { calls.push({ method, params });
+    if (params.itemId === 'Q9-9') throw new Error('任务单上没有 Q9-9');
+    return { status: 'in_revision', round: 2, items: [{ id: 'Q1-1', severity: 'must', where: 'x', problem: 'y', state: 'open', log: [] }] }; } };
+  bindA2AExecution('acp-session', { jobId: 'job-acp', attemptId: 'attempt-acp' });
+  t.after(() => unbindA2AExecution('acp-session'));
+  const handler = review.ticketHandler((sessionId, tool, args) => runTicketTool(gateway, sessionId, tool, args, 'mcp'));
+  const dsh = await listen(t, (req, res) => req.url === TICKET_PATH ? handler(req, res) : (res.writeHead(404), res.end()));
+
+  const server = review.mcpServer('acp-session', dsh);
+  const child = spawn(server.command, server.args, { env: Object.fromEntries(server.env.map(item => [item.name, item.value])), stdio: ['pipe', 'pipe', 'inherit'] });
+  t.after(() => child.kill());
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  const rpc = async (id, method, params) => { child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`); return JSON.parse((await lines.next()).value); };
+  const mark = (await rpc(1, 'tools/list')).result.tools.find(tool => tool.name === 'ticket_mark');
+  assert.deepEqual(mark.inputSchema.required, ['id', 'state', 'note']);
+  assert.match((await rpc(2, 'tools/call', { name: 'ticket_show', arguments: {} })).result.content[0].text, /Q1-1 \[必须改\] x：y\n待处理 1 条/);
+  assert.match((await rpc(3, 'tools/call', { name: 'ticket_mark', arguments: { id: 'Q1-1', state: 'done', note: '改了' } })).result.content[0].text, /Q1-1 已标为 done/);
+  assert.equal((await rpc(4, 'tools/call', { name: 'ticket_mark', arguments: { id: 'Q9-9', state: 'done', note: 'x' } })).result.content[0].text, '任务单操作被拒绝：任务单上没有 Q9-9');
+  assert.deepEqual(calls.map(call => [call.method, call.params.jobId, call.params.attemptId, call.params.sessionId, call.params.via]),
+    [['ticket_show', 'job-acp', 'attempt-acp', 'acp-session', 'mcp'], ['ticket_mark', 'job-acp', 'attempt-acp', 'acp-session', 'mcp'], ['ticket_mark', 'job-acp', 'attempt-acp', 'acp-session', 'mcp']]);
+
+  // The token names one session; another session's ticket is out of reach.
+  const token = server.env.find(item => item.name === 'ONEAGENTS_REVIEW_TOKEN').value;
+  const post = (session, body) => fetch(`${dsh}${TICKET_PATH}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Oneagents-Session': session }, body });
+  assert.equal((await post('other-session', '{"tool":"ticket_show"}')).status, 401);
+  assert.equal((await post('acp-session', '{"tool":"ticket_close"}')).status, 400, 'only the executor’s three tools');
+  assert.equal(calls.length, 3);
 });

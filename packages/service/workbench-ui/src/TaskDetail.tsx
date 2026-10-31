@@ -132,6 +132,7 @@ export function AcpTaskDetailPanel({
     const [decisionError, setDecisionError] = useState('');
     const [confirmCancel, setConfirmCancel] = useState(false);
     const [previewing, setPreviewing] = useState<ArtifactRef>();
+    const [requerying, setRequerying] = useState(false);
     const closePreview = useCallback(() => setPreviewing(undefined), []);
     const decisionRequest = useRef<{ key: string; id: string } | null>(null);
     const alive = useRef(true);
@@ -161,6 +162,22 @@ export function AcpTaskDetailPanel({
             }
         }
     }, [jobId]);
+
+    /** A task its caller stopped waiting on may have finished unseen; this asks the execution host now. */
+    const requery = async () => {
+        setRequerying(true);
+        try {
+            const next = await acpTaskService.refresh(jobId);
+            if (!alive.current) return;
+            setDetail(next);
+            setError('');
+            onChanged();
+        } catch (err) {
+            if (alive.current) setError(errorText(err));
+        } finally {
+            if (alive.current) setRequerying(false);
+        }
+    };
 
     useEffect(() => {
         alive.current = true;
@@ -290,6 +307,11 @@ export function AcpTaskDetailPanel({
                     <span>{text('任务详情', 'Task details')}</span>
                     <div>
                         {detail && <TakeOver detail={detail} />}
+                        {detail && (detail.displayStatus === 'unwatched' || detail.stale) && (
+                            <button type="button" class="acp-button" disabled={requerying} onClick={requery}>
+                                {requerying ? text('正在查询…', 'Querying…') : text('重新查询', 'Query again')}
+                            </button>
+                        )}
                         <button type="button" class="acp-button" onClick={copyLink}>
                             {text('复制链接', 'Copy link')}
                         </button>

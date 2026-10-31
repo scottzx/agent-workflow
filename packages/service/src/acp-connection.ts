@@ -465,9 +465,11 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       return result;
     })
     .onNotification('session/cancel', async ({ params }) => { requireSession(params.sessionId); await peer.command(backend, { action: 'cancel_turn', sessionId: params.sessionId }); })
-    .onRequest('session/close', async ({ params }) => { requireSession(params.sessionId); await peer.command(backend, { action: 'close_session', sessionId: params.sessionId }); attached.delete(params.sessionId);
+    .onRequest('session/close', async ({ params }) => { requireSession(params.sessionId); const events = await peer.command(backend, { action: 'close_session', sessionId: params.sessionId }); attached.delete(params.sessionId);
       for (const [key, pending] of prompts) if (pending.sessionId === params.sessionId) { prompts.delete(key); pending.resolve({ stopReason: 'cancelled' }); }
-      return {}; })
+      // Only an observed exit with its lease gone is a release; everything else stays pending upstream.
+      const released = events.some(e => e.event === 'session_released' && e.sessionId === params.sessionId && e.processReleased === true);
+      return released ? { _meta: { [NS]: { processReleased: true } } } : {}; })
     .onRequest('session/set_mode', async ({ params }) => { requireSession(params.sessionId); await peer.command(backend, { action: 'set_session_mode', sessionId: params.sessionId, payload: { modeId: params.modeId } }); return {}; })
     .onRequest('session/set_config_option', async ({ params }) => { requireSession(params.sessionId); await peer.command(backend, { action: 'set_config_option', sessionId: params.sessionId, payload: { key: params.configId, value: params.value } }); return { configOptions: configOptions(await backend.status(params.sessionId)) }; })
     .onRequest('session/list', async ({ params }) => {

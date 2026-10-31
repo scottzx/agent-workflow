@@ -427,3 +427,29 @@ test('an expired tool approval that the agent retried and a person allowed does 
   assert.equal(other.displayStatus, 'tool_blocked', 'an approval of one tool does not clear a different one');
   assert.deepEqual(other.blockedTools, ['rm sum.txt']);
 });
+
+test('a task its caller stopped waiting on is listed as abnormal with the reason until it is found ended', () => {
+  const ledger = new JobLedger(undefined, () => {});
+  const task = ledger.prepare({ originSessionId: 'rsi-cli', targetSnapshot: { targetId: 'dsh-host' }, input: {}, title: '产品介绍大纲' });
+  ledger.markDispatching(task.attempt.attemptId); ledger.accept(task.attempt.attemptId, { taskId: 'grok-task', sessionId: 'grok-session' }, { executionStatus: 'working' });
+  const view = () => {
+    const snapshot = workbenchSnapshot({ ledger: ledger.snapshot(), runs: [], reviews: [], actorId: 'owner' });
+    return { task: getWorkbenchTask(snapshot, task.job.jobId), counts: listWorkbenchTasks(snapshot).counts };
+  };
+  assert.equal(view().task.displayStatus, 'working');
+  assert.throws(() => ledger.unwatch('outsider', task.job.jobId, '超时'), /not found/i);
+  const unwatched = ledger.unwatch('rsi-cli', task.job.jobId, 'rsi run 等了 25 分钟没有结束');
+  assert.equal(unwatched.unwatched?.reason, 'rsi run 等了 25 分钟没有结束');
+  ledger.unwatch('rsi-cli', task.job.jobId, '又一次');
+  assert.deepEqual(ledger.events('rsi-cli', task.job.jobId).filter(event => event.type === 'attempt.unwatched').map(event => event.data), [{ reason: 'rsi run 等了 25 分钟没有结束' }], 'recorded once');
+  const abnormal = view();
+  assert.equal(abnormal.task.displayStatus, 'unwatched');
+  assert.match(abnormal.task.progressSummary, /停止等待（rsi run 等了 25 分钟没有结束）。任务可能仍在执行或已经结束，请重新查询执行宿主/);
+  assert.deepEqual([abnormal.counts.failed, abnormal.counts.working], [1, 0], 'abnormal, not working');
+  // A later query finds it finished on its own: it is an ordinary completed task again.
+  ledger.observe(task.attempt.attemptId, { executionStatus: 'completed' });
+  const ended = view();
+  assert.deepEqual([ended.task.displayStatus, ended.counts.failed], ['completed', 0]);
+  ledger.unwatch('rsi-cli', task.job.jobId, '结束后');
+  assert.equal(ledger.events('rsi-cli', task.job.jobId).filter(event => event.type === 'attempt.unwatched').length, 1, 'an ended round is not marked');
+});

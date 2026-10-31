@@ -47,6 +47,7 @@ export function statusLabel(status: string): string {
         resuming: ['等待续跑', 'Waiting to resume'],
         applied: ['已处理', 'Applied'],
         tool_blocked: ['工具未获批准', 'Tool not approved'],
+        unwatched: ['发起方已停止等待', 'Caller stopped waiting'],
         accepted: ['已验收', 'Accepted'],
         acceptance_changes: ['验收要求修改', 'Acceptance: changes requested'],
     };

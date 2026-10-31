@@ -1,5 +1,6 @@
 /** Durable Job/Attempt facts. This module does not execute or schedule work. */
 import { createHash, randomUUID } from 'node:crypto';
+import { TicketError, type Ticket, type TicketChange } from './ticket.js';
 
 export type ExecutionStatus = 'not_started' | 'submitted' | 'working' | 'input_required' | 'auth_required' | 'completed' | 'failed' | 'canceled' | 'rejected' | 'unknown';
 export type SubmissionStatus = 'prepared' | 'dispatching' | 'accepted' | 'known_not_submitted' | 'submission_unknown';
@@ -41,6 +42,8 @@ export interface LedgerAttempt {
   backendRunRef?: BackendRunRef; submissionStatus: SubmissionStatus; executionStatus: ExecutionStatus;
   providerState?: string; phase?: string; cancellationRequestedAt?: string; checkedAt?: string; stale: boolean;
   createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult; resultHistory?: LedgerResult[];
+  /** The origin stopped waiting on this round before it ended (it timed out, or the caller itself failed); it may still run or have finished unseen. */
+  unwatched?: { at: string; reason: string };
 }
 export interface LedgerJob {
   sourceId: string; jobId: string; title?: string; originSessionId: string; accessScopeRef: string;
@@ -58,6 +61,8 @@ export interface LedgerState {
   version: 1; sourceId: string; jobs: Record<string, LedgerJob>; attempts: Record<string, LedgerAttempt>;
   requests: Record<string, RequestRecord>; events: LedgerEvent[]; nextSequence: number;
   acceptances: Record<string, BusinessAcceptance[]>;
+  /** Task tickets by executor jobId; absent in state written before tickets existed. */
+  tickets?: Record<string, Ticket>;
 }
 export interface LedgerPrepareInput {
   originSessionId: string; targetSnapshot: LedgerTargetSnapshot; input: unknown; clientRequestId?: string;
@@ -122,9 +127,9 @@ export class JobLedger {
     if (initial) {
       if (initial.version !== 1 || !initial.sourceId || !initial.jobs || !initial.attempts || !initial.requests || !Array.isArray(initial.events)
         || !Number.isSafeInteger(initial.nextSequence) || !initial.acceptances) throw new Error('Invalid execution ledger state');
-      this.state = clone(initial);
+      this.state = { ...clone(initial), tickets: clone(initial.tickets ?? {}) };
     } else {
-      this.state = { version: 1, sourceId: randomUUID(), jobs: {}, attempts: {}, requests: {}, events: [], nextSequence: 1, acceptances: {} };
+      this.state = { version: 1, sourceId: randomUUID(), jobs: {}, attempts: {}, requests: {}, events: [], nextSequence: 1, acceptances: {}, tickets: {} };
     }
   }
   snapshot(): LedgerState { return clone(this.state); }
@@ -386,6 +391,21 @@ export class JobLedger {
       && Object.entries(ref).every(([key, value]) => value === undefined || item.backendRunRef?.[key] === value));
     return attempt ? clone({ job: this.state.jobs[attempt.jobId]!, attempt }) : undefined;
   }
+  /**
+   * The origin stopped waiting on the job's current round while it was still running. The round itself is unchanged:
+   * the workbench lists the job as abnormal until a re-query finds the round ended.
+   */
+  unwatch(originSessionId: string, jobId: string, reason: string): LedgerAttempt {
+    return this.mutate(state => {
+      const job = this.job(state, originSessionId, jobId), attempt = this.attempt(state, job.currentAttemptId);
+      nonempty(reason, 'reason');
+      if (!terminal.has(attempt.executionStatus) && !attempt.unwatched) {
+        attempt.unwatched = { at: now(), reason };
+        this.event(state, job, attempt.attemptId, 'attempt.unwatched', { reason });
+      }
+      return clone(attempt);
+    });
+  }
   acceptance(originSessionId: string, jobId: string, input: Omit<BusinessAcceptance, 'recordedAt'>): BusinessAcceptance {
     return this.mutate(state => {
       const job = this.job(state, originSessionId, jobId), attempt = this.attempt(state, input.attemptId);
@@ -398,6 +418,46 @@ export class JobLedger {
       (state.acceptances[jobId] ??= []).push(record);
       this.event(state, job, input.attemptId, 'job.acceptance_recorded', record); return record;
     });
+  }
+  ticket(originSessionId: string, jobId: string): Ticket {
+    this.job(this.state, originSessionId, jobId);
+    const ticket = this.state.tickets![jobId];
+    if (!ticket) throw new TicketError('这个任务还没有任务单');
+    return clone(ticket);
+  }
+  /**
+   * One ticket operation: it gets the job's ticket (undefined before one is opened) to change in place and reports
+   * its changes, each appended as a `ticket.*` event stamped with `caller` (attempt, session, QA job).
+   */
+  changeTicket(originSessionId: string, jobId: string, operation: (ticket: Ticket | undefined) => { ticket: Ticket; changes: TicketChange[] },
+    caller: { attemptId?: string; [key: string]: unknown } = {}): Ticket {
+    return this.mutate(state => {
+      const job = this.job(state, originSessionId, jobId), tickets = state.tickets ??= {};
+      const { ticket, changes } = operation(tickets[jobId]);
+      tickets[jobId] = ticket;
+      for (const change of changes) this.event(state, job, caller.attemptId, change.type, { ...change.data, ...caller });
+      return ticket;
+    });
+  }
+  /**
+   * Trusted adapter use only: the origin of the job whose current, unfinished attempt `attemptId` is. When the
+   * host reported which session runs the attempt, the caller must be that session.
+   */
+  executorOrigin(jobId: string, attemptId: string, sessionId: string): string {
+    const job = Object.hasOwn(this.state.jobs, jobId) ? this.state.jobs[jobId] : undefined;
+    const attempt = Object.hasOwn(this.state.attempts, attemptId) ? this.state.attempts[attemptId] : undefined;
+    if (!job || !attempt || attempt.jobId !== jobId || job.currentAttemptId !== attemptId) throw new TicketError('这一轮执行不是该任务的当前轮次');
+    if (terminal.has(attempt.executionStatus)) throw new TicketError('这一轮执行已经结束，不能再处理任务单');
+    const recorded = attempt.backendRunRef?.sessionId;
+    if (recorded !== undefined && recorded !== sessionId) throw new TicketError('调用的会话不是执行这一轮的会话');
+    return job.originSessionId;
+  }
+  /** Trusted adapter use only: the job's current attempt and the session the host reported for it, for a caller that names only the job. */
+  currentAttempt(jobId: string): { attemptId: string; sessionId?: string } {
+    const job = Object.hasOwn(this.state.jobs, jobId) ? this.state.jobs[jobId] : undefined;
+    const attempt = job && Object.hasOwn(this.state.attempts, job.currentAttemptId) ? this.state.attempts[job.currentAttemptId] : undefined;
+    if (!attempt) throw new TicketError('没有这个任务');
+    return { attemptId: attempt.attemptId, ...(attempt.backendRunRef?.sessionId !== undefined ? { sessionId: attempt.backendRunRef.sessionId } : {}) };
   }
   /** Each old Task gets one legacy Job; matching context IDs never merge jobs. */
   migrateLegacy(records: LegacyLedgerRecord[]): Array<{ remote: string; taskId: string; jobId: string; attemptId: string }> {

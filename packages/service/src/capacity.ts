@@ -280,10 +280,10 @@ export class CapacityGovernor {
     }
     // Pending processes retain their budget until spawn is registered. Stable leases stay counted
     // for concurrency, but actual free memory carries their cost after the startup window expires.
-    // Share startup memory budget across kinds. Without an explicit task-to-child association,
-    // short-lived double counting is safer than letting unrelated starts spend the same bytes.
-    const starting = reservations.filter(item => item.token !== excludeStartupToken &&
-      ((item.kind === 'process' && item.childPid === undefined) || item.startupUntil > Date.now()));
+    // Only process starts hold startup memory. A task allocates nothing itself: its ACP agent is
+    // admitted as a process, so counting the task too would charge the same start twice.
+    const starting = reservations.filter(item => item.token !== excludeStartupToken && item.kind === 'process' &&
+      (item.childPid === undefined || item.startupUntil > Date.now()));
     const startupReservedBytes = starting.length * this.estimatedInstanceBytes;
     const availableForStartupBytes = Math.max(0, reading.availableBytes - this.memoryReserveBytes - startupReservedBytes);
     const availableSlots = Math.floor(availableForStartupBytes / this.estimatedInstanceBytes);

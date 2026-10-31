@@ -205,13 +205,15 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
   const resumeError = awaitingResume ? run?.diagnostics?.findLast(item => item.startsWith('Human continuation deferred:')) : undefined;
   const acceptance = currentAcceptance(job, ledger), blocked = blockedTools(requests, job, now);
   const toolBlocked = blocked.length > 0 && acceptance?.reviewStatus !== 'accepted';
-  const displayStatus = toolBlocked ? 'tool_blocked' : pending || pendingRequest ? 'awaiting_human' : awaitingResume && !resumeError ? 'resuming' : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? 'changes_requested' : job.executionStatus;
+  const unwatched = attempt?.unwatched && !terminal.has(job.executionStatus) ? attempt.unwatched : undefined;
+  const displayStatus = toolBlocked ? 'tool_blocked' : pending || pendingRequest ? 'awaiting_human' : unwatched ? 'unwatched' : awaitingResume && !resumeError ? 'resuming' : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? 'changes_requested' : job.executionStatus;
   const phase = pending ? 'human_review' : pendingRequest ? 'process_request' : awaitingResume ? 'human_resume' : run?.phase ?? attempt?.phase ?? job.purpose ?? '';
   const progressSummary = pending ? `${review.title}已形成，等待确认 ${review.revision}；通过后开始设计制作。`
     : pendingRequest ? (pendingRequest.kind === 'plan' ? '计划待批准，请在过程请求里提交。' : pendingRequest.kind === 'permission' ? `工具「${pendingRequest.toolTitle}」待批准，请在过程请求里提交。` : '有待回答的问题，请在过程请求里提交。')
     : awaitingResume ? resumeError ? `决定已保存，继续执行受阻：${resumeError.slice('Human continuation deferred:'.length).trim()}` : '本版决定已保存，等待系统继续处理。'
     : review?.status === 'changes_requested' && !terminal.has(job.executionStatus) ? run?.summaryRevisionPending ? '修改意见已保存，正在提交原作者。' : '修改意见已提交原作者，等待新版本。'
     : toolBlocked ? `执行已结束，但有 ${blocked.length} 个工具调用未获批准，结果可能不完整，请核对后再验收。`
+    : unwatched ? `发起方在 ${unwatched.at} 停止等待（${unwatched.reason}）。任务可能仍在执行或已经结束，请重新查询执行宿主。`
     : attempt?.diagnostic || (run ? runDescription(run) : attempt?.result?.resultSummary || stateDescriptions[job.executionStatus] || '等待同步执行进展。');
   const execution = executionView(attempt, job.targetId, Boolean(run));
   const development = describeTaskDevelopment(attempt?.targetSnapshot?.development, { targetId: job.targetId, resident: execution.kind === 'resident', residentName: execution.targetName });
@@ -328,8 +330,8 @@ export function listWorkbenchTasks(snapshot: WorkbenchSnapshot, query: Workbench
   const filter = query.filter ?? 'all', offset = Math.max(0, Math.trunc(query.offset ?? 0)), limit = Math.min(200, Math.max(1, Math.trunc(query.limit ?? 50)));
   const rootIds = new Set(snapshot.tasks.filter(task => !task.parentJobRef || !Object.hasOwn(snapshot.details, task.parentJobRef.jobId)).map(task => task.jobId));
   const needsPerson = (task: AcpTaskSummary) => Boolean(task.pendingReviewId || task.pendingProcessRequestId);
-  const isWorking = (task: AcpTaskSummary) => task.displayStatus === 'resuming' || !needsPerson(task) && ['working', 'submitted', 'not_started'].includes(task.executionStatus);
-  const isFailed = (task: AcpTaskSummary) => task.unresolvedAttemptIds.length > 0 || task.displayStatus === 'tool_blocked' || ['failed', 'rejected', 'unknown', 'auth_required', 'input_required'].includes(task.executionStatus) && !['awaiting_human', 'resuming'].includes(task.displayStatus);
+  const isWorking = (task: AcpTaskSummary) => task.displayStatus === 'resuming' || !needsPerson(task) && task.displayStatus !== 'unwatched' && ['working', 'submitted', 'not_started'].includes(task.executionStatus);
+  const isFailed = (task: AcpTaskSummary) => task.unresolvedAttemptIds.length > 0 || task.displayStatus === 'tool_blocked' || task.displayStatus === 'unwatched' || ['failed', 'rejected', 'unknown', 'auth_required', 'input_required'].includes(task.executionStatus) && !['awaiting_human', 'resuming'].includes(task.displayStatus);
   const roots = snapshot.tasks.filter(task => rootIds.has(task.jobId));
   const counts = { all: roots.length, pending: roots.filter(needsPerson).length, working: roots.filter(isWorking).length, failed: roots.filter(isFailed).length };
   const matches = snapshot.tasks.filter(task => filter === 'all' ? true : filter === 'pending' ? needsPerson(task) : filter === 'working' ? isWorking(task) : isFailed(task));

@@ -1,7 +1,7 @@
 # 工作台的智能体开发阶段与运行阶段
 
 - 日期：2026-10-27（Asia/Shanghai）
-- 状态（2026-10-28 更新）：任务与智能体两个模块、试跑/正式标记、草稿/命名发布，以及网关自带的独立页面，已提交到分支 `workbench-a2a-e2e-20261027`，并部署到本机测试环境（网关 :36814 的 `/workbench/ui/`；DSH web 里的插件已换成同一构建）。发布名字还没有同步进 DSH 的 `agent-session-settings.json`，执行宿主仍回放该工作区和 ACP Agent 最近一次已接受的设置。父应用 1agents_app 里的旧工作台页面和 Go 代理没动。分支未合并 main。
+- 状态（2026-10-31 更新）：任务与智能体两个模块、试跑/正式标记、草稿/命名发布、网关自带的独立页面、DSH 内嵌工作台，以及只能从页面发起的发布和验收决定，都已合进 `main` 和 `develop`。本机测试环境（网关 :36814 的 `/workbench/ui/`，DSH web 里的插件）在 2026-10-31 11:53 用当天 11:51 的 `develop` 构建重启。发布名字还没有同步进 DSH 的 `agent-session-settings.json`，执行宿主仍回放该工作区和 ACP Agent 最近一次已接受的设置。父应用 1agents_app 里的旧工作台页面和 Go 代理没动。
 - 相关：[任务工作台](task-workbench-implementation-20261022.md)、[Grok 权限模式与工作台的两类人工事项](grok-mode-and-workbench-requests-20261027.md)
 
 工作台仍是一个入口。里面两个同级模块：任务、智能体。智能体有开发阶段和运行阶段。试跑任务和正式任务都进任务清单，也都进同一个人的审核。
@@ -52,11 +52,11 @@
 
 2026-10-30 起，发布（`POST /workbench/agents/:id/publish`）和验收决定（`POST /workbench/tasks/:id/reviews/:rid/decisions`）只能由人在页面上发起。bearer 接口直接调这两个路由返回 403 `page_action_required`，有没有令牌都一样。DSH 内嵌的页面经 bearer 接口转发，靠一份共享的转发密钥区分：网关配 `workbench.pageRelaySecret`（至少 32 个字符），DSH 在 `a2a.workbench.pageRelaySecret` 配同一个值，转发时带 `X-Workbench-Page-Relay` 头。网关没配密钥时，这两项只能在网关自己的页面上做。这只防按正常接口调用的工具和智能体，不防有意读取配置文件里的密钥。发起会话用 `execution_review` 记录验收暂时保留，等通用任务能在页面上验收后再对试跑任务收紧。父应用和驾驶舱最多保留一个链接，不再各自维护工作台页面和代理。父应用里的旧页面与 Go 代理待确认后移除。
 
-## 还没做（2026-10-28 更新）
+## 还没做（2026-10-31 更新）
 
 - 把已发布名字写进执行宿主的回放文件。DSH 插件现在只读写 `agent-session-settings.json`，不读网关的 `agent-registry.json`。
 - 人在页面上做结果验收（现在只能由发起会话用 `execution_review` 记录）。
 - 生产环境的账号体系，替代令牌。
 - 父应用里旧的工作台页面与 Go 代理，确认后移除。
 - 报告交付、workflow 执行、一键 cwd 仍单独处理，见 [A2A 缺口收口方案 §7](a2a-gap-closure-plan-20261027.md)。六页人审已修（`4fbc500`）。
-- 分支合并 main。编辑源码不会改变已经安装的网关和 DSH 插件，要重新部署后才生效。
+- DSH 会话切到完全访问后，ACP 工具审批被直接拒绝。已在 `76125a84` 修复，2026-10-31 16:14 部署到 DSH web，线上还没有复现验证，见 [A2A 缺口收口方案 §7](a2a-gap-closure-plan-20261027.md)。编辑源码不会改变已经安装的网关和 DSH 插件，要重新部署后才生效。

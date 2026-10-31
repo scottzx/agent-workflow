@@ -3,5 +3,6 @@
   "version": "0.1.0",
   "instructionsPath": "ROLE.md",
   "network": { "agentUrl": "http://127.0.0.1:36908", "timeoutMs": 30000 },
-  "skills": []
+  "skills": [],
+  "training": { "layers": ["prompt"] }
 }
