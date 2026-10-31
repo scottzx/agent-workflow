@@ -20,7 +20,7 @@ import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
 import { artifactInstructions, defaultJobDirectory, defaultManifestPath } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
-import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
+import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
@@ -136,7 +136,7 @@ const EXECUTION_METHODS = {
 export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时保持 persistent；one-shot 在完成、失败或取消后普通关闭进程，runtime 仍是 persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
@@ -1310,8 +1310,9 @@ export class RemoteAgentGateway {
     await this.cancelExecution(stop.origin, jobId, undefined, stop.reason);
     return this.workbenchTask(jobId);
   }
-  private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle | undefined {
-    if (value === undefined) return previous;
+  /** A follow-up keeps its session's policy. A new task without one is one-shot. */
+  private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle {
+    if (value === undefined && previous) return previous;
     return normalizeLifecycle(value, this.config.sessionLifecycle.persistentIdleTtlSeconds);
   }
   /**
@@ -1334,7 +1335,7 @@ export class RemoteAgentGateway {
       if (jobs.some(job => !terminal.has(taskState(job)))) continue;
       const job = jobs.at(-1)!;
       if (!isAcpAgentPreset(job.agentPreset) || !job.sessionId || job.sessionState === 'closed' || job.sessionState === 'closing' || job.sessionState === 'deleted') continue;
-      const lifecycle = job.lifecycle ?? normalizeLifecycle(undefined, policy.persistentIdleTtlSeconds);
+      const lifecycle = job.lifecycle ?? legacyLifecycle(policy.persistentIdleTtlSeconds);
       if (lifecycle.mode !== 'persistent' || lifecycle.idleTtlSeconds === 0) continue;
       const ttlMs = lifecycle.idleTtlSeconds * 1000;
       const endedAt = Date.parse(Task.fromJSON(job.task).status?.timestamp ?? '');

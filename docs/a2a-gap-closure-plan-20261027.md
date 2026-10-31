@@ -107,7 +107,7 @@ P1 必须同时包含第 1 行和第 2 行。只做关闭、不拆 60 秒时，�
 | 已关闭会话再收到 `remote_agent_message` | 默认沿用现有 message：DSH 按保存的 binding 做 `session/load` 或 `session/resume`，返回 `resumed: true` 和实际 `restoreMethod`。`autoResume: false` 时网关在调用远端前返回 `SESSION_CLOSED`，不发 `session/new` | 恢复已经在 runtime 和适配器里。网关只决定是否放行，并标明这次是重新附着 |
 | 网关 one-shot 的实现 | 终态后调用普通 `session/close`，也就是 runtime 的 release。继续使用 `ensureSession({ mode: "persistent" })`。不传 `discardPersistentState`，不调用 `prepareFreshSession`，不调用 `session/delete` | runtime 的 `oneshot` 会新建记录。本方案要的是关掉进程后仍能接回同一 ACP 会话 |
 | one-shot 何时关闭 | 默认进入 `COMPLETED`、`FAILED` 或 `CANCELED` 后关闭。`INPUT_REQUIRED` 不关。需要等主会话 ack 的调用显式传 `closeAfter: "ack"` | 容量被占的原因就是终态后进程还在。ack 可能很晚或不到。关闭后仍可按原 sessionId 附着 |
-| 默认生命周期 | 不传 `lifecycle` 仍是 persistent，不改成 one-shot。persistent 在回合结束并确认空闲后，默认再等 600 秒没有后续就普通 close。`idleTtlSeconds: 0` 不自动回收；正数覆盖 600 秒 | 多轮会话结束后也不能一直占名额。10 分钟留给同一次任务的追问。正在执行、等待输入、状态未知的不关。必须常驻的会话显式写 0 |
+| 默认生命周期 | **2026-10-31 改为：不传 `lifecycle` 就是 one-shot**，persistent 要显式传；之前保存、没有 lifecycle 的旧任务仍按 persistent（见 §8）。原决定：不传 `lifecycle` 仍是 persistent，不改成 one-shot。persistent 在回合结束并确认空闲后，默认再等 600 秒没有后续就普通 close。`idleTtlSeconds: 0` 不自动回收；正数覆盖 600 秒 | 多轮会话结束后也不能一直占名额。10 分钟留给同一次任务的追问。正在执行、等待输入、状态未知的不关。必须常驻的会话显式写 0 |
 | 适用预设 | 只关闭 `oneagents-acp-*` 拉起的 ACP 子进程。`standard` 收到 close 或 one-shot 时返回 `processReleased: true`、`acp: false`，不向 DSH 原生会话发 `session/close` | `standard` 没有 ACP 子进程。对它发 close 会关错对象 |
 | 容量排队时提前回收未到 TTL 的闲置会话 | 关闭 | 容量文档禁止为腾空间强杀。提前回收和强杀只差在「进程已空闲」，仍会打断调用方以为还在的会话 |
 | `delete` | 第一期接口不接受 `mode: "delete"`。后面要做时，网关配置 `sessionLifecycle.allowDelete` 默认 false，且不删除 DSH 原生会话历史 | 删除不能恢复。容量问题用 close 就够 |
@@ -401,10 +401,10 @@ G8 不排进 P0–P3。
 
 ## 8. 调用约定（P1 上线之后）
 
-- 使用 `oneagents-acp-*` 的口播、报告、单次检查，在 spawn 时传 `lifecycle: { "mode": "one-shot" }`，并使用默认的 `closeAfter: "terminal"`。口播验收看文件，返工在本地重渲染，不依赖模型还记得上文。不改成 `ack`：漏掉 ack 时进程会继续占名额。
+- 2026-10-31 起不传 `lifecycle` 就是 one-shot（`closeAfter: "terminal"`）：答完立即普通关闭进程、释放名额，追问经 `session/load` 接回。口播、报告、单次检查不用再传。口播验收看文件，返工在本地重渲染，不依赖模型还记得上文。不改成 `ack`：漏掉 ack 时进程会继续占名额。
 - 这只安排终态后的普通 close，runtime 仍是 `persistent`。
 - `standard` 预设不必传 one-shot。它没有 ACP 子进程，传了也只返回 `acp: false`。G9 部署后可以在 spawn 传 `provider`、`model` 指定模型，回执里看实际使用的模型；不传仍用 DSH 当时的默认模型。不要把模型名写进 prompt。
-- 需要多轮追问的用 persistent。回合结束并空闲满 10 分钟后自动关闭；10 分钟内的追问仍在原进程上。用完也可以立刻 `remote_agent_close`。必须常驻的写 `idleTtlSeconds: 0`。
+- 进程必须留着等追问的，显式传 `lifecycle: { "mode": "persistent" }`。回合结束并空闲满 10 分钟后自动关闭；10 分钟内的追问仍在原进程上。用完也可以立刻 `remote_agent_close`。必须常驻的写 `idleTtlSeconds: 0`。
 - 追问已关闭会话直接 `remote_agent_message`，看 `resumed`。grok-build 两次真机检查里模型都记得上文（§5.1），但样本少；结论必须可靠时仍从文件接续。
 - 不用 cancel 释放已完成任务，也不为腾容量重启 DSH。
 

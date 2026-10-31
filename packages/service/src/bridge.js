@@ -1647,13 +1647,20 @@ export async function dispatchCommand(ws, payload) {
               console.log(
                 `[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`,
               );
-              const handle = await runtime.adoptSession({
-                handle: prewarmedGrokHandle,
-                sessionKey: sessionId,
-              });
+              // Take the spare before awaiting: concurrent ensure_session calls would otherwise adopt the same process.
+              const spare = prewarmedGrokHandle;
               prewarmedGrokHandle = null;
               prewarmedGrokCwd = null;
+              const handle = await runtime.adoptSession({
+                handle: spare,
+                sessionKey: sessionId,
+              });
               console.timeEnd(`ensure_session_${sessionId}`);
+              // An earlier CAPACITY_PENDING attempt left this capacityId queued. The adopted process
+              // already holds its own lease, so the entry would sit at the FIFO head and block every later launch.
+              if (typeof payload.capacityId === "string" && payload.capacityId.trim()) {
+                await processCapacity.cancel({ id: payload.capacityId.trim(), kind: "process" });
+              }
 
               // Asynchronously trigger background pre-warm for the next session using the same CWD
               setTimeout(() => prewarmGrokSession(normalizedPath), 500);
@@ -3856,6 +3863,7 @@ export {
   sessionBackgroundTasks,
   killAllManagedAgents,
   gracefulExit,
+  prewarmGrokSession,
 };
 
 

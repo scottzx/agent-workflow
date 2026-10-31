@@ -69,13 +69,19 @@ export async function requestWhenAdmitted<T>(options: {
     else signal.addEventListener('abort', onAbort, { once: true });
   }));
   const pollMs = options.pollMs ?? 750;
+  let queued = false;
   for (;;) {
     options.signal.throwIfAborted();
     try {
       return await options.request();
     } catch (error) {
       const pending = options.isPending(error);
-      if (!pending) throw error;
+      if (!pending) {
+        // A queue entry left behind by an earlier pending attempt would block every later launch at the FIFO head.
+        if (queued) await options.cancel?.().catch(() => undefined);
+        throw error;
+      }
+      queued = true;
       options.onPending?.(pending);
       if (options.signal.aborted) {
         await options.cancel?.().catch(() => undefined);

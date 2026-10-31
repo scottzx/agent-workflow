@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -164,6 +164,65 @@ test('bridge cancels pending session launches, including profile keys and late s
       assert.equal(bridge.activeSessions.has('pending-capacity-id'), false);
       assert.equal(bridge.activeSessions.has('pending-capacity-id-2'), false);
     } finally { await occupied.release(); }
+  });
+
+  await t.test('adopting the pre-warmed process drops the queue entry left by an earlier pending attempt', async () => {
+    const originalEnsure = bridge.runtime.ensureSession;
+    const originalAdopt = bridge.runtime.adoptSession;
+    const occupied = await governor.acquire({ kind: 'process', source: 'automatic', id: 'occupied-for-adoption' });
+    const sessionId = 'adopts-prewarm';
+    const request = { action: 'ensure_session', sessionId, workspacePath: directory, agentType: 'grok-build',
+      responsePolicy: 'summary', capacityId: 'a2a-adopts-prewarm' };
+    try {
+      const first = peer();
+      await deadline(bridge.dispatchCommand(first, request));
+      assert.ok(first.events.some(event => event.code === 'CAPACITY_PENDING'));
+      assert.equal(queueEntries().length, 1);
+      // The spare comes up without going through this test's FIFO, as a launch admitted earlier would.
+      const spare = { sessionKey: 'prewarm_grok_test', agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
+      // Grok-only: the bridge schedules the next pre-warm 500 ms after adopting, which must not launch a real agent.
+      Reflect.set(bridge.runtime, 'ensureSession', async (input: { agent: string }) => input.agent === 'grok-build' ? spare : originalEnsure.call(bridge.runtime, input));
+      Reflect.set(bridge.runtime, 'adoptSession', async () => ({ ...spare, sessionKey: sessionId }));
+      await bridge.prewarmGrokSession(realpathSync(directory));
+      const retry = peer();
+      await deadline(bridge.dispatchCommand(retry, request));
+      assert.ok(retry.events.some(event => event.event === 'session_ready'), JSON.stringify(retry.events));
+      assert.equal(queueEntries().length, 0);
+      await delay(700);
+    } finally {
+      bridge.activeSessions.delete(sessionId);
+      Reflect.set(bridge.runtime, 'ensureSession', originalEnsure);
+      Reflect.set(bridge.runtime, 'adoptSession', originalAdopt);
+      await occupied.release();
+    }
+  });
+
+  await t.test('two concurrent starts cannot adopt the same pre-warmed process', async () => {
+    const originalEnsure = bridge.runtime.ensureSession;
+    const originalAdopt = bridge.runtime.adoptSession;
+    const spare = { sessionKey: 'prewarm_grok_race', agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
+    let adoptions = 0;
+    Reflect.set(bridge.runtime, 'ensureSession', async (input: { agent: string; sessionKey: string }) =>
+      input.agent === 'grok-build' ? { ...spare, sessionKey: input.sessionKey } : originalEnsure.call(bridge.runtime, input));
+    Reflect.set(bridge.runtime, 'adoptSession', async ({ sessionKey }: { sessionKey: string }) => {
+      adoptions++;
+      await delay(50);
+      return { ...spare, sessionKey };
+    });
+    const ids = ['race-a', 'race-b'];
+    try {
+      await bridge.prewarmGrokSession(realpathSync(directory));
+      const peers = ids.map(() => peer());
+      await deadline(Promise.all(ids.map((sessionId, index) => bridge.dispatchCommand(peers[index], {
+        action: 'ensure_session', sessionId, workspacePath: directory, agentType: 'grok-build', responsePolicy: 'summary' }))));
+      assert.equal(adoptions, 1);
+      for (const events of peers.map(item => item.events)) assert.ok(events.some(event => event.event === 'session_ready'));
+      await delay(700);
+    } finally {
+      for (const sessionId of ids) bridge.activeSessions.delete(sessionId);
+      Reflect.set(bridge.runtime, 'ensureSession', originalEnsure);
+      Reflect.set(bridge.runtime, 'adoptSession', originalAdopt);
+    }
   });
 
   await t.test('close confirms the release once the agent exited and its lease is gone', async () => {

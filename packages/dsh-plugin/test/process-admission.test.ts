@@ -52,3 +52,25 @@ test('abort during a pending wait cancels the queued admission', async () => {
   }), (error: unknown) => error instanceof Error && error.name === 'AbortError');
   assert.equal(canceled, 1);
 });
+
+test('a real failure after a pending wait cancels the queued admission', async () => {
+  let calls = 0;
+  let canceled = 0;
+  await assert.rejects(requestWhenAdmitted({
+    signal: new AbortController().signal,
+    pollMs: 1,
+    isPending: capacityPendingOf,
+    cancel: async () => { canceled += 1; },
+    sleep: async () => {},
+    request: async () => { calls += 1; throw calls === 1 ? pending : new Error('handshake failed'); },
+  }), /handshake failed/);
+  assert.equal(canceled, 1);
+  // Without an earlier pending wait there is no queue entry to cancel.
+  await assert.rejects(requestWhenAdmitted({
+    signal: new AbortController().signal,
+    isPending: capacityPendingOf,
+    cancel: async () => { canceled += 1; },
+    request: async () => { throw new Error('first try failed'); },
+  }), /first try failed/);
+  assert.equal(canceled, 1);
+});
