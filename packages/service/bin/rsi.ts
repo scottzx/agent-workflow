@@ -11,7 +11,8 @@ Runs one case of a product-intro outline role: exports the pinned commit, dispat
 executor, runs the role's program checks and sends failures back to the same session.
 With --qa, a QA agent then reviews each outline that passes the checks in its own session
 against the role's QA.md, and its issues go back to the executor. Each run is appended to
-the role's ledger.jsonl in the workspace.
+the role's ledger.jsonl in the workspace. The task ticket lives on the executor's job in the gateway;
+the run directory's ticket.json is a read-only export (see acp-service ticket --help).
 
 rsi gate reads the ledger and says whether the committed role version may leave development:
 N development runs in a row passed (default 2), each first draft passed the program checks,
@@ -30,6 +31,18 @@ Options:
   --qa-preset ID         DSH agent preset for the QA agent (default: the executor's)
   --qa-max-revisions N   times QA issues go back to the executor (default 3)
   --phase dev|test       test needs a committed role directory, --qa and an open gate (default dev)`;
+
+/** Calls methods on the local gateway's /invoke route. */
+export function gatewayInvoke(url: string) {
+  const endpoint = new URL('/invoke', url);
+  return async (method: string, params: Record<string, unknown>) => {
+    const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(60_000),
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method, params }) });
+    const data = await response.json() as Record<string, unknown>;
+    if (!response.ok) throw new Error(`${method} failed: ${String(data.error ?? response.status)}`);
+    return data;
+  };
+}
 
 export async function runRsiCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
@@ -50,14 +63,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
     const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!) });
     if (!gate.ready) throw new Error(`The role has not left development yet:\n- ${gate.reasons.join('\n- ')}`);
   }
-  const endpoint = new URL('/invoke', values.url);
-  const invoke = async (method: string, params: Record<string, unknown>) => {
-    const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(60_000),
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method, params }) });
-    const data = await response.json() as Record<string, unknown>;
-    if (!response.ok) throw new Error(`${method} failed: ${String(data.error ?? response.status)}`);
-    return data;
-  };
+  const invoke = gatewayInvoke(values.url!);
   const report = await runOutlineCase({ roleDirectory: resolve(values.role), caseId: values.case, projectPath: resolve(values.project),
     workspace: resolve(values.workspace!), phase: values.phase, targetId: values.target!, agentPreset: values.preset!, originSessionId: values.origin!,
     maxBounces: Number(values['max-bounces']), timeoutMs: Number(values['timeout-minutes']) * 60_000, python: values.python!,

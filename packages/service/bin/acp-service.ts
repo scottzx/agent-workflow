@@ -63,6 +63,7 @@ function printUnifiedHelp(binName: string) {
   a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
+  ticket show|events|proposal --job <id>  Read a job's task ticket and its events, or settle a proposal
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
 
   help = help.replace(/^Commands:/m, serverCommands);
@@ -152,6 +153,11 @@ async function main() {
   if (rawArgs[0] === 'a2a') {
     const { runA2ACli } = await import('./a2a.js');
     await runA2ACli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'ticket') {
+    const { runTicketCli } = await import('./ticket.js');
+    await runTicketCli(rawArgs.slice(1));
     return;
   }
   if (rawArgs[0] === 'rsi') {
