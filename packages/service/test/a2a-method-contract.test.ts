@@ -44,6 +44,6 @@ test('DISCOVERY_METHODS satisfy the node registration contract', () => {
 });
 
 test('REMOTE_AGENT_METHODS registers the expected method set', () => {
-  assert.ok(Object.keys(REMOTE_AGENT_METHODS).length >= 36,
-    `expected at least 36 registered methods, got ${Object.keys(REMOTE_AGENT_METHODS).length}`);
+  assert.ok(Object.keys(REMOTE_AGENT_METHODS).length >= 38,
+    `expected at least 38 registered methods, got ${Object.keys(REMOTE_AGENT_METHODS).length}`);
 });

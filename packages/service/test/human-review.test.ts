@@ -58,6 +58,15 @@ test('replaced previews remain immutable and cancellation is a distinct recorded
   assert.throws(() => decideHumanReview(old, decision, actor, binding), /no longer pending/);
   const canceled = decideHumanReview(review, { ...decision, action: 'cancel' }, actor, binding, at);
   assert.equal(canceled.review.status, 'canceled'); assert.equal(canceled.review.resume?.action, 'cancel');
-  assert.throws(() => createHumanReview({ ...input, preview: { ...input.preview, slides: input.preview.slides.slice(1) } }));
+  assert.throws(() => createHumanReview({ ...input, preview: { ...input.preview, slides: [] } }));
   assert.throws(() => createHumanReview({ ...input, digest: 'not-a-digest' }));
+});
+
+test('human review previews follow the actual script page count instead of a fixed six pages', () => {
+  const page = input.preview.slides[0]!;
+  for (const count of [1, 5, 8, 12, 30]) {
+    const slides = Array.from({ length: count }, (_, i) => ({ ...page, title: `Page ${i + 1}` }));
+    assert.equal(createHumanReview({ ...input, preview: { ...input.preview, slides } }, at).preview.slides.length, count);
+  }
+  assert.throws(() => createHumanReview({ ...input, preview: { ...input.preview, slides: Array.from({ length: 201 }, () => page) } }));
 });

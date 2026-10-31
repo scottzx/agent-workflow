@@ -1,0 +1,47 @@
+/* Pair this with @1agents/file-preview/style.css (markdown and code colors live there). */
+.cv-root, .cv-lazy {
+  --cv-bg: var(--bg-card, #ffffff);
+  --cv-panel: var(--bg-panel, #f2f4f7);
+  --cv-border: var(--border-color, #e3e6eb);
+  --cv-text: var(--text-main, #1d2129);
+  --cv-muted: var(--text-muted, #86909c);
+  --cv-accent: var(--accent, #2563eb);
+  --cv-accent-bg: var(--accent-bg, #eaf1ff);
+  --cv-success: var(--success, #15803d);
+  --cv-danger: var(--danger, #c2410c);
+  --cv-mono: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+.cv-root { height: 100%; overflow: auto; padding: 12px; color: var(--cv-text); background: var(--cv-bg); font-size: 14px; }
+.cv-row { margin: 10px 0; min-width: 0; }
+.cv-user { display: flex; justify-content: flex-end; }
+.cv-bubble { max-width: 85%; background: var(--cv-accent-bg); border-radius: 12px; padding: 8px 12px; }
+.cv-bubble .cv-pre { font-family: inherit; }
+.cv-pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.5 var(--cv-mono); }
+.cv-bubble .cv-pre { font: inherit; }
+.cv-md { padding: 0; }
+.cv-tool { border: 1px solid var(--cv-border); border-radius: 8px; padding: 8px 10px; background: var(--cv-panel); }
+.cv-tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.cv-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cv-success); flex: none; }
+.cv-tool-running .cv-dot { background: var(--cv-accent); animation: cv-pulse 1.2s ease-in-out infinite; }
+.cv-tool-failed .cv-dot { background: var(--cv-danger); }
+@keyframes cv-pulse { 50% { opacity: .35; } }
+.cv-tag { color: var(--cv-muted); font-size: 12px; }
+.cv-chip, .cv-link, .cv-more { font: inherit; cursor: pointer; }
+.cv-chip { border: 1px solid var(--cv-border); border-radius: 999px; background: var(--cv-bg); color: var(--cv-accent); padding: 1px 8px; font-size: 12px; }
+.cv-link { border: 0; background: none; padding: 0; color: var(--cv-accent); }
+.cv-link:hover { text-decoration: underline; }
+.cv-more { display: block; margin: 0 auto 8px; border: 1px solid var(--cv-border); border-radius: 999px; background: var(--cv-bg); color: var(--cv-text); padding: 4px 14px; }
+.cv-more:disabled { opacity: .6; cursor: default; }
+.cv-fold { margin-top: 6px; }
+.cv-fold > summary { cursor: pointer; color: var(--cv-muted); font-size: 12.5px; }
+.cv-diff { margin-top: 6px; }
+.cv-diff-path { font: 12px var(--cv-mono); }
+.cv-diff-add { background: color-mix(in srgb, #2da44e 18%, transparent); }
+.cv-diff-del { background: color-mix(in srgb, #cf222e 16%, transparent); }
+.cv-note { margin: 6px 0 0; color: var(--cv-muted); font-size: 13px; }
+.cv-error { margin: 0; color: var(--cv-danger); font-size: 13px; }
+.cv-receipt { margin: 0; color: var(--cv-muted); font-size: 12px; text-align: center; }
+.cv-receipt-failed, .cv-receipt-rejected { color: var(--cv-danger); }
+.cv-options { margin: 4px 0 0; padding-left: 18px; }
+.cv-lazy { border: 1px solid var(--cv-border); border-radius: 8px; overflow: hidden; background: var(--cv-bg); }
+.cv-lazy-head { display: flex; justify-content: space-between; width: 100%; border: 0; background: var(--cv-panel); color: var(--cv-text); padding: 8px 12px; font: inherit; font-weight: 600; cursor: pointer; }

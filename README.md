@@ -17,19 +17,33 @@ Use Codex, Claude Code, Grok Build and other locally discovered ACP Agents insid
 - Optionally continue native history with `@1agents/session-reader`.
 - Enable A2A 1.0 task delegation, status queries and completion callbacks when needed. A2A is off by default; waking a caller's main Agent requires its receiving host adapter.
 
+## 快速开始
+
+需要 **Node.js >= 22.13** 和 **pnpm 11**（可用 `corepack enable` 或 `npx pnpm@11`）。
+
+```sh
+git clone https://github.com/scottzx/agent-workflow.git && cd agent-workflow
+pnpm install --frozen-lockfile
+pnpm build && pnpm test
+```
+
+整个仓库可一条命令构建和测试；DSH 插件运行时依赖 DeepSeek Harness 内置的包，需在装好 DSH 的环境中使用。`@deepseek-ai/*` 包由 DeepSeek Harness 宿主提供；npm 上有同名的 rc 版本包，请不要从 npm 安装它们。
+
+（未链接 DSH 时，`packages/dsh-plugin` 用 `types/dsh-host.d.ts` 中的宿主类型声明做类型检查；要用真实类型，先运行 `pnpm link:dsh /path/to/DSH`；未链接时，需要真实 DSH 运行时的 8 个插件测试文件和 2 个 “real Cordis” 用例会被跳过并在输出中列出。第三方依赖许可证见 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)。）
+
 ## Install in DSH
 
 Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.7.0
+dsh plugin --profile web add @1agents/acp-service@^0.9.0
 ```
 
 Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, then create a session with an **ACP · Agent** preset and an existing workspace. The plugin starts or reuses its local ACP service automatically. Replace `web` with your profile name; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-For a pinned release artifact, install the identical npm tarball attached to [0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0).
+The current npm release is `0.9.0`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
 dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
@@ -54,7 +68,7 @@ The plugin currently accepts text prompts. Available controls depend on the sele
 ## Standalone CLI
 
 ```sh
-npm install -g @1agents/acp-service@^0.7.0
+npm install -g @1agents/acp-service@^0.9.0
 acp-service --help
 acp-service serve --host 127.0.0.1 --port 36812 --no-report
 ```
@@ -109,10 +123,10 @@ Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasonin
 
 ```sh
 # Ordinary CLI installation:
-npm install -g @1agents/acp-service@^0.7.0
+npm install -g @1agents/acp-service@^0.9.0
 acp-service --help
 # DSH installation (run from its checkout):
-pnpm dsh plugin --profile web add @1agents/acp-service@^0.7.0
+pnpm dsh plugin --profile web add @1agents/acp-service@^0.9.0
 ```
 
 The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.

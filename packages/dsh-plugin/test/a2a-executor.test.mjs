@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
 import SessionStore from '@deepseek-ai/dsh-session';
+import { currentA2AExecution } from '@1agents/acp-service/a2a';
 import { DshA2ABackend } from '../dist/a2a-executor.js';
 import { diagnosticsFixture, identity } from './helpers/diagnostics.mjs';
 import { toSafeError } from '@1agents/acp-service/runtime';
@@ -35,6 +36,26 @@ test('A2A checks startup admission after session serialization and before submit
   f.claim(agent, 'second', 2); f.output(agent, 2, 'second done'); f.finish(agent, 2, { kind: 'completed' });
   assert.equal((await second).outcome, 'completed');
   assert.equal(checks, 1);
+});
+
+test('an A2A execution binding lasts for the prompt and clears when the turn ends', async t => {
+  const f = await fixture(t);
+  const target = await f.backend.prepare({ cwd: f.cwd });
+  let during;
+  const prompt = f.controller.prompt.bind(f.controller);
+  f.controller.prompt = async (request, signal) => {
+    during = currentA2AExecution(target.sessionId);
+    return prompt(request, signal);
+  };
+  const execution = { jobId: 'job-1', attemptId: 'attempt-1' };
+  const run = f.backend.run(target, 'bound', { requestId: 'bound', signal: new AbortController().signal, execution });
+  await f.admitted.promise;
+  assert.deepEqual(during, execution);
+  assert.deepEqual(currentA2AExecution(target.sessionId), execution);
+  const agent = f.agents.get(target.sessionId);
+  f.claim(agent, 'bound', 1); f.output(agent, 1, 'done'); f.finish(agent, 1, { kind: 'completed' });
+  assert.equal((await run).outcome, 'completed');
+  assert.equal(currentA2AExecution(target.sessionId), undefined);
 });
 
 test('A2A samples memory after an existing native turn drains and cancellation does not wait for that turn', async t => {
@@ -212,8 +233,71 @@ test('prepare creates a real DSH Session and adopts its original directory and p
   assert.equal(f.createCount, 1);
   assert.equal(f.creates.length, 1, 'even a blank saved Session is resumed without calling create again');
   assert.equal(f.resolveCount, 2);
-  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, agentPreset: 'other' }), /preset conflicts/);
-  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, cwd: tmpdir() }), /cwd conflicts/);
+  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, agentPreset: 'other' }), error => error.code === 'SESSION_CONFLICT' && /preset conflicts/.test(error.message));
+  await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, cwd: tmpdir() }), error => error.code === 'SESSION_CONFLICT' && /cwd conflicts/.test(error.message));
+});
+
+/** Adds DSH's native model catalog and selection to the fixture controller and records call order. */
+function modelHost(f, groups = [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-v4', name: 'DeepSeek V4' }] }]) {
+  const calls = [], selections = [];
+  const { create, prompt } = f.controller;
+  f.controller.create = async request => { calls.push('create'); return create(request); };
+  f.controller.prompt = async (request, signal) => { calls.push('prompt'); return prompt(request, signal); };
+  f.controller.modelCatalog = async () => { calls.push('catalog'); return { default: { provider: 'minimax-cn', model: 'MiniMax-M3.1-Flash' }, routableProviders: groups.map(group => group.id), groups, failures: [] }; };
+  f.controller.selectModel = async request => { calls.push('select'); selections.push(request); return { selected: { provider: request.provider, model: request.model } }; };
+  return { calls, selections };
+}
+
+test('standard prepare selects the requested model after create and before the first prompt', async t => {
+  const f = await fixture(t), host = modelHost(f);
+  const target = await f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' });
+  assert.equal(target.provider, 'deepseek');
+  assert.equal(target.model, 'deepseek-v4');
+  assert.deepEqual(host.selections, [{ sessionId: target.sessionId, provider: 'deepseek', model: 'deepseek-v4' }]);
+  const agent = f.agents.get(target.sessionId);
+  const run = f.backend.run(target, 'work', { requestId: 'work', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'work', 1); f.output(agent, 1, 'Done'); f.finish(agent, 1, { kind: 'completed' });
+  assert.equal((await run).text, 'Done');
+  assert.deepEqual(host.calls, ['catalog', 'create', 'select', 'prompt']);
+  assert.deepEqual(f.prompts[0].request.content, [{ type: 'text', text: 'work' }], 'the model name is not sent as prompt text');
+});
+
+test('a model missing from the DSH catalog fails before a session is created and never falls back', async t => {
+  const f = await fixture(t), host = modelHost(f);
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'deepseek', model: 'unknown-model' }),
+    error => error.code === 'MODEL_UNAVAILABLE' && /not in the DSH model catalog/.test(error.message));
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'other', model: 'deepseek-v4' }), error => error.code === 'MODEL_UNAVAILABLE');
+  assert.deepEqual(host.calls, ['catalog', 'catalog']);
+  assert.equal(f.createCount, 0);
+  f.controller.selectModel = async () => { throw new Error('session/model-unavailable'); };
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' }), error => error.code === 'MODEL_UNAVAILABLE');
+});
+
+test('omitted provider and model keep the host default without reading the catalog', async t => {
+  const f = await fixture(t), host = modelHost(f);
+  const target = await f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard' });
+  assert.deepEqual(targetIdentity(target), { sessionId: 'dsh-a2a-1', cwd: f.cwd, agentPreset: 'standard' });
+  assert.deepEqual(host.calls, ['create']);
+});
+
+test('the same session keeps its model unless a new one is passed', async t => {
+  const f = await fixture(t), host = modelHost(f, [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-v4', name: 'V4' }, { id: 'deepseek-v4-pro', name: 'V4 Pro' }] }]);
+  const target = await f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' });
+  const reused = await f.backend.prepare({ sessionId: target.sessionId });
+  assert.equal(reused.provider, undefined, 'no new selection; the executor reports the saved one');
+  assert.equal(host.selections.length, 1);
+  const switched = await f.backend.prepare({ sessionId: target.sessionId, provider: 'deepseek', model: 'deepseek-v4-pro' });
+  assert.equal(switched.sessionId, target.sessionId);
+  assert.equal(switched.model, 'deepseek-v4-pro');
+  assert.deepEqual(host.selections.map(value => [value.sessionId, value.model]), [[target.sessionId, 'deepseek-v4'], [target.sessionId, 'deepseek-v4-pro']]);
+  assert.equal(f.createCount, 1);
+});
+
+test('ACP presets reject provider and model before creating a session', async t => {
+  const f = await fixture(t), host = modelHost(f);
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'oneagents-acp-grok', provider: 'deepseek', model: 'deepseek-v4' }), error => error.code === 'MODEL_SELECTION_UNSUPPORTED');
+  assert.deepEqual(host.calls, []);
+  assert.equal(f.createCount, 0);
 });
 
 test('prepare rejects missing sessions and invalid remote directories before creating a session', async t => {
@@ -222,7 +306,7 @@ test('prepare rejects missing sessions and invalid remote directories before cre
   await assert.rejects(f.backend.prepare({ cwd: 'relative' }), /absolute directory/);
   await assert.rejects(f.backend.prepare({ cwd: file }), /point to a directory/);
   await assert.rejects(f.backend.prepare({ cwd: join(f.cwd, 'missing') }), /ENOENT/);
-  await assert.rejects(f.backend.prepare({ sessionId: 'missing-session' }), /not found/);
+  await assert.rejects(f.backend.prepare({ sessionId: 'missing-session' }), error => error.code === 'SESSION_NOT_FOUND' && /not found/.test(error.message));
   assert.equal(f.createCount, 0);
 });
 

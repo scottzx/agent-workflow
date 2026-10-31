@@ -1,0 +1,53 @@
+{
+  "name": "@1agents/file-preview",
+  "version": "0.1.0",
+  "description": "Preact file preview component: markdown, code, JSON, CSV, images, audio, video, PDF and HTML, with lazy-loaded renderers.",
+  "keywords": ["file-preview", "preview", "markdown", "preact", "artifact"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scottzx/agent-workflow.git",
+    "directory": "packages/file-preview"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "type": "module",
+  "sideEffects": ["*.css"],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./style.css": "./dist/style.css",
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp src/style.css dist/style.css",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "preact": "^10.19.0"
+  },
+  "dependencies": {
+    "dompurify": "^3.2.0",
+    "highlight.js": "^11.11.1",
+    "marked": "^18.0.4",
+    "mermaid": "^11.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "preact": "10.29.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

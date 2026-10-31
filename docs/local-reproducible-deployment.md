@@ -62,3 +62,16 @@ node scripts/local-deployment.mjs rollback --receipt-path /absolute/path/to/rele
 若包槽位或完整安装的文件指纹已被其他操作改变，rollback 拒绝覆盖。网关将入口切回上一完整 release。回滚后重新启动并检查健康状态。回滚不删除任务状态或产物，也不能代替正在执行任务的无损迁移。
 
 本机有正在运行的 DSH 时，测试应将 `DSH_HOME` 与 `ACP_STATE_DIR` 指向独立的临时测试目录，避免测试默认诊断存储与真实 profile 争用租约。本轮记录在 `docs/dreammate-chain-deployment-20261021.json`，完整证据保存在其中的 evidenceDirectory。
+
+## dev / test 两个固定环境
+
+网关只有两个环境，各自固定在 `~/.local/share/1agents/a2a-gateway/<env>/runtime`，每次部署原地替换，不再按日期保留 release 目录；版本固定靠 Git，不做本地快照。`test` 由 LaunchAgent `com.1agents.a2a-gateway` 运行，`current` 软链指向 `test/runtime`。
+
+```sh
+pnpm build && pnpm test:integration
+launchctl bootout gui/$(id -u)/com.1agents.a2a-gateway
+node scripts/local-deployment.mjs deploy --env test --root "$PWD"
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.1agents.a2a-gateway.plist
+```
+
+`deploy` 内部在临时目录里完成 capture、stage 和校验，成功后才替换环境目录，结束后清掉临时目录。首次部署需加 `--dependency-root` 指向现有运行时的 `node_modules`。脚本不会停止或启动宿主，部署前先确认网关空闲（`/health` 中 `taskSlot.used` 与 `sessions.busy` 为 0）。

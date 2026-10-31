@@ -4,6 +4,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, wr
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { CancelTaskRequest, GetTaskRequest, SendMessageRequest, Task } from '@a2a-js/sdk';
 import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, type Client } from '@a2a-js/sdk/client';
 import { reportAndHoldRegistration, reportToAgent } from '@1agents/dreammate-node/client';
@@ -15,12 +16,22 @@ import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSc
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
+import { artifactInstructions, defaultJobDirectory, defaultManifestPath } from './job-directory.js';
+import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
+import { notifyDesktop } from './desktop-notify.js';
+import { isAcpAgentPreset, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
+import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
+import { CapacityQueue } from '../capacity-queue.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
-import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
+import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
+import { chatItems, pageChat } from '../execution/workbench-chat.js';
+import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
+import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
@@ -43,12 +54,28 @@ const configSchema = z.object({
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
-  workbench: z.object({ token: string, reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
-    allowedOrigins: z.array(string).optional() }).strict().optional(),
+  workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
+    /** Shared with a host that serves this page itself (DSH). Over the bearer API, only its relayed page requests may publish or decide reviews. */
+    pageRelaySecret: z.string().min(32).optional(),
+    allowedOrigins: z.array(string).optional(),
+    /** How long a question, plan or tool approval waits for a person. The ACP bridge's ACP_INTERACTION_TIMEOUT_MS must be at least as long. */
+    requestTimeoutMinutes: z.number().int().min(1).max(24 * 60).default(5),
+    /** Show a macOS notification when a request starts waiting. */
+    desktopNotifications: z.boolean().default(false) }).strict().optional(),
+  /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
+  capacityDirectory: z.string().min(1).optional(),
+  /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
+  sessionLifecycle: z.object({
+    persistentIdleTtlSeconds: z.number().int().min(0).max(30 * 24 * 60 * 60).default(600),
+    idleScanIntervalMs: z.number().int().min(50).max(10 * 60_000).default(60_000),
+    inputRequiredAlertSeconds: z.number().int().min(1).max(30 * 24 * 60 * 60).default(2 * 60 * 60),
+    /** remote_agent_close mode "delete" is refused unless this is set. Delete cannot be undone. */
+    allowDelete: z.boolean().default(false),
+  }).strict().default({ persistentIdleTtlSeconds: 600, idleScanIntervalMs: 60_000, inputRequiredAlertSeconds: 2 * 60 * 60, allowDelete: false }),
 }).strict().superRefine((config, ctx) => {
   const machineTokens = [...Object.values(config.remotes).map(remote => remote.token), config.callback?.token,
     ...Object.values(config.notificationTargets).map(target => target.token), config.automation?.token];
-  if (config.workbench && machineTokens.includes(config.workbench.token)) {
+  if (config.workbench?.token && machineTokens.includes(config.workbench.token)) {
     ctx.addIssue({ code: 'custom', path: ['workbench', 'token'], message: 'Workbench requires a separate credential from agent remotes' });
   }
   for (const [id, schedule] of Object.entries(config.automation?.schedules ?? {})) {
@@ -67,11 +94,14 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
   roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
-  clientRequestId: string.optional(),
+  clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
+  provider: string.optional(), model: string.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
+const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
+const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
@@ -104,10 +134,12 @@ const EXECUTION_METHODS = {
 export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。', parameters: z.toJSONSchema(spawnSchema) },
-  remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。', parameters: z.toJSONSchema(taskSchema) },
-  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时保持 persistent；one-shot 在完成、失败或取消后普通关闭进程，runtime 仍是 persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
+  remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
+  remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，并在任务上返回 resumed 与 restoreMethod。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
+  remote_agent_close: { description: '关闭该主会话派出的远端 ACP 进程并保留会话记录与绑定。taskId、contextId、sessionId 三选一。进行中返回 SESSION_BUSY；force 为 true 时先取消再关闭。宿主未实现时返回 UNSUPPORTED，且不把任务记成已关闭。standard 不发送 session/close。mode 为 delete 时还删除 ACP 会话记录，之后不能接回；仅在网关配置 sessionLifecycle.allowDelete 时接受，否则返回 DELETE_DISABLED，不删除 DSH 会话历史。', parameters: z.toJSONSchema(closeSchema) },
+  remote_agent_sessions: { description: '按 prewarm、job、user-opened 和未标注列出本机进程租约，并给出 taskSlot 与 processSlot。只读，不关闭、不补标已经在跑的进程。', parameters: z.toJSONSchema(sessionsSchema) },
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_inbox: { description: '读取当前主会话未确认的完成或需要输入通知。读取不删除；处理后调用 remote_agent_ack。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_ack: { description: '确认主会话已处理指定通知。noticeId 稳定，重复确认安全。', parameters: z.toJSONSchema(ackSchema) },
@@ -132,14 +164,31 @@ interface Job {
   stale?: boolean;
   ledgerJobId?: string;
   attemptId?: string;
+  sessionId?: string;
+  lifecycle?: SessionLifecycle;
+  sessionState?: 'attached' | 'busy' | 'idle' | 'closing' | 'closed' | 'stale' | 'deleted';
+  closedAt?: string;
+  closeReason?: CloseReason;
+  processReleased?: true | 'pending';
+}
+
+export class WorkbenchArtifactError extends Error {
+  constructor(readonly status: 404 | 409 | 413 | 502, readonly code: string) { super(code); }
+}
+
+export class RemoteAgentError extends Error {
+  constructor(readonly code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CLOSED' | 'SESSION_BUSY' | 'SESSION_CONFLICT' | 'SESSION_ATTACH_IN_PROGRESS' | 'UNSUPPORTED' | 'REMOTE_UNAVAILABLE' | 'DELETE_DISABLED', message: string) {
+    super(message);
+    this.name = 'RemoteAgentError';
+  }
 }
 interface NoticeRecord { notice: RemoteAgentNotice; target?: string; acknowledged?: boolean; delivered?: boolean; sessionDeliveryId?: string }
 interface ExecutionNotice { noticeId: string; messageId: string; originSessionId: string; jobId: string; attemptId: string;
   executionStatus: string; resultSummary: string; artifactLinks: any[]; createdAt: string; processedAt?: string; text: string }
-interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean;
+interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean; reason?: string;
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
-interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun> }
+interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[] }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
 const actionable = new Set([...terminal, 'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED']);
 const wire = (task: Task): Record<string, any> => Task.toJSON(task) as Record<string, any>;
@@ -162,6 +211,7 @@ export class RemoteAgentGateway {
   readonly automation?: A2AAutomation;
   readonly sessions: SessionDelivery;
   readonly targets: TargetDirectory;
+  readonly agents: AgentRegistry;
   readonly projectDiscovery?: ProjectRoleDiscovery;
   readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
@@ -176,13 +226,21 @@ export class RemoteAgentGateway {
   private readonly operations = new Set<Promise<unknown>>();
   private readonly advancingDeliveries = new Map<string, Promise<void>>();
   private readonly canceling = new Map<string, Promise<void>>();
+  private readonly closingSessions = new Map<string, Promise<void>>();
+  private readonly automaticCloseStopped = new Set<string>();
+  private readonly now: () => number;
+  private idleScannedAt = Number.NEGATIVE_INFINITY;
+  /** taskId and status timestamp of INPUT_REQUIRED turns already warned about. */
+  private readonly inputRequiredAlerts = new Map<string, { sessionId?: string; contextId: string; since: string }>();
+  private closeFailures = 0;
   private reconciling?: Promise<void>;
   private workbenchQueue: Promise<void> = Promise.resolve();
   private readonly timer: NodeJS.Timeout;
   private closed = false;
 
-  constructor(input: A2AGatewayConfig) {
+  constructor(input: A2AGatewayConfig, options: { now?: () => number } = {}) {
     this.config = configSchema.parse(input);
+    this.now = options.now ?? Date.now;
     if (!path.isAbsolute(this.config.stateDirectory)) throw new Error('stateDirectory must be absolute');
     mkdirSync(this.config.stateDirectory, { recursive: true, mode: 0o700 });
     // Reuse the A2A store's tested single-owner lease, in a separate empty
@@ -204,6 +262,7 @@ export class RemoteAgentGateway {
       this.sessions = new SessionDelivery(this.config.stateDirectory, this.config.sessionHosts);
       this.targets = new TargetDirectory(this.config.stateDirectory, this.config.remotes);
       this.targets.ensureLegacyRemotes();
+      this.agents = new AgentRegistry(this.config.stateDirectory);
       this.ledger = new JobLedger(this.state.ledger, next => {
         atomicJson(this.stateFile, { ...this.state, version: 2, ledger: next });
         this.state.ledger = next; this.state.version = 2;
@@ -229,6 +288,8 @@ export class RemoteAgentGateway {
       this.state.reportReviews ??= {};
       this.state.executionCancellations ??= {};
       this.state.pptDeliveries ??= { version: 1, runs: {} };
+      if (this.state.processRequests !== undefined && !Array.isArray(this.state.processRequests)) throw new Error('Invalid gateway state');
+      this.state.processRequests = z.array(processRequestSchema).parse(this.state.processRequests ?? []);
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         const attempt = this.ledger.getAttempt(run.attemptId);
         if (attempt.submissionStatus === 'prepared') this.ledger.markDispatching(attempt.attemptId);
@@ -261,6 +322,13 @@ export class RemoteAgentGateway {
     try { return this.targetSnapshot(this.targets.resolve(`legacy:${job.remote}`, { cwd: job.cwd, prompt: 'Legacy task migration', ...(job.agentPreset ? { agentPreset: job.agentPreset } : {}) })); }
     catch { return { targetId: `legacy:${job.remote}`, provider: 'a2a', remote: job.remote, cwd: job.cwd, agentPreset: job.agentPreset, historicalConfigUnknown: true }; }
   }
+  /** A continuation keeps the channel frozen on its current attempt. A new task is admitted from the registry. */
+  private developmentFor(target: { targetId: string; kind: string; name: string }, jobId?: string) {
+    if (!jobId) return this.agents.admit(target);
+    const job = this.ledger.snapshot().jobs[jobId];
+    const attempt = job ? this.ledger.snapshot().attempts[job.currentAttemptId] : undefined;
+    return readDevelopment(attempt?.targetSnapshot?.development);
+  }
   private targetSnapshot(resolved: ExecutionTargetSnapshot) {
     return { targetId: resolved.target.targetId, targetKind: resolved.target.kind, targetName: resolved.target.name,
       configVersion: resolved.configVersion, connectionId: resolved.connection.connectionId,
@@ -290,12 +358,13 @@ export class RemoteAgentGateway {
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
     const resolved = this.targets.resolve(input.targetId, input.input);
     if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
-      throw new Error('Continue must preserve the original remote, cwd and preset');
+      throw new RemoteAgentError('SESSION_CONFLICT', 'Continue must preserve the original remote, cwd and preset');
     }
     const reportRequest = input.input.reportReview;
     if (reportRequest !== undefined && (options.jobId || resolved.target.kind !== 'agent_host' || !this.config.reportReview || !this.config.workbench)) throw new Error('Report review requires a new temporary agent_host task and configured report/workbench policy');
     if (reportRequest !== undefined) reportReviewInputSchema.parse(reportRequest);
-    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
+    const development = this.developmentFor(resolved.target, options.jobId);
+    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(development ? { development } : {}), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
     if (prepared.idempotent) return this.ledgerView(input.originSessionId, prepared.job.jobId);
     const { job, attempt } = prepared;
@@ -325,34 +394,54 @@ export class RemoteAgentGateway {
         return this.ledgerView(input.originSessionId, job.jobId);
       }
       const fields = resolved.input;
+      const provider = fields.provider === undefined ? undefined : string.parse(fields.provider);
+      const model = fields.model === undefined ? undefined : string.parse(fields.model);
+      if ((provider === undefined) !== (model === undefined)) throw new Error('provider and model must be passed together');
+      if (provider && isAcpAgentPreset(resolved.agentPreset)) throw new Error('provider and model apply only to standard presets; oneagents-acp-* presets switch models through session/set_config_option');
       const preflight = fields.preflight === undefined ? undefined : a2aPreflightRequirementsSchema.parse(fields.preflight);
-      const requirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
+      const declaredRequirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
-      const resultContract = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
+      const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
+      // Unless the caller declared its own artifact location, every task gets <cwd>/.1agents/jobs/<jobId>/ and a
+      // per-attempt manifest, announced to the agent in the prompt. The host creates the directory during preflight.
+      let artifacts = !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && resolved.cwd
+        ? { directory: defaultJobDirectory(resolved.cwd, job.jobId), manifest: defaultManifestPath(resolved.cwd, job.jobId, attempt.attemptId) } : undefined;
+      const withArtifacts = <T>(declared: T, add: (found: NonNullable<typeof artifacts>) => T): T => artifacts ? add(artifacts) : declared;
+      let requirements = withArtifacts(declaredRequirements, found => ({ ...declaredRequirements, jobDirectory: found.directory }));
+      let resultContract = withArtifacts(declaredResult, found => ({ ...(declaredResult ?? { jobId: job.jobId }), artifactManifestPath: found.manifest }));
       const networkRole = resolved.target.binding.skillPolicy === 'network_pinned' ? resolved.target.binding.roleId : undefined;
       if (resolved.target.binding.skillPolicy && !networkRole) throw new Error('Network skill policy requires a fixed roleId');
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
       const roleLockPath = fields.roleLockPath === undefined ? undefined
         : z.string().min(1).refine(path.isAbsolute, 'Expected an absolute role lock path').parse(fields.roleLockPath);
-      await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
+      try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
+      catch (error) {
+        // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
+        // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
+        if (!artifacts) throw error;
+        artifacts = undefined; requirements = declaredRequirements; resultContract = declaredResult;
+        await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
+      }
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
       const fresh = this.targets.resolve(input.targetId, input.input);
       if (fresh.configVersion !== resolved.configVersion || fresh.connectionVersion !== resolved.connectionVersion) throw new Error('Execution target changed before dispatch');
       this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
       this.ledger.markDispatching(attempt.attemptId); sent = true;
+      const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
+        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '') }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
-          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}) } },
+          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
+          execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
         configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
           authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
       if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
-        ledgerJobId: job.jobId, attemptId: attempt.attemptId });
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}) });
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
@@ -423,7 +512,7 @@ export class RemoteAgentGateway {
     const artifactLinks = links.map(item => ({ url: item.url, mediaType: item.mediaType, sha256: item.sha256, size: item.size }));
     const reviewUrl = this.config.workbench?.publicBaseUrl ? new URL(this.config.workbench.publicBaseUrl) : undefined;
     if (reviewUrl && pendingReview) reviewUrl.hash = `acp/tasks/${encodeURIComponent(run.jobId)}?review=${encodeURIComponent(pendingReview.reviewId)}`;
-    const reviewEntry = pendingReview ? `\n\n${reviewUrl ? `[打开文字稿审核](${reviewUrl.href})` : '请用户打开 1agents「任务工作台 → 待我确认」。'}\n审核版本：${pendingReview.revision}；审核请求：${pendingReview.reviewId}。\n人工决定必须在审核页记录，execution_review 和通知已读均不能替代。` : '';
+    const reviewEntry = pendingReview ? `\n\n${reviewUrl ? `[打开文字稿审核](${reviewUrl.href})` : '请用户打开本机 A2A 网关的任务工作台页面（/workbench/ui/）→「待我确认」。'}\n审核版本：${pendingReview.revision}；审核请求：${pendingReview.reviewId}。\n人工决定必须在审核页记录，execution_review 和通知已读均不能替代。` : '';
     const text = `[任务交付通知] ${pendingReview ? '文字稿待人工确认' : run.executionStatus === 'completed' ? '任务已完成' : run.executionStatus === 'canceled' ? '任务已取消' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
       artifactLinks.map(item => `[${item.mediaType?.includes('presentation') ? (run.executionStatus === 'completed' ? '最终 PPT' : '已有 PPT（未完成最终验收）') : '预览产物'}](${item.url})`).join('\n') +
       reviewEntry +
@@ -512,7 +601,7 @@ export class RemoteAgentGateway {
       jobId = job.parentJobRef?.jobId;
     }
   }
-  private async cancelExecution(origin: string, jobId: string, cascade?: boolean) {
+  private async cancelExecution(origin: string, jobId: string, cascade?: boolean, reason?: string) {
     const job = this.ledger.get(origin, jobId), run = this.state.pptDeliveries.runs[job.currentAttemptId] as PptDeliveryRun | undefined;
     if (this.state.reportReviews?.[job.currentAttemptId] && cascade === false) throw new Error('Report cancellation must include its child task');
     if (run && cascade === false) throw new Error('PPT delivery cancellation must include its child tasks');
@@ -520,7 +609,7 @@ export class RemoteAgentGateway {
     if (record && cascade === true && !record.cascade) { record.cascade = true; record.status = 'pending'; }
     if (!record) {
       record = { jobId, attemptId: job.currentAttemptId, originSessionId: origin, cascade: cascade ?? Boolean(run || this.state.reportReviews?.[job.currentAttemptId]),
-        requestedAt: new Date().toISOString(), status: 'pending', targets: [], diagnostics: [] };
+        requestedAt: new Date().toISOString(), status: 'pending', targets: [], diagnostics: [], ...(reason ? { reason } : {}) };
       this.state.executionCancellations![record.attemptId] = record;
     }
     // Close admission synchronously and durably, before waiting for an in-flight submit or contacting a backend.
@@ -677,12 +766,7 @@ export class RemoteAgentGateway {
     const configured = this.config.remotes[remote];
     const config = configured ? { ...configured, url: pinnedEndpoint ?? configured.url } : undefined;
     if (!config) throw new Error(`Unknown remote: ${remote}`);
-    const client = await this.client(remote, config.url), card = await client.getAgentCard(this.auth(remote));
-    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
-    if (!endpoint) throw new Error('Remote does not advertise a JSONRPC endpoint');
-    const url = new URL(endpoint);
-    if (url.origin !== new URL(config.url).origin || url.username || url.password) throw new Error('Preflight endpoint must use the configured remote origin');
-    url.pathname = `${url.pathname.replace(/\/$/, '')}/preflight`; url.search = ''; url.hash = '';
+    const url = await this.hostRoute(remote, config.url, '/preflight');
     const controller = new AbortController(); this.controllers.add(controller);
     try {
       const response = await fetch(url, { method: 'POST', redirect: 'error',
@@ -691,6 +775,58 @@ export class RemoteAgentGateway {
       if (!response.ok) { await response.body?.cancel(); throw new Error(`Remote preflight failed (HTTP ${response.status})`); }
       return a2aPreflightReportSchema.parse(await response.json());
     } finally { this.controllers.delete(controller); }
+  }
+  /** Host extensions sit beside the JSONRPC endpoint the remote advertises, and only on its configured origin. */
+  private async hostRoute(remote: string, base: string, suffix: string): Promise<URL> {
+    const client = await this.client(remote, base), card = await client.getAgentCard(this.auth(remote));
+    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
+    if (!endpoint) throw new Error('Remote does not advertise a JSONRPC endpoint');
+    const url = new URL(endpoint);
+    if (url.origin !== new URL(base).origin || url.username || url.password) throw new Error('Host endpoint must use the configured remote origin');
+    url.pathname = `${url.pathname.replace(/\/$/, '')}${suffix}`; url.search = ''; url.hash = '';
+    return url;
+  }
+  /** One verified artifact, read from the host that produced it and checked against the recorded receipt again here. */
+  /** The execution host replaced a finished task's result (manual takeover): read it now rather than wait for a webhook. */
+  async refreshWorkbenchTask(jobId: string) {
+    this.workbenchTask(jobId);
+    await Promise.allSettled(this.state.jobs.filter(raw => raw.ledgerJobId === jobId).map(raw => this.refresh(raw)));
+    return this.workbenchTask(jobId);
+  }
+  async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
+    this.workbenchTask(jobId);
+    for (const raw of this.state.jobs) {
+      if (raw.ledgerJobId !== jobId) continue;
+      const result = Task.fromJSON(raw.task).metadata?.['1agents']?.result as Partial<A2AResultMetadata> | undefined;
+      const artifact = result?.artifacts?.find(item => item.sha256 === sha256);
+      if (!artifact) continue;
+      const config = this.config.remotes[raw.remote];
+      if (!config) throw new WorkbenchArtifactError(404, 'artifact-host-not-configured');
+      if (artifact.size > ARTIFACT_CONTENT_LIMIT) throw new WorkbenchArtifactError(413, 'artifact-too-large');
+      const controller = new AbortController(); this.controllers.add(controller);
+      try {
+        const url = await this.hostRoute(raw.remote, config.url, '/artifacts/content');
+        const response = await fetch(url, { method: 'POST', redirect: 'error',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
+          body: JSON.stringify({ taskId: raw.taskId, path: artifact.path, sha256 }),
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]) });
+        if (!response.ok) {
+          await response.body?.cancel();
+          // An older host has no such route; everything else keeps the host's own verdict.
+          throw new WorkbenchArtifactError(response.status === 409 || response.status === 413 ? response.status : 404,
+            response.status === 404 || response.status === 409 || response.status === 413 ? 'artifact-unavailable-on-host' : 'artifact-host-unsupported');
+        }
+        const content = Buffer.from(await response.arrayBuffer());
+        if (content.length !== artifact.size || createHash('sha256').update(content).digest('hex') !== sha256) {
+          throw new WorkbenchArtifactError(409, 'artifact-digest-mismatch');
+        }
+        return { content, name: path.basename(artifact.path), ...(artifact.mediaType ? { mediaType: artifact.mediaType } : {}) };
+      } catch (error) {
+        if (error instanceof WorkbenchArtifactError) throw error;
+        throw new WorkbenchArtifactError(502, 'artifact-host-unreachable');
+      } finally { this.controllers.delete(controller); }
+    }
+    throw new WorkbenchArtifactError(404, 'artifact-not-found');
   }
   private async checkDispatch(remote: string, cwd: string, requirements?: z.output<typeof a2aPreflightRequirementsSchema>, pinnedEndpoint?: string): Promise<void> {
     if (!requirements) return;
@@ -704,11 +840,21 @@ export class RemoteAgentGateway {
   }
   private view(job: Job) {
     const task = Task.fromJSON(job.task);
+    const meta = task.metadata?.['1agents'] as { sessionId?: string; preflight?: unknown; result?: unknown; capacity?: unknown; taskSlot?: unknown; processSlot?: unknown; resumed?: unknown; restoreMethod?: unknown; provider?: unknown; model?: unknown } | undefined;
     const result = job.attemptId ? this.ledger.getAttempt(job.attemptId).result : undefined;
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
       ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
-      cwd: job.cwd, agentPreset: job.agentPreset, sessionId: task.metadata?.['1agents']?.sessionId,
-      preflight: task.metadata?.['1agents']?.preflight, resultMetadata: task.metadata?.['1agents']?.result,
+      cwd: job.cwd, agentPreset: job.agentPreset, sessionId: meta?.sessionId ?? job.sessionId,
+      preflight: meta?.preflight, resultMetadata: meta?.result,
+      ...(meta?.capacity ? { capacity: meta.capacity } : {}),
+      ...(meta?.taskSlot ? { taskSlot: meta.taskSlot } : {}),
+      ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
+      ...(meta?.resumed === true ? { resumed: true } : {}),
+      ...(meta?.restoreMethod === 'session/load' || meta?.restoreMethod === 'session/resume' ? { restoreMethod: meta.restoreMethod } : {}),
+      ...(typeof meta?.provider === 'string' && typeof meta.model === 'string' ? { provider: meta.provider, model: meta.model } : {}),
+      ...(job.lifecycle ? { lifecycle: job.lifecycle } : {}),
+      ...(job.sessionState ? { sessionState: job.sessionState } : {}),
+      ...(job.processReleased !== undefined ? { processReleased: job.processReleased } : {}),
       resultRevision: result?.resultRevision, resultDigest: result?.resultDigest,
       state: taskState(job), result: resultText(task), artifactLinks: artifactLinks(task), checkedAt: job.checkedAt, stale: Boolean(job.stale) };
   }
@@ -733,13 +879,16 @@ export class RemoteAgentGateway {
     if ((terminal.has(taskState(job)) && !terminal.has(wire(task).status?.state)) ||
       Date.parse(previous.status?.timestamp ?? '') > Date.parse(task.status?.timestamp ?? '')) return;
     job.task = wire(task); job.checkedAt = new Date().toISOString(); job.stale = false;
+    const meta = task.metadata?.['1agents'] as { sessionId?: unknown } | undefined;
+    if (typeof meta?.sessionId === 'string' && meta.sessionId) job.sessionId = meta.sessionId;
     const state = taskState(job);
     if (actionable.has(state)) {
+      const reason = state === 'TASK_STATE_CANCELED' && job.attemptId ? this.state.executionCancellations?.[job.attemptId]?.reason : undefined;
       const noticeId = createHash('sha256').update(JSON.stringify([job.remote, job.taskId, state, task.status?.timestamp])).digest('hex');
       if (!this.state.notices.some(value => value.notice.noticeId === noticeId)) this.state.notices.push({
         ...(this.sessions.hasBinding(job.originSessionId) ? { sessionDeliveryId: `a2a-notice:${noticeId}` } : { target: job.notificationTarget }),
         notice: { noticeId, originSessionId: job.originSessionId, remote: job.remote, taskId: job.taskId, contextId: job.contextId,
-          cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: resultText(task),
+          cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: reason ? `${reason}\n\n${resultText(task)}`.trim() : resultText(task),
           ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}), createdAt: new Date().toISOString() } });
     }
     if (job.attemptId) {
@@ -748,6 +897,7 @@ export class RemoteAgentGateway {
         { provider: 'a2a', remote: job.remote, endpoint: job.remoteEndpoint, taskId: task.id, contextId: task.contextId, sessionId: task.metadata?.['1agents']?.sessionId }, observed);
       else this.ledger.observe(job.attemptId, observed);
     } else this.save();
+    if (oneShotShouldClose(job.lifecycle, state, this.taskAcknowledged(job, state))) this.releaseOneShot(job);
   }
   private async refresh(job: Job): Promise<void> {
     const key = `${job.remote}:${job.taskId}`;
@@ -810,6 +960,11 @@ export class RemoteAgentGateway {
         await this.sessions.reconcile();
       }
       await Promise.allSettled(this.state.notices.filter(record => record.target && !record.delivered && !record.acknowledged).map(record => this.deliver(record)));
+      for (const job of this.state.jobs) {
+        if (this.closed) break;
+        if (oneShotShouldClose(job.lifecycle, taskState(job), this.taskAcknowledged(job, taskState(job)))) this.releaseOneShot(job);
+      }
+      await this.reconcileIdleSessions();
       await this.automation?.reconcileAcknowledgements();
     })();
     this.reconciling = pending;
@@ -960,6 +1115,10 @@ export class RemoteAgentGateway {
     }
     if (method === 'remote_agent_message') {
       const input = messageSchema.parse(params), previous = this.job(input);
+      if (previous.sessionState === 'deleted') throw new RemoteAgentError('SESSION_DELETED', 'Session was deleted');
+      if (input.autoResume === false && (previous.sessionState === 'closed' || previous.sessionState === 'closing')) {
+        throw new RemoteAgentError('SESSION_CLOSED', 'Session is closed');
+      }
       if (!previous.ledgerJobId) throw new Error('Task has no unified job association');
       const record = this.ledger.get(input.originSessionId, previous.ledgerJobId);
       const target = this.targets.getTarget(record.targetId);
@@ -968,6 +1127,8 @@ export class RemoteAgentGateway {
         input: { ...(target.kind === 'agent_host' ? { cwd: previous.cwd, ...(previous.agentPreset ? { agentPreset: previous.agentPreset } : {}) } : {}), prompt: input.prompt,
           ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
           ...(input.roleId ? { roleId: input.roleId } : {}), ...(input.roleLockPath ? { roleLockPath: input.roleLockPath } : {}),
+          ...(input.lifecycle ? { lifecycle: input.lifecycle } : previous.lifecycle ? { lifecycle: previous.lifecycle } : {}),
+          ...(input.provider !== undefined ? { provider: input.provider } : {}), ...(input.model !== undefined ? { model: input.model } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
@@ -985,7 +1146,20 @@ export class RemoteAgentGateway {
       if (!notice) throw new Error('Notice not found for this origin session');
       notice.acknowledged = true; this.save();
       this.sessions.acknowledgeNotice(input.originSessionId, input.noticeId);
+      const acked = this.state.jobs.find(item => item.originSessionId === input.originSessionId && item.taskId === notice.notice.taskId);
+      if (acked && oneShotShouldClose(acked.lifecycle, notice.notice.state, true)) this.releaseOneShot(acked);
       return { acknowledged: true, noticeId: input.noticeId };
+    }
+    if (method === 'remote_agent_close') {
+      const input = closeSchema.parse(params);
+      const present = [input.taskId, input.contextId, input.sessionId].filter(value => value !== undefined);
+      if (present.length !== 1) throw new RemoteAgentError('SESSION_CONFLICT', 'Provide exactly one of taskId, contextId, or sessionId');
+      if (input.mode === 'delete' && !this.config.sessionLifecycle.allowDelete) throw new RemoteAgentError('DELETE_DISABLED', 'Session delete is disabled on this gateway');
+      return this.performClose(input, 'explicit');
+    }
+    if (method === 'remote_agent_sessions') {
+      sessionsSchema.parse(params ?? {});
+      return this.capacityReport(true);
     }
     throw new Error(`Unknown method: ${method}`);
   }
@@ -1003,13 +1177,40 @@ export class RemoteAgentGateway {
     const runs = Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[];
     const reportRuns = Object.values(this.state.reportReviews ?? {});
     return workbenchSnapshot({ ledger: this.ledger.snapshot(), runs, reportRuns, reviews: [...runs.flatMap(run => run.humanReviews ?? []), ...reportRuns.flatMap(run => run.humanReviews)],
-      actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
+      processRequests: this.state.processRequests ?? [], actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
+  }
+  private workbench<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.workbenchQueue.then(operation);
+    this.workbenchQueue = run.then(() => {}, () => {});
+    return run;
+  }
+  private writeProcessRequest(request: ProcessRequest): void {
+    const items = this.state.processRequests ?? [];
+    const index = items.findIndex(item => item.requestId === request.requestId);
+    const next = items.slice();
+    if (index < 0) next.push(request); else next[index] = request;
+    this.state.processRequests = next;
+    this.save();
   }
   workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
+  workbenchAgents() {
+    const residents = this.targets.listTargets().filter(target => target.kind === 'resident_agent').map(target => ({
+      targetId: target.targetId, name: target.name, ...(target.binding.roleId ? { roleId: target.binding.roleId } : {}),
+      ...(target.binding.agentPreset ? { agentPreset: target.binding.agentPreset } : {}) }));
+    return listWorkbenchAgents(this.workbenchProjection(), this.agents.snapshot(), residents);
+  }
+  createWorkbenchAgent(input: unknown) { return this.workbench(async () => ({ draft: this.agents.create(input), ...this.workbenchAgents() })); }
+  updateWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ draft: this.agents.update(agentId, input), ...this.workbenchAgents() })); }
+  publishWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() })); }
   workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
+  /** Read-only transcript from the stored A2A history of the job's attempts; the same scope check as the task detail. */
+  workbenchChat(jobId: string, query: { limit?: number; before?: number } = {}) {
+    this.workbenchTask(jobId);
+    return pageChat(chatItems(this.state.jobs.filter(job => job.ledgerJobId === jobId)), query);
+  }
   /** Only the dedicated HTTP workbench calls this; it is deliberately absent from the agent tool catalogue. */
   async decideWorkbenchReview(jobId: string, reviewId: string, input: unknown) {
-    const operation = this.workbenchQueue.then(async () => {
+    return this.workbench(async () => {
       if (this.closed) throw new Error('Gateway is closed');
       const scope = this.workbenchTask(jobId), config = this.config.workbench!;
       await this.advancingDeliveries.get(scope.currentAttemptId);
@@ -1041,8 +1242,274 @@ export class RemoteAgentGateway {
       if (current.humanReviews?.some(item => item.resume?.status === 'pending')) void this.advanceDelivery(current).catch(() => {});
       return this.workbenchTask(jobId);
     });
-    this.workbenchQueue = operation.then(() => {}, () => {});
-    return operation;
+  }
+  /** Records a question or plan approval against the running attempt. The workbench token never travels in A2A metadata. */
+  async openProcessRequest(jobId: string, input: unknown) {
+    return this.workbench(async () => {
+      if (this.closed) throw new Error('Gateway is closed');
+      const scope = this.workbenchTask(jobId);
+      const parsed = processRequestCreateSchema.parse(input);
+      if (parsed.jobId !== jobId) throw new ProcessRequestError('invalid', 'Process request job does not match the task');
+      let attempt;
+      try { attempt = this.ledger.getAttempt(parsed.attemptId); }
+      catch { throw new ProcessRequestError('invalid', 'Process request attempt was not found'); }
+      if (attempt.jobId !== jobId || attempt.attemptId !== scope.currentAttemptId) throw new ProcessRequestError('invalid', 'Process request attempt is not current');
+      if (['completed', 'failed', 'canceled', 'rejected'].includes(scope.executionStatus)) throw new ProcessRequestError('already_decided', 'Task is no longer running');
+      if (parsed.requestId) {
+        const existing = this.state.processRequests?.find(item => item.requestId === parsed.requestId);
+        if (existing) {
+          if (!sameProcessRequest(existing, parsed)) throw new ProcessRequestError('idempotency_conflict', 'requestId conflicts with a recorded process request');
+          return projectProcessRequest(existing);
+        }
+      }
+      const config = this.config.workbench;
+      const created = createProcessRequest(parsed, undefined, config ? config.requestTimeoutMinutes * 60_000 : undefined);
+      this.writeProcessRequest(created);
+      if (config?.desktopNotifications) {
+        const what = created.kind === 'permission' ? `工具「${created.toolTitle}」等待批准` : created.kind === 'plan' ? '计划等待批准' : '问题等待回答';
+        notifyDesktop(`任务工作台 · ${scope.title}`.slice(0, 120), `${what}，${config.requestTimeoutMinutes} 分钟内处理`.slice(0, 240), config.publicBaseUrl);
+      }
+      return created;
+    });
+  }
+  processRequest(jobId: string, requestId: string) {
+    const request = this.workbenchTask(jobId).processRequests.find(item => item.requestId === requestId);
+    if (!request) throw new ProcessRequestError('not_found', 'Process request not found in authorized task');
+    return request;
+  }
+  /** Completes the stored request. The caller must still finish the original userQuestions wait; this does not send another prompt. */
+  async answerProcessRequest(jobId: string, requestId: string, input: unknown) {
+    let stop: { origin: string; reason: string } | undefined;
+    const task = await this.workbench(async () => {
+      if (this.closed) throw new Error('Gateway is closed');
+      this.workbenchTask(jobId);
+      const stored = this.state.processRequests?.find(item => item.requestId === requestId && item.jobId === jobId);
+      if (!stored) throw new ProcessRequestError('not_found', 'Process request not found in authorized task');
+      const parsed = processRequestAnswerSchema.parse(input);
+      if (stored.status === 'pending' && Date.parse(stored.deadlineAt) <= Date.now() && stored.answer?.clientRequestId !== parsed.clientRequestId) {
+        this.writeProcessRequest(expireProcessRequest(stored));
+        throw new ProcessRequestError('expired', 'This process request has expired');
+      }
+      let result;
+      try { result = answerProcessRequest(stored, parsed); }
+      catch (error) {
+        if (error instanceof ProcessRequestError && error.code === 'expired' && stored.status === 'pending') this.writeProcessRequest(expireProcessRequest(stored));
+        throw error;
+      }
+      if (!result.idempotent) this.writeProcessRequest(result.request);
+      const view = this.workbenchTask(jobId);
+      if (parsed.stopTask && !result.idempotent) stop = { origin: view.originSessionId,
+        reason: `人工拒绝工具调用并停止任务${stored.toolTitle ? `（${stored.toolTitle.slice(0, 200)}）` : ''}${parsed.note ? `：${parsed.note}` : ''}` };
+      return view;
+    });
+    // Recorded first, so the waiting agent sees the rejection before the cancel lands.
+    if (!stop) return task;
+    await this.cancelExecution(stop.origin, jobId, undefined, stop.reason);
+    return this.workbenchTask(jobId);
+  }
+  private jobLifecycle(value: unknown, previous?: SessionLifecycle): SessionLifecycle | undefined {
+    if (value === undefined) return previous;
+    return normalizeLifecycle(value, this.config.sessionLifecycle.persistentIdleTtlSeconds);
+  }
+  /**
+   * P3. A persistent ACP session closes once the host confirms it is attached and idle and its
+   * last turn ended more than idleTtlSeconds ago. Busy, INPUT_REQUIRED and unknown status stay open.
+   */
+  private async reconcileIdleSessions(): Promise<void> {
+    const policy = this.config.sessionLifecycle;
+    const now = this.now();
+    if (now - this.idleScannedAt < policy.idleScanIntervalMs) return;
+    this.idleScannedAt = now;
+    const contexts = new Map<string, Job[]>();
+    for (const job of this.state.jobs) {
+      const key = `${job.originSessionId}\0${job.remote}\0${job.contextId}`;
+      contexts.set(key, [...(contexts.get(key) ?? []), job]);
+    }
+    for (const jobs of contexts.values()) {
+      if (this.closed) return;
+      for (const job of jobs) if (taskState(job) === 'TASK_STATE_INPUT_REQUIRED') this.alertInputRequired(job, now);
+      if (jobs.some(job => !terminal.has(taskState(job)))) continue;
+      const job = jobs.at(-1)!;
+      if (!isAcpAgentPreset(job.agentPreset) || !job.sessionId || job.sessionState === 'closed' || job.sessionState === 'closing' || job.sessionState === 'deleted') continue;
+      const lifecycle = job.lifecycle ?? normalizeLifecycle(undefined, policy.persistentIdleTtlSeconds);
+      if (lifecycle.mode !== 'persistent' || lifecycle.idleTtlSeconds === 0) continue;
+      const ttlMs = lifecycle.idleTtlSeconds * 1000;
+      const endedAt = Date.parse(Task.fromJSON(job.task).status?.timestamp ?? '');
+      if (!Number.isFinite(endedAt) || now - endedAt < ttlMs) continue;
+      let status: { attached?: unknown; activeTurn?: unknown; lastUsedAt?: unknown };
+      try { status = await this.postSession(job.remote, 'status', { sessionId: job.sessionId, contextId: job.contextId }, job.remoteEndpoint); }
+      catch { continue; }
+      if (status.attached !== true || status.activeTurn !== false) continue;
+      const lastUsedAt = typeof status.lastUsedAt === 'string' ? Date.parse(status.lastUsedAt) : Number.NaN;
+      if (Number.isFinite(lastUsedAt) && now - lastUsedAt < ttlMs) continue;
+      try { await this.performClose({ originSessionId: job.originSessionId, remote: job.remote, contextId: job.contextId }, 'idle-ttl'); }
+      catch (error) {
+        if (error instanceof RemoteAgentError && error.code === 'SESSION_BUSY') continue;
+        this.closeFailures += 1;
+        console.warn(`A2A idle close failed session=${job.sessionId} context=${job.contextId} code=${error instanceof RemoteAgentError ? error.code : 'REMOTE_UNAVAILABLE'}`);
+      }
+    }
+  }
+  /** Warns once per INPUT_REQUIRED turn after the alert window. The process is never closed for this. */
+  private alertInputRequired(job: Job, now: number): void {
+    const since = Task.fromJSON(job.task).status?.timestamp ?? '';
+    const sinceMs = Date.parse(since);
+    if (!Number.isFinite(sinceMs) || now - sinceMs < this.config.sessionLifecycle.inputRequiredAlertSeconds * 1000) return;
+    const key = `${job.taskId}\0${since}`;
+    if (this.inputRequiredAlerts.has(key)) return;
+    this.inputRequiredAlerts.set(key, { ...(job.sessionId ? { sessionId: job.sessionId } : {}), contextId: job.contextId, since });
+    console.warn(`A2A input required for too long session=${job.sessionId ?? ''} context=${job.contextId} task=${job.taskId} since=${since}`);
+  }
+  /** Read-only lifecycle counts for /health. Close reasons and resumes are counted per context from saved jobs. */
+  lifecycleReport() {
+    const contexts = new Map<string, Job[]>();
+    for (const job of this.state.jobs) {
+      const key = `${job.originSessionId}\0${job.remote}\0${job.contextId}`;
+      contexts.set(key, [...(contexts.get(key) ?? []), job]);
+    }
+    const closeReasons: Record<CloseReason, number> = { explicit: 0, 'one-shot': 0, 'idle-ttl': 0 };
+    const restoreMethods = { 'session/load': 0, 'session/resume': 0 };
+    let busy = 0, processReleasePending = 0;
+    for (const jobs of contexts.values()) {
+      if (jobs.some(job => !terminal.has(taskState(job)))) busy += 1;
+      const last = jobs.at(-1)!;
+      if (last.closeReason) closeReasons[last.closeReason] += 1;
+      if (last.processReleased === 'pending') processReleasePending += 1;
+      for (const job of jobs) {
+        const method: unknown = Task.fromJSON(job.task).metadata?.['1agents']?.restoreMethod;
+        if (method === 'session/load' || method === 'session/resume') restoreMethods[method] += 1;
+      }
+    }
+    const current = [...this.inputRequiredAlerts.entries()].filter(([key]) => {
+      const job = this.state.jobs.find(item => item.taskId === key.split('\0')[0]);
+      return job !== undefined && taskState(job) === 'TASK_STATE_INPUT_REQUIRED' && Task.fromJSON(job.task).status?.timestamp === key.split('\0')[1];
+    }).map(([, alert]) => alert);
+    return { busy, inputRequiredAlerts: current, closeReasons, restoreMethods, closeFailures: this.closeFailures, processReleasePending };
+  }
+  private taskAcknowledged(job: Job, state: string): boolean {
+    return this.state.notices.some(record => record.acknowledged === true && record.notice.taskId === job.taskId
+      && record.notice.originSessionId === job.originSessionId && record.notice.state === state);
+  }
+  private releaseOneShot(job: Job): void {
+    if (this.automaticCloseStopped.has(job.remote)) return;
+    if (job.closeReason || job.sessionState === 'closed' || job.sessionState === 'closing' || job.sessionState === 'deleted') return;
+    const key = `${job.remote}\0${job.contextId}\0one-shot`;
+    if (this.closingSessions.has(key)) return;
+    const operation = this.finishClose(job).finally(() => {
+      if (this.closingSessions.get(key) === operation) this.closingSessions.delete(key);
+    });
+    this.closingSessions.set(key, operation);
+  }
+  private async finishClose(job: Job): Promise<void> {
+    try {
+      await this.performClose({ originSessionId: job.originSessionId, remote: job.remote, contextId: job.contextId }, 'one-shot');
+    } catch (error) {
+      if (error instanceof RemoteAgentError && error.code === 'UNSUPPORTED') this.automaticCloseStopped.add(job.remote);
+      else this.closeFailures += 1;
+      console.warn(`A2A session close failed session=${job.sessionId ?? ''} context=${job.contextId} task=${job.taskId} code=${error instanceof RemoteAgentError ? error.code : 'REMOTE_UNAVAILABLE'}`);
+    }
+  }
+  private jobsForClose(input: { originSessionId: string; remote: string; taskId?: string; contextId?: string; sessionId?: string }): Job[] {
+    const owned = this.state.jobs.filter(job => job.originSessionId === input.originSessionId && job.remote === input.remote);
+    const sessionOf = (job: Job): string | undefined => job.sessionId ?? (Task.fromJSON(job.task).metadata?.['1agents']?.sessionId as string | undefined);
+    if (input.taskId) {
+      const job = owned.find(item => item.taskId === input.taskId);
+      return job ? owned.filter(item => item.contextId === job.contextId) : [];
+    }
+    if (input.contextId) return owned.filter(item => item.contextId === input.contextId);
+    return owned.filter(item => sessionOf(item) === input.sessionId);
+  }
+  private markClosed(jobs: Job[], reason: CloseReason, processReleased: true | 'pending', deleted = false): void {
+    const closedAt = new Date().toISOString();
+    const sessionState = deleted ? 'deleted' : processReleased === true ? 'closed' : 'closing';
+    for (const job of jobs) {
+      job.sessionState = sessionState;
+      job.closedAt = closedAt;
+      job.closeReason = reason;
+      job.processReleased = processReleased;
+    }
+    this.save();
+  }
+  private async performClose(input: { originSessionId: string; remote: string; taskId?: string; contextId?: string; sessionId?: string; mode?: 'close' | 'delete'; force?: boolean }, reason: CloseReason) {
+    const deleting = input.mode === 'delete';
+    const jobs = this.jobsForClose(input);
+    if (!jobs.length) throw new RemoteAgentError('SESSION_NOT_FOUND', 'Session not found for this origin session');
+    const contexts = new Set(jobs.map(job => job.contextId));
+    if (contexts.size !== 1) throw new RemoteAgentError('SESSION_CONFLICT', 'Session identifier matches more than one context');
+    const contextId = jobs[0]!.contextId;
+    if (jobs.every(job => job.sessionState === 'deleted' || (!deleting && (job.sessionState === 'closed' || job.sessionState === 'closing')))) {
+      const sample = jobs[0]!;
+      return { remote: input.remote, contextId, sessionId: sample.sessionId, state: sample.sessionState === 'deleted' ? 'deleted' as const : 'closed' as const, alreadyClosed: true,
+        processReleased: sample.processReleased ?? 'pending', canceledTaskIds: [] as string[], ...(sample.agentPreset?.startsWith('oneagents-acp-') ? { acp: true } : sample.agentPreset ? { acp: false } : {}) };
+    }
+    const busy = jobs.filter(job => !terminal.has(taskState(job)));
+    const canceledTaskIds: string[] = [];
+    if (busy.length && !input.force) throw new RemoteAgentError('SESSION_BUSY', 'Session is busy');
+    if (busy.length && input.force) {
+      for (const job of busy) {
+        if (job.attemptId) this.ledger.requestCancellation(job.attemptId);
+        try {
+          const client = await this.client(job.remote, job.remoteEndpoint);
+          this.update(job, await client.cancelTask(CancelTaskRequest.fromJSON({ id: job.taskId }), this.auth(job.remote)));
+          canceledTaskIds.push(job.taskId);
+        } catch (error) {
+          if (error instanceof RemoteAgentError) throw error;
+          if (!terminal.has(taskState(job))) throw new RemoteAgentError('SESSION_BUSY', 'Session is busy');
+        }
+      }
+    }
+    const sessionId = jobs.map(job => job.sessionId).find((value): value is string => typeof value === 'string' && value.length > 0);
+    const state = deleting ? 'deleted' as const : 'closed' as const;
+    if (!sessionId) {
+      this.markClosed(jobs, reason, true, deleting);
+      return { remote: input.remote, contextId, state, alreadyClosed: false, processReleased: true as const, canceledTaskIds, acp: false };
+    }
+    const result = await this.postSession(input.remote, deleting ? 'delete' : 'close', { sessionId, contextId }, jobs[0]!.remoteEndpoint) as { processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
+    const processReleased = result.processReleased === true ? true : 'pending';
+    this.markClosed(jobs, reason, processReleased, deleting);
+    return { remote: input.remote, contextId, sessionId, state, alreadyClosed: result.alreadyClosed === true,
+      processReleased, canceledTaskIds, ...(typeof result.acp === 'boolean' ? { acp: result.acp } : {}) };
+  }
+  private async postSession(remote: string, action: 'close' | 'status' | 'delete', body: unknown, pinnedEndpoint?: string): Promise<Record<string, unknown>> {
+    const configured = this.config.remotes[remote];
+    const config = configured ? { ...configured, url: pinnedEndpoint ?? configured.url } : undefined;
+    if (!config) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Unknown remote');
+    const client = await this.client(remote, config.url), card = await client.getAgentCard(this.auth(remote));
+    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
+    if (!endpoint) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Remote does not advertise a JSONRPC endpoint');
+    const url = new URL(endpoint);
+    if (url.origin !== new URL(config.url).origin || url.username || url.password) throw new RemoteAgentError('REMOTE_UNAVAILABLE', 'Session endpoint must use the configured remote origin');
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/sessions/${action}`; url.search = ''; url.hash = '';
+    const controller = new AbortController(); this.controllers.add(controller);
+    try {
+      const response = await fetch(url, { method: 'POST', redirect: 'error',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
+        body: JSON.stringify(body), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
+      const payload = await response.json().catch(() => ({})) as { error?: unknown; processReleased?: unknown; acp?: unknown; alreadyClosed?: unknown };
+      if (response.status === 501 || payload.error === 'UNSUPPORTED') throw new RemoteAgentError('UNSUPPORTED', `Remote host does not support session ${action}`);
+      if (!response.ok) {
+        const code = payload.error === 'SESSION_NOT_FOUND' || payload.error === 'SESSION_BUSY' || payload.error === 'SESSION_CONFLICT' || payload.error === 'REMOTE_UNAVAILABLE'
+          ? payload.error : 'REMOTE_UNAVAILABLE';
+        throw new RemoteAgentError(code, code === 'SESSION_NOT_FOUND' ? 'Session not found for this origin session' : 'Remote session close failed');
+      }
+      return payload;
+    } finally { this.controllers.delete(controller); }
+  }
+  /** Read-only ledger view. strict requests fail when the directory is unset or the ledger cannot be read. */
+  async capacityReport(strict = false): Promise<(CapacityInspection & { processSlot: CapacityInspection['processSlot'] & { headWaitMs: number } }) | undefined> {
+    if (!this.config.capacityDirectory) {
+      if (strict) throw new Error('ACP capacity directory is not configured');
+      return;
+    }
+    try {
+      const governor = new CapacityGovernor({ directory: this.config.capacityDirectory });
+      const queue = new CapacityQueue({ directory: this.config.capacityDirectory });
+      const report = await governor.inspect();
+      return { ...report, processSlot: { ...report.processSlot, headWaitMs: await queue.headWaitMs('process') } };
+    } catch (error) {
+      if (!strict) return;
+      throw new Error(error instanceof Error && error.message.startsWith('ACP capacity') ? error.message : 'ACP capacity state is unavailable');
+    }
   }
   async close(): Promise<void> {
     if (this.closed) return;
@@ -1070,13 +1537,58 @@ async function body(req: IncomingMessage): Promise<unknown> {
 function json(res: ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(data));
 }
+const ARTIFACT_TYPES: Record<string, string> = { md: 'text/markdown', txt: 'text/plain', csv: 'text/csv', json: 'application/json', html: 'text/html',
+  pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+  mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav' };
+/** The manifest's media type when well formed, else one from the extension; text is always served as UTF-8. */
+function artifactContentType(name: string, declared?: string): string {
+  const type = declared && /^[a-z0-9][\w.+-]*\/[\w.+-]+$/i.test(declared) ? declared.toLowerCase()
+    : ARTIFACT_TYPES[path.extname(name).slice(1).toLowerCase()] ?? 'application/octet-stream';
+  return type.startsWith('text/') ? `${type}; charset=utf-8` : type;
+}
 function authenticated(req: IncomingMessage, token: string): boolean {
   const expected = Buffer.from(`Bearer ${token}`), supplied = Buffer.from(req.headers.authorization ?? '');
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+/** Publishing and review decisions are a person's acts, made on the workbench page. */
+const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/];
+function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
+  if (!secret) return false;
+  const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 async function listen(server: http.Server, port: number, host: string): Promise<number> {
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
   return (server.address() as AddressInfo).port;
+}
+/** Only a missing bind address is retried. A busy port or a permission error is a bad configuration. */
+export function isRetryableCallbackBindError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'EADDRNOTAVAIL';
+}
+/** Keeps trying `bind` after EADDRNOTAVAIL. Any other error rejects without another sleep. */
+export async function retryCallbackBind(options: {
+  bind: () => Promise<void>;
+  signal: AbortSignal;
+  onPending: (error: unknown, at: string) => void;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+}): Promise<void> {
+  const sleep = options.sleep ?? ((ms, signal) => delay(ms, undefined, { signal }));
+  let waitMs = options.initialDelayMs ?? 1000;
+  const maxDelayMs = options.maxDelayMs ?? 30_000;
+  for (;;) {
+    options.signal.throwIfAborted();
+    try {
+      await options.bind();
+      return;
+    } catch (error) {
+      if (!isRetryableCallbackBindError(error)) throw error;
+      options.onPending(error, new Date().toISOString());
+      await sleep(waitMs, options.signal);
+      waitMs = Math.min(waitMs * 2, maxDelayMs);
+    }
+  }
 }
 async function stop(server: http.Server): Promise<void> {
   server.closeIdleConnections();
@@ -1099,28 +1611,111 @@ function methodContractViolations(methods: Record<string, { description?: unknow
 
 export async function serveA2AGateway(input: A2AGatewayConfig, options: { report?: boolean } = {}) {
   const gateway = new RemoteAgentGateway(input);
+  const workbenchUi = gateway.config.workbench ? new WorkbenchUi(gateway.config.workbench.token) : undefined;
+  const callbackHealth: { state?: 'pending' | 'listening' } = {};
   const server = http.createServer((req, res) => { void (async () => {
     try {
-      if (req.method === 'GET' && req.url === '/health') return json(res, gateway.sessions.healthy ? 200 : 503, { status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes), sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable' });
+      if (req.method === 'GET' && req.url === '/health') {
+        const slots = await gateway.capacityReport();
+        return json(res, gateway.sessions.healthy ? 200 : 503, {
+          status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes),
+          sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable',
+          ...(slots ? { taskSlot: slots.taskSlot, processSlot: slots.processSlot } : {}),
+          sessions: gateway.lifecycleReport(),
+          ...(callbackHealth.state === 'pending' ? { callback: 'pending' } : {}) });
+      }
       const url = new URL(req.url ?? '/', 'http://localhost');
-      if (url.pathname.startsWith('/workbench/')) {
-        if (!gateway.config.workbench) return json(res, 503, { error: 'Workbench is not configured' });
-        if (!authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
-        if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated application workbench' });
-        if (req.method === 'GET' && url.pathname === '/workbench/tasks') {
+      const page = url.pathname === WORKBENCH_UI_PATH || url.pathname.startsWith(`${WORKBENCH_UI_PATH}/`);
+      if (page || url.pathname.startsWith('/workbench/')) {
+        if (!gateway.config.workbench || !workbenchUi) return json(res, 503, { error: 'Workbench is not configured' });
+        // The page reaches the same routes as the bearer API once its own login and origin checks pass.
+        let pathname = url.pathname;
+        if (page) {
+          const routed = await workbenchUi.handle(req, res, url);
+          if (!routed) return;
+          pathname = routed.route;
+        } else {
+          if (gateway.config.workbench.token && !authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
+          if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
+          if (req.method === 'POST' && PAGE_ONLY_ROUTES.some(route => route.test(pathname)) && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) {
+            return json(res, 403, { error: 'page_action_required', message: '发布和验收决定只能由人在工作台页面发起。' });
+          }
+        }
+        if (req.method === 'GET' && pathname === '/workbench/tasks') {
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
         }
-        const route = /^\/workbench\/tasks\/([^/]+)(?:\/reviews\/([^/]+)\/decisions)?$/.exec(url.pathname);
-        if (!route || url.search) return json(res, 404, { error: 'No workbench route' });
-        const jobId = decodeURIComponent(route[1]!);
+        const agentCreate = req.method === 'POST' && pathname === '/workbench/agents';
+        const agentChange = /^\/workbench\/agents\/([^/]+)\/(settings|publish)$/.exec(pathname);
+        if (pathname === '/workbench/agents' || agentChange) {
+          if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+        }
+        if (req.method === 'GET' && pathname === '/workbench/agents') return json(res, 200, gateway.workbenchAgents());
+        if (agentCreate || agentChange) {
+          if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
+          try {
+            const payload = await body(req);
+            if (agentCreate) return json(res, 200, await gateway.createWorkbenchAgent(payload));
+            const agentId = decodeURIComponent(agentChange![1]!), action = agentChange![2];
+            return json(res, 200, await (action === 'publish' ? gateway.publishWorkbenchAgent(agentId, payload) : gateway.updateWorkbenchAgent(agentId, payload)));
+          } catch (error) {
+            if (error instanceof AgentRegistryError) {
+              const status = error.code === 'not_found' ? 404 : error.code === 'conflict' ? 409 : 400;
+              return json(res, status, { error: error.code, message: error.message });
+            }
+            if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
+            throw error;
+          }
+        }
+        const chat = /^\/workbench\/tasks\/([^/]+)\/chat$/.exec(pathname);
+        if (chat) {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          const query = z.object({ limit: z.coerce.number().int().min(1).max(200).optional(), before: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
+          try { return json(res, 200, gateway.workbenchChat(decodeURIComponent(chat[1]!), query)); }
+          catch (error) { return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' }); }
+        }
+        const artifact = /^\/workbench\/tasks\/([^/]+)\/artifacts\/([a-f0-9]{64})$/.exec(pathname);
+        if (artifact) {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          if (url.search) return json(res, 404, { error: 'No workbench route' });
+          try {
+            const file = await gateway.workbenchArtifact(decodeURIComponent(artifact[1]!), artifact[2]!);
+            // Agent-written bytes: never sniffed, and a sandboxed document with no script or network even when opened directly.
+            res.writeHead(200, { 'Content-Type': artifactContentType(file.name, file.mediaType), 'Content-Length': file.content.length,
+              'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600',
+              'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+              'Content-Security-Policy': "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'" });
+            return void res.end(file.content);
+          } catch (error) {
+            if (error instanceof WorkbenchArtifactError) return json(res, error.status, { error: error.code });
+            return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
+          }
+        }
+        if (url.search) return json(res, 404, { error: 'No workbench route' });
+        const route = /^\/workbench\/tasks\/([^/]+)(.*)$/.exec(pathname);
+        if (!route) return json(res, 404, { error: 'No workbench route' });
+        const jobId = decodeURIComponent(route[1]!), rest = route[2] ?? '';
+        // Only the DSH host opens process requests; the page can read and answer them.
+        if (page && rest === '/process-requests') return json(res, 403, { error: 'browser_action_required', message: 'Process requests are opened by the execution host.' });
+        const review = /^\/reviews\/([^/]+)\/decisions$/.exec(rest);
+        const answer = /^\/process-requests\/([^/]+)\/answers$/.exec(rest);
+        const one = /^\/process-requests\/([^/]+)$/.exec(rest);
         try {
-          if (req.method === 'GET' && !route[2]) return json(res, 200, gateway.workbenchTask(jobId));
-          if (req.method === 'POST' && route[2]) return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(route[2]), await body(req)));
-          return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
+          if (rest === '/refresh' && req.method === 'POST') return json(res, 200, await gateway.refreshWorkbenchTask(jobId));
+          if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
+          if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
+          if (answer && req.method === 'POST') return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), await body(req)));
+          if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
+          if (rest === '' || rest === '/refresh' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });
+          if (error instanceof ProcessRequestError) {
+            const status = error.code === 'forbidden' ? 403 : error.code === 'not_found' ? 404 : error.code === 'invalid' ? 400 : 409;
+            return json(res, status, { error: error.code, message: error.message });
+          }
           if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
           return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
         }
@@ -1132,21 +1727,55 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
       return json(res, 200, await gateway.invoke(request.method ?? request.capability ?? '', request.params));
     } catch (error) { json(res, 400, { error: error instanceof z.ZodError ? 'Invalid method parameters' : error instanceof Error ? error.message : 'Invocation failed' }); }
   })(); });
-  let receiver: http.Server | undefined;
+  const callbackServers = new Set<http.Server>();
+  const callbackAbort = new AbortController();
   let callbackPort: number | undefined;
   let automationServer: http.Server | undefined;
   let automationPort: number | undefined;
+  const callbackHandler = gateway.config.callback ? (req: IncomingMessage, res: ServerResponse) => { void (async () => {
+    const callback = gateway.config.callback!;
+    if (!authenticated(req, callback.token)) return json(res, 401, { error: 'Unauthorized' });
+    if (req.method !== 'POST' || req.url !== new URL(callback.url).pathname) return json(res, 404, { error: 'No route' });
+    try { const event = await body(req); json(res, 202, { accepted: true }); void gateway.receivePush(event).catch(() => {}); }
+    catch { json(res, 400, { error: 'Invalid A2A event' }); }
+  })(); } : undefined;
+  const bindCallback = async (): Promise<void> => {
+    if (!gateway.config.callback || !callbackHandler) return;
+    if (callbackAbort.signal.aborted) throw callbackAbort.signal.reason ?? new Error('callback stopped');
+    const receiver = http.createServer(callbackHandler);
+    callbackServers.add(receiver);
+    try {
+      callbackPort = await listen(receiver, gateway.config.callback.port, gateway.config.callback.host);
+      if (callbackAbort.signal.aborted) {
+        await stop(receiver);
+        throw callbackAbort.signal.reason ?? new Error('callback stopped');
+      }
+      callbackHealth.state = 'listening';
+    } catch (error) {
+      callbackServers.delete(receiver);
+      receiver.close(() => {});
+      throw error;
+    }
+  };
   try {
     const port = await listen(server, gateway.config.port, '127.0.0.1');
     if (gateway.config.callback) {
       const callback = gateway.config.callback;
-      receiver = http.createServer((req, res) => { void (async () => {
-        if (!authenticated(req, callback.token)) return json(res, 401, { error: 'Unauthorized' });
-        if (req.method !== 'POST' || req.url !== new URL(callback.url).pathname) return json(res, 404, { error: 'No route' });
-        try { const event = await body(req); json(res, 202, { accepted: true }); void gateway.receivePush(event).catch(() => {}); }
-        catch { json(res, 400, { error: 'Invalid A2A event' }); }
-      })(); });
-      callbackPort = await listen(receiver, callback.port, callback.host);
+      try {
+        await bindCallback();
+      } catch (error) {
+        if (!isRetryableCallbackBindError(error)) throw error;
+        callbackHealth.state = 'pending';
+        console.error(`[a2a-gateway] ${new Date().toISOString()} callback listen pending: ${callback.host}:${callback.port} ${error instanceof Error ? error.message : String(error)}`);
+        void retryCallbackBind({
+          bind: bindCallback,
+          signal: callbackAbort.signal,
+          onPending: (cause, at) => console.error(`[a2a-gateway] ${at} callback listen pending: ${callback.host}:${callback.port} ${cause instanceof Error ? cause.message : String(cause)}`),
+        }).catch(cause => {
+          if (callbackAbort.signal.aborted) return;
+          console.error(`[a2a-gateway] ${new Date().toISOString()} callback listen failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        });
+      }
     }
     if (gateway.config.automation && gateway.automation) {
       automationServer = createAutomationServer(gateway.automation);
@@ -1172,18 +1801,20 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     return { gateway, port, callbackPort, automationPort, registration, close: async () => {
       closing ??= (async () => {
         if (reporting) clearInterval(reporting);
+        callbackAbort.abort();
         // Stop the Reader before draining HTTP requests that may be awaiting a scan.
         await gateway.projectDiscovery?.close();
         // Stop accepting requests and drain their ledger writes while this instance
         // still owns the storage lease. Automation continuations and its admission
         // queue can outlive the gateway operation they awaited.
-        await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : []), ...(automationServer ? [stop(automationServer)] : [])]);
+        await Promise.all([stop(server), ...[...callbackServers].map(item => stop(item)), ...(automationServer ? [stop(automationServer)] : [])]);
         await gateway.close();
       })();
       await closing;
     } };
   } catch (error) {
-    await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : []), ...(automationServer ? [stop(automationServer)] : [])]);
+    callbackAbort.abort();
+    await Promise.all([stop(server), ...[...callbackServers].map(item => stop(item)), ...(automationServer ? [stop(automationServer)] : [])]);
     await gateway.close(); throw error;
   }
 }

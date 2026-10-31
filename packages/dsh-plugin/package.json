@@ -37,14 +37,24 @@
         "@deepseek-ai/dsh-client-ui-chat",
         "@deepseek-ai/dsh-client-ui-tool",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-api-remotes"
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
-    }
+    },
+    "hostProvided": [
+      "@deepseek-ai/dsh-client-connection",
+      "@deepseek-ai/dsh-api-session-controller",
+      "@deepseek-ai/dsh-session",
+      "(and other @deepseek-ai/* host packages; see types/dsh-host.d.ts)"
+    ]
   },
   "scripts": {
-    "build": "tsc && node scripts/bundle-client.mjs",
+    "build": "node scripts/typecheck.mjs && node scripts/bundle-client.mjs",
     "test": "npm run build && npm run test:only",
-    "test:only": "node --test test/*.test.mjs"
+    "test:only": "node scripts/test.mjs",
+    "typecheck": "node scripts/typecheck.mjs"
   },
   "engines": {
     "node": ">=22.13.0"

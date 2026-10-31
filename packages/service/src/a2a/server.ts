@@ -11,6 +11,36 @@ import { a2aRequestId } from './request-id.js';
 import { FileA2AStore } from './store.js';
 import type { A2ABackend } from './types.js';
 import { a2aPreflightInputSchema } from './preflight.js';
+import { ArtifactContentError, readVerifiedArtifact } from './artifact-content.js';
+import type { A2AVerifiedArtifact } from './result-metadata.js';
+import { a2aSessionTask, a2aTaskSession, resubmitA2ASession, type A2AResubmission, type A2ASessionTask } from './resubmit.js';
+
+async function readBoundedJson(req: IncomingMessage, limit: number): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > limit) throw new Error('body too large');
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function sessionRouteError(error: unknown): { status: number; code: string } {
+  const code = error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : '';
+  switch (code) {
+    case 'SESSION_NOT_FOUND': return { status: 404, code };
+    case 'SESSION_DELETED': return { status: 404, code };
+    case 'SESSION_CLOSED': return { status: 409, code };
+    case 'SESSION_BUSY': return { status: 409, code };
+    case 'SESSION_CONFLICT': return { status: 400, code };
+    case 'SESSION_ATTACH_IN_PROGRESS': return { status: 409, code };
+    case 'UNSUPPORTED': return { status: 501, code };
+    case 'REMOTE_UNAVAILABLE': return { status: 503, code };
+    default: return { status: 503, code: 'REMOTE_UNAVAILABLE' };
+  }
+}
 
 /** Remote execution is explicitly enabled with a host-owned bearer credential. */
 export interface A2AServerOptions extends A2AExecutionOptions {
@@ -152,6 +182,12 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
   card: AgentCard;
   handler: (request: IncomingMessage, response: ServerResponse) => Promise<void>;
   cardHandler: (request: IncomingMessage, response: ServerResponse) => Promise<void>;
+  /** The A2A task a DSH session last ran, for in-process takeover controls. */
+  sessionTask: (sessionId: string) => A2ASessionTask | undefined;
+  /** The DSH session an A2A task ran in. */
+  taskSession: (taskId: string) => string | undefined;
+  /** Hand a taken-over session's result back to the workflow as a new completed snapshot. */
+  resubmit: (input: { sessionId: string; summary: string }) => Promise<A2AResubmission>;
   close: () => Promise<void>;
 }> {
   if (!options.token?.trim()) throw new Error('A2A requires a bearer token');
@@ -225,6 +261,78 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
       }
       return;
     }
+    if (req.url === `${path}/sessions/close` || req.url === `${path}/sessions/status` || req.url === `${path}/sessions/delete`) {
+      const action = req.url.endsWith('/status') ? 'status' : req.url.endsWith('/delete') ? 'delete' : 'close';
+      if (!options.backend[action]) {
+        res.writeHead(501, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'UNSUPPORTED' })); return;
+      }
+      try {
+        const body = await readBoundedJson(req, 65536) as { sessionId?: unknown; contextId?: unknown };
+        if (!body || typeof body !== 'object' || typeof body.sessionId !== 'string' || !body.sessionId.trim()
+          || typeof body.contextId !== 'string' || !body.contextId.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'SESSION_CONFLICT' })); return;
+        }
+        const context = new ServerCallContext({ requestedVersion: '1.0', user: { isAuthenticated: true, userName: 'dsh-a2a' } });
+        const target = store.loadTarget(body.contextId, context);
+        if (!target || target.sessionId !== body.sessionId) {
+          res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'SESSION_NOT_FOUND' })); return;
+        }
+        if (action === 'status') {
+          const report = await options.backend.status!(target);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(report)); return;
+        }
+        if (action === 'delete') {
+          if (target.state === 'deleted') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ processReleased: true, alreadyClosed: true, state: 'deleted', acp: target.agentPreset?.startsWith('oneagents-acp-') === true, sessionId: target.sessionId, contextId: body.contextId }));
+            return;
+          }
+          const result = await options.backend.delete!(target);
+          store.saveTarget(body.contextId, { ...target, state: 'deleted', lastUsedAt: new Date().toISOString() }, context);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ...result, alreadyClosed: false, state: 'deleted', sessionId: target.sessionId, contextId: body.contextId }));
+          return;
+        }
+        if (target.state === 'closed' || target.state === 'closing' || target.state === 'deleted') {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ processReleased: target.state === 'closed' ? true : 'pending', alreadyClosed: true,
+            acp: target.agentPreset?.startsWith('oneagents-acp-') === true, sessionId: target.sessionId, contextId: body.contextId }));
+          return;
+        }
+        const result = await options.backend.close!(target);
+        store.saveTarget(body.contextId, { ...target, state: result.processReleased === true ? 'closed' : 'closing', lastUsedAt: new Date().toISOString() }, context);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ...result, alreadyClosed: false, sessionId: target.sessionId, contextId: body.contextId }));
+      } catch (error) {
+        if (error instanceof SyntaxError || (error instanceof Error && error.message === 'body too large')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'SESSION_CONFLICT' })); return;
+        }
+        const mapped = sessionRouteError(error);
+        res.writeHead(mapped.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: mapped.code }));
+      }
+      return;
+    }
+    // Same credential boundary as execution: the caller names a task and a receipt entry, never an arbitrary path.
+    if (req.url === `${path}/artifacts/content`) {
+      try {
+        const body = await readBoundedJson(req, 65536) as { taskId?: unknown; path?: unknown; sha256?: unknown };
+        if (!body || typeof body !== 'object' || typeof body.taskId !== 'string' || typeof body.path !== 'string'
+          || typeof body.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(body.sha256)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid-artifact-request' })); return;
+        }
+        const context = new ServerCallContext({ requestedVersion: '1.0', user: { isAuthenticated: true, userName: 'dsh-a2a' } });
+        const task = await store.taskStore.load(body.taskId, context);
+        const result = (task?.metadata?.['1agents'] as { result?: { artifacts?: A2AVerifiedArtifact[] } } | undefined)?.result;
+        const content = await readVerifiedArtifact(result?.artifacts ?? [], body.path, body.sha256);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': content.length, 'Cache-Control': 'no-store' });
+        res.end(content);
+      } catch (error) {
+        const status = error instanceof ArtifactContentError ? error.status : 400;
+        const code = error instanceof ArtifactContentError ? error.code : 'invalid-artifact-request';
+        res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: code }));
+      }
+      return;
+    }
     res.setHeader('A2A-Version', '1.0');
     let id: string | number | null = null;
     try {
@@ -288,7 +396,14 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
     void pending.then(clean, clean);
     return pending;
   };
-  return { path, card, handler, cardHandler, close: async () => {
+  return { path, card, handler, cardHandler,
+    sessionTask: sessionId => a2aSessionTask({ store, executor }, sessionId),
+    taskSession: taskId => a2aTaskSession({ store }, taskId),
+    resubmit: input => {
+      if (stopped) return Promise.reject(new Error('A2A host is stopping'));
+      return resubmitA2ASession({ store, executor, push: (event, context, task) => sender.send(event, context, task) }, input);
+    },
+    close: async () => {
     if (stopped) return;
     stopped = true;
     for (const res of responses) res.destroy();

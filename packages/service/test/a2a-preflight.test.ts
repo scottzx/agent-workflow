@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join, sep } from 'node:path';
 import test from 'node:test';
 import { a2aPreflightInputSchema, runA2APreflight } from '../src/a2a/preflight.js';
 
@@ -35,8 +35,14 @@ test('missing inputs and runtime dependencies are reported before dispatch, with
 test('writable paths outside DSH sandbox roots are rejected, including symlink escapes', async t => {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), 'a2a-preflight-scope-')));
   t.after(() => rm(cwd, { recursive: true, force: true }));
-  // The test source tree is OS-writable but outside this cwd and platform tmp.
-  const outside = await realpath(dirname(import.meta.dirname));
+  // Pick an OS-writable directory outside this cwd and the platform temporary roots. The source tree
+  // usually qualifies, but a checkout under /tmp does not, so fall back to the home directory.
+  const temporaryRoots = (await Promise.all(['/tmp', tmpdir()].map(path => realpath(path).catch(() => undefined))))
+    .filter((path): path is string => path !== undefined);
+  const insideTemporary = (path: string) => temporaryRoots.some(root => path === root || path.startsWith(root + sep));
+  const candidates = await Promise.all([dirname(import.meta.dirname), homedir()].map(path => realpath(path).catch(() => undefined)));
+  const outside = candidates.find((path): path is string => path !== undefined && !insideTemporary(path));
+  if (!outside) return t.skip('no writable directory outside the platform temporary roots');
   const link = join(cwd, 'escape'); await symlink(outside, link);
   const report = await runA2APreflight({ cwd, jobDirectory: link });
   assert.equal(report.ok, false);

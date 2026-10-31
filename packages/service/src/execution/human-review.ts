@@ -4,10 +4,12 @@ import { z } from 'zod';
 
 const id = z.string().trim().min(1).max(512);
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
+/** Upper bound for one human-reviewed slide script; the page count itself follows the frozen script (N pages). */
+export const MAX_HUMAN_REVIEW_SLIDES = 200;
 export const humanReviewPreviewSchema = z.object({
   title: z.string().min(1),
   slides: z.array(z.object({ title: z.string().min(1), message: z.string(), body: z.array(z.string()),
-    visual: z.string(), sources: z.array(z.string()).min(1), facts: z.array(z.string()).min(1), notes: z.string() }).strict()).length(6),
+    visual: z.string(), sources: z.array(z.string()).min(1), facts: z.array(z.string()).min(1), notes: z.string() }).strict()).min(1).max(MAX_HUMAN_REVIEW_SLIDES),
 }).strict();
 const markdownReviewPreviewSchema = z.object({
   kind: z.literal('markdown'), title: z.string().min(1), markdown: z.string().min(1).max(256 * 1024),

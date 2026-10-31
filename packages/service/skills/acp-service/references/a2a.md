@@ -59,6 +59,8 @@ acp-service a2a gateway --config /absolute/private/gateway.json
 curl http://127.0.0.1:36814/health
 ```
 
+CLI 启动时若配置没有 `capacityDirectory`，`/health` 读取本机 ACP 容量目录，并给出 `taskSlot` 与 `processSlot`。`processSlot.headWaitMs` 是进程名额 FIFO 队首已等的毫秒数。直接调用库且未传该目录时，健康检查不读取家目录里的容量账。
+
 Unix 上 CLI 校验配置权限。gateway 工具端口固定监听 `127.0.0.1`，默认 `36814`；省略 `--no-report` 会向本机 DreamMate node 注册 `a2a-gateway`。不用 DreamMate 时加 `--no-report`，通过 CLI 使用。凭据仅保存在配置中，不传入任务参数。
 
 callback 可选；不配置也会由后台 GetTask 查询补齐状态。需要 push 时增加：
@@ -83,10 +85,12 @@ DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`p
 | 方法 | 参数与用途 |
 | --- | --- |
 | `remote_agent_preflight` | `remote, originSessionId, cwd`；可选任务目录、必需输入和运行时依赖，仅检查、不创建会话 |
-| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract, clientRequestId, roleId, roleLockPath`；新建远端任务/上下文/DSH 会话 |
-| `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale |
-| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath`；复用远端会话，创建新 taskId；已有角色/锁不能更换 |
-| `remote_agent_cancel` | 任务定位字段；取消这项任务自己的执行 |
+| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract, clientRequestId, roleId, roleLockPath, lifecycle, provider, model`；新建远端任务/上下文/DSH 会话。省略 `lifecycle` 保持 persistent。`provider`、`model` 见下文「standard 选模型」 |
+| `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale。进程名额排队时仍是 submitted，并带 `capacity`、`taskSlot` 和 `processSlot`。指定过模型的 `standard` 任务带实际使用的 `provider`、`model` |
+| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath, autoResume, lifecycle, provider, model`；复用远端会话，创建新 taskId；已有角色/锁不能更换。已关闭会话默认接回，get 返回 `resumed: true` 和实际 `restoreMethod`（`session/load` 或绑定里的 `session/resume`）。`autoResume: false` 不向远端发送，返回 `SESSION_CLOSED` |
+| `remote_agent_cancel` | 任务定位字段；只取消这项任务自己的执行，不能释放已经完成的会话进程 |
+| `remote_agent_close` | `remote, originSessionId`，以及 `taskId`、`contextId`、`sessionId` 三选一；可选 `force`。普通关闭 ACP 进程，保留会话记录和绑定，不删除。进行中返回 `SESSION_BUSY`；`force: true` 先取消再关闭。宿主没有关闭能力时返回 `UNSUPPORTED`，且不把任务记成已关闭。`standard` 不发送 `session/close`。可选 `mode: "delete"` 还删除 ACP 会话记录，之后 message 返回 `SESSION_DELETED`；仅在网关 `sessionLifecycle.allowDelete: true` 时接受，否则返回 `DELETE_DISABLED`。不删 DSH 会话历史 |
+| `remote_agent_sessions` | 无业务参数。按 `prewarm`、`job`、`user-opened` 和未标注列进程租约，并给出两本账。只读，不关闭，也不给已经在跑且没有来源的进程补标签 |
 | `remote_agent_list` | `originSessionId`；列出该主会话派发的任务 |
 | `remote_agent_inbox` | `originSessionId`；读取未确认的完成/需要输入通知 |
 | `remote_agent_ack` | `originSessionId, noticeId`；确认已处理，重复确认安全 |
@@ -119,7 +123,13 @@ acp-service a2a invoke remote_agent_ack <<'JSON'
 JSON
 ```
 
-每次 spawn 都创建新会话，即使 cwd 相同。message 复用原 context/cwd/preset，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。`remote_agent_*` 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。投递到已存在的主会话使用下面新增的 `session_*` 工具，两类 API 的任务 ID 和会话 ID 不可混用。
+每次 spawn 都创建新会话，即使 cwd 相同。这次新会话会回放该工作区、该 Agent 在 ACP 设置里已经接受的模式和配置；Grok Build 与 Codex 的记录各自保存。message 复用原 context/cwd/preset 和原会话上的设置，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。未传 `lifecycle` 时 message 沿用原会话策略。`remote_agent_*` 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。
+
+**standard 选模型。** `provider` 和 `model` 只用于 `standard` 等 DSH 原生预设，必须一起传，例如 `"provider": "deepseek", "model": "<目录里的模型 id>"`。DSH 新建会话后、第一条 prompt 前，按 `modelCatalog()` 核对，再调用 `selectModel`。目录里没有时任务失败，`resultMetadata.validation.code` 为 `MODEL_UNAVAILABLE`，不退回默认模型，也不发 prompt。省略时用 DSH 当时的默认模型，get 不带这两个字段。message 不传时沿用该会话已选的模型，传了就在本轮前切换。`oneagents-acp-*` 预设传这两个字段会被拒绝（宿主侧为 `MODEL_SELECTION_UNSUPPORTED`），它们的模型由 Agent 自己公布，经 `session/set_config_option` 切换。get 与 `resultMetadata` 写出实际使用的 `provider`、`model`。不要把模型名写进 prompt，那不会改会话模型。注意：DSH 的 `selectModel` 同时把这次选择存成 DSH 的默认模型，之后不指定模型的新会话（包括 DSH 界面里新开的）会用它。投递到已存在的主会话使用下面新增的 `session_*` 工具，两类 API 的任务 ID 和会话 ID 不可混用。
+
+`lifecycle.mode: "one-shot"` 在任务完成、失败或取消后由网关普通关闭进程。`closeAfter: "ack"` 要等这条通知被 ack。`INPUT_REQUIRED` 不关闭。one-shot 在 runtime 里仍调用 `ensureSession({ mode: "persistent" })`，关闭只 release，不 delete，也不改 runtime 模式。`remote_agent_get` 在进程名额排队时仍是 submitted，并带 `capacity.position` 与 `capacity.waitedMs`；60 秒握手时限从出队之后才开始计。本技能不保证模型在进程关闭后仍记得上文。
+
+persistent 的 `oneagents-acp-*` 会话在最后一轮结束、远端 `status` 确认已附着且没有进行中的回合，并且空闲超过时限后，由网关普通关闭，原因 `idle-ttl`，之后 message 仍可接回。时限缺省取网关配置 `sessionLifecycle.persistentIdleTtlSeconds`（600 秒），`lifecycle.idleTtlSeconds` 覆盖它，`0` 不回收。进行中、`INPUT_REQUIRED`、状态查不到的不关。`INPUT_REQUIRED` 超过 `sessionLifecycle.inputRequiredAlertSeconds`（7200 秒）只告警，不关进程。`/health` 的 `sessions` 给出 busy、告警、按原因的关闭数、恢复方式、关闭失败数和 `processReleasePending`。
 
 ## 原会话排队投递（本次新增）
 
@@ -245,6 +255,8 @@ gateway 将状态、任务归属和通知原子落盘；通知有稳定 `noticeI
 目录须已存在；预检核验真实路径、任务目录属于项目或平台临时目录，并创建随后删除的小文件确认可写。Python/Node 使用指定解释器检查依赖，有超时且不经过 shell。返回 `ok, checkedAt, cwd, jobDirectory, checks`；ok=false 时不得派单。spawn/message 的可选 `preflight` 接收同一检查要求（不带 cwd/remote/originSessionId），gateway 在创建 A2A 任务前检查，DSH backend 在创建原生会话前重检。旧调用保持兼容，DSH 至少检查 cwd。预检是一时刻的检查，无法保证后续磁盘和依赖永不变化。
 
 spawn/message 可传 `resultContract: {jobId, parentTaskId?, parentSessionId?, originSessionId?, artifactManifestPath?}`。身份不由模型填入：get/list 的 `resultMetadata` 来自执行宿主，包含真实 task/context/session/request ID、cwd/preset、起止时间、outcome、预检和验证后的产物。lineage 明确标为调用方声明。manifest 路径及所列文件均须在已通过预检的 jobDirectory 内，严格格式：
+
+**默认产物位置**：调用方没有声明 `jobDirectory` 和 `artifactManifestPath` 时，网关为每个任务指定 `<cwd>/.1agents/jobs/<jobId>/`（执行宿主在预检时创建，不跟随符号链接），清单为该目录下的 `manifest-<attemptId>.json`，并把位置与格式附在提示词末尾。默认清单是可选的：没有清单就没有产物，清单损坏只记入 `validation`，不会让已完成的任务失败。执行宿主不支持（旧版本或预检失败）时，网关回退为不带默认位置派发。调用方自己声明的清单仍按严格模式校验。
 
 ```json
 {"artifacts":[{"path":"/tmp/actual-job/final.pptx","url":"http://actual-host/artifacts/job/final.pptx","mediaType":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}

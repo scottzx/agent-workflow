@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { verifyPackageBuild } from './verify-package-build.mjs';
@@ -267,6 +267,36 @@ export function rollbackActivation(receiptPath) {
   return { rolledBack: true, target: receipt.target };
 }
 
+export const environments = ['dev', 'test'];
+/**
+ * Fixed dev/test environments: <base>/<env>/runtime is replaced in place and no per-deploy release directory is kept.
+ * Reuses capture/stage/verify through a scratch directory. Caller stops the host first and restarts it afterwards.
+ * Version pinning lives in Git, not in local snapshots.
+ */
+export function deployEnvironment({ env, root, base = join(homedir(), '.local/share/1agents/a2a-gateway'), dependencyRoot }) {
+  assert.ok(environments.includes(env), `Environment must be one of ${environments.join(', ')}`);
+  root = resolve(root); base = resolve(base);
+  const target = join(base, env, 'runtime');
+  dependencyRoot = resolve(dependencyRoot ?? join(target, 'node_modules'));
+  assert.ok(existsSync(dependencyRoot), `Missing dependency image ${dependencyRoot}; pass --dependency-root on the first deploy`);
+  mkdirSync(join(base, env), { recursive: true, mode: 0o700 });
+  const scratch = mkdtempSync(join(base, env, '.deploy-'));
+  try {
+    const release = join(scratch, 'release'), stage = join(scratch, 'stage'), previous = join(scratch, 'previous');
+    const manifest = captureRelease({ root, output: release, dependencyRoot });
+    stageRelease({ release, target: stage });
+    verifyStage(stage);
+    if (existsSync(target)) renameSync(target, previous);
+    try { renameSync(stage, target); } catch (error) { if (existsSync(previous)) renameSync(previous, target); throw error; }
+    rmSync(join(target, 'deployment-receipt.json'), { force: true }); // points at the scratch release, which is deleted below
+    if (env === 'test') { // stable entry used by the launchd service
+      const link = join(base, 'current.new'); rmSync(link, { force: true });
+      symlinkSync(target, link, 'dir'); renameSync(link, join(base, 'current'));
+    }
+    return { env, target, releaseId: manifest.releaseId, dirty: manifest.source.dirty };
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+}
+
 function main() {
   const [command, ...args] = process.argv.slice(2), options = {};
   for (let i = 0; i < args.length; i += 2) { assert.ok(args[i].startsWith('--') && args[i + 1], 'Expected --key value'); options[args[i].slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = args[i + 1]; }
@@ -277,8 +307,9 @@ function main() {
   else if (command === 'verify') { required(['target']); result = verifyStage(options.target); }
   else if (command === 'verify-release') { required(['release']); result = { releaseId: verifyRelease(options.release).releaseId, verified: true }; }
   else if (command === 'activate') { required(['stage', 'target', 'receiptPath']); result = activateStage(options); }
+  else if (command === 'deploy') { required(['env', 'root']); result = deployEnvironment(options); }
   else if (command === 'rollback') { required(['receiptPath']); result = rollbackActivation(options.receiptPath); }
-  else throw new Error('Use capture, stage, verify, verify-release, activate or rollback');
+  else throw new Error('Use capture, stage, verify, verify-release, activate, deploy or rollback');
   // Inventories can be large; the saved manifest is authoritative.
   console.log(JSON.stringify(command === 'capture' ? { releaseId: result.releaseId, output: resolve(options.output), packageSha256: result.package.sha256, sourceInventorySha256: result.source.inventorySha256, dirty: result.source.dirty } : result, null, 2));
 }

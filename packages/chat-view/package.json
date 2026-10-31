@@ -1,0 +1,62 @@
+{
+  "name": "@1agents/chat-view",
+  "version": "0.1.0",
+  "description": "Preact chat transcript view for ACP sessions: messages, tool calls, diffs, plans, with on-demand paging.",
+  "keywords": [
+    "chat",
+    "acp",
+    "transcript",
+    "preact",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scottzx/agent-workflow.git",
+    "directory": "packages/chat-view"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "type": "module",
+  "sideEffects": [
+    "*.css"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./style.css": "./dist/style.css",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp src/style.css dist/style.css",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "preact": "^10.19.0"
+  },
+  "dependencies": {
+    "@1agents/file-preview": "workspace:^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "preact": "10.29.2",
+    "preact-render-to-string": "^6.8.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
