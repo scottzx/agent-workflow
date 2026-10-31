@@ -2,6 +2,7 @@
   "name": "@1agents/piece-wechat-stock",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Restricted AP actions for the 30-minute WeChat reserve stock workflow.",
   "type": "commonjs",
   "main": "dist/index.js",

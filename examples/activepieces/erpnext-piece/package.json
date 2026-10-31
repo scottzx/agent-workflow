@@ -2,6 +2,7 @@
   "name": "@1agents/piece-erpnext-daily-report",
   "version": "0.1.3",
   "private": true,
+  "license": "MIT",
   "description": "Private Activepieces action for saving 1acp final daily reports to ERPNext.",
   "type": "commonjs",
   "main": "dist/index.js",

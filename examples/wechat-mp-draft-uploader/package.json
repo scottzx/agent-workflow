@@ -2,6 +2,7 @@
   "name": "@1agents/dsh-wechat-mp-draft-uploader",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "公众号草稿上传的标准模式备份预设：工具与 standard 相同，模型仅在该预设内固定为 MiniMax-M3.1-Flash。",
   "dsh": {

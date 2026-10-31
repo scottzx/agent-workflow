@@ -60,6 +60,8 @@ try {
   assert.deepEqual(api.inject, plugin.inject);
   for (const name of api.inject) ctx.provide(name, {});
   ctx.set('llm', { registerAdapter: () => () => {} });
+  // The plugin registers its submit_to_review tool through the host tools service.
+  ctx.set('tools', { register: () => () => {} });
   ctx.set('webServer', { register: route => { routes.set(route.path, route); return () => routes.delete(route.path); } });
   ctx.set('agentPresets', { register: async definition => {
     presets.set(definition.id, definition);

@@ -95,8 +95,8 @@ function taskPrompt(role: string, kase: z.infer<typeof caseSchema>, work: string
 
 /** The checks need jsonschema, so the interpreter is resolved once and handed to the executor by absolute path. */
 async function checkInterpreter(name: string): Promise<string> {
-  const found = await run(name, ['-I', '-c', 'import sys, jsonschema; print(sys.executable)']);
-  if (found.code !== 0) throw new Error(`${name} cannot run the role checks (needs jsonschema); pass another interpreter`);
+  const found = await run(name, ['-I', '-c', 'import sys; from jsonschema import Draft202012Validator; print(sys.executable)']);
+  if (found.code !== 0) throw new Error(`${name} cannot run the role checks (needs jsonschema with Draft 2020-12); pass another interpreter`);
   return found.stdout.trim();
 }
 
