@@ -177,7 +177,7 @@ json-schema-traverse@1.0.0	MIT	https://github.com/epoberezkin/json-schema-traver
 json-schema-typed@8.0.2	BSD-2-Clause	https://github.com/RemyRylan/json-schema-typed/tree/main/dist/node
 jszip@3.10.2	(MIT OR GPL-3.0-or-later)	https://github.com/Stuk/jszip#readme
 katex@0.18.2	MIT	https://katex.org
-khroma@2.1.0	Unknown	https://github.com/fabiospampinato/khroma#readme
+khroma@2.1.0	MIT (依据上游仓库)	https://github.com/fabiospampinato/khroma#readme
 layout-base@1.0.2	MIT	https://github.com/iVis-at-Bilkent/layout-base#readme
 layout-base@2.0.1	MIT	https://github.com/iVis-at-Bilkent/layout-base#readme
 lie@3.3.0	MIT	https://github.com/calvinmetcalf/lie#readme
@@ -261,4 +261,4 @@ zod-to-json-schema@3.25.2	ISC	https://github.com/StefanTerdell/zod-to-json-schem
 Notes:
 - jszip is dual-licensed (MIT OR GPL-3.0-or-later); used under MIT.
 - dompurify is dual-licensed (MPL-2.0 OR Apache-2.0); used under Apache-2.0.
-- khroma@2.1.0 reports no license field in package metadata (upstream repo states MIT); verify before redistribution.
+- khroma@2.1.0: npm metadata has no license field; MIT 依据上游仓库 LICENSE: https://github.com/fabiospampinato/khroma/blob/master/license

@@ -27,7 +27,7 @@ pnpm install --frozen-lockfile
 pnpm build && pnpm test
 ```
 
-整个仓库可一条命令构建和测试；DSH 插件运行时依赖 DeepSeek Harness 内置的包，需在装好 DSH 的环境中使用。
+整个仓库可一条命令构建和测试；DSH 插件运行时依赖 DeepSeek Harness 内置的包，需在装好 DSH 的环境中使用。`@deepseek-ai/*` 包由 DeepSeek Harness 宿主提供；npm 上有同名的 rc 版本包，请不要从 npm 安装它们。
 
 （未链接 DSH 时，`packages/dsh-plugin` 用 `types/dsh-host.d.ts` 中的宿主类型声明做类型检查；要用真实类型，先运行 `pnpm link:dsh /path/to/DSH`；未链接时，需要真实 DSH 运行时的 8 个插件测试文件和 2 个 “real Cordis” 用例会被跳过并在输出中列出。第三方依赖许可证见 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)。）
 
