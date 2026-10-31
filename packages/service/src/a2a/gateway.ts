@@ -27,6 +27,7 @@ import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '.
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
+import { invokeTicket, TICKET_METHODS } from '../execution/ticket.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
@@ -129,6 +130,7 @@ const EXECUTION_METHODS = {
   execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
+  ...TICKET_METHODS,
 };
 
 export const REMOTE_AGENT_METHODS = {
@@ -1064,6 +1066,7 @@ export class RemoteAgentGateway {
       const { originSessionId, jobId, ...review } = executionReviewSchema.parse(params);
       return this.ledger.acceptance(originSessionId, jobId, review);
     }
+    if (Object.hasOwn(TICKET_METHODS, method)) return invokeTicket(this.ledger, method, params);
     if (method === 'execution_inbox') {
       const { originSessionId } = inboxSchema.parse(params);
       return { notices: this.state.executionNotices!.filter(item => item.originSessionId === originSessionId && !item.processedAt)

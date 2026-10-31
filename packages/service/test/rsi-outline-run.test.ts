@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { checkGate } from '../src/rsi/gate.js';
-import { type LedgerEntry, runOutlineCase } from '../src/rsi/outline-run.js';
-import { executorChanges, type Ticket } from '../src/rsi/ticket.js';
+import { JobLedger } from '../src/execution/ledger.js';
+import { invokeTicket, pendingItems, type Ticket } from '../src/execution/ticket.js';
+import { type LedgerEntry, runOutlineCase, type OutlineRunOptions } from '../src/rsi/outline-run.js';
 
 const ROLE = resolve(import.meta.dirname, '../../../.1agents/roles/product-intro-outline');
 const checksAvailable = spawnSync('python3', ['-I', '-c', 'import jsonschema']).status === 0;
@@ -28,14 +29,31 @@ function outline(repo: string, commit: string, font = '微软雅黑') {
     ] };
 }
 
-/** What a well-behaved executor does with the ticket: mark every pending item done through ticket.py, then submit. */
-function handleTicket(work: string, note = '已按意见修改') {
-  const tool = (...args: string[]) => {
-    const out = spawnSync('python3', ['-I', join(work, 'checks', 'ticket.py'), join(work, 'ticket.json'), ...args], { encoding: 'utf8' });
-    assert.equal(out.status, 0, out.stderr); return out.stdout;
+/**
+ * The gateway's ticket methods on a real ledger. The fake execution methods hand out short job IDs; each is aliased
+ * onto a ledger job, and each executor round is a new attempt there, as execution_continue records it.
+ */
+function ticketGateway() {
+  const ledger = new JobLedger(undefined, () => {}), jobs = new Map<string, string>();
+  const job = (id: string) => jobs.get(id) ?? jobs.set(id, ledger.prepare({ originSessionId: 'rsi-test', targetSnapshot: { targetId: 'dsh-host' }, input: {} }).job.jobId).get(id)!;
+  return {
+    ledger, job,
+    /** The run's invoke: ticket methods go to the ledger, everything else to the test's fake. */
+    invoke: (fake: OutlineRunOptions['invoke']): OutlineRunOptions['invoke'] => async (method, params: any) =>
+      method.startsWith('ticket_') ? invokeTicket(ledger, method, { ...params, jobId: job(params.jobId) }) : fake(method, params),
+    /** A new executor round on the job; returns that round's ticket tools, as the DSH plugin calls them. */
+    round(id: string) {
+      const attemptId = ledger.prepare({ originSessionId: 'rsi-test', jobId: job(id), targetSnapshot: { targetId: 'dsh-host' }, input: {} }).attempt.attemptId;
+      return (method: string, params: Record<string, unknown> = {}) => invokeTicket(ledger, method, { jobId: job(id), attemptId, sessionId: 'executor-session', ...params });
+    },
   };
-  for (const line of tool('show').split('\n')) { const id = /^([PQ]\d+-\S+) \[/.exec(line)?.[1]; if (id) tool('mark', id, 'done', '--note', note); }
-  tool('submit');
+}
+type Executor = ReturnType<ReturnType<typeof ticketGateway>['round']>;
+
+/** What a well-behaved executor does with its ticket tools: mark every pending item done, then submit. */
+function handleTicket(executor: Executor, note = '已按意见修改') {
+  for (const item of pendingItems(executor('ticket_show'))) executor('ticket_mark', { itemId: item.id, state: 'done', note });
+  executor('ticket_submit');
 }
 const readTicket = async (work: string) => JSON.parse(await readFile(join(work, 'ticket.json'), 'utf8')) as Ticket;
 
@@ -61,11 +79,11 @@ async function fixture(t: TestContext) {
 }
 
 test('a failed program check goes back to the same task with its evidence, and the next round passes', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
-  const f = await fixture(t);
+  const f = await fixture(t), gw = ticketGateway();
   let work = '';
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
-    invoke: async (method, params: any) => {
+    invoke: gw.invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       if (method === 'execution_submit') {
         work = params.input.cwd;
@@ -74,11 +92,11 @@ test('a failed program check goes back to the same task with its evidence, and t
       }
       if (method === 'execution_continue') {
         await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
-        handleTicket(work, '字体改成微软雅黑');
+        handleTicket(gw.round('job-1'), '字体改成微软雅黑');
         return { jobId: 'job-1' };
       }
       return { executionStatus: 'completed' };
-    } });
+    }) });
   assert.equal(report.passed, true);
   assert.equal(report.rounds.length, 2);
   assert.deepEqual(report.rounds[0]!.results.filter(r => !r.pass).map(r => r.itemId), ['P2']);
@@ -89,14 +107,22 @@ test('a failed program check goes back to the same task with its evidence, and t
   assert.match(submit.input.prompt, /自查用的 Python：`\/[^`]+`/, 'the executor gets the checker interpreter by absolute path');
   const bounce = f.calls.find(call => call.method === 'execution_continue')!.params;
   assert.equal(bounce.jobId, 'job-1');
-  assert.match(bounce.input.prompt, /ticket\.py ticket\.json show/, 'the executor is pointed at the ticket, not given the evidence as text');
-  assert.doesNotMatch(bounce.input.prompt, /Arial/);
+  assert.match(bounce.input.prompt, /`ticket_show`.*`ticket_mark`.*`ticket_submit`/s, 'the executor is pointed at its ticket tools, not given the evidence as text');
+  assert.doesNotMatch(bounce.input.prompt, /Arial|ticket\.py/);
+  assert.match(submit.input.prompt, /ticket_show/); assert.doesNotMatch(submit.input.prompt, /ticket\.py/);
   const ticket = await readTicket(work);
+  assert.deepEqual(ticket, invokeTicket(gw.ledger, 'ticket_get', { originSessionId: 'rsi-test', jobId: gw.job('job-1') }), 'ticket.json is the gateway ticket');
+  assert.equal((await stat(join(work, 'ticket.json'))).mode & 0o222, 0, 'and a read-only export');
   assert.equal(ticket.status, 'closed');
   const item = ticket.items.find(i => i.id === 'P1-P2')!;
   assert.match(JSON.stringify(item.evidence), /Arial/);
   assert.deepEqual([item.state, item.log.map(e => `${e.round}:${e.by}:${e.action}`)], ['verified', ['1:host:raised', '2:executor:done', '2:host:verified']]);
   assert.equal(item.log[1]!.note, '字体改成微软雅黑');
+  const events = gw.ledger.events('rsi-test', gw.job('job-1')).filter(e => e.type.startsWith('ticket.')).map(e => e.data as Record<string, unknown>);
+  assert.deepEqual(gw.ledger.events('rsi-test', gw.job('job-1')).filter(e => e.type.startsWith('ticket.')).map(e => `${e.type}:${(e.data as any).actor}:${(e.data as any).round}`),
+    ['ticket.opened:host:1', 'ticket.item_raised:host:1', 'ticket.checked:host:1', 'ticket.revision_started:host:2', 'ticket.item_marked:executor:2',
+      'ticket.submitted:executor:2', 'ticket.item_settled:host:2', 'ticket.checked:host:2', 'ticket.closed:host:2'], 'every step is a ledger event');
+  assert.deepEqual([events[4]!.itemId, events[4]!.note, events[4]!.sessionId, typeof events[4]!.attemptId], ['P1-P2', '字体改成微软雅黑', 'executor-session', 'string']);
   assert.ok(await stat(join(work, 'project', 'README.md')));
   await assert.rejects(stat(join(work, 'project', 'internal')), 'excluded paths are not in the copy');
   assert.equal(JSON.parse(await readFile(join(work, 'run.json'), 'utf8')).passed, true);
@@ -105,12 +131,12 @@ test('a failed program check goes back to the same task with its evidence, and t
 });
 
 test('a delivered copy that differs from the checked outline fails and goes back; matching bytes pass', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
-  const f = await fixture(t);
+  const f = await fixture(t), gw = ticketGateway();
   let work = '', prompt = '';
   const good = JSON.stringify(outline('example/demo', f.commit));
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
-    invoke: async (method, params: any) => {
+    invoke: gw.invoke(async (method, params: any) => {
       const delivered = join(work, '.1agents', 'jobs', 'job-5');
       if (method === 'execution_submit') {
         work = params.input.cwd;
@@ -123,11 +149,11 @@ test('a delivered copy that differs from the checked outline fails and goes back
       if (method === 'execution_continue') {
         prompt = params.input.prompt;
         await cp(join(work, 'outline.json'), join(delivered, 'outline.json'));
-        handleTicket(work);
+        handleTicket(gw.round('job-5'));
         return { jobId: 'job-5' };
       }
       return { executionStatus: 'completed' };
-    } });
+    }) });
   const first = report.rounds[0]!;
   assert.equal(first.passed, false);
   assert.deepEqual(first.results.filter(r => !r.pass).map(r => r.itemId), ['D1'], 'P1–P7 pass; only the copy differs');
@@ -144,37 +170,37 @@ test('without bounces left a failed check ends the run, and a failed task is not
   const f = await fixture(t);
   const bad = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, maxBounces: 0,
-    invoke: async (method, params: any) => {
+    invoke: ticketGateway().invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       if (method === 'execution_submit') return { jobId: 'job-2' };
       return { executionStatus: 'completed' };
-    } });
+    }) });
   assert.equal(bad.passed, false);
   assert.deepEqual(bad.rounds.map(r => r.results.map(x => x.itemId)), [['P0']], 'no outline.json at all');
   assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
 
   const failed = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-2'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1,
-    invoke: async method => method === 'execution_submit' ? { jobId: 'job-3' } : { executionStatus: 'failed' } });
+    invoke: ticketGateway().invoke(async method => method === 'execution_submit' ? { jobId: 'job-3' } : { executionStatus: 'failed' }) });
   assert.equal(failed.passed, false);
   assert.deepEqual(failed.rounds, [{ round: 1, jobId: 'job-3', executionStatus: 'failed', passed: false, results: [] }]);
 
   const stuck = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-3'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, timeoutMs: 5,
-    invoke: async method => method === 'execution_submit' ? { jobId: 'job-4' } : { executionStatus: 'working' } });
+    invoke: ticketGateway().invoke(async method => method === 'execution_submit' ? { jobId: 'job-4' } : { executionStatus: 'working' }) });
   assert.equal(stuck.passed, false);
   assert.equal(stuck.rounds[0]!.executionStatus, 'timed_out', 'a task that never finishes is recorded, not thrown');
 });
 
 test('with QA on, a QA agent in its own session reviews a frozen copy, its issues go back to the executor, and the same QA session re-reviews the revision', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
-  const f = await fixture(t);
+  const f = await fixture(t), gw = ticketGateway();
   let work = '', reviews = 0;
   const first = outline('example/demo', f.commit), revised = { ...first, project: { ...first.project, oneLiner: '一行命令生成产品介绍' } };
   const review = (verdict: string, issues: unknown[]) => ({ verdict, summary: verdict === 'pass' ? '可以了' : '开头太空泛', issues,
     scores: { 吸引力: verdict === 'pass' ? 4 : 2, 具体: 4, 受众: 4, 结构: 4, 可信: 5, 行动: 4 } });
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: { agentPreset: 'qa-preset' },
-    invoke: async (method, params: any) => {
+    invoke: gw.invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       const qaReview = async () => {
         reviews++;
@@ -186,9 +212,9 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
       if (method === 'execution_submit' && params.title.startsWith('质检')) return qaReview();
       if (method === 'execution_continue' && params.jobId === 'qa-1') return qaReview();
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
-      if (method === 'execution_continue') { await writeFile(join(work, 'outline.json'), JSON.stringify(revised)); handleTicket(work, '改成一行命令生成产品介绍'); return { jobId: 'job-1' }; }
+      if (method === 'execution_continue') { await writeFile(join(work, 'outline.json'), JSON.stringify(revised)); handleTicket(gw.round('job-1'), '改成一行命令生成产品介绍'); return { jobId: 'job-1' }; }
       return { executionStatus: 'completed' };
-    } });
+    }) });
   assert.equal(report.passed, true);
   assert.deepEqual(report.rounds.map(r => [r.round, r.review?.review?.verdict]), [[1, 'revise'], [2, 'pass']]);
   assert.equal(f.calls.filter(call => call.method === 'execution_submit' && call.params.title.startsWith('质检')).length, 1, 'one QA session per task');
@@ -200,6 +226,7 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
   assert.equal(ticket.status, 'closed');
   assert.deepEqual(ticket.items.map(i => [i.id, i.state, i.log.map(e => `${e.by}:${e.action}`).join(',')]), [['Q1-1', 'verified', 'qa:raised,executor:done,qa:fixed']]);
   assert.deepEqual(ticket.history.filter(h => h.by === 'qa').map(h => h.verdict), ['revise', 'pass']);
+  assert.deepEqual(gw.ledger.events('rsi-test', gw.job('job-1')).filter(e => e.type === 'ticket.reviewed').map(e => (e.data as any).qaJobId), ['qa-1', 'qa-1'], 'the QA job is on record');
   assert.equal(report.rounds[1]!.review!.jobId, 'qa-1');
   const qaSubmit = f.calls.find(call => call.method === 'execution_submit' && call.params.title.startsWith('质检'))!.params;
   assert.equal(qaSubmit.input.agentPreset, 'qa-preset');
@@ -212,22 +239,23 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
   assert.equal(JSON.parse(await readFile(join(work, 'reviews', 'outline-r2.json'), 'utf8')).project.oneLiner, '一行命令生成产品介绍');
 });
 
-test('a QA agent that edits the outline itself is undone, and a run without a readable review stops without sending anything back', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+test('a QA agent that edits the outline itself is undone, its edit of the exported ticket changes nothing, and a run without a readable review stops without sending anything back', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
   const f = await fixture(t);
   let work = '';
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
-    invoke: async (method, params: any) => {
+    invoke: ticketGateway().invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       if (method === 'execution_submit' && params.title.startsWith('质检')) {
-        await writeFile(join(work, 'outline.json'), '{"tampered":true}'); await writeFile(join(work, 'ticket.json'), '{}'); return { jobId: 'qa-1' };
+        await writeFile(join(work, 'outline.json'), '{"tampered":true}');
+        await rm(join(work, 'ticket.json')); await writeFile(join(work, 'ticket.json'), '{"status":"closed"}'); return { jobId: 'qa-1' };
       }
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
       return { executionStatus: 'completed' };
-    } });
+    }) });
   assert.equal(report.passed, false);
-  assert.match(report.rounds[0]!.review!.error!, /改动了 outline\.json，已恢复.*改动了 ticket\.json，已恢复.*读不出来/);
-  assert.equal((await readTicket(work)).status, 'stopped', 'the restored ticket records how the run ended');
+  assert.match(report.rounds[0]!.review!.error!, /改动了 outline\.json，已恢复.*读不出来/);
+  assert.equal((await readTicket(work)).status, 'stopped', 'the export is rewritten from the gateway ticket, which records how the run ended');
   assert.equal(JSON.parse(await readFile(join(work, 'outline.json'), 'utf8')).schemaVersion, 1, "the executor's outline is restored");
   assert.ok(!f.calls.some(call => call.method === 'execution_continue'));
 });
@@ -271,9 +299,10 @@ test('P8-P11 catch the deterministic problems QA used to find, and leave legitim
 /** A run whose QA agent answers each review with the next scripted one; the executor just touches the outline. */
 async function scriptedQaRun(f: Awaited<ReturnType<typeof fixture>>, workspace: string, script: (n: number) => unknown, extra: Record<string, unknown> = {}) {
   let work = '', reviews = 0, edits = 0;
+  const gw = ticketGateway();
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {}, ...extra,
-    invoke: async (method, params: any) => {
+    invoke: gw.invoke(async (method, params: any) => {
       const qa = async () => { reviews++; await writeFile(join(work, 'reviews', `review-r${reviews}.json`), JSON.stringify(script(reviews))); return { jobId: 'qa-1' }; };
       if (method === 'execution_submit' && params.title.startsWith('质检')) return qa();
       if (method === 'execution_continue' && params.jobId === 'qa-1') return qa();
@@ -281,11 +310,11 @@ async function scriptedQaRun(f: Awaited<ReturnType<typeof fixture>>, workspace: 
         if (method === 'execution_submit') work = params.input.cwd;
         const doc = outline('example/demo', f.commit); doc.project.oneLiner = `第 ${++edits} 版`;
         await writeFile(join(work, 'outline.json'), JSON.stringify(doc));
-        if (method === 'execution_continue') handleTicket(work);
+        if (method === 'execution_continue') handleTicket(gw.round('job-1'));
         return { jobId: 'job-1' };
       }
       return { executionStatus: 'completed' };
-    } });
+    }) });
   return { report, reviews };
 }
 
@@ -354,26 +383,8 @@ test('the gate opens only after consecutive clean passes on the committed role v
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, invoke: async () => ({}) }), /committed with no local changes/);
 });
 
-test('the executor can only mark pending items done or disputed with a note and submit; anything else is undone and sent back', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
-  const before: Ticket = { schemaVersion: 1, roleId: 'r', caseId: 'c', outline: 'outline.json', status: 'in_revision', round: 2, proposals: [], history: [],
-    items: [{ id: 'Q1-1', source: 'qa', raisedInRound: 1, severity: 'must', where: 'project/oneLiner', problem: '太空泛', state: 'open', log: [{ round: 1, by: 'qa', action: 'raised' }] },
-      { id: 'Q1-2', source: 'qa', raisedInRound: 1, severity: 'should', where: 'x', problem: 'y', state: 'verified', log: [] }] };
-  const edit = (change: (ticket: any) => void) => { const copy = structuredClone(before) as any; change(copy); return executorChanges(before, JSON.stringify(copy)); };
-  const done = (ticket: any, note = '改了') => { ticket.items[0].state = 'done'; ticket.items[0].log.push({ round: 2, by: 'executor', action: 'done', note }); };
-  const submit = (ticket: any) => { ticket.status = 'ready_for_review'; ticket.history.push({ round: 2, by: 'executor', action: 'submitted' }); };
-  assert.deepEqual(edit(ticket => { done(ticket); submit(ticket); }).illegal, []);
-  assert.deepEqual(edit(ticket => { done(ticket); submit(ticket); }).incomplete, []);
-  assert.match(edit(done).incomplete.join(), /还没有提交/);
-  assert.match(edit(ticket => { ticket.items[0].state = 'verified'; ticket.items[0].log.push({ round: 2, by: 'executor', action: 'verified', note: '好了' }); }).illegal.join(), /Q1-1/);
-  assert.match(edit(ticket => done(ticket, ' ')).illegal.join(), /说明/);
-  assert.match(edit(ticket => { ticket.items[0].severity = 'should'; }).illegal.join(), /不能改意见本身/);
-  assert.match(edit(ticket => { ticket.items.pop(); }).illegal.join(), /增删/);
-  assert.match(edit(ticket => { ticket.items[1].state = 'done'; ticket.items[1].log.push({ round: 2, by: 'executor', action: 'done', note: 'x' }); }).illegal.join(), /Q1-2/);
-  assert.match(edit(ticket => { ticket.status = 'closed'; }).illegal.join(), /不能改成 closed/);
-  assert.match(edit(ticket => { ticket.proposals.push({ id: 'R1-1' }); }).illegal.join(), /提议/);
-  assert.match(executorChanges(before, '{').illegal.join(), /不是可读的 JSON/);
-
-  const f = await fixture(t);
+test('an executor that ends its round without submitting the ticket is sent back once with the reason', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {
+  const f = await fixture(t), gw = ticketGateway();
   let work = '', continues = 0;
   const first = outline('example/demo', f.commit);
   const review = (verdict: string) => ({ verdict, summary: '…', scores: { 吸引力: 4, 具体: 4, 受众: 4, 结构: 4, 可信: 4, 行动: 4 },
@@ -381,28 +392,40 @@ test('the executor can only mark pending items done or disputed with a note and 
     ...(verdict === 'pass' ? { previous: [{ id: 'Q1-1', status: 'fixed' }] } : {}) });
   const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'),
     targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
-    invoke: async (method, params: any) => {
+    invoke: gw.invoke(async (method, params: any) => {
       f.calls.push({ method, params });
       const qa = (verdict: string) => writeFile(join(work, 'reviews', `review-r${verdict === 'pass' ? 3 : 1}.json`), JSON.stringify(review(verdict))).then(() => ({ jobId: 'qa-1' }));
       if (method === 'execution_submit' && params.title.startsWith('质检')) return qa('revise');
       if (method === 'execution_continue' && params.jobId === 'qa-1') return qa('pass');
       if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
       if (method === 'execution_continue' && ++continues === 1) {
-        // Straight to verified, by editing the file: not the executor's call.
-        const ticket = await readTicket(work); ticket.items[0]!.state = 'verified'; ticket.status = 'ready_for_review';
-        await writeFile(join(work, 'ticket.json'), JSON.stringify(ticket)); return { jobId: 'job-1' };
+        // Editing the export instead of using the tools leaves the gateway ticket as it was.
+        await rm(join(work, 'ticket.json')); await writeFile(join(work, 'ticket.json'), '{"status":"ready_for_review"}');
+        return { jobId: 'job-1' };
       }
-      if (method === 'execution_continue') { handleTicket(work, '开头改成场景加结果'); return { jobId: 'job-1' }; }
+      if (method === 'execution_continue') { handleTicket(gw.round('job-1'), '开头改成场景加结果'); return { jobId: 'job-1' }; }
       return { executionStatus: 'completed' };
-    } });
+    }) });
   assert.equal(report.passed, true);
-  assert.match(report.rounds[1]!.ticketErrors!.join(), /Q1-1：执行者只能/);
+  assert.deepEqual(report.rounds[1]!.ticketErrors, ['还没有提交任务单（待处理 Q1-1）']);
+  assert.equal(report.rounds[1]!.results.length, 0, 'the round goes back unchecked');
   const bounce = f.calls.filter(call => call.method === 'execution_continue' && call.params.jobId === 'job-1')[1]!.params.input.prompt;
-  assert.match(bounce, /任务单没有按规定处理/); assert.match(bounce, /越权的改动已经恢复/);
+  assert.match(bounce, /任务单没有按规定处理/); assert.match(bounce, /还没有提交任务单/); assert.match(bounce, /`ticket_submit`/);
   const ticket = await readTicket(work);
   assert.deepEqual(ticket.items[0]!.log.map(e => `${e.round}:${e.by}:${e.action}`), ['1:qa:raised', '3:executor:done', '3:qa:fixed']);
-  assert.ok(ticket.history.some(h => h.by === 'host' && h.action === 'reverted'), 'the undone change stays on record');
   assert.equal(ticket.status, 'closed');
+  assert.equal(gw.ledger.events('rsi-test', gw.job('job-1')).filter(e => e.type === 'ticket.revision_started').length, 2);
+
+  const once = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-2'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', pollMs: 1, qa: {},
+    invoke: ticketGateway().invoke(async (method, params: any) => {
+      if (method === 'execution_submit' && params.title.startsWith('质检')) return qa1();
+      if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(first)); return { jobId: 'job-1' }; }
+      return method === 'execution_continue' ? { jobId: 'job-1' } : { executionStatus: 'completed' };
+    }) });
+  async function qa1() { await writeFile(join(work, 'reviews', 'review-r1.json'), JSON.stringify(review('revise'))); return { jobId: 'qa-1' }; }
+  assert.equal(once.stopReason, 'max_bounces', 'the bounce counts against maxBounces');
+  assert.equal((await readTicket(work)).stopReason, 'max_bounces');
 });
 
 test('P12-P14: the closing slide comes last, a title that counts its points is right, and the same sources are not paraphrased twice', { skip: !checksAvailable && 'python3 jsonschema is unavailable' }, async t => {

@@ -4,14 +4,15 @@
  * same session with its evidence. No model judges the result here; people accept it on the workbench.
  * The checked bytes are recorded by sha256, and a delivered copy in the job's artifact folder must match them.
  * Each run appends a line to the role's ledger, which the gate reads to decide when development is done.
- * Everything sent back goes through the task ticket (ticket.ts): the executor gets the file, not a message.
+ * Everything sent back goes through the task ticket on the executor's job (execution/ticket.ts), kept by the gateway:
+ * the executor handles it with its ticket tools, every step is a ledger event, and ticket.json is a read-only export.
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
-import { applyChecks, applyReview, executorChanges, newTicket, pendingItems, type Ticket, unsettledMust } from './ticket.js';
+import { checkResultSchema, pendingItems, qualityReviewSchema, type QualityReview, type CheckResult, type Ticket, unsettledMust } from '../execution/ticket.js';
 
 const caseSchema = z.object({
   schemaVersion: z.literal(1), id: z.string().min(1), kind: z.enum(['original', 'variant']), locked: z.boolean(),
@@ -21,28 +22,14 @@ const caseSchema = z.object({
 }).strict();
 const featuresSchema = z.object({ repo: z.string(), commit: z.string(), confirmation: z.unknown(),
   features: z.array(z.object({ id: z.string().min(1), name: z.string().min(1) }).passthrough()).min(1) }).passthrough();
-const resultsSchema = z.array(z.object({ itemId: z.string(), pass: z.boolean(), evidence: z.array(z.unknown()) }).strict());
+const resultsSchema = z.array(checkResultSchema);
 
-const reviewSchema = z.object({
-  verdict: z.enum(['pass', 'revise']),
-  summary: z.string().trim().min(1).max(4000),
-  scores: z.record(z.string(), z.number().int().min(1).max(5)),
-  issues: z.array(z.object({ where: z.string().trim().min(1).max(300), problem: z.string().trim().min(1).max(2000),
-    suggestion: z.string().trim().min(1).max(2000), severity: z.enum(['must', 'should']) }).strict()).max(30),
-  /** On a re-review: QA's verdict on each ticket item the executor handled, by item id. */
-  previous: z.array(z.object({ id: z.string().trim().min(1).max(40), status: z.enum(['fixed', 'partly', 'not_fixed', 'withdrawn']),
-    note: z.string().trim().max(2000).optional() }).strict()).max(30).optional(),
-  /** Changes to the role itself: a program check, the executor's or QA's instructions, or a locked item only a person can change. */
-  proposals: z.array(z.object({ kind: z.enum(['check', 'role', 'qa', 'locked']), text: z.string().trim().min(1).max(2000) }).strict()).max(10).optional(),
-}).passthrough().refine(review => review.verdict === 'pass' || review.issues.length > 0, { message: 'A revise verdict needs at least one issue' });
-
-export type CheckResult = z.infer<typeof resultsSchema>[number];
-export type QualityReview = z.infer<typeof reviewSchema>;
+export type { CheckResult, QualityReview };
 /** One QA pass over a frozen copy of the outline, in its own session. */
 export interface ReviewRecord { jobId?: string; executionStatus: string; outlineCopy: string; review?: QualityReview; error?: string }
 export interface OutlineRound {
   round: number; jobId: string; executionStatus: string; passed: boolean; results: CheckResult[]; outlineSha256?: string; review?: ReviewRecord;
-  /** What was wrong with the executor's handling of the ticket; the round went back without being checked. */
+  /** Why the round went back unchecked: the executor finished without submitting the ticket. */
   ticketErrors?: string[];
 }
 export type Phase = 'dev' | 'test';
@@ -103,7 +90,7 @@ async function exportProject(repository: string, commit: string, destination: st
 }
 
 function taskPrompt(role: string, kase: z.infer<typeof caseSchema>, work: string, python: string): string {
-  return `${role}\n\n## 本次任务\n\n- 工作目录：${work}\n- 仓库：${kase.input.repo}\n- 提交：${kase.input.commit}\n- 受众：${kase.input.audience}\n- 自查用的 Python：\`${python}\`（已装好 jsonschema）\n\n读 \`project/\`，按 \`features.json\` 和 \`checks/outline.schema.json\` 写出 \`${path.join(work, 'outline.json')}\`。自查：\`${python} -I checks/check_outline.py outline.json features.json project\`。通过后结束，最终答复给出文件路径。\n\n工作目录里的 \`ticket.json\` 是这次任务的任务单，宿主维护。被打回时，意见都写在任务单上，按打回消息里的步骤用 \`checks/ticket.py\` 处理。`;
+  return `${role}\n\n## 本次任务\n\n- 工作目录：${work}\n- 仓库：${kase.input.repo}\n- 提交：${kase.input.commit}\n- 受众：${kase.input.audience}\n- 自查用的 Python：\`${python}\`（已装好 jsonschema）\n\n读 \`project/\`，按 \`features.json\` 和 \`checks/outline.schema.json\` 写出 \`${path.join(work, 'outline.json')}\`。自查：\`${python} -I checks/check_outline.py outline.json features.json project\`。通过后结束，最终答复给出文件路径。\n\n这次任务的任务单记在系统里，宿主维护。被打回时，意见都在任务单上，按打回消息里的步骤用 \`ticket_show\`、\`ticket_mark\`、\`ticket_submit\` 工具处理；工作目录里的 \`ticket.json\` 只是只读导出。`;
 }
 
 /** The checks need jsonschema, so the interpreter is resolved once and handed to the executor by absolute path. */
@@ -113,17 +100,17 @@ async function checkInterpreter(name: string): Promise<string> {
   return found.stdout.trim();
 }
 
-function ticketSteps(ticket: Ticket, python: string): string {
-  const tool = `${python} -I checks/ticket.py ticket.json`, pending = pendingItems(ticket);
-  return `任务单 \`ticket.json\` 上有 ${pending.length} 条待处理（${pending.filter(item => item.severity === 'must').length} 条必须改）：\n\n1. \`${tool} show\` 查看待处理的意见和证据。\n2. 在同一个 outline.json 上逐条修改。改完一条就标记：\`${tool} mark <编号> done --note "怎么改的"\`；不同意的：\`${tool} mark <编号> disputed --note "理由"\`。\n3. 全部处理完：\`${tool} submit\`。\n4. 用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。\n\n只用 ticket.py 改任务单，不要直接编辑 ticket.json。`;
+function ticketSteps(ticket: Ticket): string {
+  const pending = pendingItems(ticket);
+  return `任务单上有 ${pending.length} 条待处理（${pending.filter(item => item.severity === 'must').length} 条必须改）：\n\n1. 调用 \`ticket_show\` 工具查看待处理的意见和证据。\n2. 在同一个 outline.json 上逐条修改。改完一条就调用 \`ticket_mark\`：\`id\` 填编号，\`state\` 填 \`done\`，\`note\` 写怎么改的；不同意的 \`state\` 填 \`disputed\`，\`note\` 写理由。\n3. 全部处理完，调用 \`ticket_submit\`。\n4. 用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。\n\n任务单只能用这三个工具处理；工作目录里的 ticket.json 是只读导出，改它没有用。`;
 }
 
-function bouncePrompt(ticket: Ticket, round: number, python: string): string {
-  return `宿主程序检查没有通过（第 ${round} 轮），未通过的检查项和证据已写进任务单。${ticketSteps(ticket, python)}`;
+function bouncePrompt(ticket: Ticket, round: number): string {
+  return `宿主程序检查没有通过（第 ${round} 轮），未通过的检查项和证据已写进任务单。${ticketSteps(ticket)}`;
 }
 
-function ticketBouncePrompt(ticket: Ticket, problems: string[], python: string): string {
-  return `任务单没有按规定处理：\n\n${problems.map(problem => `- ${problem}`).join('\n')}\n\n越权的改动已经恢复。${ticketSteps(ticket, python)}`;
+function ticketBouncePrompt(ticket: Ticket, problems: string[]): string {
+  return `任务单没有按规定处理：\n\n${problems.map(problem => `- ${problem}`).join('\n')}\n\n${ticketSteps(ticket)}`;
 }
 
 export async function roleVersion(roleDirectory: string): Promise<RoleVersion> {
@@ -147,16 +134,16 @@ function stalled(reviews: QualityReview[]): boolean {
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 
 function reviewPrompt(qaRole: string, kase: z.infer<typeof caseSchema>, work: string, copy: string, output: string): string {
-  return `${qaRole}\n\n## 本次质检\n\n- 工作目录：${work}\n- 要审的大纲：\`${copy}\`\n- 项目副本（只读）：\`${path.join(work, 'project')}\`\n- 功能清单：\`${path.join(work, 'features.json')}\`\n- 任务单（只读）：\`${path.join(work, 'ticket.json')}\`\n- 仓库：${kase.input.repo}\n- 受众：${kase.input.audience}\n\n把质检结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
+  return `${qaRole}\n\n## 本次质检\n\n- 工作目录：${work}\n- 要审的大纲：\`${copy}\`\n- 项目副本（只读）：\`${path.join(work, 'project')}\`\n- 功能清单：\`${path.join(work, 'features.json')}\`\n- 任务单（系统里的任务单的只读导出）：\`${path.join(work, 'ticket.json')}\`\n- 仓库：${kase.input.repo}\n- 受众：${kase.input.audience}\n\n把质检结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
 }
 
 /** A re-review continues the same QA session, so it remembers its own issues and checks them first. */
 function reReviewPrompt(copy: string, output: string, ticketPath: string, round: number): string {
-  return `执行者按任务单改了大纲（第 ${round} 轮）。新版本：\`${copy}\`。任务单：\`${ticketPath}\`，执行者在上面把你的每条意见标了 done（已改）或 disputed（不同意），并写了说明。\n\n按 QA.md 的复审要求：先在 previous 里用任务单编号逐条核对执行者处理过的质检意见，再用同样的标准打分，issues 只写新问题。把结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
+  return `执行者按任务单改了大纲（第 ${round} 轮）。新版本：\`${copy}\`。任务单记在系统里，只读导出在 \`${ticketPath}\`；执行者在上面把你的每条意见标了 done（已改）或 disputed（不同意），并写了说明。\n\n按 QA.md 的复审要求：先在 previous 里用任务单编号逐条核对执行者处理过的质检意见，再用同样的标准打分，issues 只写新问题。把结果写到 \`${output}\`，写完立即结束。不要修改其他任何文件。`;
 }
 
-function revisePrompt(ticket: Ticket, review: QualityReview, round: number, python: string): string {
-  return `质检审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n质检的意见已写进任务单，没改到位的旧意见已重新打开。${ticketSteps(ticket, python)}`;
+function revisePrompt(ticket: Ticket, review: QualityReview, round: number): string {
+  return `质检审了你第 ${round} 轮的大纲，结论是需要修改：${review.summary}\n\n质检的意见已写进任务单，没改到位的旧意见已重新打开。${ticketSteps(ticket)}`;
 }
 
 async function check(work: string, python: string, jobId: string): Promise<{ results: CheckResult[]; outlineSha256?: string }> {
@@ -220,9 +207,6 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const roleText = await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8');
   const qaRole = options.qa ? await readFile(path.join(roleDirectory, 'QA.md'), 'utf8') : '';
   const outlinePath = path.join(work, 'outline.json'), ticketPath = path.join(work, 'ticket.json');
-  let ticket = newTicket(roleId, kase.id);
-  const saveTicket = () => writeFile(ticketPath, JSON.stringify(ticket, null, 2) + '\n');
-  await saveTicket();
   /**
    * One QA session per task: the first review opens it and each re-review continues it. The QA agent reads a
    * frozen copy; if it touches the live outline anyway, the executor's version is restored.
@@ -231,7 +215,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const review = async (round: number): Promise<ReviewRecord> => {
     await mkdir(path.join(work, 'reviews'), { recursive: true });
     const copy = path.join(work, 'reviews', `outline-r${round}.json`), output = path.join(work, 'reviews', `review-r${round}.json`);
-    const bytes = await readFile(outlinePath), ticketBytes = await readFile(ticketPath);
+    const bytes = await readFile(outlinePath);
     await writeFile(copy, bytes);
     const clientRequestId = `${roleId}:${kase.id}:${stamp}:review-${round}`;
     if (qaJobId) {
@@ -245,13 +229,8 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     const record: ReviewRecord = { jobId: qaJobId, executionStatus: await wait(qaJobId), outlineCopy: copy };
     const after = await readFile(outlinePath).catch(() => undefined);
     if (!after || sha256(after) !== sha256(bytes)) { await writeFile(outlinePath, bytes); record.error = '质检智能体改动了 outline.json，已恢复执行者的版本'; }
-    const ticketAfter = await readFile(ticketPath).catch(() => undefined);
-    if (!ticketAfter || sha256(ticketAfter) !== sha256(ticketBytes)) {
-      await writeFile(ticketPath, ticketBytes);
-      record.error = [record.error, '质检智能体改动了 ticket.json，已恢复'].filter(Boolean).join('；');
-    }
     if (record.executionStatus !== 'completed') return { ...record, error: record.error ?? `质检任务没有完成（${record.executionStatus}）` };
-    try { record.review = reviewSchema.parse(JSON.parse(await readFile(output, 'utf8'))); }
+    try { record.review = qualityReviewSchema.parse(JSON.parse(await readFile(output, 'utf8'))); }
     catch (error) { record.error = [record.error, `质检结果读不出来：${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('；'); }
     return record;
   };
@@ -259,29 +238,36 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`,
     input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(roleText, kase, work, python) } });
   const jobId = String(submitted.jobId);
+  /** Each change goes through the gateway, which records it on the job; the work directory gets a read-only copy. */
+  const ticketCall = async (method: string, params: Record<string, unknown> = {}): Promise<Ticket> => {
+    const scope = { originSessionId: options.originSessionId, jobId };
+    if (method !== 'ticket_get') await options.invoke(method, { ...scope, ...params });
+    const current = await options.invoke('ticket_get', scope) as Ticket;
+    await rm(ticketPath, { force: true });
+    await writeFile(ticketPath, JSON.stringify(current, null, 2) + '\n', { mode: 0o444 });
+    return current;
+  };
+  let ticket = await ticketCall('ticket_open', { roleId, caseId: kase.id });
   const rounds: OutlineRound[] = [];
   const reviews: QualityReview[] = [];
   let bounces = 0, revisions = 0, stopReason: StopReason = 'passed';
-  const sendBack = async (round: number, feedback: string) => {
-    ticket.status = 'in_revision'; ticket.round = round + 1;
-    await saveTicket();
+  const sendBack = async (round: number, feedback: (ticket: Ticket) => string, note: string) => {
+    ticket = await ticketCall('ticket_revise', { note });
     await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId,
-      clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${round + 1}`, input: { prompt: feedback } });
+      clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${round + 1}`, input: { prompt: feedback(ticket) } });
     log(`已打回执行者（第 ${round + 1} 轮）`);
   };
   for (let round = 1; ; round++) {
     const executionStatus = await wait(jobId);
     if (round > 1 && executionStatus === 'completed') {
-      const changes = executorChanges(ticket, await readFile(ticketPath, 'utf8').catch(() => ''));
-      if (changes.after) ticket = changes.after;
-      else ticket.history.push({ round, by: 'host', action: 'reverted', note: changes.illegal.join('；') });
-      const problems = [...changes.illegal, ...changes.incomplete];
-      if (problems.length) {
+      ticket = await ticketCall('ticket_get');
+      if (ticket.status !== 'ready_for_review') {
+        const problems = [`还没有提交任务单（待处理 ${pendingItems(ticket).map(item => item.id).join('、') || '0 条'}）`];
         rounds.push({ round, jobId, executionStatus, passed: false, results: [], ticketErrors: problems });
         log(`第 ${round} 轮：任务单没有按规定处理（${problems.join('；')}）`);
         if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
-        bounces++; ticket.round = round + 1;
-        await sendBack(round, ticketBouncePrompt(ticket, problems, python));
+        bounces++;
+        await sendBack(round, current => ticketBouncePrompt(current, problems), '执行者没有提交任务单');
         continue;
       }
     }
@@ -291,35 +277,31 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     rounds.push(record);
     log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
     if (executionStatus !== 'completed') { stopReason = 'not_completed'; break; }
-    applyChecks(ticket, round, results);
-    let feedback: string;
+    ticket = await ticketCall('ticket_checks', { results });
+    let feedback: (ticket: Ticket) => string, note: string;
     if (!programPassed) {
       if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
-      bounces++; ticket.round = round + 1; feedback = bouncePrompt(ticket, round, python);
+      bounces++; feedback = current => bouncePrompt(current, round); note = '程序检查没有通过';
     } else if (options.qa) {
-      ticket.status = 'in_review';
-      await saveTicket();
       record.review = await review(round);
       const verdict = record.review.review?.verdict;
       record.passed = verdict === 'pass';
       log(`第 ${round} 轮质检：${verdict ? `${verdict === 'pass' ? '通过' : '需要修改'}，${JSON.stringify(record.review.review!.scores)}` : record.review.error}`);
       if (!verdict) { stopReason = 'review_failed'; break; }
-      applyReview(ticket, round, record.review.review!);
+      const accepted = record.review.review!;
+      ticket = await ticketCall('ticket_review', { review: accepted, ...(record.review.jobId ? { qaJobId: record.review.jobId } : {}) });
       if (verdict === 'pass') break;
-      reviews.push(record.review.review!);
+      reviews.push(accepted);
       if (stalled(reviews)) { stopReason = 'stalled'; log('质检意见连续两轮没有改到位，或分数连续两轮没有提高，停止修改'); break; }
       if (revisions >= (options.qa.maxRevisions ?? 3)) { stopReason = 'max_revisions'; break; }
-      revisions++; ticket.round = round + 1; feedback = revisePrompt(ticket, record.review.review!, round, python);
+      revisions++; feedback = current => revisePrompt(current, accepted, round); note = '质检要求修改';
     } else break;
-    await sendBack(round, feedback);
+    await sendBack(round, feedback, note);
   }
   const last = rounds.at(-1)!;
   // Revising further cannot help when QA says a locked item is in the way; only a person can change it.
   if ((stopReason === 'stalled' || stopReason === 'max_revisions') && ticket.proposals.some(p => p.kind === 'locked')) stopReason = 'needs_human';
-  if (last.passed) ticket.status = 'closed';
-  else { ticket.status = 'stopped'; ticket.stopReason = stopReason; }
-  ticket.history.push({ round: last.round, by: 'host', action: ticket.status, note: stopReason });
-  await saveTicket();
+  ticket = await ticketCall('ticket_close', { status: last.passed ? 'closed' : 'stopped', stopReason });
   const report: OutlineRunReport = { roleId, caseId: kase.id, phase, role, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work,
     outlinePath, ticketPath, featuresConfirmed: Boolean(features.confirmation), rounds,
     passed: last.passed, stopReason, startedAt, finishedAt: now().toISOString() };
