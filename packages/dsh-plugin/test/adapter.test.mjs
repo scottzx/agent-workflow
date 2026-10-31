@@ -388,6 +388,15 @@ test('main session streams ACP output, surfaces approval, and retains remote ide
   await assert.rejects(collect(f.adapter, { ...f.options('message-3'), model: 'grok-build' }), /matching Agent preset/);
 });
 
+test('full access allows ACP tool permissions without asking DSH approval', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  const stateOf = f.ctx.sessionProjections.stateOf;
+  f.ctx.sessionProjections.stateOf = (session, key) => key === 'sandboxMode' ? 'danger-full-access' : stateOf(session, key);
+  await collect(f.adapter, f.options('message-1'));
+  assert.deepEqual(f.permissionResults, [{ outcome: 'selected', optionId: 'once' }]);
+  assert.equal(f.counts().permissions, 0);
+});
+
 test('reconnect replays missing output and reuses the prompt id without duplicate execution', { timeout: 5000 }, async t => {
   const f = await fixture(t, true);
   const output = await collect(f.adapter, f.options('message-1'));

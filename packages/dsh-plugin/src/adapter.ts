@@ -23,6 +23,11 @@ import { toSafeError } from '@1agents/acp-service/runtime';
 import { capacityPendingOf, noteProcessCapacity, noteProcessReady, noteSessionRestore, requestWhenAdmitted } from './process-admission.js';
 import type { ProcessQuestionInput, ProcessRequestClient, ProcessRequestView } from './process-requests.js';
 import { AgentSessionSettings, pinnedModeError, pinnedOptionError, replayPinnedOptions } from './session-settings.js';
+
+// Owned by dsh-sandbox-policy, which this plugin does not link: the last logged sandbox/mode switch, or null.
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap { sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access' | null }
+}
 export interface SessionPolicy {
   /** Exact workspace and ACP registry name; no global or wildcard policy. */
   cwd: string;
@@ -527,6 +532,11 @@ export class AcpAdapter implements LlmAdapter {
     const allow = params.options.find(o => o.kind === 'allow_once');
     const deny = params.options.find(o => o.kind === 'reject_once');
     if (!allow) return { outcome: { outcome: 'cancelled' } };
+    // DSH full access never asks, so its approval service would reject every ACP request. The user's switch to
+    // full access is the grant: allow without asking. The fold reads only an explicit sandbox/mode switch.
+    if (this.ctx.sessionProjections.stateOf(agent.session, 'sandboxMode') === 'danger-full-access') {
+      return { outcome: { outcome: 'selected', optionId: allow.optionId } };
+    }
     const toolName = params.toolCall.title || 'ACP tool';
     const reason = JSON.stringify(params.toolCall.rawInput ?? params.toolCall.content ?? {}, null, 2);
     // An A2A turn also offers the approval to the workbench; the first answer wins. The tool call id keeps
