@@ -181,7 +181,7 @@ test('bridge cancels pending session launches, including profile keys and late s
       // The spare comes up without going through this test's FIFO, as a launch admitted earlier would.
       const spare = { sessionKey: 'prewarm_grok_test', agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
       // Grok-only: the bridge schedules the next pre-warm 500 ms after adopting, which must not launch a real agent.
-      Reflect.set(bridge.runtime, 'ensureSession', async (input: { agent: string }) => input.agent === 'grok-build' ? spare : originalEnsure.call(bridge.runtime, input));
+      Reflect.set(bridge.runtime, 'ensureSession', async (input: Parameters<typeof originalEnsure>[0]) => input.agent === 'grok-build' ? spare : originalEnsure.call(bridge.runtime, input));
       Reflect.set(bridge.runtime, 'adoptSession', async () => ({ ...spare, sessionKey: sessionId }));
       await bridge.prewarmGrokSession(realpathSync(directory));
       const retry = peer();
@@ -202,7 +202,7 @@ test('bridge cancels pending session launches, including profile keys and late s
     const originalAdopt = bridge.runtime.adoptSession;
     const spare = { sessionKey: 'prewarm_grok_race', agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
     let adoptions = 0;
-    Reflect.set(bridge.runtime, 'ensureSession', async (input: { agent: string; sessionKey: string }) =>
+    Reflect.set(bridge.runtime, 'ensureSession', async (input: Parameters<typeof originalEnsure>[0]) =>
       input.agent === 'grok-build' ? { ...spare, sessionKey: input.sessionKey } : originalEnsure.call(bridge.runtime, input));
     Reflect.set(bridge.runtime, 'adoptSession', async ({ sessionKey }: { sessionKey: string }) => {
       adoptions++;
