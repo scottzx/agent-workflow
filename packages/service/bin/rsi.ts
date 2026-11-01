@@ -15,6 +15,10 @@ against the role's QA.md, and its issues go back to the executor. Each run is ap
 the role's ledger.jsonl in the workspace. The task ticket lives on the executor's job in the gateway;
 the run directory's ticket.json is a read-only export (see acp-service ticket --help).
 
+A run that stopped partway (the task timed out or failed, QA did not finish, the host failed) goes on
+with --resume and its run directory, with the same options; --project is then not needed. The ticket
+reopens where it stood, a task still running is waited on again, and a failed one is told to go on.
+
 rsi gate reads the ledger and says whether the committed role version may leave development:
 N development runs in a row passed (default 2), each first draft passed the program checks,
 QA left no must-fix issue, and every proposal to codify a check or change a locked item has
@@ -28,12 +32,13 @@ Options:
   --workspace DIR        where run directories go (default .1agents/runtime/rsi)
   --url URL              gateway (default http://127.0.0.1:36814)
   --max-bounces N        times a failed check goes back (default 1)
-  --timeout-minutes N    per round (default 30)
+  --timeout-minutes N    how long to wait on each task, an executor round or a QA review (default 60)
   --python PATH          interpreter with jsonschema for the checks (default python3)
   --qa                   add the QA agent review after the program checks
   --qa-preset ID         DSH agent preset for the QA agent (default: the executor's)
   --qa-max-revisions N   times QA issues go back to the executor (default 3)
-  --phase dev|test       test needs a committed role directory, --qa and an open gate (default dev)`;
+  --phase dev|test       test needs a committed role directory, --qa and an open gate (default dev)
+  --resume DIR           go on with the run recorded in this run directory`;
 
 /** Calls methods on the local gateway's /invoke route. */
 export function gatewayInvoke(url: string) {
@@ -56,18 +61,19 @@ export async function runRsiCli(argv: string[]): Promise<void> {
     target: { type: 'string', default: 'legacy:ppt-beautifier' }, preset: { type: 'string', default: 'standard' },
     origin: { type: 'string', default: 'rsi-cli' }, workspace: { type: 'string', default: '.1agents/runtime/rsi' },
     url: { type: 'string', default: 'http://127.0.0.1:36814' }, 'max-bounces': { type: 'string', default: '1' },
-    'timeout-minutes': { type: 'string', default: '30' }, python: { type: 'string', default: 'python3' },
+    'timeout-minutes': { type: 'string', default: '60' }, python: { type: 'string', default: 'python3' },
     qa: { type: 'boolean', default: false }, 'qa-preset': { type: 'string' }, 'qa-max-revisions': { type: 'string', default: '3' },
-    phase: { type: 'string', default: 'dev' },
+    phase: { type: 'string', default: 'dev' }, resume: { type: 'string' },
   } });
-  if (!values.role || !values.case || !values.project) throw new Error('--role, --case and --project are required');
+  if (!values.role || !values.case || (!values.project && !values.resume)) throw new Error('--role, --case and --project are required (--project not with --resume)');
   if (values.phase !== 'dev' && values.phase !== 'test') throw new Error('--phase is dev or test');
   if (values.phase === 'test') {
     const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!), invoke: gatewayInvoke(values.url!) });
     if (!gate.ready) throw new Error(`The role has not left development yet:\n- ${gate.reasons.join('\n- ')}`);
   }
   const invoke = gatewayInvoke(values.url!);
-  const report = await runOutlineCase({ roleDirectory: resolve(values.role), caseId: values.case, projectPath: resolve(values.project),
+  const report = await runOutlineCase({ roleDirectory: resolve(values.role), caseId: values.case, projectPath: resolve(values.project ?? '.'),
+    ...(values.resume ? { resume: resolve(values.resume) } : {}),
     workspace: resolve(values.workspace!), phase: values.phase, targetId: values.target!, agentPreset: values.preset!, originSessionId: values.origin!,
     maxBounces: Number(values['max-bounces']), timeoutMs: Number(values['timeout-minutes']) * 60_000, python: values.python!,
     ...(values.qa ? { qa: { ...(values['qa-preset'] ? { agentPreset: values['qa-preset'] } : {}), maxRevisions: Number(values['qa-max-revisions']) } } : {}),

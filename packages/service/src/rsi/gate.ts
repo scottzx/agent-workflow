@@ -31,7 +31,9 @@ export async function checkGate(options: { roleDirectory: string; workspace: str
   const roleId = z.object({ id: z.string().min(1) }).passthrough().parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))).id;
   const role = await roleVersion(roleDirectory);
   const text = await readFile(ledgerPath(options.workspace, roleId), 'utf8').catch(() => '');
-  const entries = text.split('\n').filter(Boolean).map(line => JSON.parse(line) as LedgerEntry)
+  // A resumed run appends a new line for the same work directory; its latest line is the run.
+  const lines = text.split('\n').filter(Boolean).map(line => JSON.parse(line) as LedgerEntry);
+  const entries = lines.filter((entry, index) => !lines.slice(index + 1).some(later => later.workDirectory === entry.workDirectory))
     .filter(entry => role.commit && entry.role.commit === role.commit && !entry.role.dirty);
   const dev = entries.filter(entry => entry.phase === 'dev' && entry.caseKind === 'original');
   const unfinished = dev.filter(entry => UNFINISHED.includes(entry.stopReason));

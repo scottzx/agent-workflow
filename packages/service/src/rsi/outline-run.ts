@@ -49,6 +49,8 @@ export type StopReason = 'passed' | 'max_bounces' | 'max_revisions' | 'stalled' 
 export interface RoleVersion { commit?: string; dirty: boolean }
 export interface OutlineRunReport {
   roleId: string; caseId: string; phase: Phase; role: RoleVersion; repo: string; commit: string; workDirectory: string; outlinePath: string; ticketPath: string;
+  /** The executor's job, which carries the ticket. */
+  jobId?: string;
   featuresConfirmed: boolean; rounds: OutlineRound[]; passed: boolean; stopReason: StopReason; startedAt: string; finishedAt: string;
   /** The host error that stopped the run. */
   error?: string;
@@ -75,8 +77,12 @@ export interface OutlineRunOptions {
   qa?: { agentPreset?: string; targetId?: string; maxRevisions?: number };
   invoke: (method: string, params: Record<string, unknown>) => Promise<any>;
   log?: (line: string) => void; now?: () => Date;
+  /** A run directory: goes on with the run recorded there instead of starting one. */
+  resume?: string;
 }
 
+/** Runs that stopped because something did not finish; the others stopped by the training's rules. */
+const RESUMABLE: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 const terminal = new Set(['completed', 'failed', 'canceled', 'rejected']);
 
 function run(command: string, args: string[], options: { cwd?: string; input?: NodeJS.ReadableStream } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -191,8 +197,9 @@ async function check(work: string, python: string, jobId: string): Promise<{ res
 
 export async function runOutlineCase(options: OutlineRunOptions): Promise<OutlineRunReport> {
   const log = options.log ?? (() => {}), now = options.now ?? (() => new Date());
-  const pollMs = options.pollMs ?? 10_000, timeoutMs = options.timeoutMs ?? 30 * 60_000, maxBounces = options.maxBounces ?? 1;
-  const python = await checkInterpreter(options.python ?? 'python3'), startedAt = now().toISOString();
+  const pollMs = options.pollMs ?? 10_000, timeoutMs = options.timeoutMs ?? 60 * 60_000, maxBounces = options.maxBounces ?? 1;
+  const prior = options.resume ? JSON.parse(await readFile(path.join(options.resume, 'run.json'), 'utf8')) as OutlineRunReport : undefined;
+  const python = await checkInterpreter(options.python ?? 'python3'), startedAt = prior?.startedAt ?? now().toISOString();
   const roleDirectory = path.resolve(options.roleDirectory);
   const profile = profileSchema.parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))), roleId = profile.id;
   const layers = profile.training?.layers ?? ['prompt'];
@@ -208,13 +215,20 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   if (phase === 'test' && !options.qa) throw new Error('A test run needs the QA review');
 
   const stamp = startedAt.replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-  const work = path.join(path.resolve(options.workspace), roleId, `${kase.id}-${stamp}`);
-  await mkdir(work, { recursive: true });
-  await exportProject(path.resolve(options.projectPath), kase.input.commit, path.join(work, 'project'), kase.input.exclude);
-  await cp(path.join(roleDirectory, 'checklist.json'), path.join(work, 'checklist.json'));
-  await cp(path.join(roleDirectory, 'checks'), path.join(work, 'checks'), { recursive: true });
-  await cp(path.join(caseDirectory, kase.features), path.join(work, 'features.json'));
-  log(`工作目录：${work}`);
+  const work = options.resume ? path.resolve(options.resume) : path.join(path.resolve(options.workspace), roleId, `${kase.id}-${stamp}`);
+  if (prior) {
+    if (prior.roleId !== roleId || prior.caseId !== kase.id || prior.phase !== phase) throw new Error(`That run is ${prior.roleId} / ${prior.caseId} in phase ${prior.phase}`);
+    if (prior.passed) throw new Error('That run already passed');
+    if (!RESUMABLE.includes(prior.stopReason)) throw new Error(`That run stopped by the training's rules (${prior.stopReason}); start a new one to try again`);
+    if (prior.role.commit !== role.commit || prior.role.dirty !== role.dirty) throw new Error(`The role changed since that run (${prior.role.commit?.slice(0, 8)}); start a new one`);
+  } else {
+    await mkdir(work, { recursive: true });
+    await exportProject(path.resolve(options.projectPath), kase.input.commit, path.join(work, 'project'), kase.input.exclude);
+    await cp(path.join(roleDirectory, 'checklist.json'), path.join(work, 'checklist.json'));
+    await cp(path.join(roleDirectory, 'checks'), path.join(work, 'checks'), { recursive: true });
+    await cp(path.join(caseDirectory, kase.features), path.join(work, 'features.json'));
+  }
+  log(`${prior ? '接着跑，工作目录' : '工作目录'}：${work}`);
   log(`阶段：${phase === 'dev' ? '开发' : '测试'}，角色版本：${role.commit?.slice(0, 8) ?? '未提交'}${role.commit && role.dirty ? '（有未提交的改动）' : ''}`);
   log(`执行者：${options.agentPreset}，训练的层：${layers.map(layer => LAYERS[layer]).join('、')}`);
   if (!features.confirmation) log('注意：这份功能清单还没有经人确认。');
@@ -257,22 +271,27 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
    * One QA session per task: the first review opens it and each re-review continues it. The QA agent reads a
    * frozen copy; if it touches the live outline anyway, the executor's version is restored.
    */
-  let qaJobId: string | undefined;
-  const review = async (round: number): Promise<ReviewRecord> => {
+  let qaJobId = prior?.rounds.flatMap(round => round.review?.jobId ?? []).at(-1);
+  const review = async (round: number, resuming = false): Promise<ReviewRecord> => {
     await mkdir(path.join(work, 'reviews'), { recursive: true });
     const copy = path.join(work, 'reviews', `outline-r${round}.json`), output = path.join(work, 'reviews', `review-r${round}.json`);
     const bytes = await readFile(outlinePath);
     await writeFile(copy, bytes);
-    const clientRequestId = `${roleId}:${kase.id}:${stamp}:review-${round}`;
-    if (qaJobId) {
-      await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId: qaJobId, clientRequestId, input: { prompt: reReviewPrompt(copy, output, ticketPath, round) } });
+    const clientRequestId = `${roleId}:${kase.id}:${stamp}:review-${round}${resuming ? `-resume-${now().toISOString()}` : ''}`;
+    // Going on with a review: if QA is still at it, or has written its result, only the waiting was lost.
+    const qaStatus = resuming && qaJobId ? String((await options.invoke('execution_get', { originSessionId: options.originSessionId, jobId: qaJobId })).executionStatus) : undefined;
+    const lostOnlyTheWait = qaStatus !== undefined && (!terminal.has(qaStatus) || (qaStatus === 'completed' && await readFile(output).then(() => true, () => false)));
+    if (lostOnlyTheWait) log(`第 ${round} 轮质检：接着等任务 ${qaJobId}`);
+    else if (qaJobId) {
+      await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId: qaJobId, clientRequestId,
+        input: { prompt: resuming && !reviews.length ? reviewPrompt(qaRole, kase, work, copy, output) : reReviewPrompt(copy, output, ticketPath, round) } });
     } else {
       const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.qa!.targetId ?? options.targetId,
         title: `质检：产品介绍大纲 ${kase.input.repo}`, clientRequestId,
         input: { cwd: work, agentPreset: options.qa!.agentPreset ?? options.agentPreset, prompt: reviewPrompt(qaRole, kase, work, copy, output) } });
       qaJobId = String(submitted.jobId);
     }
-    const record: ReviewRecord = { jobId: qaJobId, executionStatus: await wait(qaJobId), outlineCopy: copy };
+    const record: ReviewRecord = { jobId: qaJobId!, executionStatus: await wait(qaJobId!), outlineCopy: copy };
     const after = await readFile(outlinePath).catch(() => undefined);
     if (!after || sha256(after) !== sha256(bytes)) { await writeFile(outlinePath, bytes); record.error = '质检智能体改动了 outline.json，已恢复执行者的版本'; }
     if (record.executionStatus !== 'completed') return { ...record, error: record.error ?? `质检任务没有完成（${record.executionStatus}）` };
@@ -280,21 +299,34 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     catch (error) { record.error = [record.error, `质检结果读不出来：${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('；'); }
     return record;
   };
-  const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.targetId,
+  const priorJob = prior?.jobId ?? prior?.rounds[0]?.jobId;
+  if (prior && !priorJob) throw new Error('That run recorded no job to go on with');
+  const jobId = priorJob ?? String((await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.targetId,
     title: `产品介绍大纲：${kase.input.repo}`, clientRequestId: `${roleId}:${kase.id}:${stamp}:round-1`,
-    input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(roleText, kase, work, python) } });
-  const jobId = String(submitted.jobId);
+    input: { cwd: work, agentPreset: options.agentPreset, prompt: taskPrompt(roleText, kase, work, python) } })).jobId);
   /** Each change goes through the gateway, which records it on the job and rewrites the read-only copy in the work directory. */
   const ticketCall = async (method: string, params: Record<string, unknown> = {}): Promise<Ticket> => {
     const scope = { originSessionId: options.originSessionId, jobId };
     if (method !== 'ticket_get') await options.invoke(method, { ...scope, ...params });
     return await options.invoke('ticket_get', scope) as Ticket;
   };
-  let ticket = await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath });
+  let ticket = prior ? await ticketCall('ticket_get') : await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath });
   const steps = ticketSteps(jobId, options.cli);
-  const rounds: OutlineRound[] = [];
-  const reviews: QualityReview[] = [];
-  let bounces = 0, revisions = 0, stopReason: StopReason = 'passed';
+  const rounds: OutlineRound[] = prior ? [...prior.rounds] : [];
+  // Where a resumed run picks up: the round its host never finished waiting on, or the review QA did not finish.
+  let startRound = 1, resumingReview = false;
+  if (prior) {
+    const last = rounds.at(-1);
+    if (!last || ticket.round > last.round) startRound = ticket.round;
+    else if (last.executionStatus !== 'completed') { rounds.pop(); startRound = last.round; }
+    else if (options.qa && last.results.every(result => result.pass) && !last.review?.review) { rounds.pop(); startRound = last.round; resumingReview = true; }
+    else throw new Error(`That run stopped between steps of round ${last.round}; start a new one`);
+  }
+  const reviews = rounds.flatMap(round => round.review?.review && round.review.review.verdict !== 'pass' ? [round.review.review] : []);
+  let bounces = rounds.filter(round => round.ticketErrors || (round.executionStatus === 'completed' && round.results.some(result => !result.pass))).length;
+  let revisions = reviews.length, stopReason: StopReason = 'passed';
+  // The stopped ticket refused whatever this round's executor tried to mark, so a missing submission is not its miss.
+  const excusedRound = prior && !resumingReview ? startRound : undefined;
   const sendBack = async (round: number, feedback: (ticket: Ticket) => string, note: string) => {
     ticket = await ticketCall('ticket_revise', { note });
     await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId,
@@ -303,16 +335,31 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   };
   // Whatever stops the run, the ticket is closed and the run is recorded; a host error is rethrown afterwards.
   let hostError: unknown;
-  try { for (let round = 1; ; round++) {
-    const executionStatus = await wait(jobId);
-    if (round > 1 && executionStatus === 'completed') {
+  try {
+  if (prior) {
+    if (ticket.status === 'stopped') ticket = await ticketCall('ticket_reopen', { note: 'rsi run 接着跑' });
+    for (const id of [jobId, qaJobId]) if (id) await options.invoke('execution_rewatch', { originSessionId: options.originSessionId, jobId: id });
+    const view = resumingReview ? undefined : await options.invoke('execution_get', { originSessionId: options.originSessionId, jobId });
+    if (view?.executionStatus === 'failed') {
+      await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId,
+        clientRequestId: `${roleId}:${kase.id}:${stamp}:round-${startRound}-resume-${now().toISOString()}`,
+        input: { prompt: `上一轮执行中断了，工作目录里的文件都还在，接着把这一轮做完。${ticket.status === 'in_revision' ? `\n\n${steps(ticket)}` : ''}` } });
+      log(`任务 ${jobId} 上一轮失败了，已让执行者接着做（第 ${startRound} 轮）`);
+    }
+  }
+  for (let round = startRound; ; round++) {
+    const reviewOnly = resumingReview && round === startRound;
+    const executionStatus = reviewOnly ? 'completed' : await wait(jobId);
+    if (!reviewOnly && round > 1 && executionStatus === 'completed') {
       ticket = await ticketCall('ticket_get');
       if (ticket.status !== 'ready_for_review') {
         const problems = [`还没有提交任务单（待处理 ${pendingItems(ticket).map(item => item.id).join('、') || '0 条'}）`];
         rounds.push({ round, jobId, executionStatus, passed: false, results: [], ticketErrors: problems });
         log(`第 ${round} 轮：任务单没有按规定处理（${problems.join('；')}）`);
-        if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
-        bounces++;
+        if (round !== excusedRound) {
+          if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
+          bounces++;
+        }
         await sendBack(round, current => ticketBouncePrompt(steps, current, problems), '执行者没有提交任务单');
         continue;
       }
@@ -323,13 +370,13 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     rounds.push(record);
     log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
     if (executionStatus !== 'completed') { stopReason = 'not_completed'; break; }
-    ticket = await ticketCall('ticket_checks', { results });
+    if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
     let feedback: (ticket: Ticket) => string, note: string;
     if (!programPassed) {
       if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
       bounces++; feedback = current => bouncePrompt(steps, current, round); note = '程序检查没有通过';
     } else if (options.qa) {
-      record.review = await review(round);
+      record.review = await review(round, reviewOnly);
       const verdict = record.review.review?.verdict;
       record.passed = verdict === 'pass';
       log(`第 ${round} 轮质检：${verdict ? `${verdict === 'pass' ? '通过' : '需要修改'}，${JSON.stringify(record.review.review!.scores)}` : record.review.error}`);
@@ -353,7 +400,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   if ((stopReason === 'stalled' || stopReason === 'max_revisions') && ticket.proposals.some(p => p.kind === 'locked')) stopReason = 'needs_human';
   try { ticket = await ticketCall('ticket_close', { status: passed ? 'closed' : 'stopped', stopReason }); }
   catch (error) { if (!hostError) throw error; } // The gateway may be what failed; the ledger line below still records the run.
-  const report: OutlineRunReport = { roleId, caseId: kase.id, phase, role, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work,
+  const report: OutlineRunReport = { roleId, caseId: kase.id, phase, role, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work, jobId,
     outlinePath, ticketPath, featuresConfirmed: Boolean(features.confirmation), rounds,
     passed, stopReason, startedAt, finishedAt: now().toISOString(),
     ...(hostError ? { error: hostError instanceof Error ? hostError.message : String(hostError) } : {}) };

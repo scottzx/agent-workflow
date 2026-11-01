@@ -419,6 +419,17 @@ export class JobLedger {
       this.event(state, job, input.attemptId, 'job.acceptance_recorded', record); return record;
     });
   }
+  /** The originator waits on the job again, so it is no longer listed as abandoned. */
+  rewatch(originSessionId: string, jobId: string): LedgerAttempt {
+    return this.mutate(state => {
+      const job = this.job(state, originSessionId, jobId), attempt = this.attempt(state, job.currentAttemptId);
+      if (attempt.unwatched) {
+        delete attempt.unwatched;
+        this.event(state, job, attempt.attemptId, 'attempt.rewatched', {});
+      }
+      return clone(attempt);
+    });
+  }
   ticket(originSessionId: string, jobId: string): Ticket {
     this.job(this.state, originSessionId, jobId);
     const ticket = this.state.tickets![jobId];

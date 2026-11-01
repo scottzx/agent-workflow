@@ -27,7 +27,7 @@ import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '.
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
-import { invokeTicket, TICKET_METHODS } from '../execution/ticket.js';
+import { invokeTicket, reopenForContinue, TICKET_METHODS } from '../execution/ticket.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
@@ -133,6 +133,7 @@ const EXECUTION_METHODS = {
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
   execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
   execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
+  execution_rewatch: { description: '发起方重新等待任务当前这一轮，撤销 execution_unwatch 的记录。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_unwatch: { description: '发起方不再等待任务当前这一轮（等待超时，或自己出错），reason 写原因。执行轮次本身不变；工作台把它列为异常，可以之后重新查询执行宿主。', parameters: z.toJSONSchema(executionUnwatchSchema) },
   execution_process_requests: { description: '读取任务上的过程请求（执行者的工具审批、提问、计划），含已回答的和谁回答的。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_process_answer: { description: '回答任务上的一条过程请求，和工作台页面同一记录；decidedBy 写明是人还是教练（教练写明所在的智能体会话），note 写理由。', parameters: z.toJSONSchema(processAnswerSchema) },
@@ -1048,8 +1049,15 @@ export class RemoteAgentGateway {
       }
       const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
       if (!previous) throw new Error('Continue is unsupported for this provider');
-      return this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
+      // A round queued behind a running one could not surface the running round's approvals, and the two would wait on each other.
+      if (job.inFlightAttemptIds.length) await this.refresh(previous);
+      const current = this.ledger.get(input.originSessionId, job.jobId);
+      if (current.attempts.some(item => current.inFlightAttemptIds.includes(item.attemptId) && item.executionStatus !== 'input_required'))
+        throw new Error('Job still has a running round; wait for it to end or cancel it before continuing');
+      const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
         input: { ...(attempt.input as Record<string, unknown>), ...input.input }, clientRequestId: input.clientRequestId }, { jobId: job.jobId, previous, requestDigestInput: input.input });
+      reopenForContinue(this.ledger, input.originSessionId, job.jobId);
+      return submitted;
     }
     if (method === 'execution_get') {
       const input = executionJobSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
@@ -1079,6 +1087,11 @@ export class RemoteAgentGateway {
     if (method === 'execution_unwatch') {
       const input = executionUnwatchSchema.parse(params);
       this.ledger.unwatch(input.originSessionId, input.jobId, input.reason);
+      return this.ledgerView(input.originSessionId, input.jobId);
+    }
+    if (method === 'execution_rewatch') {
+      const input = executionJobSchema.parse(params);
+      this.ledger.rewatch(input.originSessionId, input.jobId);
       return this.ledgerView(input.originSessionId, input.jobId);
     }
     if (method === 'execution_process_requests') {

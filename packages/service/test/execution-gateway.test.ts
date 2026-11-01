@@ -247,6 +247,29 @@ test('legacy spawn fields remain compatible and message creates a new attempt in
   assert.equal(view.currentAttemptId, next.attemptId);
 });
 
+test('a job with a running round refuses a continue, and one that ended goes on with its stopped ticket reopened', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('execution_submit', submit) as any;
+  const scope = { originSessionId: 'root', jobId: first.jobId };
+  await until(async () => f.backend.runs.length, count => count === 1);
+  await gateway.invoke('ticket_open', { ...scope, roleId: 'role', caseId: 'case' });
+  await gateway.invoke('execution_unwatch', { ...scope, reason: '等太久' });
+  await gateway.invoke('ticket_close', { ...scope, status: 'stopped', stopReason: 'not_completed' });
+  await assert.rejects(gateway.invoke('execution_continue', { ...scope, input: { prompt: 'go on' }, clientRequestId: 'too-early' }), /still has a running round/);
+  assert.equal((await gateway.invoke('ticket_get', scope) as any).status, 'stopped', 'a refused continue leaves the ticket alone');
+  assert.equal(f.backend.runs.length, 1);
+  await gateway.invoke('execution_rewatch', scope);
+  assert.equal((await gateway.invoke('execution_get', scope) as any).attempts[0].unwatched, undefined);
+
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'late' });
+  await until(() => gateway.invoke('execution_get', scope) as Promise<any>, item => item.executionStatus === 'completed');
+  const next = await gateway.invoke('execution_continue', { ...scope, input: { prompt: 'go on' }, clientRequestId: 'in-time' }) as any;
+  assert.notEqual(next.attemptId, first.attemptId);
+  assert.equal((await gateway.invoke('ticket_get', scope) as any).status, 'drafting');
+  await until(async () => f.backend.runs.length, count => count === 2);
+  f.backend.runs[1]!.finish({ outcome: 'completed', text: 'done' });
+});
+
 test('unified explicit continuation uses the same job and session without reopening the old attempt', async t => {
   const f = await fixture(t), gateway = f.gateway();
   const first = await gateway.invoke('execution_submit', submit) as any;
@@ -292,6 +315,8 @@ test('an old continuation request replays after later rounds change inherited fi
   const replayAfterLater = await gateway.invoke('execution_continue', originalRequest) as any;
   assert.equal(replayAfterLater.attemptId, second.attemptId); assert.equal(replayAfterLater.requestedAttempt.attemptId, second.attemptId);
   assert.equal(replayAfterLater.currentAttemptId, third.attemptId); assert.equal(f.backend.runs.length, 3);
+  f.backend.runs[2]!.finish({ outcome: 'completed', text: 'v3' });
+  await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as Promise<any>, item => item.executionStatus === 'completed');
   const originalClient = (gateway as any).client.bind(gateway);
   (gateway as any).client = async (remote: string) => {
     const client = await originalClient(remote);
@@ -306,7 +331,7 @@ test('an old continuation request replays after later rounds change inherited fi
   assert.equal(replayDuringUnknown.attempts.length, 4);
   await assert.rejects(gateway.invoke('execution_continue', { ...originalRequest, clientRequestId: 'new-during-unknown' }), /submission_unknown/);
   await assert.rejects(gateway.invoke('execution_continue', { ...originalRequest, input: { prompt: 'conflicting request' } }), /conflicts/);
-  // v4 was received by the real host but remains queued behind v3; replay must not add any fifth round.
+  // v4 was received by the real host but its acceptance is unknown; replay must not add any fifth round.
   const list = await gateway.invoke('execution_list', { originSessionId: 'root' }) as any;
   assert.equal(list.jobs[0].attempts.length, 4);
 });

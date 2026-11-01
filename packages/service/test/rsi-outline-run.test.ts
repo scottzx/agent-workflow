@@ -439,9 +439,10 @@ test('the gate opens only after consecutive clean passes on the committed role v
   const git = (...args: string[]) => execFileSync('git', ['-C', f.role, ...args], { encoding: 'utf8' }).trim();
   git('init', '-q'); git('add', '.'); git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'role v1');
   const commit = git('rev-parse', 'HEAD');
+  let runs = 0;
   const entry = (over: Partial<LedgerEntry> = {}): LedgerEntry => ({ startedAt: '2026-10-31T00:00:00.000Z', phase: 'dev', caseId: 'demo', caseKind: 'original',
     role: { commit, dirty: false }, passed: true, stopReason: 'passed', firstDraftPassed: true, bounces: 0, revisions: 1,
-    scores: [{ 吸引力: 3 }, { 吸引力: 4 }], mustIssues: 0, proposals: [], workDirectory: '/w', ticketPath: '/w/ticket.json', ...over });
+    scores: [{ 吸引力: 3 }, { 吸引力: 4 }], mustIssues: 0, proposals: [], workDirectory: `/w${++runs}`, ticketPath: '/w/ticket.json', ...over });
   const ledger = join(workspace, 'product-intro-outline', 'ledger.jsonl');
   const write = (entries: LedgerEntry[]) => mkdir(join(workspace, 'product-intro-outline'), { recursive: true })
     .then(() => writeFile(ledger, entries.map(e => JSON.stringify(e)).join('\n') + '\n'));
@@ -579,4 +580,140 @@ test('P12-P15: the closing slide comes last and links what it offers, a title th
   assert.deepEqual(p15.evidence.map((e: any) => e.path), ['sections/getting_started/slides/1/points/2', 'sections/getting_started/slides/1/points/3'],
     'a link, a point without a download, and a download mentioned on another slide all pass');
   assert.equal((await run(ok)).P15!.pass, true);
+});
+
+/** A run stopped by its wait running out, for a resume to go on with. */
+async function timedOut(f: Awaited<ReturnType<typeof fixture>>, gw: ReturnType<typeof ticketGateway>, options: Partial<OutlineRunOptions>, fake: OutlineRunOptions['invoke']) {
+  return runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard',
+    originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 5, ...options, invoke: gw.invoke(fake) });
+}
+const review = (verdict: string, previous: unknown[] = []) => ({ verdict, summary: '…', scores: { 吸引力: 4, 具体: 4, 受众: 4, 结构: 4, 可信: 4, 行动: 4 }, previous,
+  issues: verdict === 'pass' ? [] : [{ where: 'project/oneLiner', problem: '太空泛', suggestion: '写场景', severity: 'must' }] });
+
+test('a timed-out run goes on with --resume: the ticket reopens, the caller waits again, and the gate counts one run', async t => {
+  const f = await fixture(t), gw = ticketGateway(), workspace = join(f.root, 'runs');
+  let work = '';
+  const stopped = await timedOut(f, gw, {}, async (method, params: any) => {
+    if (method === 'execution_submit') { work = params.input.cwd; return { jobId: 'job-1' }; }
+    return method === 'execution_unwatch' ? {} : { executionStatus: 'working' };
+  });
+  assert.equal(stopped.stopReason, 'not_completed');
+  assert.equal((await readTicket(work)).status, 'stopped');
+
+  const calls: string[] = [];
+  const resume = (fake: OutlineRunOptions['invoke']) => runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace, targetId: 'dsh-host', agentPreset: 'standard',
+    originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, resume: work, invoke: gw.invoke(fake) });
+  const report = await resume(async method => {
+    calls.push(method);
+    await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+    return { executionStatus: 'completed' };
+  });
+  assert.equal(report.passed, true);
+  assert.equal(report.workDirectory, work);
+  assert.equal(report.startedAt, stopped.startedAt);
+  assert.deepEqual(report.rounds.map(round => round.round), [1], 'the unfinished round is replaced, not added to');
+  assert.ok(calls.includes('execution_rewatch'));
+  assert.ok(!calls.includes('execution_submit') && !calls.includes('execution_continue'), 'the task kept running; nothing is sent again');
+  const types = gw.ledger.events('rsi-test', gw.job('job-1')).map(event => event.type).filter(type => type.startsWith('ticket.') && type !== 'ticket.checked');
+  assert.deepEqual(types, ['ticket.opened', 'ticket.stopped', 'ticket.reopened', 'ticket.closed']);
+  const lines = (await readFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as LedgerEntry);
+  assert.deepEqual(lines.map(line => [line.stopReason, line.workDirectory === work]), [['not_completed', true], ['passed', true]]);
+
+  await assert.rejects(resume(async () => ({ executionStatus: 'completed' })), /already passed/);
+});
+
+test('the gate reads a resumed run by its latest line', async t => {
+  const f = await fixture(t), workspace = join(f.root, 'runs');
+  execFileSync('git', ['-C', f.root, 'init', '-q']); execFileSync('git', ['-C', f.root, 'add', 'role']);
+  execFileSync('git', ['-C', f.root, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'role']);
+  const commit = execFileSync('git', ['-C', f.root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const line = (stopReason: string, workDirectory: string) => JSON.stringify({ startedAt: '2026-11-01T00:00:00Z', phase: 'dev', caseId: 'demo', caseKind: 'original', role: { commit, dirty: false },
+    passed: stopReason === 'passed', stopReason, firstDraftPassed: true, bounces: 0, revisions: 0, scores: [], mustIssues: 0, proposals: [], workDirectory, ticketPath: '' });
+  await mkdir(join(workspace, 'product-intro-outline'), { recursive: true });
+  await writeFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), [line('not_completed', '/a'), line('passed', '/a'), line('not_completed', '/b')].join('\n') + '\n');
+  const gate = await checkGate({ roleDirectory: f.role, workspace });
+  assert.deepEqual(gate.devRuns.map(run => run.workDirectory), ['/a']);
+  assert.deepEqual(gate.unfinished.map(run => run.workDirectory), ['/b']);
+});
+
+test('a resumed revision round is not charged for marks the stopped ticket refused, and a failed task is told to go on', async t => {
+  const f = await fixture(t), gw = ticketGateway();
+  let work = '', qa = 0;
+  const stopped = await timedOut(f, gw, { qa: {}, maxBounces: 0 }, async (method, params: any) => {
+    if (method === 'execution_submit' && params.title.startsWith('质检')) {
+      qa++;
+      await writeFile(join(work, 'reviews', 'review-r1.json'), JSON.stringify(review('revise')));
+      return { jobId: 'qa-1' };
+    }
+    if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
+    if (method === 'execution_continue') { f.calls.push({ method: 'round-2', params }); return { jobId: 'job-1' }; }
+    if (method === 'execution_unwatch') return {};
+    return { executionStatus: f.calls.some(call => call.method === 'round-2') && params.jobId === 'job-1' ? 'working' : 'completed' };
+  });
+  assert.equal(stopped.stopReason, 'not_completed');
+  assert.deepEqual([stopped.rounds.length, stopped.rounds[1]!.executionStatus], [2, 'timed_out']);
+  assert.equal(qa, 1);
+  const refused = gw.round('job-1');
+  assert.throws(() => refused('ticket_mark', { itemId: 'Q1-1', state: 'done', note: '改了' }), /stopped/);
+
+  const sent: any[] = [];
+  let status = 'failed', executorRounds = 0;
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard',
+    originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {}, maxBounces: 0, resume: work, invoke: gw.invoke(async (method, params: any) => {
+      if (method === 'execution_continue' && params.jobId === 'qa-1') {
+        await writeFile(join(work, 'reviews', `review-r${JSON.parse(await readFile(join(work, 'ticket.json'), 'utf8')).round}.json`), JSON.stringify(review('pass', [{ id: 'Q1-1', status: 'fixed' }])));
+        return { jobId: 'qa-1' };
+      }
+      if (method === 'execution_continue') {
+        sent.push(params);
+        status = 'completed';
+        // The first go after the resume ends without the ticket, as an executor whose marks were refused would; the next one handles it.
+        if (++executorRounds === 2) handleTicket(gw.round('job-1'), '开头改成场景');
+        return { jobId: 'job-1' };
+      }
+      return { executionStatus: params.jobId === 'job-1' ? status : 'completed' };
+    }) });
+  assert.equal(report.passed, true);
+  assert.match(sent[0].input.prompt, /上一轮执行中断了/);
+  assert.match(sent[0].input.prompt, /`ticket_submit`/);
+  assert.match(sent[1].input.prompt, /还没有提交任务单/);
+  assert.deepEqual(report.rounds.map(round => [round.round, round.ticketErrors?.length ?? 0]), [[1, 0], [2, 1], [3, 0]], 'maxBounces 0 did not end the run at the excused round');
+});
+
+test('a run stopped in the QA review goes on with that review; QA still running is only waited on again', async t => {
+  const f = await fixture(t), gw = ticketGateway();
+  let work = '';
+  const stopped = await timedOut(f, gw, { qa: {} }, async (method, params: any) => {
+    if (method === 'execution_submit' && params.title.startsWith('质检')) return { jobId: 'qa-1' };
+    if (method === 'execution_submit') { work = params.input.cwd; await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit))); return { jobId: 'job-1' }; }
+    if (method === 'execution_unwatch') return {};
+    return { executionStatus: params.jobId === 'qa-1' ? 'working' : 'completed' };
+  });
+  assert.equal(stopped.stopReason, 'review_failed');
+  const calls: string[] = [];
+  let polls = 0;
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard',
+    originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {}, resume: work, invoke: gw.invoke(async (method, params: any) => {
+      calls.push(method);
+      if (method !== 'execution_get' || params.jobId !== 'qa-1') return {};
+      if (++polls < 3) return { executionStatus: 'working' };
+      await writeFile(join(work, 'reviews', 'review-r1.json'), JSON.stringify(review('pass')));
+      return { executionStatus: 'completed' };
+    }) });
+  assert.equal(report.passed, true);
+  assert.deepEqual(report.rounds.map(round => round.round), [1]);
+  assert.ok(!calls.includes('execution_continue') && !calls.includes('execution_submit'));
+  assert.equal(gw.ledger.events('rsi-test', gw.job('job-1')).filter(event => event.type === 'ticket.checked').length, 1, 'the checks are not merged twice');
+});
+
+test('a run the training stopped by its own rules does not resume', async t => {
+  const f = await fixture(t), gw = ticketGateway();
+  let work = '';
+  const stopped = await timedOut(f, gw, { maxBounces: 0 }, async (method, params: any) => {
+    if (method === 'execution_submit') { work = params.input.cwd; return { jobId: 'job-1' }; }
+    return { executionStatus: 'completed' };
+  });
+  assert.equal(stopped.stopReason, 'max_bounces');
+  await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard',
+    originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, resume: work, invoke: gw.invoke(async () => ({})) }), /training's rules/);
 });
