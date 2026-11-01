@@ -118,6 +118,7 @@ const executionEventsSchema = z.object({ ...originFields, jobId: string.optional
   limit: z.number().int().min(1).max(500).default(100) }).strict();
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
   reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
+const workbenchContinueSchema = z.object({ prompt: string }).strict();
 const executionUnwatchSchema = executionJobSchema.extend({ reason: string }).strict();
 /** The coach answers an executor's process request: the same answer as the workbench page, naming who decided and why. */
 const processAnswerSchema = executionJobSchema.extend({ requestId: string, clientRequestId: string,
@@ -802,6 +803,13 @@ export class RemoteAgentGateway {
   async refreshWorkbenchTask(jobId: string) {
     this.workbenchTask(jobId);
     await Promise.allSettled(this.state.jobs.filter(raw => raw.ledgerJobId === jobId).map(raw => this.refresh(raw)));
+    return this.workbenchTask(jobId);
+  }
+  /** A person sends a failed task another round in its own session. */
+  async continueWorkbenchTask(jobId: string, prompt: string) {
+    const task = this.workbenchTask(jobId);
+    if (!task.canContinue) throw new Error('只有执行失败的任务可以在这里继续。');
+    await this.invoke('execution_continue', { originSessionId: task.originSessionId, jobId, input: { prompt } });
     return this.workbenchTask(jobId);
   }
   async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
@@ -1593,7 +1601,7 @@ function authenticated(req: IncomingMessage, token: string): boolean {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 /** Publishing and review decisions are a person's acts, made on the workbench page. */
-const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/];
+const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/];
 function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
   if (!secret) return false;
   const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
@@ -1680,7 +1688,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           if (gateway.config.workbench.token && !authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
           if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
           if (req.method === 'POST' && PAGE_ONLY_ROUTES.some(route => route.test(pathname)) && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) {
-            return json(res, 403, { error: 'page_action_required', message: '发布和验收决定只能由人在工作台页面发起。' });
+            return json(res, 403, { error: 'page_action_required', message: '发布、验收决定和继续任务只能由人在工作台页面发起。' });
           }
         }
         if (req.method === 'GET' && pathname === '/workbench/tasks') {
@@ -1746,11 +1754,17 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         try {
           if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
           if (rest === '/refresh' && req.method === 'POST') return json(res, 200, await gateway.refreshWorkbenchTask(jobId));
+          if (rest === '/continue' && req.method === 'POST') {
+            const { prompt } = workbenchContinueSchema.parse(await body(req));
+            gateway.workbenchTask(jobId);
+            try { return json(res, 200, await gateway.continueWorkbenchTask(jobId, prompt)); }
+            catch (error) { return json(res, 409, { error: 'continue_refused', message: error instanceof Error ? error.message : String(error) }); }
+          }
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
           if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
           if (answer && req.method === 'POST') return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), await body(req)));
           if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
-          if (rest === '' || rest === '/refresh' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' || rest === '/refresh' || rest === '/continue' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
           return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });

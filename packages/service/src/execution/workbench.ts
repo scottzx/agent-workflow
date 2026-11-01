@@ -28,6 +28,8 @@ export interface AcpTaskSummary {
   businessAcceptance?: BusinessAcceptance;
   /** Tools the finished attempt asked for that nobody approved; its result may be incomplete. */
   blockedTools?: string[];
+  /** The round failed and nothing else drives this task, so a person can send it another round from the workbench. */
+  canContinue?: boolean;
 }
 export interface WorkbenchStage { stage: string; name: string; status: string; planned: boolean; jobId?: string; attemptId?: string }
 export interface WorkbenchProgress { stage: string; phase: string; stages: WorkbenchStage[]; completedStages: string[];
@@ -225,7 +227,8 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
     inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds], execution,
     ...(review ? { reviewStatus: review.status } : {}), ...(pending && review.reviewerId === actorId ? { pendingReviewId: review.reviewId } : {}),
     ...(pendingRequest ? { pendingProcessRequestId: pendingRequest.requestId } : {}), progressSummary,
-    ...(acceptance ? { businessAcceptance: structuredClone(acceptance) } : {}), ...(blocked.length ? { blockedTools: blocked } : {}) };
+    ...(acceptance ? { businessAcceptance: structuredClone(acceptance) } : {}), ...(blocked.length ? { blockedTools: blocked } : {}),
+    ...(job.executionStatus === 'failed' && !run && !job.parentJobRef && !job.unresolvedAttemptIds.length ? { canContinue: true } : {}) };
 }
 function bubbleProcessWait(summaries: Map<string, AcpTaskSummary>): void {
   const tasks = [...summaries.values()];
@@ -308,6 +311,7 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
   for (const report of source.reportRuns ?? []) {
     const detail = details[report.jobId], task = summaries.get(report.jobId);
     if (!detail || !task || detail.currentAttemptId !== report.attemptId) continue;
+    delete task.canContinue; delete detail.canContinue;
     const pending = report.humanReviews.at(-1), author = report.child;
     const stages: WorkbenchStage[] = [
       { stage: 'research', name: '临时智能体分析', status: author ? ledger.attempts[author.attemptId]?.executionStatus ?? 'unknown' : 'not_started', planned: !author,

@@ -72,6 +72,9 @@ export const acpTaskService = {
         post(`/tasks/${encodeURIComponent(jobId)}/reviews/${encodeURIComponent(reviewId)}/decisions`, input),
     /** Asks the execution host for the task's latest state now, e.g. after its caller stopped waiting on it. */
     refresh: (jobId: string): Promise<AcpTaskDetail> => post(`/tasks/${encodeURIComponent(jobId)}/refresh`, {}),
+    /** Sends a failed task another round in its own session. */
+    continueTask: (jobId: string, prompt: string): Promise<AcpTaskDetail> =>
+        post(`/tasks/${encodeURIComponent(jobId)}/continue`, { prompt }),
     answerProcessRequest: (jobId: string, requestId: string, input: AcpProcessAnswerInput): Promise<AcpTaskDetail> =>
         post(`/tasks/${encodeURIComponent(jobId)}/process-requests/${encodeURIComponent(requestId)}/answers`, input),
     listAgents: (): Promise<AcpAgentCatalog> => call('/agents'),

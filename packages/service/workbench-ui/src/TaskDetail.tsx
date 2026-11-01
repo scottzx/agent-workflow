@@ -27,6 +27,7 @@ import {
 
 type DetailTab = 'overview' | 'progress' | 'review' | 'chat' | 'events';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const CONTINUE_PROMPT = '上一轮执行中断了，已经完成的不用重做，请接着把任务做完。';
 
 // Inside DSH the page sits in a same-origin frame whose host can open the task's own session.
 const embedded = window.parent !== window;
@@ -133,6 +134,9 @@ export function AcpTaskDetailPanel({
     const [confirmCancel, setConfirmCancel] = useState(false);
     const [previewing, setPreviewing] = useState<ArtifactRef>();
     const [requerying, setRequerying] = useState(false);
+    const [continuePrompt, setContinuePrompt] = useState<string | null>(null);
+    const [continuing, setContinuing] = useState(false);
+    const [continueError, setContinueError] = useState('');
     const closePreview = useCallback(() => setPreviewing(undefined), []);
     const decisionRequest = useRef<{ key: string; id: string } | null>(null);
     const alive = useRef(true);
@@ -176,6 +180,22 @@ export function AcpTaskDetailPanel({
             if (alive.current) setError(errorText(err));
         } finally {
             if (alive.current) setRequerying(false);
+        }
+    };
+
+    const continueTask = async () => {
+        setContinuing(true);
+        setContinueError('');
+        try {
+            const next = await acpTaskService.continueTask(jobId, continuePrompt ?? '');
+            if (!alive.current) return;
+            setDetail(next);
+            setContinuePrompt(null);
+            onChanged();
+        } catch (err) {
+            if (alive.current) setContinueError(errorText(err));
+        } finally {
+            if (alive.current) setContinuing(false);
         }
     };
 
@@ -312,6 +332,18 @@ export function AcpTaskDetailPanel({
                                 {requerying ? text('正在查询…', 'Querying…') : text('重新查询', 'Query again')}
                             </button>
                         )}
+                        {detail?.canContinue && continuePrompt === null && (
+                            <button
+                                type="button"
+                                class="acp-button acp-primary"
+                                onClick={() => {
+                                    setContinueError('');
+                                    setContinuePrompt(CONTINUE_PROMPT);
+                                }}
+                            >
+                                {text('继续', 'Continue')}
+                            </button>
+                        )}
                         <button type="button" class="acp-button" onClick={copyLink}>
                             {text('复制链接', 'Copy link')}
                         </button>
@@ -392,6 +424,42 @@ export function AcpTaskDetailPanel({
                     />
                 )}
                 {loading && <p class="acp-muted">{text('正在载入…', 'Loading…')}</p>}
+                {detail?.canContinue && continuePrompt !== null && (
+                    <div class="acp-review-form">
+                        <label htmlFor="acp-continue-prompt">
+                            {text('在原会话里新开一轮，发给执行者的话', 'Message for a new round in the same session')}
+                        </label>
+                        <textarea
+                            id="acp-continue-prompt"
+                            value={continuePrompt}
+                            disabled={continuing}
+                            onInput={event => setContinuePrompt(event.currentTarget.value)}
+                        />
+                        {continueError && (
+                            <p role="alert" class="acp-decision-error">
+                                {continueError}
+                            </p>
+                        )}
+                        <div class="acp-review-buttons">
+                            <button
+                                type="button"
+                                class="acp-button acp-primary"
+                                disabled={continuing || !continuePrompt.trim()}
+                                onClick={() => void continueTask()}
+                            >
+                                {continuing ? text('正在提交…', 'Submitting…') : text('提交并继续', 'Submit and continue')}
+                            </button>
+                            <button
+                                type="button"
+                                class="acp-link"
+                                disabled={continuing}
+                                onClick={() => setContinuePrompt(null)}
+                            >
+                                {text('取消', 'Cancel')}
+                            </button>
+                        </div>
+                    </div>
+                )}
                 {detail && (
                     <Fragment>
                         {tab === 'overview' && (

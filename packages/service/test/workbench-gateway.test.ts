@@ -310,6 +310,54 @@ test('a caller that stops waiting marks the task abnormal, and a re-query from t
   assert.deepEqual([refreshed, requeried.displayStatus], [[jobId], 'completed'], 'the task finished unseen and is found ended');
 });
 
+test('a person continues a failed task from the workbench page, and nothing else can', async t => {
+  const f = await fixture(t);
+  const prepare = (originSessionId: string, extra: Record<string, unknown> = {}) => {
+    const prepared = f.gateway.ledger.prepare({ originSessionId, title: '训练任务', targetSnapshot: { targetId: 'legacy:host' }, input: {}, ...extra });
+    f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+    f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: prepared.attempt.attemptId, sessionId: 'dsh-1' }, { executionStatus: 'working' });
+    return prepared;
+  };
+  const prepared = prepare('allowed-root'), jobId = prepared.job.jobId, path = `/workbench/tasks/${jobId}/continue`;
+  const calls: unknown[] = [], real = f.gateway.invoke.bind(f.gateway);
+  (f.gateway as any).invoke = async (method: string, params: unknown) => {
+    if (method !== 'execution_continue') return real(method, params);
+    calls.push(params);
+    const round = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', jobId, title: '训练任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+    f.gateway.ledger.markDispatching(round.attempt.attemptId);
+    return {};
+  };
+  assert.equal(f.gateway.workbenchTask(jobId).canContinue, undefined);
+  const running = await f.request(path, relayed({ prompt: '接着做' }));
+  assert.deepEqual([running.status, (await running.json() as any).error], [409, 'continue_refused'], 'a running round is not continued');
+
+  f.gateway.ledger.observe(prepared.attempt.attemptId, { executionStatus: 'failed' });
+  assert.equal(f.gateway.workbenchTask(jobId).canContinue, true);
+  assert.equal(f.gateway.workbenchList({ filter: 'failed' }).items.find((item: any) => item.jobId === jobId)?.canContinue, true);
+  assert.equal((await f.request(path, post({ prompt: '接着做' }))).status, 403, 'the bearer API cannot start a round in a person\'s name');
+  assert.equal((await f.request(path, relayed({ prompt: '' }))).status, 400);
+  assert.equal((await f.request(path, { method: 'GET' })).status, 405);
+  const hidden = prepare('private-root');
+  assert.equal((await f.request(`/workbench/tasks/${hidden.job.jobId}/continue`, relayed({ prompt: '接着做' }))).status, 404);
+  assert.deepEqual(calls, []);
+
+  const continued = await f.request(path, relayed({ prompt: '接着做' }));
+  assert.equal(continued.status, 200);
+  assert.deepEqual(calls, [{ originSessionId: 'allowed-root', jobId, input: { prompt: '接着做' } }]);
+  assert.equal((await continued.json() as any).canContinue, undefined, 'the button goes away once a round runs');
+});
+
+test('a failed child task is left to its parent', async t => {
+  const f = await fixture(t);
+  const parent = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '父任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  const child = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '子任务', targetSnapshot: { targetId: 'legacy:host' }, input: {},
+    parentJobRef: { sourceId: f.gateway.workbenchTask(parent.job.jobId).sourceId, jobId: parent.job.jobId }, parentAttemptId: parent.attempt.attemptId });
+  f.gateway.ledger.markDispatching(child.attempt.attemptId);
+  f.gateway.ledger.accept(child.attempt.attemptId, { taskId: 'child', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  f.gateway.ledger.observe(child.attempt.attemptId, { executionStatus: 'failed' });
+  assert.equal(f.gateway.workbenchTask(child.job.jobId).canContinue, undefined);
+});
+
 test('abandoning through human review closes further child dispatch admission', async t => {
   const f = await fixture(t), item = await f.seed('allowed-root', '人工放弃任务'), internals = f.gateway as any;
   internals.advanceDelivery = Object.getPrototypeOf(f.gateway).advanceDelivery;

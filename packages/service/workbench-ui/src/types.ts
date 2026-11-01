@@ -57,6 +57,7 @@ export interface AcpTaskSummary {
     unresolvedAttemptIds?: string[];
     businessAcceptance?: AcpBusinessAcceptance;
     blockedTools?: string[];
+    canContinue?: boolean;
 }
 
 export interface AcpBusinessAcceptance {
