@@ -142,6 +142,8 @@ const capacityLifecycle = createCapacityLifecycle({
     });
   },
 });
+/** Runtime session key -> the MCP servers its ensure_session asked for. */
+const sessionMcpServers = new Map();
 const runtime = createAcpRuntime({
   // Includes compatibility checks, probes and pre-warm launches. Native user
   // processes outside this service are not admitted through this governor.
@@ -201,6 +203,7 @@ const runtime = createAcpRuntime({
   cwd: process.cwd(),
   sessionStore: createRuntimeStore({ stateDir: DEFAULT_STATE_DIR }),
   agentRegistry: createServiceAgentRegistry(),
+  mcpServers: ({ sessionKey }) => sessionMcpServers.get(sessionKey) ?? [],
   permissionMode: "approve-reads", // default, will be overridden by session or client options
   onPermissionRequest: handlePermissionRequestCallback,
   onAskUserQuestion: handleAskUserQuestionCallback,
@@ -1399,12 +1402,7 @@ export async function dispatchCommand(ws, payload) {
             // client supplying extra context wants.
             sessionOptions.systemPrompt = { append: systemContext };
           }
-          // Per-session MCP servers (e.g. the AI Project Manager's
-          // project-locked task tools). Merged with runtime-level servers in
-          // the engine; only applies when this session's client is created.
-          if (Array.isArray(mcpServers) && mcpServers.length > 0) {
-            sessionOptions.mcpServers = mcpServers;
-          }
+          const hasMcpServers = Array.isArray(mcpServers) && mcpServers.length > 0;
           if (env && typeof env === "object" && !Array.isArray(env)) {
             const safeEnv = Object.fromEntries(
               Object.entries(env).filter(
@@ -1492,6 +1490,11 @@ export async function dispatchCommand(ws, payload) {
           const runtimeSessionKey = profileId
             ? `${sessionId}@${profileId}-r${profileRevision}`
             : (payload.runtimeSessionKey || sessionId);
+          // Per-session MCP servers (e.g. the DSH hand-back and ticket tools). The engine ignores
+          // sessionOptions.mcpServers and reads only the runtime-level option, which looks them up
+          // here by session key whenever it creates this session's client.
+          if (hasMcpServers) sessionMcpServers.set(runtimeSessionKey, mcpServers);
+          else sessionMcpServers.delete(runtimeSessionKey);
 
           // Prefer the explicit resumeSessionId (the agent-side UUID
           // recorded in the 1agents index); fall back to acpSessionId
@@ -1641,7 +1644,8 @@ export async function dispatchCommand(ws, payload) {
           }
 
           // Phase 2: Instant pre-warm hit for fresh grok-build sessions if CWD matches!
-          if (agentType === "grok-build" && launchArgv.length === 0 && !resumeId && prewarmedGrokHandle) {
+          // The spare was created without this session's MCP servers, so such a session starts its own process.
+          if (agentType === "grok-build" && launchArgv.length === 0 && !resumeId && !hasMcpServers && prewarmedGrokHandle) {
             if (prewarmedGrokCwd === normalizedPath) {
               console.time(`ensure_session_${sessionId}`);
               console.log(
@@ -2444,6 +2448,7 @@ export async function dispatchCommand(ws, payload) {
               }
               await cancelSessionQueue(session, sessionId);
               await runtime.close({ handle: session.handle, reason: "Session closed by request" });
+              sessionMcpServers.delete(session.handle.sessionKey);
             } catch (err) {
               console.error(`[acpx-server] Error closing runtime handle:`, err);
               throw err;
