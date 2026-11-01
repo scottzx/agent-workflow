@@ -15,7 +15,7 @@ import { createWorkbenchProcessClient } from './process-requests.js';
 import { registerNativeApprovals } from './native-approvals.js';
 import type {} from '@deepseek-ai/dsh-tools';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { WORKBENCH_UI_PATH, currentA2AExecution, type ExecutorTicketArgs } from '@1agents/acp-service/a2a';
+import { WORKBENCH_UI_PATH, type ExecutorTicketArgs } from '@1agents/acp-service/a2a';
 import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
 import { workbenchHandler } from './workbench.js';
 import { createTicketGateway, runTicketTool, ticketTools } from './ticket-tools.js';
@@ -108,10 +108,11 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: TICKET_PATH,
         handler: review.ticketHandler((sessionId, tool, args) => runTicketTool(gateway, sessionId, tool, args as ExecutorTicketArgs, 'mcp')) }));
     }
-    // ACP agents reach the same hand-back through a per-session MCP server, offered only to A2A task sessions.
+    // ACP agents reach the same hand-back and ticket tools through a per-session MCP server. It is offered to every ACP
+    // session: the connection is opened once and reused, often before a turn binds the session to its A2A task or a
+    // person takes it over, so the tools themselves refuse a session that has no task.
     const origin = `${(ctx.webServer as { protocol?: string }).protocol ?? 'http:'}//127.0.0.1:${ctx.webServer.port}`;
-    adapter.mcpServersFor = sessionId => review.host && (currentA2AExecution(sessionId) || review.host.sessionTask(sessionId))
-      ? [review.mcpServer(sessionId, origin)] : [];
+    adapter.mcpServersFor = sessionId => review.host ? [review.mcpServer(sessionId, origin)] : [];
     closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics, {
       release: sessionId => adapter.releaseSession(sessionId),
       delete: sessionId => adapter.deleteSession(sessionId),
