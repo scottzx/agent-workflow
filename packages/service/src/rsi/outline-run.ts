@@ -121,7 +121,7 @@ async function checkInterpreter(name: string): Promise<string> {
 type TicketSteps = (ticket: Ticket) => string;
 function ticketSteps(jobId: string, cli?: { command: string; url: string }): TicketSteps {
   const ticket = cli && `${cli.command} ticket`;
-  const commands = cli ? `\n\nACP 智能体里这三个工具由 \`1agents-review\` MCP 服务提供。找不到这些工具时，在终端里用命令做同样的事：\n\n- 查看：\`${ticket} pending --job ${jobId} --url ${cli.url}\`\n- 标记：\`${ticket} mark --job ${jobId} --url ${cli.url} --id 编号 --state done --note '怎么改的'\`\n- 提交：\`${ticket} submit --job ${jobId} --url ${cli.url}\`` : '';
+  const commands = cli ? `\n\nACP 智能体里这三个工具由 \`oneagents-review\` MCP 服务提供。找不到这些工具时，在终端里用命令做同样的事：\n\n- 查看：\`${ticket} pending --job ${jobId} --url ${cli.url}\`\n- 标记：\`${ticket} mark --job ${jobId} --url ${cli.url} --id 编号 --state done --note '怎么改的'\`\n- 提交：\`${ticket} submit --job ${jobId} --url ${cli.url}\`` : '';
   return ticket => {
     const pending = pendingItems(ticket);
     return `任务单上有 ${pending.length} 条待处理（${pending.filter(item => item.severity === 'must').length} 条必须改）：\n\n1. 调用 \`ticket_show\` 工具查看待处理的意见和证据。\n2. 在同一个 outline.json 上逐条修改。改完一条就调用 \`ticket_mark\`：\`id\` 填编号，\`state\` 填 \`done\`，\`note\` 写怎么改的；不同意的 \`state\` 填 \`disputed\`，\`note\` 写理由。\n3. 全部处理完，调用 \`ticket_submit\`。\n4. 用任务里给的 Python 再运行自查，全部检查通过后结束，最终答复给出文件路径。${commands}\n\n任务单只能用这三个工具${cli ? '或这三条命令' : ''}处理；工作目录里的 ticket.json 是只读导出，改它没有用。`;

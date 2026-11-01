@@ -165,7 +165,7 @@ test('an ACP executor runs a role that trains only its first message, is told th
   assert.equal(report.passed, true);
   assert.equal(f.calls.find(call => call.method === 'execution_submit')!.params.input.agentPreset, 'oneagents-acp-grok');
   const bounce = f.calls.find(call => call.method === 'execution_continue')!.params.input.prompt as string;
-  assert.match(bounce, /`1agents-review` MCP 服务/);
+  assert.match(bounce, /`oneagents-review` MCP 服务/);
   assert.ok(bounce.includes('`/bin/node /x/acp-service.js ticket mark --job job-1 --url http://127.0.0.1:36814 --id 编号 --state done'), 'the commands name the executor’s own job');
   assert.match(bounce, /只能用这三个工具或这三条命令处理/);
   assert.deepEqual(lines.filter(line => line.includes('prc-check')), ['任务 job-1 的过程请求 prc-check：工具「Run python3 -I checks/check_outline.py」待批准。教练处理：/bin/node /x/acp-service.js process answer --job job-1 --id prc-check approve|reject --note 理由 --url http://127.0.0.1:36814'],
