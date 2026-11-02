@@ -286,8 +286,11 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       await options.invoke('execution_continue', { originSessionId: options.originSessionId, jobId: qaJobId, clientRequestId,
         input: { prompt: resuming && !reviews.length ? reviewPrompt(qaRole, kase, work, copy, output) : reReviewPrompt(copy, output, ticketPath, round) } });
     } else {
+      // A child of the executor's job, so the ledger shows the two as one run and cancelling the run reaches QA.
+      const executor = await options.invoke('execution_get', { originSessionId: options.originSessionId, jobId });
       const submitted = await options.invoke('execution_submit', { originSessionId: options.originSessionId, targetId: options.qa!.targetId ?? options.targetId,
-        title: `质检：产品介绍大纲 ${kase.input.repo}`, clientRequestId,
+        title: `质检：产品介绍大纲 ${kase.input.repo}`, clientRequestId, purpose: 'qa_review',
+        parentJobRef: { sourceId: executor.sourceId, jobId }, parentAttemptId: executor.currentAttemptId,
         input: { cwd: work, agentPreset: options.qa!.agentPreset ?? options.agentPreset, prompt: reviewPrompt(qaRole, kase, work, copy, output) } });
       qaJobId = String(submitted.jobId);
     }

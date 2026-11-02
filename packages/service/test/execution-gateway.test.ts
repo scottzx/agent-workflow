@@ -175,11 +175,13 @@ test('generic resident results support version-bound review, stable reads and re
   const completed = await until(() => gateway.invoke('execution_get', query) as Promise<any>, item => item.executionStatus === 'completed');
   assert.equal(completed.resultRevision, 'result-1'); assert.match(completed.resultDigest, /^[a-f0-9]{64}$/);
   assert.equal(completed.resultHistory.length, 1);
-  const review = { ...query, attemptId: first.attemptId, resultRevision: completed.resultRevision, resultDigest: completed.resultDigest, reviewStatus: 'accepted' };
+  const review = { ...query, attemptId: first.attemptId, resultRevision: completed.resultRevision, resultDigest: completed.resultDigest, reviewStatus: 'accepted', decidedBy: { kind: 'coach', agent: 'claude-code', sessionId: 'coach-1' } };
+  await assert.rejects(gateway.invoke('execution_review', { ...review, decidedBy: undefined }), 'an acceptance must say who decided');
   await gateway.invoke('execution_review', review);
   const repeated = await gateway.invoke('execution_get', query) as any;
   assert.equal(repeated.resultDigest, completed.resultDigest); assert.equal(repeated.resultRevision, completed.resultRevision);
   assert.equal(repeated.resultHistory.length, 1); assert.equal(repeated.businessAcceptance.reviewStatus, 'accepted');
+  assert.deepEqual(repeated.businessAcceptance.decidedBy, review.decidedBy);
   const raw = await gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: first.taskId }) as any;
   assert.equal(raw.resultDigest, completed.resultDigest); assert.equal(raw.resultRevision, completed.resultRevision);
   const inbox = await gateway.invoke('remote_agent_inbox', { originSessionId: 'root' }) as any;

@@ -88,6 +88,8 @@ export type A2AGatewayConfig = z.input<typeof configSchema>;
 type Config = z.output<typeof configSchema>;
 
 const originFields = { originSessionId: string };
+/** Who acted: a person, or a coach agent naming its session. */
+const actorSchema = z.object({ kind: z.enum(['person', 'coach']), agent: string.optional(), sessionId: string.optional() }).strict();
 const taskFields = { ...originFields, remote: string, taskId: string };
 const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'Prompt must contain text');
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
@@ -96,11 +98,11 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
   clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
-  provider: string.optional(), model: string.optional(),
+  provider: string.optional(), model: string.optional(), initiatedBy: actorSchema.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
 const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
@@ -108,22 +110,23 @@ const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
   clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
   parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(),
-  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional() }).strict();
+  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional() }).strict();
 const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
 const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
 const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
   limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0) }).strict();
-const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional() }).strict();
+const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional(), initiatedBy: actorSchema.optional() }).strict();
 const executionEventsSchema = z.object({ ...originFields, jobId: string.optional(), afterSequence: z.number().int().nonnegative().optional(),
   limit: z.number().int().min(1).max(500).default(100) }).strict();
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
-  reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
+  reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional(), decidedBy: actorSchema }).strict();
 const workbenchContinueSchema = z.object({ prompt: string }).strict();
+const workbenchAcceptSchema = z.object({ note: string.optional() }).strict();
 const executionUnwatchSchema = executionJobSchema.extend({ reason: string }).strict();
 /** The coach answers an executor's process request: the same answer as the workbench page, naming who decided and why. */
 const processAnswerSchema = executionJobSchema.extend({ requestId: string, clientRequestId: string,
   outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']), note: string.optional(), stopTask: z.literal(true).optional(),
-  decidedBy: z.object({ kind: z.enum(['person', 'coach']), agent: string.optional(), sessionId: string.optional() }).strict().optional() }).strict();
+  decidedBy: actorSchema.optional() }).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
@@ -133,7 +136,7 @@ const EXECUTION_METHODS = {
   execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
   execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
-  execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
+  execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；decidedBy 必填，写明是人还是教练；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
   execution_rewatch: { description: '发起方重新等待任务当前这一轮，撤销 execution_unwatch 的记录。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_unwatch: { description: '发起方不再等待任务当前这一轮（等待超时，或自己出错），reason 写原因。执行轮次本身不变；工作台把它列为异常，可以之后重新查询执行宿主。', parameters: z.toJSONSchema(executionUnwatchSchema) },
   execution_process_requests: { description: '读取任务上的过程请求（执行者的工具审批、提问、计划），含已回答的和谁回答的。', parameters: z.toJSONSchema(executionJobSchema) },
@@ -809,7 +812,16 @@ export class RemoteAgentGateway {
   async continueWorkbenchTask(jobId: string, prompt: string) {
     const task = this.workbenchTask(jobId);
     if (!task.canContinue) throw new Error('只有执行失败的任务可以在这里继续。');
-    await this.invoke('execution_continue', { originSessionId: task.originSessionId, jobId, input: { prompt } });
+    await this.invoke('execution_continue', { originSessionId: task.originSessionId, jobId, input: { prompt }, initiatedBy: { kind: 'person' } });
+    return this.workbenchTask(jobId);
+  }
+  /** A person marks the task's current result as read (已阅). */
+  acceptWorkbenchTask(jobId: string, note?: string) {
+    const task = this.workbenchTask(jobId);
+    if (!task.canAccept) throw new Error('只有已完成、还没有结论的任务可以标记已阅。');
+    const result = this.ledger.getAttempt(task.currentAttemptId).result!;
+    this.ledger.acceptance(task.originSessionId, jobId, { attemptId: task.currentAttemptId, resultRevision: result.resultRevision!, resultDigest: result.resultDigest!,
+      reviewStatus: 'accepted', ...(note ? { note } : {}), decidedBy: { kind: 'person' } });
     return this.workbenchTask(jobId);
   }
   async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
@@ -1052,7 +1064,7 @@ export class RemoteAgentGateway {
             || current.agentPreset !== snapshot.agentPreset || current.target.binding.roleId !== snapshot.roleId
             || current.target.binding.driver !== 'ppt_delivery') throw new Error('PPT checkpoint recovery cannot change its host or role');
         return this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
-          input: attempt.input as Record<string, unknown>, clientRequestId: input.clientRequestId },
+          input: attempt.input as Record<string, unknown>, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy },
           { jobId: job.jobId, deliveryRecovery: delivery, deliveryRecoveryInput: recoveryInput, requestDigestInput: input.input });
       }
       const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
@@ -1063,7 +1075,7 @@ export class RemoteAgentGateway {
       if (current.attempts.some(item => current.inFlightAttemptIds.includes(item.attemptId) && item.executionStatus !== 'input_required'))
         throw new Error('Job still has a running round; wait for it to end or cancel it before continuing');
       const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
-        input: { ...(attempt.input as Record<string, unknown>), ...input.input }, clientRequestId: input.clientRequestId }, { jobId: job.jobId, previous, requestDigestInput: input.input });
+        input: { ...(attempt.input as Record<string, unknown>), ...input.input }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: input.input });
       reopenForContinue(this.ledger, input.originSessionId, job.jobId);
       return submitted;
     }
@@ -1145,8 +1157,8 @@ export class RemoteAgentGateway {
     if (method === 'remote_agent_spawn') {
       const input = spawnSchema.parse(params);
       if (input.notificationTarget && !this.config.notificationTargets[input.notificationTarget]) throw new Error('Unknown notificationTarget');
-      const { originSessionId, remote, clientRequestId, title, ...fields } = input;
-      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title });
+      const { originSessionId, remote, clientRequestId, title, initiatedBy, ...fields } = input;
+      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title, initiatedBy });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
       if (!raw) throw new Error(`Task admission unresolved; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
@@ -1171,7 +1183,7 @@ export class RemoteAgentGateway {
       const record = this.ledger.get(input.originSessionId, previous.ledgerJobId);
       const target = this.targets.getTarget(record.targetId);
       const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: record.targetId,
-        clientRequestId: input.clientRequestId, title: previous.title,
+        clientRequestId: input.clientRequestId, title: previous.title, initiatedBy: input.initiatedBy,
         input: { ...(target.kind === 'agent_host' ? { cwd: previous.cwd, ...(previous.agentPreset ? { agentPreset: previous.agentPreset } : {}) } : {}), prompt: input.prompt,
           ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
           ...(input.roleId ? { roleId: input.roleId } : {}), ...(input.roleLockPath ? { roleLockPath: input.roleLockPath } : {}),
@@ -1238,6 +1250,10 @@ export class RemoteAgentGateway {
     const next = items.slice();
     if (index < 0) next.push(request); else next[index] = request;
     this.state.processRequests = next;
+    const { requestId, kind, toolTitle, status, answer } = request;
+    this.ledger.processEvent(request.jobId, request.attemptId, index < 0 ? 'process.opened' : status === 'expired' ? 'process.expired' : 'process.answered', {
+      requestId, kind, ...(toolTitle ? { toolTitle } : {}), status,
+      ...(answer ? { outcome: answer.outcome, ...(answer.note ? { note: answer.note } : {}), ...(answer.stopTask ? { stopTask: true } : {}), ...(answer.decidedBy ? { decidedBy: answer.decidedBy } : {}) } : {}) });
     this.save();
   }
   workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
@@ -1601,7 +1617,7 @@ function authenticated(req: IncomingMessage, token: string): boolean {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 /** Publishing and review decisions are a person's acts, made on the workbench page. */
-const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/];
+const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/, /^\/workbench\/tasks\/[^/]+\/acceptance$/];
 function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
   if (!secret) return false;
   const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
@@ -1760,11 +1776,21 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             try { return json(res, 200, await gateway.continueWorkbenchTask(jobId, prompt)); }
             catch (error) { return json(res, 409, { error: 'continue_refused', message: error instanceof Error ? error.message : String(error) }); }
           }
+          if (rest === '/acceptance' && req.method === 'POST') {
+            const { note } = workbenchAcceptSchema.parse(await body(req));
+            gateway.workbenchTask(jobId);
+            try { return json(res, 200, gateway.acceptWorkbenchTask(jobId, note)); }
+            catch (error) { return json(res, 409, { error: 'accept_refused', message: error instanceof Error ? error.message : String(error) }); }
+          }
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
           if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
-          if (answer && req.method === 'POST') return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), await body(req)));
+          // The page, here or relayed by its host, always answers as a person; only the gateway's own callers name a coach.
+          if (answer && req.method === 'POST') {
+            const input = await body(req), asPerson = page || relayedFromPage(req, gateway.config.workbench.pageRelaySecret);
+            return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), asPerson ? { ...(input as object), decidedBy: { kind: 'person' } } : input));
+          }
           if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
-          if (rest === '' || rest === '/refresh' || rest === '/continue' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' || rest === '/refresh' || rest === '/continue' || rest === '/acceptance' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
           return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });

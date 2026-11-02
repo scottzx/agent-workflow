@@ -124,6 +124,7 @@ export function AcpTaskDetailPanel({
 }) {
     const [detail, setDetail] = useState<AcpTaskDetail | null>(null);
     const [error, setError] = useState('');
+    const [accepting, setAccepting] = useState(false);
     const [loading, setLoading] = useState(true);
     const [tab, setTab] = useState<DetailTab>(requestedReviewId ? 'review' : 'overview');
     const [reviewId, setReviewId] = useState<string | undefined>(requestedReviewId);
@@ -180,6 +181,21 @@ export function AcpTaskDetailPanel({
             if (alive.current) setError(errorText(err));
         } finally {
             if (alive.current) setRequerying(false);
+        }
+    };
+
+    const accept = async () => {
+        setAccepting(true);
+        setError('');
+        try {
+            const next = await acpTaskService.accept(jobId);
+            if (!alive.current) return;
+            setDetail(next);
+            onChanged();
+        } catch (err) {
+            if (alive.current) setError(errorText(err));
+        } finally {
+            if (alive.current) setAccepting(false);
         }
     };
 
@@ -330,6 +346,11 @@ export function AcpTaskDetailPanel({
                         {detail && (detail.displayStatus === 'unwatched' || detail.stale) && (
                             <button type="button" class="acp-button" disabled={requerying} onClick={requery}>
                                 {requerying ? text('正在查询…', 'Querying…') : text('重新查询', 'Query again')}
+                            </button>
+                        )}
+                        {detail?.canAccept && (
+                            <button type="button" class="acp-button acp-primary" disabled={accepting} onClick={() => void accept()}>
+                                {text('已阅', 'Mark as read')}
                             </button>
                         )}
                         {detail?.canContinue && continuePrompt === null && (
@@ -657,6 +678,12 @@ function AcceptanceSection({ detail }: { detail: AcpTaskDetail }) {
                 <dd>{acceptance.resultRevision}</dd>
                 <dt>{text('记录时间', 'Recorded')}</dt>
                 <dd>{date(acceptance.recordedAt)}</dd>
+                {acceptance.decidedBy && (
+                    <Fragment>
+                        <dt>{text('处理人', 'Decided by')}</dt>
+                        <dd>{acceptance.decidedBy.kind === 'coach' ? text('教练', 'Coach') : text('人', 'Person')}</dd>
+                    </Fragment>
+                )}
                 {acceptance.note && (
                     <Fragment>
                         <dt>{text('说明', 'Note')}</dt>

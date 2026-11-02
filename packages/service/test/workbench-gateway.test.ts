@@ -291,6 +291,40 @@ test('the coach lists a task’s process requests and answers one through the ga
   assert.deepEqual([answered.status, answered.answer.outcome, answered.answer.note, answered.answer.decidedBy], ['answered', 'approved', '角色要求的自查命令', coach]);
   assert.equal(f.gateway.workbenchTask(jobId).processRequests[0]!.answer!.decidedBy!.kind, 'coach', 'the page reads the same record');
   await assert.rejects(f.gateway.invoke('execution_process_answer', { ...scope, requestId: 'prc-check', clientRequestId: 'cli-2', outcome: 'rejected' }), /no longer pending/);
+  const { events } = await f.gateway.invoke('execution_events', scope) as any;
+  const processEvents = events.filter((event: any) => event.type.startsWith('process.'));
+  assert.deepEqual(processEvents.map((event: any) => event.type), ['process.opened', 'process.answered'], 'the rejected repeat records nothing');
+  assert.deepEqual(processEvents[1].data, { requestId: 'prc-check', kind: 'permission', toolTitle: 'Run python3 -I checks/check_outline.py', status: 'answered', outcome: 'approved', note: '角色要求的自查命令', decidedBy: coach });
+  assert.equal(processEvents[1].attemptId, prepared.attempt.attemptId);
+  await f.request(`/workbench/tasks/${jobId}/process-requests`, post({ requestId: 'prc-page', jobId, attemptId: prepared.attempt.attemptId, sessionId: 'dsh-1', kind: 'permission', toolTitle: 'Run git', toolDetail: '{}' }));
+  const onPage = await f.request(`/workbench/tasks/${jobId}/process-requests/prc-page/answers`, relayed({ clientRequestId: 'page-1', outcome: 'approved', decidedBy: coach }));
+  assert.equal(onPage.status, 200);
+  assert.deepEqual(f.gateway.workbenchTask(jobId).processRequests.find(request => request.requestId === 'prc-page')!.answer!.decidedBy, { kind: 'person' }, 'a page answer cannot speak as the coach');
+});
+
+test('a person marks a finished top-level task as read from the page; a child or an unfinished task cannot be', async t => {
+  const f = await fixture(t);
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '任务', targetSnapshot: { targetId: 'legacy:host' }, input: {}, initiatedBy: { kind: 'coach', agent: 'claude-code', sessionId: 'coach-1' } });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId, path = `/workbench/tasks/${jobId}/acceptance`;
+  assert.equal(f.gateway.workbenchTask(jobId).canAccept, undefined);
+  assert.equal((await f.request(path, post({}))).status, 403, 'the bearer API cannot read a result in a person\'s name');
+  assert.equal((await f.request(path, relayed({}))).status, 409, 'still running');
+  const child = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', targetSnapshot: { targetId: 'legacy:host' }, input: {}, parentJobRef: { sourceId: f.gateway.ledger.sourceId, jobId }, parentAttemptId: prepared.attempt.attemptId });
+  f.gateway.ledger.markDispatching(child.attempt.attemptId);
+  f.gateway.ledger.accept(child.attempt.attemptId, { taskId: 'task-2', sessionId: 'dsh-2' }, { executionStatus: 'working' });
+  const done = { executionStatus: 'completed' as const, resultAvailable: true, resultRevision: 'result-1', resultDigest: 'a'.repeat(64) };
+  f.gateway.ledger.observe(child.attempt.attemptId, done);
+  assert.equal(f.gateway.workbenchTask(child.job.jobId).canAccept, undefined, 'a child is read with its parent');
+  f.gateway.ledger.observe(prepared.attempt.attemptId, done);
+  const task = f.gateway.workbenchTask(jobId);
+  assert.equal(task.canAccept, true); assert.deepEqual(task.initiatedBy, { kind: 'coach', agent: 'claude-code', sessionId: 'coach-1' });
+  const accepted = await f.request(path, relayed({}));
+  assert.equal(accepted.status, 200);
+  const detail = await accepted.json() as any;
+  assert.deepEqual([detail.businessAcceptance.reviewStatus, detail.businessAcceptance.decidedBy, detail.businessAcceptance.resultRevision, detail.canAccept], ['accepted', { kind: 'person' }, 'result-1', undefined]);
+  assert.equal((await f.request(path, relayed({}))).status, 409, 'already concluded');
 });
 
 test('a caller that stops waiting marks the task abnormal, and a re-query from the workbench reads the host again', async t => {
@@ -343,7 +377,7 @@ test('a person continues a failed task from the workbench page, and nothing else
 
   const continued = await f.request(path, relayed({ prompt: '接着做' }));
   assert.equal(continued.status, 200);
-  assert.deepEqual(calls, [{ originSessionId: 'allowed-root', jobId, input: { prompt: '接着做' } }]);
+  assert.deepEqual(calls, [{ originSessionId: 'allowed-root', jobId, input: { prompt: '接着做' }, initiatedBy: { kind: 'person' } }]);
   assert.equal((await continued.json() as any).canContinue, undefined, 'the button goes away once a round runs');
 });
 

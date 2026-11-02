@@ -106,7 +106,7 @@ preset 必须在执行宿主真实可用；要用普通 DSH 时显式选 `standa
 | 通知后或用户明确要求的单次读取 | `execution_get {originSessionId,jobId}`；保留历史 attempt，查询不唤醒主会话 |
 | 同任务继续/返工 | `execution_continue {originSessionId,jobId,input,clientRequestId?}`；保留原 job，增加执行轮次 |
 | 关闭任务并取消子任务 | `execution_cancel {originSessionId,jobId,cascade?}`；PPT 交付默认级联，通用任务需显式 cascade=true；未决取消不能冒记全部停止 |
-| 记录业务接受/退回 | `execution_review {originSessionId,jobId,attemptId,resultRevision,resultDigest,reviewStatus,note?}`；reviewStatus 为 pending/accepted/changes_requested，值来自真实当前回执 |
+| 记录业务接受/退回 | `execution_review {originSessionId,jobId,attemptId,resultRevision,resultDigest,reviewStatus,decidedBy,note?}`；reviewStatus 为 pending/accepted/changes_requested，值来自真实当前回执；decidedBy 必填，人写 `{kind:"person"}`，教练写 `{kind:"coach",agent,sessionId}`，`acp-service a2a invoke` 会按运行环境自动填写 |
 
 通用 A2A 结果完成后由账本自动生成轮次内 `resultRevision` 与 `resultDigest`；从 `execution_get` 或 `remote_agent_get` 取真实值，不用技能 revision、请求中的父子关联版本或手工编号替代。digest 覆盖结果正文、回执引用、链接及宿主返回的文件大小/SHA256 清单；没有清单时不代表已验证文件字节。重复读取/重启保持版本稳定，结果变化追加新版本，`execution_get/list` 的 `resultHistory` 和 `attempts[].resultHistory` 留存版本快照。只接受当前已完成且结果可用的轮次及版本；新结果不继承旧验收。升级从缓存回执补齐旧任务缺失版本，不重派、不自动验收；需补登时核对本地既有结论与同一回执的身份、正文和产物清单后另调 `execution_review`。
 

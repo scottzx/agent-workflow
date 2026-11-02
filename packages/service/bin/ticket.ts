@@ -37,6 +37,13 @@ export function settler(env: NodeJS.ProcessEnv = process.env): { kind: 'person' 
   return { kind: 'person' };
 }
 
+/** Names the caller on the calls that start work or record a verdict, unless it already named itself. */
+export function stampActor(method: string, params: Record<string, unknown>, env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+  if (['execution_submit', 'execution_continue', 'remote_agent_spawn', 'remote_agent_message'].includes(method) && !params.initiatedBy) return { ...params, initiatedBy: settler(env) };
+  if (method === 'execution_review' && !params.decidedBy) return { ...params, decidedBy: settler(env) };
+  return params;
+}
+
 export async function runTicketCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
   if (!['show', 'events', 'proposal', 'pending', 'mark', 'submit'].includes(argv[0]!)) throw new Error('Unknown ticket command; use ticket --help');

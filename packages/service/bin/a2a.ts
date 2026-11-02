@@ -45,7 +45,8 @@ execution targets or starting tasks. Optional interval mode runs in the gateway.
   }
   if (args[0] === 'invoke' && args[1] && !args[1].startsWith('--')) {
     const url = new URL('/invoke', flag('--url') ?? 'http://127.0.0.1:36814');
-    const params = JSON.parse(fs.readFileSync(0, 'utf8')) as unknown;
+    const { stampActor } = await import('./ticket.js');
+    const params = stampActor(args[1], JSON.parse(fs.readFileSync(0, 'utf8')) as Record<string, unknown>);
     const response = await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15_000),
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method: args[1], params }) });
     const data = await response.json();

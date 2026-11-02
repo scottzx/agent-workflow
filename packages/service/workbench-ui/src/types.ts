@@ -58,6 +58,7 @@ export interface AcpTaskSummary {
     businessAcceptance?: AcpBusinessAcceptance;
     blockedTools?: string[];
     canContinue?: boolean;
+    canAccept?: boolean;
 }
 
 export interface AcpBusinessAcceptance {
@@ -67,6 +68,7 @@ export interface AcpBusinessAcceptance {
     reviewStatus: 'pending' | 'accepted' | 'changes_requested';
     note?: string;
     recordedAt: string;
+    decidedBy?: { kind: 'person' | 'coach'; agent?: string; sessionId?: string };
 }
 
 export interface AcpTaskList {

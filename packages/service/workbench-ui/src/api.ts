@@ -75,6 +75,8 @@ export const acpTaskService = {
     /** Sends a failed task another round in its own session. */
     continueTask: (jobId: string, prompt: string): Promise<AcpTaskDetail> =>
         post(`/tasks/${encodeURIComponent(jobId)}/continue`, { prompt }),
+    /** Marks the task's current result as read (已阅). */
+    accept: (jobId: string): Promise<AcpTaskDetail> => post(`/tasks/${encodeURIComponent(jobId)}/acceptance`, {}),
     answerProcessRequest: (jobId: string, requestId: string, input: AcpProcessAnswerInput): Promise<AcpTaskDetail> =>
         post(`/tasks/${encodeURIComponent(jobId)}/process-requests/${encodeURIComponent(requestId)}/answers`, input),
     listAgents: (): Promise<AcpAgentCatalog> => call('/agents'),

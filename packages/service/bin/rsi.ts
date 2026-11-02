@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { checkGate } from '../src/rsi/gate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
+import { stampActor } from './ticket.js';
 
 const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [options]
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
@@ -45,7 +46,7 @@ export function gatewayInvoke(url: string) {
   const endpoint = new URL('/invoke', url);
   return async (method: string, params: Record<string, unknown>) => {
     const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(60_000),
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method, params }) });
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method, params: stampActor(method, params) }) });
     const data = await response.json() as Record<string, unknown>;
     if (!response.ok) throw new Error(`${method} failed: ${String(data.error ?? response.status)}`);
     return data;

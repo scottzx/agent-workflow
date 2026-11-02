@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { settler } from '../bin/ticket.js';
+import { settler, stampActor } from '../bin/ticket.js';
 import { JobLedger, type LedgerState } from '../src/execution/ledger.js';
 import { invokeTicket, reopenForContinue, TICKET_METHODS, type Ticket } from '../src/execution/ticket.js';
 import { runExecutorTicket } from '../src/execution/ticket-executor.js';
@@ -177,6 +177,11 @@ test('a coach settling a proposal is recorded as the coach and its session, a pe
 
   assert.deepEqual(settler({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'cc-9' }), { kind: 'coach', agent: 'claude-code', sessionId: 'cc-9' });
   assert.deepEqual(settler({}), { kind: 'person' }, 'outside an agent harness the CLI speaks for a person');
+  const coach = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'cc-9' }, named = { kind: 'coach', agent: 'claude-code', sessionId: 'cc-9' };
+  assert.deepEqual(stampActor('execution_submit', { targetId: 't' }, coach), { targetId: 't', initiatedBy: named });
+  assert.deepEqual(stampActor('execution_review', { jobId: 'j' }, {}), { jobId: 'j', decidedBy: { kind: 'person' } });
+  assert.deepEqual(stampActor('execution_submit', { initiatedBy: { kind: 'person' } }, coach), { initiatedBy: { kind: 'person' } }, 'a caller that named itself keeps its name');
+  assert.deepEqual(stampActor('execution_get', { jobId: 'j' }, coach), { jobId: 'j' });
 });
 
 test('a stopped ticket reopens where it stood, a continue sends it back to the executor, and a closed one stays closed', () => {

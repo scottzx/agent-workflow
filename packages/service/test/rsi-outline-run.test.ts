@@ -293,6 +293,7 @@ test('with QA on, a QA agent in its own session reviews a frozen copy, its issue
   assert.equal(report.rounds[1]!.review!.jobId, 'qa-1');
   const qaSubmit = f.calls.find(call => call.method === 'execution_submit' && call.params.title.startsWith('质检'))!.params;
   assert.equal(qaSubmit.input.agentPreset, 'qa-preset');
+  assert.equal(qaSubmit.purpose, 'qa_review'); assert.equal(qaSubmit.parentJobRef.jobId, 'job-1', 'QA is a child of the executor job');
   assert.match(qaSubmit.input.prompt, /# 产品介绍大纲 · 质检/, 'the QA role leads the review prompt');
   assert.match(qaSubmit.input.prompt, /reviews\/outline-r1\.json/, 'QA reviews a frozen copy');
   const back = f.calls.find(call => call.method === 'execution_continue' && call.params.jobId === 'job-1')!.params;
