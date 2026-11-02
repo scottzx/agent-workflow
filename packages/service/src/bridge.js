@@ -270,6 +270,8 @@ const turnJournal = createTurnJournal({ stateDir: DEFAULT_STATE_DIR });
 const activeSessions = new Map();
 
 // Phase 2 Pre-warm pool for grok-build (scoped to the most recent CWD)
+// Disabled: nothing schedules prewarmGrokSession. A spare starts without the
+// session's env, so adopting one silently dropped settings such as GROK_HOME.
 let prewarmedGrokHandle = null;
 let prewarmedGrokCwd = null;
 let lastUsedCwd = process.cwd();
@@ -1666,9 +1668,6 @@ export async function dispatchCommand(ws, payload) {
                 await processCapacity.cancel({ id: payload.capacityId.trim(), kind: "process" });
               }
 
-              // Asynchronously trigger background pre-warm for the next session using the same CWD
-              setTimeout(() => prewarmGrokSession(normalizedPath), 500);
-
               activeSessions.set(sessionId, {
                 handle,
                 activeTurn: null,
@@ -1783,11 +1782,6 @@ export async function dispatchCommand(ws, payload) {
             initialization.controller.signal.throwIfAborted();
             console.timeEnd(`ensure_session_${sessionId}`);
             console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);
-
-            // Asynchronously trigger background pre-warm after a cold spawn using the new CWD
-            if (agentType === "grok-build" && launchArgv.length === 0) {
-              setTimeout(() => prewarmGrokSession(normalizedPath), 500);
-            }
 
             activeSessions.set(sessionId, {
               handle,
