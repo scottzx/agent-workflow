@@ -90,6 +90,8 @@ test('an ACP agent hands its session back through the stdio MCP server, bound to
   const dsh = await listen(t, (req, res) => req.url === REVIEW_SUBMIT_PATH ? review.handler(req, res) : (res.writeHead(404), res.end()));
 
   const server = review.mcpServer('session-1', dsh);
+  assert.equal(server.env.find(item => item.name === 'ELECTRON_RUN_AS_NODE')?.value, '1', 'DSH’s execPath is Electron, so the script needs node mode');
+  assert.match(server.name, /^[A-Za-z_][A-Za-z0-9_-]*$/, 'Grok refuses every tool of a server whose name does not start with a letter or underscore');
   const child = spawn(server.command, server.args, { env: Object.fromEntries(server.env.map(item => [item.name, item.value])), stdio: ['pipe', 'pipe', 'inherit'] });
   t.after(() => child.kill());
   const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();

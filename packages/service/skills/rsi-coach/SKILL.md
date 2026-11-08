@@ -53,6 +53,12 @@ acp-service ticket events --job <jobId>
 acp-service ticket proposal --job <jobId> --id <提议编号> accept|reject|done --note "理由"
 ```
 
+查一个任务的完整留痕（谁发起、派给谁、谁批了什么、产物摘要、谁看过，含质检子任务）：
+
+```sh
+acp-service trail --job <jobId>
+```
+
 结果在工作目录：`run.json`（每轮的检查结果和质检记录，以及停止原因 `stopReason` 和角色版本）、`ticket.json`（网关写出的任务单只读导出）、`reviews/outline-rN.json`（每轮被审的版本）、`reviews/review-rN.json`（质检的分数、意见、`previous` 核对和 `proposals`）。每次运行还会在 `<workspace>/<role-id>/ledger.jsonl` 追加一行，门禁就读这本账。
 
 停止原因：`passed` 通过；`max_bounces` 程序打回用完；`max_revisions` 质检修改轮数用完；`stalled` 改不动了；`needs_human` 改不动了且质检提了锁定项提议；`not_completed`、`review_failed` 执行者或质检没跑完。

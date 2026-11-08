@@ -1,0 +1,13 @@
+#!/bin/bash
+# The executor's only way to WeChat: take one person's unanswered messages and settle them.
+H=administrator@WINPC_HOST
+here="$(cd "$(dirname "$0")" && pwd)"
+case "$1" in
+  next)
+    if [ "$(date +%s)" -ge "$(cat "$here/end_at")" ]; then echo '{"stop": true}'; exit 0; fi
+    exec ssh -o LogLevel=ERROR "$H" "python -X utf8 wx-baseline\\wx_rounds.py next 120" ;;
+  reply)
+    printf '%s' "$2" | exec ssh -o LogLevel=ERROR "$H" "python -X utf8 wx-baseline\\wx_rounds.py reply" ;;
+  skip) exec ssh -o LogLevel=ERROR "$H" "python -X utf8 wx-baseline\\wx_rounds.py skip" ;;
+  *) echo "usage: ./wx next | ./wx reply TEXT | ./wx skip" >&2; exit 2 ;;
+esac

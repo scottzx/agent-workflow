@@ -3,9 +3,9 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { settler } from '../bin/ticket.js';
+import { settler, stampActor } from '../bin/ticket.js';
 import { JobLedger, type LedgerState } from '../src/execution/ledger.js';
-import { invokeTicket, TICKET_METHODS, type Ticket } from '../src/execution/ticket.js';
+import { invokeTicket, reopenForContinue, TICKET_METHODS, type Ticket } from '../src/execution/ticket.js';
 import { runExecutorTicket } from '../src/execution/ticket-executor.js';
 
 const origin = 'root', target = { targetId: 'dsh-host' };
@@ -149,7 +149,7 @@ test('ledger state written before tickets existed loads and takes tickets', () =
 });
 
 test('every ticket method is described for discovery', () => {
-  assert.deepEqual(Object.keys(TICKET_METHODS), ['ticket_get', 'ticket_open', 'ticket_checks', 'ticket_review', 'ticket_revise', 'ticket_show', 'ticket_mark', 'ticket_submit', 'ticket_proposal', 'ticket_close']);
+  assert.deepEqual(Object.keys(TICKET_METHODS), ['ticket_get', 'ticket_open', 'ticket_checks', 'ticket_review', 'ticket_revise', 'ticket_show', 'ticket_mark', 'ticket_submit', 'ticket_proposal', 'ticket_close', 'ticket_reopen']);
   for (const method of Object.values(TICKET_METHODS)) assert.equal((method.parameters as { type?: string }).type, 'object');
 });
 
@@ -177,4 +177,34 @@ test('a coach settling a proposal is recorded as the coach and its session, a pe
 
   assert.deepEqual(settler({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'cc-9' }), { kind: 'coach', agent: 'claude-code', sessionId: 'cc-9' });
   assert.deepEqual(settler({}), { kind: 'person' }, 'outside an agent harness the CLI speaks for a person');
+  const coach = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'cc-9' }, named = { kind: 'coach', agent: 'claude-code', sessionId: 'cc-9' };
+  assert.deepEqual(stampActor('execution_submit', { targetId: 't' }, coach), { targetId: 't', initiatedBy: named });
+  assert.deepEqual(stampActor('execution_review', { jobId: 'j' }, {}), { jobId: 'j', decidedBy: { kind: 'person' } });
+  assert.deepEqual(stampActor('execution_submit', { initiatedBy: { kind: 'person' } }, coach), { initiatedBy: { kind: 'person' } }, 'a caller that named itself keeps its name');
+  assert.deepEqual(stampActor('execution_get', { jobId: 'j' }, coach), { jobId: 'j' });
+});
+
+test('a stopped ticket reopens where it stood, a continue sends it back to the executor, and a closed one stays closed', () => {
+  const f = fixture();
+  f.call('ticket_open', { roleId: 'role', caseId: 'demo' });
+  assert.throws(() => f.call('ticket_reopen'), /只有 stopped/);
+  f.call('ticket_close', { status: 'stopped', stopReason: 'not_completed' });
+  assert.throws(() => f.executor('ticket_mark', { itemId: 'Q1-1', state: 'done', note: '改了' }), /stopped/);
+  const drafting = f.call('ticket_reopen', { note: '接着跑' });
+  assert.deepEqual([drafting.status, drafting.round, drafting.stopReason, drafting.stoppedFrom], ['drafting', 1, undefined, undefined]);
+  assert.deepEqual(drafting.history.at(-1), { round: 1, by: 'host', action: 'reopened', note: '接着跑' });
+  assert.deepEqual(f.events().at(-1)!.data, { actor: 'host', round: 1, status: 'drafting', note: '接着跑' });
+
+  f.call('ticket_checks', { results: [] });
+  f.call('ticket_close', { status: 'stopped', stopReason: 'review_failed' });
+  assert.equal(f.call('ticket_reopen').status, 'in_review', 'QA goes on with the same review');
+  f.call('ticket_close', { status: 'stopped', stopReason: 'review_failed' });
+  reopenForContinue(f.ledger, origin, f.jobId);
+  const again = f.call('ticket_get');
+  assert.deepEqual([again.status, again.round], ['in_revision', 2], 'the executor cannot mark a ticket under review, so a continue starts a revision');
+  f.call('ticket_close', { status: 'closed' });
+  reopenForContinue(f.ledger, origin, f.jobId);
+  assert.equal(f.call('ticket_get').status, 'closed');
+  const bare = new JobLedger(undefined, () => {}), job = bare.prepare({ originSessionId: origin, targetSnapshot: target, input: {} }).job.jobId;
+  reopenForContinue(bare, origin, job);
 });

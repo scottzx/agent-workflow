@@ -57,6 +57,13 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
     const [tasks, setTasks] = useState<AcpTaskSummary[]>([]);
     const [selectedId, setSelectedId] = useState('');
     const [creating, setCreating] = useState(false);
+    const [registering, setRegistering] = useState(false);
+    const [agentPath, setAgentPath] = useState('');
+    const [pathAgent, setPathAgent] = useState('grok-build');
+    const [pathRuntime, setPathRuntime] = useState<'acp' | 'native'>('acp');
+    const [pathPreset, setPathPreset] = useState('standard');
+    const [pathModel, setPathModel] = useState('');
+    const [connectionId, setConnectionId] = useState('');
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [notice, setNotice] = useState('');
@@ -95,6 +102,8 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
     }, [refreshKey, reload]);
 
     const rows = rowsOf(catalog, phase);
+    const connections = catalog.connections ?? [];
+    const chosenConnection = connectionId || connections[0]?.connectionId || '';
     const selected = [...catalog.developing, ...catalog.published].find(row => row.agentId === selectedId);
     const stamp = selected
         ? [selected.agentId, selected.modeId, selected.targetId, selected.roleId, selected.acpAgent, optionLines(selected.options)].join('|')
@@ -152,7 +161,7 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
             </nav>
             {error && <ErrorState title={text('智能体读取或保存失败', 'Could not load or save agents')} message={error} onRetry={() => setReload(value => value + 1)} />}
             {loading && <p class="acp-muted">{text('正在载入…', 'Loading…')}</p>}
-            {!loading && !error && !rows.length && !creating && (
+            {!loading && !error && !rows.length && !creating && !registering && (
                 <EmptyState
                     title={phase === 'developing' ? text('还没有开发中的智能体', 'No agents in development') : text('还没有已上线的名字', 'No published names')}
                     description={text('常驻角色会直接出现在已上线。新的试跑从开发中的草稿开始。', 'Resident roles appear under Published. A new trial starts from a developing draft.')}
@@ -161,16 +170,21 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
             <div class="acp-agent-layout">
                 <div class="acp-agent-list">
                     {phase === 'developing' && (
-                        <button type="button" class="acp-button" onClick={() => { setCreating(true); setSelectedId(''); setName(''); setAcpAgent('grok-build'); setRoleId(''); setTargetId(''); setModeId(''); setOptionText(''); }}>
-                            {text('新建草稿', 'New draft')}
-                        </button>
+                        <>
+                            <button type="button" class="acp-button" onClick={() => { setCreating(true); setRegistering(false); setSelectedId(''); setName(''); setAcpAgent('grok-build'); setRoleId(''); setTargetId(''); setModeId(''); setOptionText(''); }}>
+                                {text('新建草稿', 'New draft')}
+                            </button>
+                            <button type="button" class="acp-button" onClick={() => { setRegistering(true); setCreating(false); setSelectedId(''); }}>
+                                {text('按路径登记', 'Register a path')}
+                            </button>
+                        </>
                     )}
                     {rows.map(row => (
                         <button
                             key={row.agentId}
                             type="button"
                             class={`acp-agent-row${selectedId === row.agentId ? ' is-selected' : ''}`}
-                            onClick={() => { setSelectedId(row.agentId); setCreating(false); }}
+                            onClick={() => { setSelectedId(row.agentId); setCreating(false); setRegistering(false); }}
                         >
                             <strong>{row.name}</strong>
                             <small>{row.acpAgent || row.agentPreset || row.origin}</small>
@@ -181,6 +195,80 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                     ))}
                 </div>
                 <div class="acp-agent-detail">
+                    {registering && (
+                        <form
+                            class="acp-agent-form"
+                            onSubmit={event => {
+                                event.preventDefault();
+                                void run(async () => {
+                                    const model = pathModel.trim(), slash = model.indexOf('/');
+                                    if (pathRuntime === 'native' && model && slash <= 0) throw new Error(text('模型写成 provider/model，例如 minimax-cn/MiniMax-M3.1-Flash', 'Write the model as provider/model'));
+                                    const saved = await acpTaskService.registerAgentPath({
+                                        path: agentPath.trim(),
+                                        connectionId: chosenConnection,
+                                        ...(pathRuntime === 'acp'
+                                            ? { acpAgent: pathAgent.trim() }
+                                            : { agentPreset: pathPreset.trim(), ...(model ? { provider: model.slice(0, slash), model: model.slice(slash + 1) } : {}) }),
+                                    });
+                                    setCatalog(saved);
+                                    setRegistering(false);
+                                    setPhase('developing');
+                                    setSelectedId(saved.registered[0]?.agentId ?? '');
+                                    setNotice(text(
+                                        `已登记 ${saved.registered.map(item => item.name).join('、')}。每个都有自己的执行目标，派发时宿主读取 agent 文件作为角色说明。`,
+                                        `Registered ${saved.registered.map(item => item.name).join(', ')}. Each has its own target; the host reads the agent file as its role at dispatch.`,
+                                    ));
+                                });
+                            }}
+                        >
+                            <h3>{text('按路径登记', 'Register a path')}</h3>
+                            <p class="acp-muted">
+                                {text(
+                                    '读取这个目录下的 agents/*.md，每个文件登记成一个开发中的智能体，名字是“文件名@运行方式”，工作目录就是这个目录。同一个目录可以分别登记 grok、DSH 原生等多种运行方式；同一种运行方式再登记一次会更新原有记录。',
+                                    'Each agents/*.md under the directory becomes a developing agent named name@runtime that runs in that directory. One directory can be registered on several runtimes; registering the same runtime again updates its records.'
+                                )}
+                            </p>
+                            <label>
+                                {text('目录路径', 'Directory')}
+                                <input value={agentPath} placeholder="/absolute/path/to/scenario" onInput={event => setAgentPath(event.currentTarget.value)} />
+                            </label>
+                            <label>
+                                {text('运行方式', 'Runtime')}
+                                <select value={pathRuntime} onChange={event => setPathRuntime(event.currentTarget.value === 'native' ? 'native' : 'acp')}>
+                                    <option value="acp">{text('ACP Agent', 'ACP agent')}</option>
+                                    <option value="native">{text('DSH 原生预设', 'DSH-native preset')}</option>
+                                </select>
+                            </label>
+                            {pathRuntime === 'acp' ? (
+                                <label>
+                                    ACP Agent
+                                    <input value={pathAgent} placeholder="grok-build" onInput={event => setPathAgent(event.currentTarget.value)} />
+                                </label>
+                            ) : (
+                                <>
+                                    <label>
+                                        {text('预设', 'Preset')}
+                                        <input value={pathPreset} placeholder="standard" onInput={event => setPathPreset(event.currentTarget.value)} />
+                                    </label>
+                                    <label>
+                                        {text('模型（可选）', 'Model (optional)')}
+                                        <input value={pathModel} placeholder="minimax-cn/MiniMax-M3.1-Flash" onInput={event => setPathModel(event.currentTarget.value)} />
+                                    </label>
+                                </>
+                            )}
+                            <label>
+                                {text('执行连接', 'Connection')}
+                                <select value={chosenConnection} onChange={event => setConnectionId(event.currentTarget.value)}>
+                                    {connections.map(item => (
+                                        <option key={item.connectionId} value={item.connectionId}>{item.connectionId} · {item.remote}</option>
+                                    ))}
+                                </select>
+                            </label>
+                            <button type="submit" class="acp-button" disabled={busy || !agentPath.trim() || !chosenConnection || !(pathRuntime === 'acp' ? pathAgent.trim() : pathPreset.trim())}>
+                                {text('登记', 'Register')}
+                            </button>
+                        </form>
+                    )}
                     {creating && (
                         <form
                             class="acp-agent-form"
@@ -216,7 +304,7 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                             </button>
                         </form>
                     )}
-                    {selected && !creating && (
+                    {selected && !creating && !registering && (
                         <>
                             <h3>{selected.name}</h3>
                             <p class="acp-muted">
@@ -238,10 +326,14 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                             )}
                             <dl class="acp-agent-facts">
                                 <div><dt>ACP Agent</dt><dd>{selected.acpAgent || '—'}</dd></div>
+                                {selected.origin !== 'resident' && selected.agentPreset && <div><dt>{text('预设', 'Preset')}</dt><dd>{selected.agentPreset}</dd></div>}
+                                {selected.provider && <div><dt>{text('模型', 'Model')}</dt><dd>{selected.provider}/{selected.model}</dd></div>}
                                 <div><dt>{text('模式', 'Mode')}</dt><dd>{selected.modeId || '—'}</dd></div>
                                 <div><dt>{text('执行目标', 'Target')}</dt><dd>{selected.targetId || '—'}</dd></div>
                                 <div><dt>{text('角色', 'Role')}</dt><dd>{selected.roleId || '—'}</dd></div>
+                                {selected.source && <div><dt>{text('来源', 'Source')}</dt><dd>{selected.source.file}</dd></div>}
                             </dl>
+                            {selected.description && <p>{selected.description}</p>}
                             {selected.options.length > 0 && (
                                 <ul>
                                     {selected.options.map(option => (

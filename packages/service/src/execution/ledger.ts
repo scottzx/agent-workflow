@@ -31,9 +31,13 @@ export interface LedgerResult {
   resultAvailable: boolean;
   observedAt: string;
 }
+/** Who acted: a person, or a coach agent naming its session. */
+export interface LedgerActor { kind: 'person' | 'coach'; agent?: string; sessionId?: string }
 export interface BusinessAcceptance {
   attemptId: string; resultRevision: string; resultDigest: string;
   reviewStatus: 'pending' | 'accepted' | 'changes_requested'; note?: string; recordedAt: string;
+  /** Absent on records written before acceptances named who decided. */
+  decidedBy?: LedgerActor;
 }
 export interface LedgerAttempt {
   attemptId: string; jobId: string; operation: string; clientRequestId?: string; requestDigest: string;
@@ -44,6 +48,8 @@ export interface LedgerAttempt {
   createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult; resultHistory?: LedgerResult[];
   /** The origin stopped waiting on this round before it ended (it timed out, or the caller itself failed); it may still run or have finished unseen. */
   unwatched?: { at: string; reason: string };
+  /** Who asked for this round, when the caller named itself. */
+  initiatedBy?: LedgerActor;
 }
 export interface LedgerJob {
   sourceId: string; jobId: string; title?: string; originSessionId: string; accessScopeRef: string;
@@ -51,6 +57,8 @@ export interface LedgerJob {
   currentAttemptId: string; executionStatus: ExecutionStatus; inFlightAttemptIds: string[]; unresolvedAttemptIds: string[];
   parentJobRef?: JobRef; parentAttemptId?: string; purpose?: string; resultRevision?: string; replacesJobRef?: JobRef;
   jobVersion: number; createdAt: string | null; updatedAt: string; provenance: 'native' | 'legacy'; migratedAt?: string;
+  /** Who asked for the task. originSessionId stays the access scope, and many callers share a default one. */
+  initiatedBy?: LedgerActor;
 }
 export interface LedgerEvent {
   eventId: string; sourceId: string; sequence: number; jobId: string; attemptId?: string;
@@ -69,7 +77,7 @@ export interface LedgerPrepareInput {
   /** Trusted adapter only: hash the caller request before adding current-attempt defaults. */
   requestDigestInput?: unknown;
   jobId?: string; parentJobRef?: JobRef; parentAttemptId?: string; purpose?: string; title?: string;
-  operation?: string; resultRevision?: string; replacesJobRef?: JobRef;
+  operation?: string; resultRevision?: string; replacesJobRef?: JobRef; initiatedBy?: LedgerActor;
 }
 export interface LedgerObservation {
   executionStatus?: ExecutionStatus; providerState?: string; phase?: string; checkedAt?: string; stale?: boolean;
@@ -236,7 +244,8 @@ export class JobLedger {
           ...(input.targetSnapshot.roleId ? { roleId: input.targetSnapshot.roleId } : {}),
           ...(input.parentJobRef ? { parentJobRef: clone(input.parentJobRef), parentAttemptId: input.parentAttemptId } : {}),
           ...(input.purpose ? { purpose: input.purpose } : {}), ...(input.resultRevision ? { resultRevision: input.resultRevision } : {}),
-          ...(input.replacesJobRef ? { replacesJobRef: clone(input.replacesJobRef) } : {}) };
+          ...(input.replacesJobRef ? { replacesJobRef: clone(input.replacesJobRef) } : {}),
+          ...(input.initiatedBy ? { initiatedBy: clone(input.initiatedBy) } : {}) };
         state.jobs[job.jobId] = job;
       }
       const attempt: LedgerAttempt = { attemptId: randomUUID(), jobId: job.jobId, operation, requestDigest: digest,
@@ -245,10 +254,11 @@ export class JobLedger {
         connectionId: input.targetSnapshot.connectionId, connectionVersion: input.targetSnapshot.connectionVersion,
         provider: input.targetSnapshot.provider ?? 'a2a', targetSnapshot: clone(input.targetSnapshot), input: clone(input.input),
         ...(job.currentAttemptId ? { previousAttemptId: job.currentAttemptId } : {}), submissionStatus: 'prepared',
-        executionStatus: 'not_started', stale: false, createdAt: timestamp, updatedAt: timestamp };
+        executionStatus: 'not_started', stale: false, createdAt: timestamp, updatedAt: timestamp,
+        ...(input.initiatedBy ? { initiatedBy: clone(input.initiatedBy) } : {}) };
       state.attempts[attempt.attemptId] = attempt; job.currentAttemptId = attempt.attemptId;
       if (requestKey) state.requests[requestKey] = { digest, jobId: job.jobId, attemptId: attempt.attemptId };
-      this.event(state, job, attempt.attemptId, input.jobId ? 'attempt.prepared' : 'job.created', { operation });
+      this.event(state, job, attempt.attemptId, input.jobId ? 'attempt.prepared' : 'job.created', { operation, ...(input.initiatedBy ? { initiatedBy: input.initiatedBy } : {}) });
       return { job, attempt, idempotent: false };
     });
   }
@@ -417,6 +427,21 @@ export class JobLedger {
       const record = { ...clone(input), recordedAt: now() };
       (state.acceptances[jobId] ??= []).push(record);
       this.event(state, job, input.attemptId, 'job.acceptance_recorded', record); return record;
+    });
+  }
+  /** A process request changed. The request itself is stored by the gateway; this puts it on the job's timeline. */
+  processEvent(jobId: string, attemptId: string, type: string, data: unknown): void {
+    this.mutate(state => { this.event(state, state.jobs[jobId]!, attemptId, type, data); });
+  }
+  /** The originator waits on the job again, so it is no longer listed as abandoned. */
+  rewatch(originSessionId: string, jobId: string): LedgerAttempt {
+    return this.mutate(state => {
+      const job = this.job(state, originSessionId, jobId), attempt = this.attempt(state, job.currentAttemptId);
+      if (attempt.unwatched) {
+        delete attempt.unwatched;
+        this.event(state, job, attempt.attemptId, 'attempt.rewatched', {});
+      }
+      return clone(attempt);
     });
   }
   ticket(originSessionId: string, jobId: string): Ticket {

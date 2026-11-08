@@ -180,7 +180,6 @@ test('bridge cancels pending session launches, including profile keys and late s
       assert.equal(queueEntries().length, 1);
       // The spare comes up without going through this test's FIFO, as a launch admitted earlier would.
       const spare = { sessionKey: 'prewarm_grok_test', agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
-      // Grok-only: the bridge schedules the next pre-warm 500 ms after adopting, which must not launch a real agent.
       Reflect.set(bridge.runtime, 'ensureSession', async (input: Parameters<typeof originalEnsure>[0]) => input.agent === 'grok-build' ? spare : originalEnsure.call(bridge.runtime, input));
       Reflect.set(bridge.runtime, 'adoptSession', async () => ({ ...spare, sessionKey: sessionId }));
       await bridge.prewarmGrokSession(realpathSync(directory));
@@ -218,6 +217,38 @@ test('bridge cancels pending session launches, including profile keys and late s
       assert.equal(adoptions, 1);
       for (const events of peers.map(item => item.events)) assert.ok(events.some(event => event.event === 'session_ready'));
       await delay(700);
+    } finally {
+      for (const sessionId of ids) bridge.activeSessions.delete(sessionId);
+      Reflect.set(bridge.runtime, 'ensureSession', originalEnsure);
+      Reflect.set(bridge.runtime, 'adoptSession', originalAdopt);
+    }
+  });
+
+  await t.test('grok-build starts schedule no pre-warm, so each session launches with its own env', async () => {
+    const originalEnsure = bridge.runtime.ensureSession;
+    const originalAdopt = bridge.runtime.adoptSession;
+    const launches: Array<[string, string | undefined]> = [];
+    let adoptions = 0;
+    Reflect.set(bridge.runtime, 'ensureSession', async (input: Parameters<typeof originalEnsure>[0]) => {
+      if (input.agent !== 'grok-build') return originalEnsure.call(bridge.runtime, input);
+      launches.push([input.sessionKey, input.sessionOptions?.env?.GROK_HOME]);
+      return { sessionKey: input.sessionKey, agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
+    });
+    Reflect.set(bridge.runtime, 'adoptSession', async ({ sessionKey }: { sessionKey: string }) => {
+      adoptions++;
+      return { sessionKey, agent: 'grok-build', mode: 'persistent', cwd: realpathSync(directory) };
+    });
+    const ids = ['env-a', 'env-b'];
+    try {
+      for (const sessionId of ids) {
+        const ws = peer();
+        await deadline(bridge.dispatchCommand(ws, { action: 'ensure_session', sessionId, workspacePath: directory,
+          agentType: 'grok-build', responsePolicy: 'summary', env: { GROK_HOME: `/isolated/${sessionId}` } }));
+        assert.ok(ws.events.some(event => event.event === 'session_ready'), JSON.stringify(ws.events));
+        await delay(700);
+      }
+      assert.deepEqual(launches, ids.map(id => [id, `/isolated/${id}`]));
+      assert.equal(adoptions, 0);
     } finally {
       for (const sessionId of ids) bridge.activeSessions.delete(sessionId);
       Reflect.set(bridge.runtime, 'ensureSession', originalEnsure);

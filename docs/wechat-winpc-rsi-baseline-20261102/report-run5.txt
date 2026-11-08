@@ -1,0 +1,22 @@
+now 12:16:56 run_start 166
+--- messages
+167 11:49:08 2404图灵测试 晓风 lag=0.931 trigger=None at=None seen round=9 to_round=58.38 <redacted>
+168 11:49:23 2404图灵测试 晓风 lag=1.034 trigger=None at=None seen round=9 to_round=44.27 <redacted>
+169 11:49:40 2404图灵测试 晓风 lag=1.143 trigger=None at=None seen round=9 to_round=27.16 <redacted>
+170 11:50:07 2404图灵测试 晓风 lag=1.288 trigger=at at=wxid_SELF replied round=9 to_round=0.02 <redacted>
+172 11:51:13 2404图灵测试 晓风 lag=0.692 trigger=quote at=None replied round=10 to_round=13.27 <redacted>
+174 11:52:53 2404图灵测试 晓风 lag=0.793 trigger=at at=wxid_SELF replied round=12 to_round=81.03 <redacted>
+176 11:55:32 2404图灵测试 晓风 lag=1.539 trigger=None at=None seen round=13 to_round=314.28 <redacted>
+177 12:00:46 2404图灵测试 晓风 lag=1.676 trigger=at at=wxid_SELF replied round=13 to_round=0.14 <redacted>
+179 12:01:25 2404图灵测试 晓风 lag=1.439 trigger=at at=wxid_SELF skipped round=14 to_round=31.0 <redacted>
+--- rounds
+round 9 replied open=11:50:07
+    reply #23 sent model=18.01 queue=0.03 send=1.61 enter_to_store=0.51 from_oldest=78.54 text=<redacted> err=None
+round 10 replied open=11:51:26
+    reply #24 sent model=20.17 queue=0.09 send=1.62 enter_to_store=0.12 from_oldest=35.27 text=<redacted> err=None
+round 12 replied open=11:54:14
+    reply #25 sent model=8.71 queue=0.08 send=1.62 enter_to_store=0.48 from_oldest=91.92 text=<redacted> err=None
+round 13 replied open=12:00:46
+    reply #26 sent model=7.85 queue=0.08 send=1.61 enter_to_store=0.41 from_oldest=324.24 text=<redacted> err=None
+round 14 skipped open=12:01:56
+--- own rows outside test conversations (0,)

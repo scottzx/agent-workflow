@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import { testCapacityLifecycle } from './capacity-fixture.js';
 test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', { timeout: 20000 }, async t => {
   const directory = mkdtempSync(join(tmpdir(), 'acp-runtime-'));
   process.env.ACP_STATE_DIR = directory;
+  process.env.ACP_FIXTURE_MCP_LOG = join(directory, 'mcp.log');
   const { runtime } = await import('../src/bridge.js');
   const { serveAcpService } = await import('../src/server.js');
   const { webSocketStream } = await import('../src/acp-connection.js');
@@ -30,7 +31,7 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
     return terminalAnswers.has(input.text) ? { ...turn, result: turn.result.then(result => ({ ...result, finalAnswer: terminalAnswers.get(input.text)! })) } : turn;
   };
   const service = await serveAcpService({ host: '127.0.0.1', port: 0, report: false });
-  t.after(async () => { await service.close(); delete process.env.ACP_STATE_DIR; rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => { await service.close(); delete process.env.ACP_STATE_DIR; delete process.env.ACP_FIXTURE_MCP_LOG; rmSync(directory, { recursive: true, force: true }); });
   const ws = new WebSocket(`ws://127.0.0.1:${service.port}/agents/codex`);
   await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   const updates: string[] = [];
@@ -45,7 +46,8 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
     .onRequest('session/request_permission', ({ params }) => { permissions++; assert.equal(params.options[0].optionId, 'yes'); return { outcome: { outcome: 'selected' as const, optionId: 'yes' } }; })
     .connect(webSocketStream(ws));
   await connection.agent.request('initialize', { protocolVersion: 1, clientCapabilities: { _meta: { '1agents': { version: 1 } } } });
-  const { sessionId } = await connection.agent.request('session/new', { cwd: directory, mcpServers: [] });
+  const { sessionId } = await connection.agent.request('session/new', { cwd: directory, mcpServers: [{ name: 'per-session', command: process.execPath, args: [], env: [] }] });
+  assert.match(readFileSync(process.env.ACP_FIXTURE_MCP_LOG, 'utf8'), /^session\/new per-session$/m, 'the Agent receives the per-session MCP servers');
   const prompt: PromptRequest = { sessionId, prompt: [{ type: 'text', text: 'perform fixture operation' }], _meta: { '1agents': { turnManaged: true, turnId: 'managed-fixture', requestId: 'managed-fixture' } } };
   const result = await connection.agent.request('session/prompt', prompt);
   assert.equal(result.stopReason, 'end_turn');

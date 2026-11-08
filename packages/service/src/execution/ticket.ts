@@ -44,6 +44,8 @@ export interface Ticket {
   schemaVersion: 1; roleId: string; caseId: string; outline: 'outline.json'; status: TicketStatus;
   /** The executor round now under way; executor log entries carry it. */
   round: number; stopReason?: string;
+  /** Where a stopped ticket stood, so a run that goes on picks it up there. */
+  stoppedFrom?: TicketStatus;
   /** The read-only copy rewritten on every change, usually <work>/ticket.json. */
   exportPath?: string;
   items: TicketItem[]; proposals: TicketProposal[];
@@ -182,10 +184,22 @@ function writeExport(ticket: Ticket): void {
 /** Host: the run is over, passed (closed) or not (stopped). */
 export function closeTicket(ticket: Ticket, status: 'closed' | 'stopped', stopReason?: string): TicketChange[] {
   if (isFinal(ticket)) fail(`任务单已经 ${ticket.status}`);
+  if (status === 'stopped') ticket.stoppedFrom = ticket.status;
   ticket.status = status;
   if (status === 'stopped' && stopReason) ticket.stopReason = stopReason;
   ticket.history.push({ round: ticket.round, by: 'host', action: status, ...(stopReason ? { note: stopReason } : {}) });
   return [{ type: `ticket.${status}`, data: { actor: 'host', round: ticket.round, ...(stopReason ? { note: stopReason } : {}) } }];
+}
+
+/** Host: a stopped run goes on, so the ticket returns to where it stood; work going back to the executor enters a revision if it had left the executor's hands. */
+export function reopenTicket(ticket: Ticket, note?: string, forExecutor = false): TicketChange[] {
+  expect(ticket, ['stopped'], '只有 stopped 的任务单能重新打开');
+  const from = ticket.stoppedFrom ?? (ticket.round === 1 ? 'drafting' : 'in_revision');
+  ticket.status = from;
+  delete ticket.stoppedFrom; delete ticket.stopReason;
+  ticket.history.push({ round: ticket.round, by: 'host', action: 'reopened', ...(note ? { note } : {}) });
+  const changes: TicketChange[] = [{ type: 'ticket.reopened', data: { actor: 'host', round: ticket.round, status: from, ...(note ? { note } : {}) } }];
+  return forExecutor && from !== 'drafting' && from !== 'in_revision' ? [...changes, ...startRevision(ticket, note)] : changes;
 }
 
 const id = z.string().trim().min(1).max(512);
@@ -197,6 +211,7 @@ const settlerSchema = z.object({ kind: z.enum(['person', 'coach']), agent: id.op
 const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200) }).strict();
 const reviewSchema = jobSchema.extend({ review: qualityReviewSchema, qaJobId: id.optional() }).strict();
 const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).optional() }).strict();
+const reopenSchema = reviseSchema;
 const proposalSchema = jobSchema.extend({ proposalId: id, state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional(),
   by: settlerSchema.optional() }).strict();
 const closeSchema = jobSchema.extend({ status: z.enum(['closed', 'stopped']), stopReason: id.optional() }).strict();
@@ -223,7 +238,17 @@ export const TICKET_METHODS = {
   ticket_submit: { description: '执行者：没有待处理意见时提交任务单，等待宿主检查。', parameters: z.toJSONSchema(executorSchema) },
   ticket_proposal: { description: '人或教练：把一条提议标为 accepted、rejected 或 done，可写说明；运行结束后也可以。by 说明是人还是教练（教练写明所在的智能体会话），缺省为人。', parameters: z.toJSONSchema(proposalSchema) },
   ticket_close: { description: '宿主：运行结束时关单，通过为 closed，否则为 stopped 并写停止原因。', parameters: z.toJSONSchema(closeSchema) },
+  ticket_reopen: { description: '宿主：停下的运行接着跑时，把 stopped 的任务单放回停止前的状态。', parameters: z.toJSONSchema(reopenSchema) },
 };
+
+/** An explicit continue gives the executor another go, so a stopped ticket opens with it; a job without a ticket has nothing to do. */
+export function reopenForContinue(ledger: JobLedger, originSessionId: string, jobId: string): void {
+  let status: TicketStatus;
+  try { status = ledger.ticket(originSessionId, jobId).status; }
+  catch (error) { if (error instanceof TicketError) return; throw error; }
+  if (status !== 'stopped') return;
+  writeExport(ledger.changeTicket(originSessionId, jobId, current => ({ ticket: current!, changes: reopenTicket(current!, '任务被继续', true) })));
+}
 
 /**
  * The gateway's ticket methods. The method decides the actor: the host opens, merges checks and reviews, sends back
@@ -253,6 +278,7 @@ export function invokeTicket(ledger: JobLedger, method: string, params: unknown)
     case 'ticket_revise': { const input = reviseSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => startRevision(ticket, input.note)); }
     case 'ticket_proposal': { const input = proposalSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => setProposal(ticket, input.proposalId, input.state, input.note, input.by)); }
     case 'ticket_close': { const input = closeSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => closeTicket(ticket, input.status, input.stopReason)); }
+    case 'ticket_reopen': { const input = reopenSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => reopenTicket(ticket, input.note)); }
     case 'ticket_show': case 'ticket_mark': case 'ticket_submit': {
       const mark = method === 'ticket_mark' ? markSchema.parse(params) : undefined, input = mark ?? executorSchema.parse(params);
       const current = input.via === 'cli' ? ledger.currentAttempt(input.jobId) : undefined;

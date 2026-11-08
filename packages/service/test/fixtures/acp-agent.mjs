@@ -1,11 +1,14 @@
 // Deterministic external ACP Agent used by the runtime integration test.
 import readline from 'node:readline';
+import { appendFileSync } from 'node:fs';
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
 let turn;
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const m = JSON.parse(line);
   const p = m.params;
   const reply = result => send({ id: m.id, result });
+  // Lets a test see which MCP servers each session request carried.
+  if (process.env.ACP_FIXTURE_MCP_LOG && ['session/new', 'session/load', 'session/resume'].includes(m.method)) appendFileSync(process.env.ACP_FIXTURE_MCP_LOG, `${m.method} ${(p.mcpServers ?? []).map(s => s.name).join(',')}\n`);
   switch (m.method) {
     case 'initialize': reply({ protocolVersion: 1, agentInfo: { name: 'fixture', version: '1' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } }, authMethods: [] }); break;
     case 'session/new': reply({ sessionId: 'native-fixture' }); break;

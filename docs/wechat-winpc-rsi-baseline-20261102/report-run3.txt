@@ -1,0 +1,21 @@
+now 11:18:15 run_start 154
+--- messages
+155 11:07:47 晓风 晓风 lag=1.355 replied round=3 to_round=0.06 <redacted>
+157 11:08:04 晓风 晓风 lag=0.533 replied round=4 to_round=53.92 <redacted>
+158 11:08:07 晓风 晓风 lag=1.564 replied round=4 to_round=50.89 <redacted>
+159 11:08:09 晓风 晓风 lag=0.619 replied round=4 to_round=48.83 <redacted>
+161 11:11:42 晓风 晓风 lag=1.055 skipped round=5 to_round=0.05 <redacted>
+162 11:14:24 2404图灵测试 晓风 lag=0.703 skipped round=6 to_round=0.17 <redacted>
+163 11:15:49 2404图灵测试 晓风 lag=1.061 skipped round=7 to_round=0.15 <redacted>
+164 11:16:22 晓风 晓风 lag=1.202 replied round=8 to_round=0.22 <redacted>
+--- rounds
+round 3 replied open=11:07:47
+    reply #20 sent model=9.32 queue=0.06 send=1.62 enter_to_store=0.06 from_oldest=11.12 text=<redacted> err=None
+round 4 replied open=11:08:58
+    reply #21 sent model=7.11 queue=0.1 send=1.62 enter_to_store=0.14 from_oldest=62.89 text=<redacted> err=None
+round 5 skipped open=11:11:42
+round 6 skipped open=11:14:24
+round 7 skipped open=11:15:49
+round 8 replied open=11:16:22
+    reply #22 sent model=4.29 queue=0.05 send=1.62 enter_to_store=0.4 from_oldest=6.59 text=<redacted> err=None
+--- own rows outside test conversations (0,)

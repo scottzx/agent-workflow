@@ -65,6 +65,7 @@ function printUnifiedHelp(binName: string) {
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
   ticket show|events|proposal --job <id>  Read a job's task ticket and its events, or settle a proposal
   process list|answer --job <id>          Read a job's process requests, or answer one as the coach or a person
+  trail --job <id>                        One task's record: who asked, what ran, who approved, what came out, who read it
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
 
   help = help.replace(/^Commands:/m, serverCommands);
@@ -164,6 +165,11 @@ async function main() {
   if (rawArgs[0] === 'process') {
     const { runProcessCli } = await import('./process.js');
     await runProcessCli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'trail') {
+    const { runTrailCli } = await import('./trail.js');
+    await runTrailCli(rawArgs.slice(1));
     return;
   }
   if (rawArgs[0] === 'rsi') {

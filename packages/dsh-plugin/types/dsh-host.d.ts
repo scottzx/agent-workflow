@@ -43,6 +43,7 @@ declare module '@deepseek-ai/dsh-commands' {}
 declare module '@deepseek-ai/dsh-host-webserver' {}
 declare module '@deepseek-ai/dsh-session-persistence' {}
 declare module '@deepseek-ai/dsh-session-projection' {}
+declare module '@deepseek-ai/dsh-session-projection/types' { export interface SessionProjectionStateMap {} }
 declare module '@deepseek-ai/dsh-user-approval' {}
 declare module '@deepseek-ai/dsh-user-questions' {}
 declare module '@deepseek-ai/dsh-workspace' {}

@@ -74,6 +74,9 @@ export function eventLabel(type: string): string {
         'human_review.approve': ['人工审核：已通过', 'Review: approved'],
         'human_review.changes_requested': ['人工审核：要求修改', 'Review: changes requested'],
         'human_review.cancel': ['人工审核：已取消任务', 'Review: task canceled'],
+        'process.opened': ['过程请求：等待处理', 'Process request opened'],
+        'process.answered': ['过程请求：已处理', 'Process request answered'],
+        'process.expired': ['过程请求：已过期', 'Process request expired'],
     };
     const label = labels[type];
     return label ? text(...label) : type;

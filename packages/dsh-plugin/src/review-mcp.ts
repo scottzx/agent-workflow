@@ -36,7 +36,7 @@ createInterface({ input: process.stdin }).on('line', line => {
   const { id, method, params } = message;
   if (id === undefined) return; // notifications
   const result = (value: unknown) => write({ jsonrpc: '2.0', id, result: value });
-  if (method === 'initialize') return result({ protocolVersion: params?.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: '1agents-review', version: '1.0.0' } });
+  if (method === 'initialize') return result({ protocolVersion: params?.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'oneagents-review', version: '1.0.0' } });
   if (method === 'ping') return result({});
   if (method === 'tools/list') return result({ tools });
   if (method === 'tools/call') {

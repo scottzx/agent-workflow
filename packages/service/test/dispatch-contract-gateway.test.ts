@@ -74,7 +74,7 @@ test('gateway forwards result contracts, exposes authoritative metadata and emit
   assert.deepEqual(completed.result.resultArtifacts, final.resultMetadata.artifacts);
   assert.deepEqual(completed.resultHistory[0].resultArtifacts, final.resultMetadata.artifacts);
   const review = await f.gateway.invoke('execution_review', { originSessionId, jobId: task.jobId, attemptId: task.attemptId,
-    resultRevision: completed.resultRevision, resultDigest: completed.resultDigest, reviewStatus: 'accepted' }) as any;
+    resultRevision: completed.resultRevision, resultDigest: completed.resultDigest, reviewStatus: 'accepted', decidedBy: { kind: 'person' } }) as any;
   assert.equal(review.reviewStatus, 'accepted');
   await assert.rejects(f.gateway.invoke('remote_agent_spawn', { originSessionId, remote, cwd: f.root, prompt: 'run', resultContract: { jobId: 'fake', taskId: 'spoof' } }));
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -291,6 +291,40 @@ test('the coach lists a task’s process requests and answers one through the ga
   assert.deepEqual([answered.status, answered.answer.outcome, answered.answer.note, answered.answer.decidedBy], ['answered', 'approved', '角色要求的自查命令', coach]);
   assert.equal(f.gateway.workbenchTask(jobId).processRequests[0]!.answer!.decidedBy!.kind, 'coach', 'the page reads the same record');
   await assert.rejects(f.gateway.invoke('execution_process_answer', { ...scope, requestId: 'prc-check', clientRequestId: 'cli-2', outcome: 'rejected' }), /no longer pending/);
+  const { events } = await f.gateway.invoke('execution_events', scope) as any;
+  const processEvents = events.filter((event: any) => event.type.startsWith('process.'));
+  assert.deepEqual(processEvents.map((event: any) => event.type), ['process.opened', 'process.answered'], 'the rejected repeat records nothing');
+  assert.deepEqual(processEvents[1].data, { requestId: 'prc-check', kind: 'permission', toolTitle: 'Run python3 -I checks/check_outline.py', status: 'answered', outcome: 'approved', note: '角色要求的自查命令', decidedBy: coach });
+  assert.equal(processEvents[1].attemptId, prepared.attempt.attemptId);
+  await f.request(`/workbench/tasks/${jobId}/process-requests`, post({ requestId: 'prc-page', jobId, attemptId: prepared.attempt.attemptId, sessionId: 'dsh-1', kind: 'permission', toolTitle: 'Run git', toolDetail: '{}' }));
+  const onPage = await f.request(`/workbench/tasks/${jobId}/process-requests/prc-page/answers`, relayed({ clientRequestId: 'page-1', outcome: 'approved', decidedBy: coach }));
+  assert.equal(onPage.status, 200);
+  assert.deepEqual(f.gateway.workbenchTask(jobId).processRequests.find(request => request.requestId === 'prc-page')!.answer!.decidedBy, { kind: 'person' }, 'a page answer cannot speak as the coach');
+});
+
+test('a person marks a finished top-level task as read from the page; a child or an unfinished task cannot be', async t => {
+  const f = await fixture(t);
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '任务', targetSnapshot: { targetId: 'legacy:host' }, input: {}, initiatedBy: { kind: 'coach', agent: 'claude-code', sessionId: 'coach-1' } });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId, path = `/workbench/tasks/${jobId}/acceptance`;
+  assert.equal(f.gateway.workbenchTask(jobId).canAccept, undefined);
+  assert.equal((await f.request(path, post({}))).status, 403, 'the bearer API cannot read a result in a person\'s name');
+  assert.equal((await f.request(path, relayed({}))).status, 409, 'still running');
+  const child = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', targetSnapshot: { targetId: 'legacy:host' }, input: {}, parentJobRef: { sourceId: f.gateway.ledger.sourceId, jobId }, parentAttemptId: prepared.attempt.attemptId });
+  f.gateway.ledger.markDispatching(child.attempt.attemptId);
+  f.gateway.ledger.accept(child.attempt.attemptId, { taskId: 'task-2', sessionId: 'dsh-2' }, { executionStatus: 'working' });
+  const done = { executionStatus: 'completed' as const, resultAvailable: true, resultRevision: 'result-1', resultDigest: 'a'.repeat(64) };
+  f.gateway.ledger.observe(child.attempt.attemptId, done);
+  assert.equal(f.gateway.workbenchTask(child.job.jobId).canAccept, undefined, 'a child is read with its parent');
+  f.gateway.ledger.observe(prepared.attempt.attemptId, done);
+  const task = f.gateway.workbenchTask(jobId);
+  assert.equal(task.canAccept, true); assert.deepEqual(task.initiatedBy, { kind: 'coach', agent: 'claude-code', sessionId: 'coach-1' });
+  const accepted = await f.request(path, relayed({}));
+  assert.equal(accepted.status, 200);
+  const detail = await accepted.json() as any;
+  assert.deepEqual([detail.businessAcceptance.reviewStatus, detail.businessAcceptance.decidedBy, detail.businessAcceptance.resultRevision, detail.canAccept], ['accepted', { kind: 'person' }, 'result-1', undefined]);
+  assert.equal((await f.request(path, relayed({}))).status, 409, 'already concluded');
 });
 
 test('a caller that stops waiting marks the task abnormal, and a re-query from the workbench reads the host again', async t => {
@@ -308,6 +342,54 @@ test('a caller that stops waiting marks the task abnormal, and a re-query from t
   (f.gateway as any).state.jobs.push({ ledgerJobId: jobId, attemptId: prepared.attempt.attemptId, taskId: 'task-1' });
   const requeried = await (await f.request(`/workbench/tasks/${jobId}/refresh`, { method: 'POST' })).json() as any;
   assert.deepEqual([refreshed, requeried.displayStatus], [[jobId], 'completed'], 'the task finished unseen and is found ended');
+});
+
+test('a person continues a failed task from the workbench page, and nothing else can', async t => {
+  const f = await fixture(t);
+  const prepare = (originSessionId: string, extra: Record<string, unknown> = {}) => {
+    const prepared = f.gateway.ledger.prepare({ originSessionId, title: '训练任务', targetSnapshot: { targetId: 'legacy:host' }, input: {}, ...extra });
+    f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+    f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: prepared.attempt.attemptId, sessionId: 'dsh-1' }, { executionStatus: 'working' });
+    return prepared;
+  };
+  const prepared = prepare('allowed-root'), jobId = prepared.job.jobId, path = `/workbench/tasks/${jobId}/continue`;
+  const calls: unknown[] = [], real = f.gateway.invoke.bind(f.gateway);
+  (f.gateway as any).invoke = async (method: string, params: unknown) => {
+    if (method !== 'execution_continue') return real(method, params);
+    calls.push(params);
+    const round = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', jobId, title: '训练任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+    f.gateway.ledger.markDispatching(round.attempt.attemptId);
+    return {};
+  };
+  assert.equal(f.gateway.workbenchTask(jobId).canContinue, undefined);
+  const running = await f.request(path, relayed({ prompt: '接着做' }));
+  assert.deepEqual([running.status, (await running.json() as any).error], [409, 'continue_refused'], 'a running round is not continued');
+
+  f.gateway.ledger.observe(prepared.attempt.attemptId, { executionStatus: 'failed' });
+  assert.equal(f.gateway.workbenchTask(jobId).canContinue, true);
+  assert.equal(f.gateway.workbenchList({ filter: 'failed' }).items.find((item: any) => item.jobId === jobId)?.canContinue, true);
+  assert.equal((await f.request(path, post({ prompt: '接着做' }))).status, 403, 'the bearer API cannot start a round in a person\'s name');
+  assert.equal((await f.request(path, relayed({ prompt: '' }))).status, 400);
+  assert.equal((await f.request(path, { method: 'GET' })).status, 405);
+  const hidden = prepare('private-root');
+  assert.equal((await f.request(`/workbench/tasks/${hidden.job.jobId}/continue`, relayed({ prompt: '接着做' }))).status, 404);
+  assert.deepEqual(calls, []);
+
+  const continued = await f.request(path, relayed({ prompt: '接着做' }));
+  assert.equal(continued.status, 200);
+  assert.deepEqual(calls, [{ originSessionId: 'allowed-root', jobId, input: { prompt: '接着做' }, initiatedBy: { kind: 'person' } }]);
+  assert.equal((await continued.json() as any).canContinue, undefined, 'the button goes away once a round runs');
+});
+
+test('a failed child task is left to its parent', async t => {
+  const f = await fixture(t);
+  const parent = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '父任务', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  const child = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '子任务', targetSnapshot: { targetId: 'legacy:host' }, input: {},
+    parentJobRef: { sourceId: f.gateway.workbenchTask(parent.job.jobId).sourceId, jobId: parent.job.jobId }, parentAttemptId: parent.attempt.attemptId });
+  f.gateway.ledger.markDispatching(child.attempt.attemptId);
+  f.gateway.ledger.accept(child.attempt.attemptId, { taskId: 'child', sessionId: 'dsh-1' }, { executionStatus: 'working' });
+  f.gateway.ledger.observe(child.attempt.attemptId, { executionStatus: 'failed' });
+  assert.equal(f.gateway.workbenchTask(child.job.jobId).canContinue, undefined);
 });
 
 test('abandoning through human review closes further child dispatch admission', async t => {
@@ -502,4 +584,106 @@ test('workbench artifacts are read from the producing host and served only when 
   const changed = await f.request(path(jobId));
   assert.equal(changed.status, 409, 'bytes that no longer match the receipt are refused');
   assert.equal((await changed.json() as any).error, 'artifact-digest-mismatch');
+});
+
+test('a registered path turns each agents/*.md into a developing draft with a fixed path-agent target', async t => {
+  const f = await fixture(t), internals = f.gateway as any;
+  const scenario = join(f.root, '场景', 'trajectory-restore');
+  await mkdir(join(scenario, 'agents'), { recursive: true });
+  await writeFile(join(scenario, 'agents', 'restore-executor.md'), '---\nname: restore-executor\ndescription: 还原轨迹\ntools: Read, Bash\n---\n\n你是执行者。\n');
+  await writeFile(join(scenario, 'agents', 'restore-qa.md'), '---\nname: restore-qa\n---\n你是 QA。\n');
+  const scenarioPath = scenario;
+  const real = await realpath(scenario);
+  f.gateway.config.remotes.fixture = { url: 'http://127.0.0.1:1', token: 'machine-fixture-credential' };
+  f.gateway.targets.ensureLegacyRemotes();
+  const listed = await (await f.request('/workbench/agents')).json() as any;
+  assert.deepEqual(listed.connections, [{ connectionId: 'remote:fixture', remote: 'fixture' }]);
+
+  assert.equal((await f.request('/workbench/agents/register-path', post({ path: 'relative', acpAgent: 'grok-build', connectionId: 'remote:fixture' }))).status, 400);
+  assert.equal((await f.request('/workbench/agents/register-path', post({ path: f.root, acpAgent: 'grok-build', connectionId: 'remote:fixture' }))).status, 400);
+  const response = await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'grok-build', connectionId: 'remote:fixture' }));
+  assert.equal(response.status, 200);
+  const body = await response.json() as any;
+  assert.deepEqual(body.registered.map((item: any) => item.name), ['restore-executor@grok-build', 'restore-qa@grok-build']);
+  const executor = body.developing.find((row: any) => row.name === 'restore-executor@grok-build');
+  assert.equal(executor.acpAgent, 'grok-build');
+  assert.equal(executor.description, '还原轨迹');
+  assert.equal(executor.source.path, real);
+  const target = f.gateway.targets.getTarget(executor.targetId);
+  assert.equal(target.kind, 'agent_host');
+  assert.deepEqual(target.binding, { cwd: real, agentPreset: 'oneagents-acp-grok-build', agentFile: join(real, 'agents', 'restore-executor.md') });
+
+  // The same runtime refreshes its draft and target; another runtime gets its own pair beside them.
+  const again = await (await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'grok-build', connectionId: 'remote:fixture' }))).json() as any;
+  assert.equal(again.developing.length, 2);
+  assert.equal(again.developing.find((row: any) => row.name === 'restore-executor@grok-build').agentId, executor.agentId);
+  const codex = await (await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'codex', connectionId: 'remote:fixture' }))).json() as any;
+  assert.equal(codex.developing.length, 4);
+  const codexExecutor = codex.developing.find((row: any) => row.name === 'restore-executor@codex');
+  assert.notEqual(codexExecutor.targetId, executor.targetId);
+  assert.equal(f.gateway.targets.getTarget(codexExecutor.targetId).binding.agentPreset, 'oneagents-acp-codex');
+  assert.equal(f.gateway.targets.getTarget(executor.targetId).binding.agentPreset, 'oneagents-acp-grok-build');
+  assert.equal(f.gateway.targets.listTargets().filter(item => item.binding.agentFile).length, 4);
+
+  // Dispatch sends the fixed cwd, preset and agent file; a caller cannot point the role elsewhere.
+  let sent: any;
+  internals.checkDispatch = async () => {};
+  internals.client = async () => ({ sendMessage: async (request: any) => {
+    sent = request;
+    return Task.fromJSON({ id: 'path-agent-task', contextId: 'path-agent-context', status: { state: 'TASK_STATE_WORKING' } });
+  } });
+  await assert.rejects(f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: codexExecutor.targetId,
+    input: { cwd: f.root, prompt: '还原这份轨迹' } }), /cannot override/);
+  await f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: codexExecutor.targetId, input: { prompt: '还原这份轨迹' } });
+  const metadata = sent.metadata['1agents'];
+  assert.equal(metadata.cwd, real);
+  assert.equal(metadata.agentPreset, 'oneagents-acp-codex');
+  assert.equal(metadata.agentFile, join(real, 'agents', 'restore-executor.md'));
+  const after = await (await f.request('/workbench/agents')).json() as any;
+  assert.equal(after.developing.find((row: any) => row.agentId === codexExecutor.agentId).taskCount, 1);
+  assert.equal(after.developing.find((row: any) => row.agentId === executor.agentId).taskCount, 0);
+});
+
+test('a path can register on a DSH-native preset with a fixed model', async t => {
+  const f = await fixture(t), internals = f.gateway as any;
+  const scenario = join(f.root, 'native-scenario');
+  await mkdir(join(scenario, 'agents'), { recursive: true });
+  await writeFile(join(scenario, 'agents', 'restore-qa.md'), '---\nname: restore-qa\n---\n你是 QA。\n');
+  const real = await realpath(scenario);
+  f.gateway.config.remotes.fixture = { url: 'http://127.0.0.1:1', token: 'machine-fixture-credential' };
+  f.gateway.targets.ensureLegacyRemotes();
+  const register = (body: unknown) => f.request('/workbench/agents/register-path', post({ path: scenario, connectionId: 'remote:fixture', ...body as object }));
+  for (const invalid of [{}, { acpAgent: 'grok-build', agentPreset: 'standard' }, { acpAgent: 'grok-build', provider: 'minimax-cn', model: 'm' },
+    { agentPreset: 'standard', provider: 'minimax-cn' }, { agentPreset: 'oneagents-acp-codex' }]) {
+    assert.equal((await register(invalid)).status, 400, JSON.stringify(invalid));
+  }
+  const body = await (await register({ agentPreset: 'standard', provider: 'minimax-cn', model: 'MiniMax-M3.1-Flash' })).json() as any;
+  const row = body.developing.find((item: any) => item.name === 'restore-qa@standard');
+  assert.equal(row.acpAgent, undefined);
+  assert.equal(row.agentPreset, 'standard');
+  assert.equal(`${row.provider}/${row.model}`, 'minimax-cn/MiniMax-M3.1-Flash');
+  assert.deepEqual(f.gateway.targets.getTarget(row.targetId).binding, { cwd: real, agentPreset: 'standard', agentFile: join(real, 'agents', 'restore-qa.md'),
+    provider: 'minimax-cn', model: 'MiniMax-M3.1-Flash' });
+
+  let sent: any;
+  internals.checkDispatch = async () => {};
+  internals.client = async () => ({ sendMessage: async (request: any) => {
+    sent = request;
+    return Task.fromJSON({ id: 'native-path-task', contextId: 'native-path-context', status: { state: 'TASK_STATE_WORKING' } });
+  } });
+  await assert.rejects(f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: row.targetId,
+    input: { prompt: '复核', provider: 'deepseek', model: 'deepseek-chat' } }), /fixed provider and model/);
+  await f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: row.targetId, input: { prompt: '复核' } });
+  const metadata = sent.metadata['1agents'];
+  assert.deepEqual([metadata.cwd, metadata.agentPreset, metadata.agentFile, metadata.provider, metadata.model],
+    [real, 'standard', join(real, 'agents', 'restore-qa.md'), 'minimax-cn', 'MiniMax-M3.1-Flash']);
+
+  // Registering grok beside it leaves the native draft and its fixed model as they were.
+  const both = await (await register({ acpAgent: 'grok-build' })).json() as any;
+  assert.deepEqual(both.developing.map((item: any) => item.name).sort(), ['restore-qa@grok-build', 'restore-qa@standard']);
+  assert.equal(f.gateway.targets.getTarget(row.targetId).binding.model, 'MiniMax-M3.1-Flash');
+  // A new model on the same preset updates that draft rather than adding one.
+  const remodel = await (await register({ agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-chat' })).json() as any;
+  assert.equal(remodel.developing.length, 2);
+  assert.equal(remodel.developing.find((item: any) => item.agentId === row.agentId).model, 'deepseek-chat');
 });

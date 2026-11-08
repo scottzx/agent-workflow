@@ -10,6 +10,7 @@ import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import type { FileA2AStore } from './store.js';
 import { a2aRoleSkillsSchema, type A2ABackend, type A2APrepareInput, type A2ARoleSkills, type A2ARunResult, type A2ATarget } from './types.js';
 import { resolveRoleSkills, type RoleSkillLock } from '../roles/index.js';
+import { agentPromptPrefix, readAgentFile } from '../execution/agent-files.js';
 import { A2APreflightError, a2aPreflightRequirementsSchema } from './preflight.js';
 import { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetadata, saveA2AResultMetadata,
   type A2AResultContract, type A2AResultMetadata } from './result-metadata.js';
@@ -101,8 +102,8 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   const metadata: unknown = request.metadata?.['1agents'];
   if (metadata !== undefined && (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))) throw new RequestMalformedError('metadata.1agents must be an object');
   const value = (metadata ?? {}) as Record<string, unknown>;
-  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
-  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath', 'provider', 'model']) {
+  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'agentFile', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
+  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath', 'agentFile', 'provider', 'model']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !(value[key] as string).trim())) throw new RequestMalformedError(`${key} must be a nonempty string`);
   }
   if ((value.provider === undefined) !== (value.model === undefined)) throw new RequestMalformedError('provider and model must be passed together');
@@ -110,6 +111,8 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
       || !options.roleSkills || !Object.hasOwn(options.roleSkills.profiles, value.roleId as string))) throw new RequestMalformedError('Unknown host role');
   if (value.roleLockPath !== undefined && (!options.roleSkills || !isAbsolute(value.roleLockPath as string)
       || (value.roleLockPath as string).includes('\0'))) throw new RequestMalformedError('Invalid role lock path');
+  if (value.agentFile !== undefined && (!isAbsolute(value.agentFile as string) || (value.agentFile as string).includes('\0')
+      || value.roleId !== undefined || value.roleLockPath !== undefined)) throw new RequestMalformedError('agentFile must be an absolute path and cannot be combined with a host role');
   if (value.cwd && value.workspace) throw new RequestMalformedError('Use cwd or workspace, not both');
   let cwd = value.cwd as string | undefined;
   if (value.workspace) {
@@ -125,6 +128,7 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
     ...(preflight?.success ? { preflight: preflight.data } : {}),
     ...(value.roleId ? { roleId: value.roleId as string } : {}),
     ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}),
+    ...(value.agentFile ? { agentFile: value.agentFile as string } : {}),
     ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}) },
     ...(resultContract?.success ? { resultContract: resultContract.data } : {}),
     ...(execution ? { execution } : {}) };
@@ -318,6 +322,14 @@ export class A2ASessionExecutor implements AgentExecutor {
         // The DSH session keeps its earlier selection; report it until a new value is passed.
         if (!target.provider && saved?.provider) { target.provider = saved.provider; target.model = saved.model; }
         if (role) { target.roleId = role.roleId; target.roleSkills = role.summary; promptPrefix = role.promptPrefix; }
+        // A path agent's role is read on this host, inside the session's real cwd. A continuation already carries it in its history.
+        if (input.agentFile && !saved?.sessionId) {
+          if (role) throw Object.assign(new Error('A path agent cannot also take a host role bound to its preset'), { code: 'AGENT_FILE_INVALID' });
+          let agent;
+          try { agent = await readAgentFile(input.agentFile, target.cwd ?? ''); }
+          catch (error) { throw Object.assign(new Error(`Cannot load path agent: ${error instanceof Error ? error.message : String(error)}`), { code: 'AGENT_FILE_INVALID' }); }
+          promptPrefix = agentPromptPrefix(agent);
+        }
         this.store.saveTarget(context.contextId, target, context.context);
       } finally {
         unlock();

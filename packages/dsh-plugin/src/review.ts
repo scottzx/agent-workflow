@@ -64,7 +64,9 @@ export class ReviewHandBack {
 
   /** The stdio MCP server an ACP agent starts for one session; the token only acts for that session. */
   mcpServer(sessionId: string, origin: string): McpServerStdio {
-    return { name: '1agents-review', command: process.execPath, args: [MCP_SCRIPT], env: [
+    // Inside DSH process.execPath is the Electron app; without this it would start the app instead of the script.
+    return { name: 'oneagents-review', command: process.execPath, args: [MCP_SCRIPT], env: [
+      { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
       { name: 'ONEAGENTS_REVIEW_URL', value: new URL(REVIEW_SUBMIT_PATH, origin).href },
       { name: 'ONEAGENTS_TICKET_URL', value: new URL(TICKET_PATH, origin).href },
       { name: 'ONEAGENTS_REVIEW_SESSION', value: sessionId },
