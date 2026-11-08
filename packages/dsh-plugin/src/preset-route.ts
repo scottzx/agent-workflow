@@ -13,8 +13,24 @@ import type { SessionId } from '@deepseek-ai/dsh-session';
 /** The provider a session runs its ACP Agent under. */
 export const ACP_PROVIDER = '1agents-acp';
 
-/** The part of a live agent this module needs. */
-type RoutableAgent = { model?: { select?: (selection: { provider: string; model: string }) => void } };
+/** One recorded model choice. */
+export interface ModelSelection { provider: string; model: string }
+
+/** The part of an agent that records a model selection. */
+export interface ModelSelectionApi { select(selection: ModelSelection): void }
+
+/**
+ * The model selection API of a live agent, when the host provides one.
+ *
+ * Current DSH records the route on the agent; older DSH agents have no such
+ * API and take the route from the request waterfall instead. The host's own
+ * types do not declare the API, so it is read structurally.
+ */
+export function modelSelectionOf(agent: unknown): ModelSelectionApi | undefined {
+  const model = (agent as { model?: { select?: (selection: ModelSelection) => void } } | undefined)?.model;
+  if (!model || typeof model.select !== 'function') return undefined;
+  return { select: (selection: ModelSelection) => model.select!(selection) };
+}
 
 /**
  * The ACP Agent a preset id names, when this plugin registered that preset.
@@ -27,8 +43,8 @@ export function acpAgentOf(agentPreset: string, known: readonly string[]): strin
 }
 
 /** The live agent of a session, without resuming or creating one. */
-function liveAgent(ctx: Context, sessionId: SessionId): RoutableAgent | undefined {
-  const agents = (ctx as unknown as { agents?: { get?: (id: SessionId) => RoutableAgent | undefined } }).agents;
+function liveAgent(ctx: Context, sessionId: SessionId): unknown {
+  const agents = (ctx as unknown as { agents?: { get?: (id: SessionId) => unknown } }).agents;
   return agents?.get?.(sessionId);
 }
 
@@ -46,9 +62,9 @@ function liveAgent(ctx: Context, sessionId: SessionId): RoutableAgent | undefine
 export async function selectAcpRoute(ctx: Context, sessionId: SessionId, agentPreset: string, known: readonly string[]): Promise<boolean> {
   const acpAgent = acpAgentOf(agentPreset, known);
   if (acpAgent === undefined) return false;
-  const agent = liveAgent(ctx, sessionId);
-  if (agent?.model?.select === undefined) return false;
+  const model = modelSelectionOf(liveAgent(ctx, sessionId));
+  if (model === undefined) return false;
   await new Promise<void>(resolve => setTimeout(resolve, 0));
-  agent.model.select({ provider: ACP_PROVIDER, model: acpAgent });
+  model.select({ provider: ACP_PROVIDER, model: acpAgent });
   return true;
 }
