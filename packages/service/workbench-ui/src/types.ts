@@ -214,8 +214,13 @@ export interface AcpAgentRow {
     roleId?: string;
     targetId?: string;
     agentPreset?: string;
+    provider?: string;
+    model?: string;
     modeId?: string;
     options: AcpAgentOption[];
+    /** Set when the row was registered from a directory's agents/*.md. */
+    source?: { path: string; file: string };
+    description?: string;
     releaseName?: string;
     sourceAgentId?: string;
     counterpartId?: string;
@@ -225,6 +230,17 @@ export interface AcpAgentRow {
 export interface AcpAgentCatalog {
     developing: AcpAgentRow[];
     published: AcpAgentRow[];
+    /** A2A connections a path registration can dispatch through. */
+    connections?: { connectionId: string; remote: string }[];
+}
+/** Either acpAgent, or a DSH-native agentPreset with an optional fixed provider and model. */
+export interface AcpAgentPathInput {
+    path: string;
+    connectionId: string;
+    acpAgent?: string;
+    agentPreset?: string;
+    provider?: string;
+    model?: string;
 }
 export interface AcpAgentDraftInput {
     name?: string;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -584,4 +584,99 @@ test('workbench artifacts are read from the producing host and served only when 
   const changed = await f.request(path(jobId));
   assert.equal(changed.status, 409, 'bytes that no longer match the receipt are refused');
   assert.equal((await changed.json() as any).error, 'artifact-digest-mismatch');
+});
+
+test('a registered path turns each agents/*.md into a developing draft with a fixed path-agent target', async t => {
+  const f = await fixture(t), internals = f.gateway as any;
+  const scenario = join(f.root, '场景', 'trajectory-restore');
+  await mkdir(join(scenario, 'agents'), { recursive: true });
+  await writeFile(join(scenario, 'agents', 'restore-executor.md'), '---\nname: restore-executor\ndescription: 还原轨迹\ntools: Read, Bash\n---\n\n你是执行者。\n');
+  await writeFile(join(scenario, 'agents', 'restore-qa.md'), '---\nname: restore-qa\n---\n你是 QA。\n');
+  const scenarioPath = scenario;
+  const real = await realpath(scenario);
+  f.gateway.config.remotes.fixture = { url: 'http://127.0.0.1:1', token: 'machine-fixture-credential' };
+  f.gateway.targets.ensureLegacyRemotes();
+  const listed = await (await f.request('/workbench/agents')).json() as any;
+  assert.deepEqual(listed.connections, [{ connectionId: 'remote:fixture', remote: 'fixture' }]);
+
+  assert.equal((await f.request('/workbench/agents/register-path', post({ path: 'relative', acpAgent: 'grok-build', connectionId: 'remote:fixture' }))).status, 400);
+  assert.equal((await f.request('/workbench/agents/register-path', post({ path: f.root, acpAgent: 'grok-build', connectionId: 'remote:fixture' }))).status, 400);
+  const response = await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'grok-build', connectionId: 'remote:fixture' }));
+  assert.equal(response.status, 200);
+  const body = await response.json() as any;
+  assert.deepEqual(body.registered.map((item: any) => item.name), ['restore-executor', 'restore-qa']);
+  const executor = body.developing.find((row: any) => row.name === 'restore-executor');
+  assert.equal(executor.acpAgent, 'grok-build');
+  assert.equal(executor.description, '还原轨迹');
+  assert.equal(executor.source.path, real);
+  const target = f.gateway.targets.getTarget(executor.targetId);
+  assert.equal(target.kind, 'agent_host');
+  assert.deepEqual(target.binding, { cwd: real, agentPreset: 'oneagents-acp-grok-build', agentFile: join(real, 'agents', 'restore-executor.md') });
+
+  // Registering again refreshes the same draft and target instead of adding new ones.
+  const again = await (await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'codex', connectionId: 'remote:fixture' }))).json() as any;
+  assert.equal(again.developing.length, 2);
+  assert.equal(again.developing.find((row: any) => row.name === 'restore-executor').agentId, executor.agentId);
+  assert.equal(f.gateway.targets.getTarget(executor.targetId).binding.agentPreset, 'oneagents-acp-codex');
+  assert.equal(f.gateway.targets.listTargets().filter(item => item.binding.agentFile).length, 2);
+
+  // Dispatch sends the fixed cwd, preset and agent file; a caller cannot point the role elsewhere.
+  let sent: any;
+  internals.checkDispatch = async () => {};
+  internals.client = async () => ({ sendMessage: async (request: any) => {
+    sent = request;
+    return Task.fromJSON({ id: 'path-agent-task', contextId: 'path-agent-context', status: { state: 'TASK_STATE_WORKING' } });
+  } });
+  await assert.rejects(f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: executor.targetId,
+    input: { cwd: f.root, prompt: '还原这份轨迹' } }), /cannot override/);
+  await f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: executor.targetId, input: { prompt: '还原这份轨迹' } });
+  const metadata = sent.metadata['1agents'];
+  assert.equal(metadata.cwd, real);
+  assert.equal(metadata.agentPreset, 'oneagents-acp-codex');
+  assert.equal(metadata.agentFile, join(real, 'agents', 'restore-executor.md'));
+  const after = await (await f.request('/workbench/agents')).json() as any;
+  assert.equal(after.developing.find((row: any) => row.agentId === executor.agentId).taskCount, 1);
+});
+
+test('a path can register on a DSH-native preset with a fixed model', async t => {
+  const f = await fixture(t), internals = f.gateway as any;
+  const scenario = join(f.root, 'native-scenario');
+  await mkdir(join(scenario, 'agents'), { recursive: true });
+  await writeFile(join(scenario, 'agents', 'restore-qa.md'), '---\nname: restore-qa\n---\n你是 QA。\n');
+  const real = await realpath(scenario);
+  f.gateway.config.remotes.fixture = { url: 'http://127.0.0.1:1', token: 'machine-fixture-credential' };
+  f.gateway.targets.ensureLegacyRemotes();
+  const register = (body: unknown) => f.request('/workbench/agents/register-path', post({ path: scenario, connectionId: 'remote:fixture', ...body as object }));
+  for (const invalid of [{}, { acpAgent: 'grok-build', agentPreset: 'standard' }, { acpAgent: 'grok-build', provider: 'minimax-cn', model: 'm' },
+    { agentPreset: 'standard', provider: 'minimax-cn' }, { agentPreset: 'oneagents-acp-codex' }]) {
+    assert.equal((await register(invalid)).status, 400, JSON.stringify(invalid));
+  }
+  const body = await (await register({ agentPreset: 'standard', provider: 'minimax-cn', model: 'MiniMax-M3.1-Flash' })).json() as any;
+  const row = body.developing.find((item: any) => item.name === 'restore-qa');
+  assert.equal(row.acpAgent, undefined);
+  assert.equal(row.agentPreset, 'standard');
+  assert.equal(`${row.provider}/${row.model}`, 'minimax-cn/MiniMax-M3.1-Flash');
+  assert.deepEqual(f.gateway.targets.getTarget(row.targetId).binding, { cwd: real, agentPreset: 'standard', agentFile: join(real, 'agents', 'restore-qa.md'),
+    provider: 'minimax-cn', model: 'MiniMax-M3.1-Flash' });
+
+  let sent: any;
+  internals.checkDispatch = async () => {};
+  internals.client = async () => ({ sendMessage: async (request: any) => {
+    sent = request;
+    return Task.fromJSON({ id: 'native-path-task', contextId: 'native-path-context', status: { state: 'TASK_STATE_WORKING' } });
+  } });
+  await assert.rejects(f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: row.targetId,
+    input: { prompt: '复核', provider: 'deepseek', model: 'deepseek-chat' } }), /fixed provider and model/);
+  await f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: row.targetId, input: { prompt: '复核' } });
+  const metadata = sent.metadata['1agents'];
+  assert.deepEqual([metadata.cwd, metadata.agentPreset, metadata.agentFile, metadata.provider, metadata.model],
+    [real, 'standard', join(real, 'agents', 'restore-qa.md'), 'minimax-cn', 'MiniMax-M3.1-Flash']);
+
+  // Switching the path back to an ACP agent drops the fixed model from the same draft and target.
+  const back = await (await register({ acpAgent: 'grok-build' })).json() as any;
+  const again = back.developing.find((item: any) => item.name === 'restore-qa');
+  assert.equal(again.agentId, row.agentId);
+  assert.equal(again.provider, undefined);
+  assert.equal(again.agentPreset, undefined);
+  assert.equal(f.gateway.targets.getTarget(row.targetId).binding.provider, undefined);
 });

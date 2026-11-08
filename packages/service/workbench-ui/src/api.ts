@@ -1,6 +1,7 @@
 import type {
     AcpAgentCatalog,
     AcpAgentDraftInput,
+    AcpAgentPathInput,
     AcpChatPage,
     AcpDecisionInput,
     AcpDshSession,
@@ -85,4 +86,7 @@ export const acpTaskService = {
         post(`/agents/${encodeURIComponent(agentId)}/settings`, input),
     publishAgent: (agentId: string, input: { releaseName: string; replace?: boolean }): Promise<AcpAgentCatalog> =>
         post(`/agents/${encodeURIComponent(agentId)}/publish`, input),
+    /** Registers each agents/*.md under the path as a developing draft with its own path-agent target. */
+    registerAgentPath: (input: AcpAgentPathInput): Promise<AcpAgentCatalog & { registered: { agentId: string; name: string; targetId: string; file: string }[] }> =>
+        post('/agents/register-path', input),
 };

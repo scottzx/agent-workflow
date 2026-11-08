@@ -74,6 +74,8 @@ export interface A2APrepareInput {
   roleId?: string;
   /** Optional existing parent lock under the host cache's locks directory. */
   roleLockPath?: string;
+  /** A path agent's agents/*.md inside cwd; its body prefixes the first message of a new session. Not combined with roleId. */
+  agentFile?: string;
   /** Standard presets only, passed together. Omitted keeps the session's current or host-default model. */
   provider?: string;
   model?: string;

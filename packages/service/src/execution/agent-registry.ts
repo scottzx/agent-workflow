@@ -17,24 +17,40 @@ export const agentOptionSchema = z.object({
   model: z.literal(true).optional(),
 }).strict();
 export type AgentOption = z.output<typeof agentOptionSchema>;
+const absolute = z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && !value.includes('\0'), 'Expected an absolute local path');
+/** Where a path-registered agent came from: the registered directory and its agents/*.md file. */
+export const agentSourceSchema = z.object({ path: absolute, file: absolute }).strict();
+export type AgentSource = z.output<typeof agentSourceSchema>;
+const description = z.string().trim().min(1).max(1024);
 export const agentDraftSchema = z.object({
   agentId: z.string().regex(agentIdPattern),
   name: callName,
-  acpAgent: acpAgentName,
+  // ACP drafts name their ACP agent; a path agent on a DSH-native preset names the preset (and an optional fixed model) instead.
+  acpAgent: acpAgentName.optional(),
+  agentPreset: targetId.optional(),
+  provider: targetId.optional(),
+  model: optionValue.optional(),
   roleId: targetId.optional(),
   targetId: targetId.optional(),
   modeId: optionId.optional(),
   options: z.array(agentOptionSchema).max(20),
+  source: agentSourceSchema.optional(),
+  description: description.optional(),
   updatedAt: z.string().datetime(),
 }).strict();
 export const agentReleaseSchema = z.object({
   releaseName: callName,
   sourceAgentId: z.string().regex(agentIdPattern).optional(),
-  acpAgent: acpAgentName,
+  acpAgent: acpAgentName.optional(),
+  agentPreset: targetId.optional(),
+  provider: targetId.optional(),
+  model: optionValue.optional(),
   roleId: targetId.optional(),
   targetId: targetId.optional(),
   modeId: optionId.optional(),
   options: z.array(agentOptionSchema).max(20),
+  source: agentSourceSchema.optional(),
+  description: description.optional(),
   publishedAt: z.string().datetime(),
 }).strict();
 export type AgentDraft = z.output<typeof agentDraftSchema>;
@@ -56,8 +72,12 @@ export interface WorkbenchAgentRow {
   roleId?: string;
   targetId?: string;
   agentPreset?: string;
+  provider?: string;
+  model?: string;
   modeId?: string;
   options: AgentOption[];
+  source?: AgentSource;
+  description?: string;
   releaseName?: string;
   sourceAgentId?: string;
   counterpartId?: string;
@@ -125,15 +145,19 @@ export function projectWorkbenchAgents(catalog: { drafts: readonly AgentDraft[];
   };
   const developing = catalog.drafts.map(draft => {
     const release = catalog.releases.find(item => item.sourceAgentId === draft.agentId);
-    return { agentId: draft.agentId, name: draft.name, phase: 'developing' as const, origin: 'draft' as const, acpAgent: draft.acpAgent,
+    return { agentId: draft.agentId, name: draft.name, phase: 'developing' as const, origin: 'draft' as const, ...(draft.acpAgent ? { acpAgent: draft.acpAgent } : {}),
+      ...(draft.agentPreset ? { agentPreset: draft.agentPreset } : {}), ...(draft.provider ? { provider: draft.provider, model: draft.model } : {}),
       ...(draft.roleId ? { roleId: draft.roleId } : {}), ...(draft.targetId ? { targetId: draft.targetId } : {}),
       ...(draft.modeId ? { modeId: draft.modeId } : {}), options: draft.options.map(option => ({ ...option })),
+      ...(draft.source ? { source: { ...draft.source } } : {}), ...(draft.description ? { description: draft.description } : {}),
       ...(release ? { counterpartId: `release:${release.releaseName}`, releaseName: release.releaseName } : {}), ...count(draft.agentId) };
   });
   const publishedReleases = catalog.releases.map(release => ({
     agentId: `release:${release.releaseName}`, name: release.releaseName, phase: 'published' as const, origin: 'release' as const,
-    acpAgent: release.acpAgent, ...(release.roleId ? { roleId: release.roleId } : {}), ...(release.targetId ? { targetId: release.targetId } : {}),
+    ...(release.acpAgent ? { acpAgent: release.acpAgent } : {}), ...(release.agentPreset ? { agentPreset: release.agentPreset } : {}), ...(release.provider ? { provider: release.provider, model: release.model } : {}),
+    ...(release.roleId ? { roleId: release.roleId } : {}), ...(release.targetId ? { targetId: release.targetId } : {}),
     ...(release.modeId ? { modeId: release.modeId } : {}), options: release.options.map(option => ({ ...option })), releaseName: release.releaseName,
+    ...(release.source ? { source: { ...release.source } } : {}), ...(release.description ? { description: release.description } : {}),
     ...(release.sourceAgentId ? { sourceAgentId: release.sourceAgentId, counterpartId: release.sourceAgentId } : {}), ...count(`release:${release.releaseName}`),
   }));
   const releasedTargets = new Set(catalog.releases.map(release => release.targetId).filter((id): id is string => Boolean(id)));
@@ -195,13 +219,33 @@ export class AgentRegistry {
     const draft = this.draft(agentId);
     const existing = this.state.releases.find(item => item.releaseName === parsed.releaseName);
     if (existing && !parsed.replace) throw new AgentRegistryError(`Published name "${parsed.releaseName}" already exists`, 'conflict');
-    const release: AgentRelease = { releaseName: parsed.releaseName, sourceAgentId: draft.agentId, acpAgent: draft.acpAgent, options: orderAgentOptions(draft.options), publishedAt: new Date().toISOString(),
-      ...(draft.roleId ? { roleId: draft.roleId } : {}), ...(draft.targetId ? { targetId: draft.targetId } : {}), ...(draft.modeId ? { modeId: draft.modeId } : {}) };
+    const release: AgentRelease = { releaseName: parsed.releaseName, sourceAgentId: draft.agentId, ...(draft.acpAgent ? { acpAgent: draft.acpAgent } : {}),
+      ...(draft.agentPreset ? { agentPreset: draft.agentPreset } : {}), ...(draft.provider ? { provider: draft.provider, model: draft.model } : {}), options: orderAgentOptions(draft.options), publishedAt: new Date().toISOString(),
+      ...(draft.roleId ? { roleId: draft.roleId } : {}), ...(draft.targetId ? { targetId: draft.targetId } : {}), ...(draft.modeId ? { modeId: draft.modeId } : {}),
+      ...(draft.source ? { source: { ...draft.source } } : {}), ...(draft.description ? { description: draft.description } : {}) };
     const opened: AgentDraft = { ...draft, updatedAt: release.publishedAt };
     delete opened.targetId;
     this.commit({ ...this.state, drafts: this.state.drafts.map(item => item.agentId === agentId ? opened : item),
       releases: [...this.state.releases.filter(item => item.releaseName !== parsed.releaseName), release] });
     return structuredClone(release);
+  }
+  /**
+   * Create or refresh the draft for one agents/*.md file. The file identifies the draft, so registering the same
+   * path again updates it in place and keeps its tasks; a different draft already using the name is a conflict.
+   */
+  registerPathDraft(input: { name: string; targetId: string; source: AgentSource; description?: string; acpAgent?: string; agentPreset?: string; provider?: string; model?: string }): AgentDraft {
+    const parsed = this.parse(z.object({ name: callName, targetId, source: agentSourceSchema, description: description.optional(),
+      acpAgent: acpAgentName.optional(), agentPreset: targetId.optional(), provider: targetId.optional(), model: optionValue.optional() }).strict()
+      .refine(value => (value.acpAgent === undefined) !== (value.agentPreset === undefined) && (value.provider === undefined) === (value.model === undefined)
+        && !(value.acpAgent && value.provider), 'Name either an ACP agent or a DSH-native preset'), input);
+    const current = this.state.drafts.find(item => item.source?.file === parsed.source.file);
+    if (this.state.drafts.some(item => item !== current && item.name === parsed.name)) throw new AgentRegistryError(`An agent draft named "${parsed.name}" already exists`, 'conflict');
+    const { acpAgent: _acp, agentPreset: _preset, provider: _provider, model: _model, description: _description, ...kept } = current ?? { agentId: `agt-${randomUUID()}`, options: [] };
+    const next: AgentDraft = { ...kept, name: parsed.name, targetId: parsed.targetId, source: parsed.source, updatedAt: new Date().toISOString(),
+      ...(parsed.acpAgent ? { acpAgent: parsed.acpAgent } : { agentPreset: parsed.agentPreset! }),
+      ...(parsed.provider ? { provider: parsed.provider, model: parsed.model! } : {}), ...(parsed.description ? { description: parsed.description } : {}) };
+    this.commit({ ...this.state, drafts: current ? this.state.drafts.map(item => item === current ? next : item) : [...this.state.drafts, next] });
+    return structuredClone(next);
   }
   private draft(agentId: string): AgentDraft {
     const found = this.state.drafts.find(item => item.agentId === agentId);

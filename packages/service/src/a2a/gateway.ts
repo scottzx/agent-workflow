@@ -1,6 +1,6 @@
 /** Main-agent tools backed by standard A2A, with a durable completion inbox. */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -33,6 +33,7 @@ import { answerProcessRequest, createProcessRequest, expireProcessRequest, proce
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
 import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
+import { agentNamePattern, listAgentFiles } from '../execution/agent-files.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
@@ -409,8 +410,9 @@ export class RemoteAgentGateway {
         return this.ledgerView(input.originSessionId, job.jobId);
       }
       const fields = resolved.input;
-      const provider = fields.provider === undefined ? undefined : string.parse(fields.provider);
-      const model = fields.model === undefined ? undefined : string.parse(fields.model);
+      const fixed = resolved.target.binding;
+      const provider = fields.provider === undefined ? fixed.provider : string.parse(fields.provider);
+      const model = fields.model === undefined ? fixed.model : string.parse(fields.model);
       if ((provider === undefined) !== (model === undefined)) throw new Error('provider and model must be passed together');
       if (provider && isAcpAgentPreset(resolved.agentPreset)) throw new Error('provider and model apply only to standard presets; oneagents-acp-* presets switch models through session/set_config_option');
       const preflight = fields.preflight === undefined ? undefined : a2aPreflightRequirementsSchema.parse(fields.preflight);
@@ -446,7 +448,8 @@ export class RemoteAgentGateway {
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '') }] },
-        metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
+        metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
+          ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
           ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
           execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
@@ -1261,7 +1264,50 @@ export class RemoteAgentGateway {
     const residents = this.targets.listTargets().filter(target => target.kind === 'resident_agent').map(target => ({
       targetId: target.targetId, name: target.name, ...(target.binding.roleId ? { roleId: target.binding.roleId } : {}),
       ...(target.binding.agentPreset ? { agentPreset: target.binding.agentPreset } : {}) }));
-    return listWorkbenchAgents(this.workbenchProjection(), this.agents.snapshot(), residents);
+    const connections = this.targets.listConnections().filter(connection => connection.enabled && connection.provider === 'a2a')
+      .map(connection => ({ connectionId: connection.connectionId, remote: connection.remote }));
+    return { ...listWorkbenchAgents(this.workbenchProjection(), this.agents.snapshot(), residents), connections };
+  }
+  /**
+   * Register every agents/*.md under a directory as a developing draft with its own path-agent target: cwd and preset
+   * fixed to that directory and ACP agent, the file as the role. Registering again refreshes the same drafts and targets.
+   * The file is read here for its name and again by the execution host at dispatch, so both must see the same path.
+   */
+  registerWorkbenchAgentPath(input: unknown) {
+    return this.workbench(async () => {
+      // Either an ACP agent (preset oneagents-acp-<agent>) or a DSH-native preset such as standard, optionally with a fixed model.
+      const parsed = z.object({ path: z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && !value.includes('\0'), 'Expected an absolute local path'),
+        acpAgent: z.string().trim().min(1).max(64).regex(agentNamePattern).optional(),
+        agentPreset: z.string().trim().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9.:_-]*$/).refine(value => !isAcpAgentPreset(value), 'Use acpAgent for ACP presets').optional(),
+        provider: string.optional(), model: string.optional(), connectionId: string }).strict()
+        .refine(value => (value.acpAgent === undefined) !== (value.agentPreset === undefined), 'Pass acpAgent or agentPreset')
+        .refine(value => (value.provider === undefined) === (value.model === undefined) && !(value.acpAgent && value.provider), 'provider and model go together and only with agentPreset')
+        .safeParse(input);
+      if (!parsed.success) throw new AgentRegistryError(parsed.error.issues[0]?.message ?? 'Invalid path registration', 'invalid');
+      let agents;
+      try { agents = await listAgentFiles(parsed.data.path); }
+      catch (error) { throw new AgentRegistryError(error instanceof Error ? error.message : String(error), 'invalid'); }
+      if (!agents.length) throw new AgentRegistryError('No agent files under agents/', 'invalid');
+      const connection = this.targets.listConnections().find(item => item.connectionId === parsed.data.connectionId);
+      if (!connection?.enabled || connection.provider !== 'a2a') throw new AgentRegistryError('Unknown or disabled A2A connection', 'invalid');
+      const cwd = realpathSync(parsed.data.path), scope = createHash('sha256').update(cwd).digest('hex').slice(0, 8);
+      const { acpAgent, provider, model } = parsed.data, agentPreset = acpAgent ? `oneagents-acp-${acpAgent}` : parsed.data.agentPreset!;
+      const runtime = acpAgent ? { acpAgent } : { agentPreset, ...(provider ? { provider, model: model! } : {}) }, registered = [];
+      for (const agent of agents) {
+        const targetId = `path:${scope}:${agent.name}`, binding = { cwd, agentPreset, agentFile: agent.file, ...(provider ? { provider, model } : {}) };
+        const fields = { kind: 'agent_host' as const, name: `${path.basename(cwd)}/${agent.name}`, connectionId: connection.connectionId,
+          ...(agent.description ? { description: agent.description } : {}), binding };
+        const existing = this.targets.listTargets().find(item => item.targetId === targetId);
+        try {
+          if (existing) this.targets.invoke('execution_target_update', { targetId, patch: { ...fields, ...(existing.description && !agent.description ? { description: existing.description } : {}) } });
+          else this.targets.invoke('execution_target_create', { targetId, ...fields });
+        } catch (error) { throw new AgentRegistryError(error instanceof Error ? error.message : String(error), 'invalid'); }
+        const draft = this.agents.registerPathDraft({ name: agent.name, ...runtime, targetId,
+          source: { path: cwd, file: agent.file }, ...(agent.description ? { description: agent.description } : {}) });
+        registered.push({ agentId: draft.agentId, name: draft.name, targetId, file: agent.file });
+      }
+      return { registered, ...this.workbenchAgents() };
+    });
   }
   createWorkbenchAgent(input: unknown) { return this.workbench(async () => ({ draft: this.agents.create(input), ...this.workbenchAgents() })); }
   updateWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ draft: this.agents.update(agentId, input), ...this.workbenchAgents() })); }
@@ -1711,6 +1757,15 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
+        }
+        if (pathname === '/workbench/agents/register-path') {
+          if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
+          if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+          try { return json(res, 200, await gateway.registerWorkbenchAgentPath(await body(req))); }
+          catch (error) {
+            if (error instanceof AgentRegistryError) return json(res, error.code === 'conflict' ? 409 : 400, { error: error.code, message: error.message });
+            throw error;
+          }
         }
         const agentCreate = req.method === 'POST' && pathname === '/workbench/agents';
         const agentChange = /^\/workbench\/agents\/([^/]+)\/(settings|publish)$/.exec(pathname);

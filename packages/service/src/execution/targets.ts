@@ -33,6 +33,10 @@ export const executionTargetBindingSchema = z.object({
   allowedDirectories: z.array(absolutePath).min(1).max(100).optional(),
   allowedPresets: z.array(id).min(1).max(100).optional(),
   flowId: id.optional(), flowVersion: text.optional(), driver: z.literal('ppt_delivery').optional(),
+  // A path agent: an agent_host fixed to cwd and preset whose role is this agents/*.md file inside cwd.
+  agentFile: absolutePath.optional(),
+  // A path agent on a DSH-native preset may fix its model; both are passed together and checked against the host catalog.
+  provider: id.optional(), model: text.optional(),
 }).strict();
 export const executionTargetConfigSchema = z.object({
   targetId: id, kind: z.enum(['agent_host', 'resident_agent', 'workflow']), name: text,
@@ -233,7 +237,16 @@ export class TargetDirectory {
       if (binding.flowId || binding.flowVersion) throw new Error('Agent targets cannot bind a workflow');
       if (target.kind === 'resident_agent' && (!binding.cwd || !binding.agentPreset || !binding.roleId))
         throw new Error('resident_agent requires fixed cwd, agentPreset and roleId');
-      if (target.kind === 'agent_host' && (binding.cwd || binding.agentPreset || binding.roleId || binding.driver))
+      if (binding.agentFile) {
+        if (target.kind !== 'agent_host' || !binding.cwd || !binding.agentPreset || binding.roleId || binding.driver)
+          throw new Error('A path agent is an agent_host with fixed cwd and agentPreset and no roleId or driver');
+        const relative = path.posix.relative(path.posix.normalize(binding.cwd), path.posix.normalize(binding.agentFile));
+        if (!relative || relative.startsWith('../') || relative === '..' || path.posix.isAbsolute(relative) || !relative.endsWith('.md'))
+          throw new Error('agentFile must be a .md file inside cwd');
+        if ((binding.provider === undefined) !== (binding.model === undefined)) throw new Error('provider and model must be fixed together');
+        if (binding.provider && binding.agentPreset.startsWith('oneagents-acp-')) throw new Error('provider and model apply only to DSH-native presets');
+      } else if (binding.provider || binding.model) throw new Error('Only a path agent can fix provider and model');
+      else if (target.kind === 'agent_host' && (binding.cwd || binding.agentPreset || binding.roleId || binding.driver))
         throw new Error('agent_host takes cwd and preset per task, not a fixed role binding');
       if (binding.cwd && binding.allowedDirectories) this.checkDirectory(binding.cwd, binding.allowedDirectories);
       if (binding.agentPreset && binding.allowedPresets && !binding.allowedPresets.includes(binding.agentPreset))
@@ -262,10 +275,12 @@ export class TargetDirectory {
     if (resolvedInput.remote !== undefined || resolvedInput.connectionId !== undefined || resolvedInput.targetId !== undefined)
       throw new Error('Input cannot override target or connection binding');
     let cwd: string | undefined, agentPreset: string | undefined;
-    if (target.kind === 'resident_agent') {
+    if (target.kind === 'resident_agent' || target.binding.agentFile) {
       // Even an identical value is not an allowed caller override; the binding is authoritative.
       if (resolvedInput.cwd !== undefined || resolvedInput.agentPreset !== undefined || resolvedInput.roleId !== undefined || resolvedInput.driver !== undefined)
-        throw new Error('resident_agent input cannot override its fixed cwd, preset, role or driver');
+        throw new Error(`${target.binding.agentFile ? 'A path agent' : 'resident_agent'} input cannot override its fixed cwd, preset, role or driver`);
+      if (target.binding.provider && (resolvedInput.provider !== undefined || resolvedInput.model !== undefined))
+        throw new Error('A path agent input cannot override its fixed provider and model');
       cwd = target.binding.cwd!; agentPreset = target.binding.agentPreset!;
     } else {
       cwd = absolutePath.parse(resolvedInput.cwd);
