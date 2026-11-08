@@ -33,6 +33,27 @@ function isMissingSession(error: unknown, sessionId: string): boolean {
     || value.message === `session "${sessionId}" not found`;
 }
 
+type SessionInspection = { meta: { id: string; cwd?: string; agentPreset?: string } } | null;
+
+/**
+ * Read a Session's identity without resuming it; null when it does not exist.
+ * Current DSH dropped sessionController.inspect, so this observes the stored header through sessionQuery instead.
+ */
+export async function inspectSession(ctx: Context, sessionId: SessionId): Promise<SessionInspection> {
+  if (typeof ctx.sessionController.inspect === 'function') return ctx.sessionController.inspect(sessionId);
+  const live = ctx.sessions?.get?.(sessionId);
+  if (live?.header) return { meta: { id: live.header.id, cwd: live.header.cwd, agentPreset: live.header.agentPreset } };
+  const query = ctx.get('sessionQuery');
+  if (!query) throw new Error('This DSH host offers neither sessionController.inspect nor sessionQuery');
+  let observation;
+  try { observation = await query.observeSession(sessionId, { projectionMode: 'none' }); }
+  catch (error) { if (isMissingSession(error, sessionId)) return null; throw error; }
+  try {
+    const { id, cwd, agentPreset } = observation.header;
+    return { meta: { id, ...(cwd === undefined ? {} : { cwd }), ...(agentPreset === undefined ? {} : { agentPreset }) } };
+  } finally { observation[Symbol.dispose](); }
+}
+
 function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string, diagnostic?: ReturnType<typeof toSafeError>): A2ARunResult {
   switch (reason.kind) {
     case 'completed': return finalAnswerExpected && !text.trim()
@@ -111,7 +132,7 @@ export class DshA2ABackend implements A2ABackend {
 
   async status(target: A2ATarget): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }> {
     if (target.agentPreset?.startsWith('oneagents-acp-') && this.sessions) return this.sessions.status(target.sessionId);
-    const found = await this.ctx.sessionController.inspect(target.sessionId as SessionId).catch(() => null);
+    const found = await inspectSession(this.ctx, target.sessionId as SessionId).catch(() => null);
     return { attached: found != null, activeTurn: false };
   }
 
@@ -131,10 +152,10 @@ export class DshA2ABackend implements A2ABackend {
   async prepare(input: A2APrepareInput, options?: { signal: AbortSignal }): Promise<A2ATarget> {
     const signal = options?.signal;
     signal?.throwIfAborted();
-    let previous: Awaited<ReturnType<Context['sessionController']['inspect']>> | undefined;
+    let previous: SessionInspection | undefined;
     if (input.sessionId !== undefined) {
       try {
-        previous = await this.ctx.sessionController.inspect(input.sessionId as SessionId);
+        previous = await inspectSession(this.ctx, input.sessionId as SessionId);
       } catch (error) {
         if (isMissingSession(error, input.sessionId)) throw sessionError('SESSION_NOT_FOUND', `Session ${input.sessionId} not found`);
         throw error;
@@ -202,8 +223,16 @@ export class DshA2ABackend implements A2ABackend {
   /** Install the requested model before the first prompt and return what DSH resolved. Omitted fields leave the session unchanged. */
   private async selectModel(input: A2APrepareInput, sessionId: SessionId, signal?: AbortSignal): Promise<{ provider?: string; model?: string }> {
     if (input.provider === undefined || input.model === undefined) return {};
-    let selected;
-    try { ({ selected } = await this.ctx.sessionController.selectModel({ sessionId, provider: input.provider, model: input.model })); }
+    let selected: { provider: string; model: string } = { provider: input.provider, model: input.model };
+    try {
+      const agent = await this.agent(sessionId);
+      // sessionController.selectModel also saves the choice as the host's default model.
+      // A task only chooses for its own session, so current DSH selects on the agent directly.
+      if (typeof agent.model?.select === 'function') {
+        await this.ctx.llm.resolveCallConfig?.(selected);
+        agent.model.select(selected);
+      } else ({ selected } = await this.ctx.sessionController.selectModel({ sessionId, ...selected }));
+    }
     catch (error) { throw Object.assign(sessionError('MODEL_UNAVAILABLE', `DSH did not select ${input.provider}/${input.model}`), { cause: error }); }
     signal?.throwIfAborted();
     return { provider: selected.provider, model: selected.model };
