@@ -604,8 +604,8 @@ test('a registered path turns each agents/*.md into a developing draft with a fi
   const response = await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'grok-build', connectionId: 'remote:fixture' }));
   assert.equal(response.status, 200);
   const body = await response.json() as any;
-  assert.deepEqual(body.registered.map((item: any) => item.name), ['restore-executor', 'restore-qa']);
-  const executor = body.developing.find((row: any) => row.name === 'restore-executor');
+  assert.deepEqual(body.registered.map((item: any) => item.name), ['restore-executor@grok-build', 'restore-qa@grok-build']);
+  const executor = body.developing.find((row: any) => row.name === 'restore-executor@grok-build');
   assert.equal(executor.acpAgent, 'grok-build');
   assert.equal(executor.description, '还原轨迹');
   assert.equal(executor.source.path, real);
@@ -613,12 +613,17 @@ test('a registered path turns each agents/*.md into a developing draft with a fi
   assert.equal(target.kind, 'agent_host');
   assert.deepEqual(target.binding, { cwd: real, agentPreset: 'oneagents-acp-grok-build', agentFile: join(real, 'agents', 'restore-executor.md') });
 
-  // Registering again refreshes the same draft and target instead of adding new ones.
-  const again = await (await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'codex', connectionId: 'remote:fixture' }))).json() as any;
+  // The same runtime refreshes its draft and target; another runtime gets its own pair beside them.
+  const again = await (await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'grok-build', connectionId: 'remote:fixture' }))).json() as any;
   assert.equal(again.developing.length, 2);
-  assert.equal(again.developing.find((row: any) => row.name === 'restore-executor').agentId, executor.agentId);
-  assert.equal(f.gateway.targets.getTarget(executor.targetId).binding.agentPreset, 'oneagents-acp-codex');
-  assert.equal(f.gateway.targets.listTargets().filter(item => item.binding.agentFile).length, 2);
+  assert.equal(again.developing.find((row: any) => row.name === 'restore-executor@grok-build').agentId, executor.agentId);
+  const codex = await (await f.request('/workbench/agents/register-path', post({ path: scenario, acpAgent: 'codex', connectionId: 'remote:fixture' }))).json() as any;
+  assert.equal(codex.developing.length, 4);
+  const codexExecutor = codex.developing.find((row: any) => row.name === 'restore-executor@codex');
+  assert.notEqual(codexExecutor.targetId, executor.targetId);
+  assert.equal(f.gateway.targets.getTarget(codexExecutor.targetId).binding.agentPreset, 'oneagents-acp-codex');
+  assert.equal(f.gateway.targets.getTarget(executor.targetId).binding.agentPreset, 'oneagents-acp-grok-build');
+  assert.equal(f.gateway.targets.listTargets().filter(item => item.binding.agentFile).length, 4);
 
   // Dispatch sends the fixed cwd, preset and agent file; a caller cannot point the role elsewhere.
   let sent: any;
@@ -627,15 +632,16 @@ test('a registered path turns each agents/*.md into a developing draft with a fi
     sent = request;
     return Task.fromJSON({ id: 'path-agent-task', contextId: 'path-agent-context', status: { state: 'TASK_STATE_WORKING' } });
   } });
-  await assert.rejects(f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: executor.targetId,
+  await assert.rejects(f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: codexExecutor.targetId,
     input: { cwd: f.root, prompt: '还原这份轨迹' } }), /cannot override/);
-  await f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: executor.targetId, input: { prompt: '还原这份轨迹' } });
+  await f.gateway.invoke('execution_submit', { originSessionId: 'allowed-root', targetId: codexExecutor.targetId, input: { prompt: '还原这份轨迹' } });
   const metadata = sent.metadata['1agents'];
   assert.equal(metadata.cwd, real);
   assert.equal(metadata.agentPreset, 'oneagents-acp-codex');
   assert.equal(metadata.agentFile, join(real, 'agents', 'restore-executor.md'));
   const after = await (await f.request('/workbench/agents')).json() as any;
-  assert.equal(after.developing.find((row: any) => row.agentId === executor.agentId).taskCount, 1);
+  assert.equal(after.developing.find((row: any) => row.agentId === codexExecutor.agentId).taskCount, 1);
+  assert.equal(after.developing.find((row: any) => row.agentId === executor.agentId).taskCount, 0);
 });
 
 test('a path can register on a DSH-native preset with a fixed model', async t => {
@@ -652,7 +658,7 @@ test('a path can register on a DSH-native preset with a fixed model', async t =>
     assert.equal((await register(invalid)).status, 400, JSON.stringify(invalid));
   }
   const body = await (await register({ agentPreset: 'standard', provider: 'minimax-cn', model: 'MiniMax-M3.1-Flash' })).json() as any;
-  const row = body.developing.find((item: any) => item.name === 'restore-qa');
+  const row = body.developing.find((item: any) => item.name === 'restore-qa@standard');
   assert.equal(row.acpAgent, undefined);
   assert.equal(row.agentPreset, 'standard');
   assert.equal(`${row.provider}/${row.model}`, 'minimax-cn/MiniMax-M3.1-Flash');
@@ -672,11 +678,12 @@ test('a path can register on a DSH-native preset with a fixed model', async t =>
   assert.deepEqual([metadata.cwd, metadata.agentPreset, metadata.agentFile, metadata.provider, metadata.model],
     [real, 'standard', join(real, 'agents', 'restore-qa.md'), 'minimax-cn', 'MiniMax-M3.1-Flash']);
 
-  // Switching the path back to an ACP agent drops the fixed model from the same draft and target.
-  const back = await (await register({ acpAgent: 'grok-build' })).json() as any;
-  const again = back.developing.find((item: any) => item.name === 'restore-qa');
-  assert.equal(again.agentId, row.agentId);
-  assert.equal(again.provider, undefined);
-  assert.equal(again.agentPreset, undefined);
-  assert.equal(f.gateway.targets.getTarget(row.targetId).binding.provider, undefined);
+  // Registering grok beside it leaves the native draft and its fixed model as they were.
+  const both = await (await register({ acpAgent: 'grok-build' })).json() as any;
+  assert.deepEqual(both.developing.map((item: any) => item.name).sort(), ['restore-qa@grok-build', 'restore-qa@standard']);
+  assert.equal(f.gateway.targets.getTarget(row.targetId).binding.model, 'MiniMax-M3.1-Flash');
+  // A new model on the same preset updates that draft rather than adding one.
+  const remodel = await (await register({ agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-chat' })).json() as any;
+  assert.equal(remodel.developing.length, 2);
+  assert.equal(remodel.developing.find((item: any) => item.agentId === row.agentId).model, 'deepseek-chat');
 });

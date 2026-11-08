@@ -1270,7 +1270,9 @@ export class RemoteAgentGateway {
   }
   /**
    * Register every agents/*.md under a directory as a developing draft with its own path-agent target: cwd and preset
-   * fixed to that directory and ACP agent, the file as the role. Registering again refreshes the same drafts and targets.
+   * fixed to that directory and runtime, the file as the role. Each runtime (an ACP agent or a DSH-native preset) gets
+   * its own draft `<name>@<runtime>` and target, so one directory can run on several. Registering the same runtime again
+   * refreshes its drafts and targets.
    * The file is read here for its name and again by the execution host at dispatch, so both must see the same path.
    */
   registerWorkbenchAgentPath(input: unknown) {
@@ -1292,17 +1294,18 @@ export class RemoteAgentGateway {
       if (!connection?.enabled || connection.provider !== 'a2a') throw new AgentRegistryError('Unknown or disabled A2A connection', 'invalid');
       const cwd = realpathSync(parsed.data.path), scope = createHash('sha256').update(cwd).digest('hex').slice(0, 8);
       const { acpAgent, provider, model } = parsed.data, agentPreset = acpAgent ? `oneagents-acp-${acpAgent}` : parsed.data.agentPreset!;
-      const runtime = acpAgent ? { acpAgent } : { agentPreset, ...(provider ? { provider, model: model! } : {}) }, registered = [];
+      const runtime = acpAgent ? { acpAgent } : { agentPreset, ...(provider ? { provider, model: model! } : {}) }, runtimeKey = acpAgent ?? agentPreset, registered = [];
       for (const agent of agents) {
-        const targetId = `path:${scope}:${agent.name}`, binding = { cwd, agentPreset, agentFile: agent.file, ...(provider ? { provider, model } : {}) };
-        const fields = { kind: 'agent_host' as const, name: `${path.basename(cwd)}/${agent.name}`, connectionId: connection.connectionId,
+        // An existing draft keeps its target, including one registered before targets carried the runtime.
+        const targetId = this.agents.pathDraft(agent.file, runtimeKey)?.targetId ?? `path:${scope}:${runtimeKey}:${agent.name}`, binding = { cwd, agentPreset, agentFile: agent.file, ...(provider ? { provider, model } : {}) };
+        const fields = { kind: 'agent_host' as const, name: `${path.basename(cwd)}/${agent.name}@${runtimeKey}`, connectionId: connection.connectionId,
           ...(agent.description ? { description: agent.description } : {}), binding };
         const existing = this.targets.listTargets().find(item => item.targetId === targetId);
         try {
           if (existing) this.targets.invoke('execution_target_update', { targetId, patch: { ...fields, ...(existing.description && !agent.description ? { description: existing.description } : {}) } });
           else this.targets.invoke('execution_target_create', { targetId, ...fields });
         } catch (error) { throw new AgentRegistryError(error instanceof Error ? error.message : String(error), 'invalid'); }
-        const draft = this.agents.registerPathDraft({ name: agent.name, ...runtime, targetId,
+        const draft = this.agents.registerPathDraft({ name: `${agent.name}@${runtimeKey}`, ...runtime, targetId,
           source: { path: cwd, file: agent.file }, ...(agent.description ? { description: agent.description } : {}) });
         registered.push({ agentId: draft.agentId, name: draft.name, targetId, file: agent.file });
       }

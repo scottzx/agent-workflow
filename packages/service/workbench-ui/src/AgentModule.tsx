@@ -224,8 +224,8 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                             <h3>{text('按路径登记', 'Register a path')}</h3>
                             <p class="acp-muted">
                                 {text(
-                                    '读取这个目录下的 agents/*.md，每个文件登记成一个开发中的智能体，工作目录就是这个目录。再登记一次会按文件更新原有记录。',
-                                    'Each agents/*.md under the directory becomes a developing agent that runs in that directory. Registering again updates the same records.'
+                                    '读取这个目录下的 agents/*.md，每个文件登记成一个开发中的智能体，名字是“文件名@运行方式”，工作目录就是这个目录。同一个目录可以分别登记 grok、DSH 原生等多种运行方式；同一种运行方式再登记一次会更新原有记录。',
+                                    'Each agents/*.md under the directory becomes a developing agent named name@runtime that runs in that directory. One directory can be registered on several runtimes; registering the same runtime again updates its records.'
                                 )}
                             </p>
                             <label>

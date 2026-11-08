@@ -229,16 +229,23 @@ export class AgentRegistry {
       releases: [...this.state.releases.filter(item => item.releaseName !== parsed.releaseName), release] });
     return structuredClone(release);
   }
+  /** The draft registered from this agents/*.md file for this runtime: an ACP agent name or a DSH-native preset. */
+  pathDraft(file: string, runtime: string): AgentDraft | undefined {
+    const found = this.state.drafts.find(item => item.source?.file === file && (item.acpAgent ?? item.agentPreset) === runtime);
+    return found && structuredClone(found);
+  }
   /**
-   * Create or refresh the draft for one agents/*.md file. The file identifies the draft, so registering the same
-   * path again updates it in place and keeps its tasks; a different draft already using the name is a conflict.
+   * Create or refresh the draft for one agents/*.md file on one runtime. The file and runtime identify the draft, so
+   * registering the same path again updates it in place and keeps its tasks, while another runtime gets its own draft.
+   * A different draft already using the name is a conflict.
    */
   registerPathDraft(input: { name: string; targetId: string; source: AgentSource; description?: string; acpAgent?: string; agentPreset?: string; provider?: string; model?: string }): AgentDraft {
     const parsed = this.parse(z.object({ name: callName, targetId, source: agentSourceSchema, description: description.optional(),
       acpAgent: acpAgentName.optional(), agentPreset: targetId.optional(), provider: targetId.optional(), model: optionValue.optional() }).strict()
       .refine(value => (value.acpAgent === undefined) !== (value.agentPreset === undefined) && (value.provider === undefined) === (value.model === undefined)
         && !(value.acpAgent && value.provider), 'Name either an ACP agent or a DSH-native preset'), input);
-    const current = this.state.drafts.find(item => item.source?.file === parsed.source.file);
+    const runtime = parsed.acpAgent ?? parsed.agentPreset;
+    const current = this.state.drafts.find(item => item.source?.file === parsed.source.file && (item.acpAgent ?? item.agentPreset) === runtime);
     if (this.state.drafts.some(item => item !== current && item.name === parsed.name)) throw new AgentRegistryError(`An agent draft named "${parsed.name}" already exists`, 'conflict');
     const { acpAgent: _acp, agentPreset: _preset, provider: _provider, model: _model, description: _description, ...kept } = current ?? { agentId: `agt-${randomUUID()}`, options: [] };
     const next: AgentDraft = { ...kept, name: parsed.name, targetId: parsed.targetId, source: parsed.source, updatedAt: new Date().toISOString(),
