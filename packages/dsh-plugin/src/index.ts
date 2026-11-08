@@ -12,6 +12,7 @@ import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
 import { mountDshA2A, type DshA2AOptions } from './a2a.js';
 import { createWorkbenchProcessClient } from './process-requests.js';
+import { selectAcpRoute } from './preset-route.js';
 import { registerNativeApprovals } from './native-approvals.js';
 import type {} from '@deepseek-ai/dsh-tools';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -86,6 +87,12 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     });
     ctx.effect(() => dispose);
   }
+  // A preset chosen on a session that is already running is composed onto its
+  // live agent instead of creating one, so the route the preset proposes is
+  // never recorded and the next step rejects it. Record it here.
+  ctx.on('agent-preset/selected', (sessionId: SessionId, agentPreset: string) => {
+    void selectAcpRoute(ctx, sessionId, agentPreset, presets.map(preset => preset.id));
+  });
   if (input.a2a) {
     const review = await ReviewHandBack.open(join(home, 'plugins', '1agents-acp', 'review.secret'), input.a2a.workbench);
     ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: WORKBENCH_UI_PATH, handler: workbenchHandler(ctx, { workbench: input.a2a!.workbench, host: () => review.host }) }));
