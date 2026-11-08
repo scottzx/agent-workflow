@@ -78,6 +78,21 @@ test('DSH serves the workbench page framed by itself and forwards only owner bro
   assert.equal((await fetch(`${dsh}/workbench/ui/api/dsh/tasks/local-task`)).status, 401);
 });
 
+test('a host without the shared page relay secret forwards no relay header, so the gateway can tell a page from an agent', async t => {
+  const gw = await gateway(t);
+  const ctx = {
+    connection: { admit: req => req.headers.cookie === 'dsh=owner' ? { peer: { principal: { kind: 'owner' } } } : { rejection: 401 } },
+    sessionController: { inspect: async () => null },
+  };
+  const dsh = await listen(t, workbenchHandler(ctx, { workbench: { url: `${gw.origin}/ignored-path`, token: 'gw-token' }, host: () => undefined }));
+  const write = { cookie: 'dsh=owner', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
+
+  const decide = await fetch(`${dsh}/workbench/ui/api/tasks/j/reviews/r/decisions`, { method: 'POST', headers: write, body: '{"action":"approve"}' });
+  assert.equal(decide.status, 200);
+  assert.equal(gw.seen.at(-1).authorization, 'Bearer gw-token');
+  assert.equal(gw.seen.at(-1).relay, undefined, 'without the shared secret the gateway refuses the page-only route');
+});
+
 test('an ACP agent hands its session back through the stdio MCP server, bound to that session only', async t => {
   const gw = await gateway(t);
   const directory = await mkdtemp(join(tmpdir(), 'review-'));
