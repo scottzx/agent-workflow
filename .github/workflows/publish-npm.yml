@@ -1,0 +1,48 @@
+name: Publish npm
+# Publishes the tarball that push CI built for this exact main commit, using npm trusted publishing (OIDC).
+# No npm token is stored or passed: npmjs.com must list scottzx/agent-workflow + publish-npm.yml as a
+# trusted publisher of @1agents/acp-service. Provenance is attached by npm automatically.
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Optional successful main CI run ID (must match this commit)
+        type: string
+        default: ''
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      # No registry-url: setup-node would write a token-based .npmrc, and npm must exchange the OIDC token instead.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Use an npm with trusted publishing
+        run: npm install -g npm@11.6.2 && npm --version
+      - name: Resolve successful CI for this exact commit
+        id: ci
+        run: node scripts/resolve-release-ci.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: service-package
+          path: release
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.ci.outputs.run-id }}
+      - name: Verify and publish the unified CI tarball
+        run: node scripts/publish-packages.mjs

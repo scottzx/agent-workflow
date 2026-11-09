@@ -38,14 +38,14 @@ pnpm build && pnpm test
 Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.9.0
+dsh plugin --profile web add @1agents/acp-service@^0.10.0
 ```
 
 Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, then create a session with an **ACP · Agent** preset and an existing workspace. The plugin starts or reuses its local ACP service automatically. Replace `web` with your profile name; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-The current npm release is `0.9.0`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+The current npm release is `0.10.0`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
 dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
@@ -70,7 +70,7 @@ The plugin currently accepts text prompts. Available controls depend on the sele
 ## Standalone CLI
 
 ```sh
-npm install -g @1agents/acp-service@^0.9.0
+npm install -g @1agents/acp-service@^0.10.0
 acp-service --help
 acp-service serve --host 127.0.0.1 --port 36812 --no-report
 ```
@@ -81,7 +81,17 @@ The runtime and service can be used outside DSH. Installing the npm package star
 
 One published package contains the runtime, CLI, service and DSH plugin. The upstream runtime and DSH plugin remain private source modules in one repository with one pnpm lockfile. The DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
 
-Project-owned roles, skill caches, workspaces and runtime state live under [`.1agents/`](.1agents/README.md). Role definitions and public examples are tracked; local data and credentials are excluded from Git.
+Project-owned roles, workspaces and runtime state live under [`.1agents/`](.1agents/README.md). Role definitions and public examples are tracked; local data and credentials are excluded from Git.
+
+### Roles and skills
+
+A resident role is a profile (`ROLE.md` plus the skill names it needs) and a fixed target that runs it in a working directory. The skills sit in that directory, where the agent runtimes already look: `<cwd>/.agents/skills/<name>/` for DSH and Codex, and `<cwd>/.claude/skills` for Claude Code, which the host links to `.agents/skills`. Before the model starts, the host checks that every named skill is present and prefixes the first message with the role text and each skill's `SKILL.md` path. Nothing is downloaded, cached or pinned: a continuation reads the directory as it is, and acceptance checks guard against drift. Copy skills into a role's directory, assets included, with:
+
+```sh
+acp-service roles sync --profile .1agents/roles/<role>/profile.json --cwd <workspace> --source <distribution-dir>
+```
+
+A fixed target runs on the `standard` preset unless its binding names another. A model is optional: a target may set a default `provider`/`model`, and each task may pass its own for that task only. Change a target's defaults with `execution_target_update`, or keep it and make a copy with different defaults with `execution_target_fork`.
 
 | Directory             | npm package            | Responsibility                                                               |
 | --------------------- | ---------------------- | ---------------------------------------------------------------------------- |
@@ -115,7 +125,11 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 ## Package releases
 
-Only `@1agents/acp-service` is published. Version 0.7.0 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
+Only `@1agents/acp-service` is published.
+
+Version 0.10.0 loads role skills from the session's working directory instead of downloading and pinning them (see [Roles and skills](#roles-and-skills)), runs fixed roles on the `standard` preset with optional per-task models, adds `execution_target_fork`, and lets a path agent be combined with a host role. It is a breaking release: the role lock and cache are gone, together with `roleLockPath`, `roleSkills.cacheRoot`, the profile `network`/`sourceId`/`skillId`/`nodeUrl`/`assetsManifest` fields and `binding.skillPolicy` (now `binding.loadRole: true`). Contexts saved with a lock no longer load. See [changelog/2026-11-09.md](changelog/2026-11-09.md).
+
+Version 0.7.0 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
 
 Version 0.7.0 adds [Activepieces scheduled tasks](docs/activepieces-automation.md) through the existing A2A gateway, with durable occurrence admission, result claims and acknowledgement. Codex commentary stays in DSH execution logs while A2A reports contain the final answer; explicit empty answers survive replay. The [scheduled-chain verification](docs/activepieces-final-answer-proof.json) records the completed WSL deployment test.
 
@@ -125,19 +139,19 @@ Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasonin
 
 ```sh
 # Ordinary CLI installation:
-npm install -g @1agents/acp-service@^0.9.0
+npm install -g @1agents/acp-service@^0.10.0
 acp-service --help
 # DSH installation (run from its checkout):
-pnpm dsh plugin --profile web add @1agents/acp-service@^0.9.0
+pnpm dsh plugin --profile web add @1agents/acp-service@^0.10.0
 ```
 
 The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.
 
 Push CI builds each source module once and packs the unified release package once, after service and plugin checks. Runtime integration tests run in four disjoint lanes; remaining tests, viewer, coverage and Python Autoreview run independently. Fixed-ref DSH build outputs are cached by ref, lockfile, OS, architecture and Node version. CI installs the tarball outside the workspace and verifies the CLI, runtime flows and service, then uses the real DSH profile reader, Cordis Loader and client registry to check plugin startup, browser discovery and cleanup.
 
-Run the root **Release** workflow on `main`. It locates successful push CI for the exact commit, waits if that CI is running, and downloads its single existing tarball. The optional `ci_run_id` pins the source run; SHA, repository, workflow, branch and success are verified. Release performs no install, build or test. If matching CI is absent or artifacts have expired, run CI first.
+Run the root **Publish npm** workflow (`publish-npm.yml`) on `main`. It locates successful push CI for the exact commit, waits if that CI is running, and downloads its single existing tarball. The optional `ci_run_id` pins the source run; SHA, repository, workflow, branch and success are verified. It performs no install, build or test. If matching CI is absent or artifacts have expired, run CI first.
 
-Release checks artifact SHA/checksum, manifests, dependencies, runtime and DSH entrypoints, then publishes via `NPM_TOKEN`. Retry Release on the same commit after a publish or registry error: it reuses the CI tarball and skips an already published version only after verifying its contents and permissions. Registry propagation retries are bounded to eight attempts with five-second intervals. Changed published contents require a version bump.
+The workflow checks artifact SHA/checksum, manifests, dependencies, runtime and DSH entrypoints, then publishes with npm trusted publishing: GitHub's OIDC token is exchanged for a short-lived publish credential, so no npm token is stored in the repository, and npm attaches provenance. This requires `scottzx/agent-workflow` with workflow `publish-npm.yml` to be registered as a trusted publisher of `@1agents/acp-service` on npmjs.com. Retry on the same commit after a publish or registry error: it reuses the CI tarball and skips an already published version only after verifying its contents and permissions. Registry propagation retries are bounded to eight attempts with five-second intervals. Changed published contents require a version bump. After publishing, the workflow pushes the `acp-service-v<version>` tag.
 
 For local packaging, build first, then run `pnpm run pack` from this root. Packing checks existing outputs and never rebuilds them. To verify the resulting package:
 
