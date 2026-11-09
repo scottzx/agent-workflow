@@ -1,7 +1,7 @@
 {
   "version": "ppt-delivery-v1",
-  "workspaceRoot": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace/jobs",
-  "publicDirectory": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace/artifacts",
+  "workspaceRoot": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace/jobs",
+  "publicDirectory": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace/artifacts",
   "publicBaseUrl": "http://100.88.227.56:36818/artifacts",
   "allowedProjectRoots": [
     "/Users/scott/Documents/01-开发项目/1agents"
@@ -14,8 +14,8 @@
     "ppt_production": "ppt-beautifier-backup"
   },
   "maxTargetSwitches": 1,
-  "runtimeDocument": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace/RUNTIME.md",
-  "designSkill": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/skills/ppt/ppt-report-design/SKILL.md",
+  "runtimeDocument": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace/RUNTIME.md",
+  "designSkill": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace/.agents/skills/ppt-report-design/SKILL.md",
   "pythonExecutable": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
   "nodeExecutable": "/Users/scott/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
   "nodeModuleRoot": "/Users/scott/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules",
@@ -24,7 +24,7 @@
   "maxDurationMs": 5400000,
   "httpTimeoutMs": 15000,
   "roleSkills": {
-    "profilePath": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/roles/ppt-beautifier/profile.json",
-    "cacheRoot": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/cache/roles"
+    "profilePath": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/roles/ppt-beautifier/profile.json",
+    "cacheRoot": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/cache/roles"
   }
 }
