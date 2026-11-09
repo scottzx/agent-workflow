@@ -29,7 +29,8 @@ export const executionConnectionSchema = executionConnectionConfigSchema.extend(
 export const executionTargetBindingSchema = z.object({
   remote: id.optional(), cwd: absolutePath.optional(), agentPreset: id.optional(),
   roleId: id.optional(), skillRefs: z.array(text).max(100).optional(),
-  skillPolicy: z.literal('network_pinned').optional(),
+  // Forward roleId to the host so it loads that role and the skills in cwd/.agents/skills. Without it roleId is only a label.
+  loadRole: z.literal(true).optional(),
   allowedDirectories: z.array(absolutePath).min(1).max(100).optional(),
   allowedPresets: z.array(id).min(1).max(100).optional(),
   flowId: id.optional(), flowVersion: text.optional(), driver: z.literal('ppt_delivery').optional(),

@@ -1,15 +1,14 @@
 /** Official A2A executor with durable DSH context bindings and independent turns. */
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { Role, Task, TaskState, Message, type SendMessageRequest } from '@a2a-js/sdk';
 import { ContentTypeNotSupportedError, RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import { AgentEvent, type AgentExecutor, type ExecutionEventBus, type RequestContext, resolveUserScope } from '@a2a-js/sdk/server';
 import { a2aRequestId } from './request-id.js';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import type { FileA2AStore } from './store.js';
-import { a2aRoleSkillsSchema, type A2ABackend, type A2APrepareInput, type A2ARoleSkills, type A2ARunResult, type A2ATarget } from './types.js';
-import { resolveRoleSkills, type RoleSkillLock } from '../roles/index.js';
+import { type A2ABackend, type A2APrepareInput, type A2ARoleSkills, type A2ARunResult, type A2ATarget } from './types.js';
+import { loadRoleSkills } from '../roles/index.js';
 import { agentPromptPrefix, readAgentFile } from '../execution/agent-files.js';
 import { A2APreflightError, a2aPreflightRequirementsSchema } from './preflight.js';
 import { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetadata, saveA2AResultMetadata,
@@ -34,8 +33,8 @@ export interface A2AExecutionOptions {
   defaultCwd?: string;
   defaultAgentPreset?: string;
   workspaces?: Record<string, string>;
-  /** Profiles and the writable cache root are controlled by the execution host. */
-  roleSkills?: { cacheRoot: string; profiles: Record<string, string>;
+  /** Role profiles are controlled by the execution host; the skills themselves are read from the session's `.agents/skills`. */
+  roleSkills?: { profiles: Record<string, string>;
     /** Optional compatibility binding for fresh fixed-preset contexts only. */
     presetRoles?: Record<string, string> };
 }
@@ -45,10 +44,9 @@ export function validateA2AExecutionOptions(options: A2AExecutionOptions): void 
   new CapacityGovernor(options.capacity);
   const roles = options.roleSkills;
   if (roles === undefined) return;
-  if (!roles || typeof roles !== 'object' || typeof roles.cacheRoot !== 'string' || !isAbsolute(roles.cacheRoot) || roles.cacheRoot.includes('\0')
-      || !roles.profiles || typeof roles.profiles !== 'object' || Array.isArray(roles.profiles)
+  if (!roles || typeof roles !== 'object' || !roles.profiles || typeof roles.profiles !== 'object' || Array.isArray(roles.profiles)
       || Object.entries(roles.profiles).some(([id, path]) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(id)
-        || typeof path !== 'string' || !isAbsolute(path) || path.includes('\0'))) throw new Error('Role skills require host-owned absolute cache and profile paths');
+        || typeof path !== 'string' || !isAbsolute(path) || path.includes('\0'))) throw new Error('Role skills require host-owned absolute profile paths');
   if (roles.presetRoles !== undefined && (!roles.presetRoles || typeof roles.presetRoles !== 'object' || Array.isArray(roles.presetRoles)
       || Object.entries(roles.presetRoles).some(([preset, roleId]) => !preset.trim() || preset.length > 256 || preset.includes('\0')
         || typeof roleId !== 'string' || !Object.hasOwn(roles.profiles, roleId)))) throw new Error('Role preset bindings must reference registered host profiles');
@@ -102,17 +100,15 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   const metadata: unknown = request.metadata?.['1agents'];
   if (metadata !== undefined && (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))) throw new RequestMalformedError('metadata.1agents must be an object');
   const value = (metadata ?? {}) as Record<string, unknown>;
-  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'roleLockPath', 'agentFile', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
-  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'roleLockPath', 'agentFile', 'provider', 'model']) {
+  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'agentFile', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
+  for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'agentFile', 'provider', 'model']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !(value[key] as string).trim())) throw new RequestMalformedError(`${key} must be a nonempty string`);
   }
   if ((value.provider === undefined) !== (value.model === undefined)) throw new RequestMalformedError('provider and model must be passed together');
   if (value.roleId !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value.roleId as string)
       || !options.roleSkills || !Object.hasOwn(options.roleSkills.profiles, value.roleId as string))) throw new RequestMalformedError('Unknown host role');
-  if (value.roleLockPath !== undefined && (!options.roleSkills || !isAbsolute(value.roleLockPath as string)
-      || (value.roleLockPath as string).includes('\0'))) throw new RequestMalformedError('Invalid role lock path');
   if (value.agentFile !== undefined && (!isAbsolute(value.agentFile as string) || (value.agentFile as string).includes('\0')
-      || value.roleId !== undefined || value.roleLockPath !== undefined)) throw new RequestMalformedError('agentFile must be an absolute path and cannot be combined with a host role');
+      )) throw new RequestMalformedError('agentFile must be an absolute path');
   if (value.cwd && value.workspace) throw new RequestMalformedError('Use cwd or workspace, not both');
   let cwd = value.cwd as string | undefined;
   if (value.workspace) {
@@ -127,7 +123,6 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   return { prompt, input: { cwd, agentPreset: value.agentPreset as string | undefined,
     ...(preflight?.success ? { preflight: preflight.data } : {}),
     ...(value.roleId ? { roleId: value.roleId as string } : {}),
-    ...(value.roleLockPath ? { roleLockPath: value.roleLockPath as string } : {}),
     ...(value.agentFile ? { agentFile: value.agentFile as string } : {}),
     ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}) },
     ...(resultContract?.success ? { resultContract: resultContract.data } : {}),
@@ -167,41 +162,22 @@ export class A2ASessionExecutor implements AgentExecutor {
     return preset && bindings && Object.hasOwn(bindings, preset) ? bindings[preset] : undefined;
   }
 
-  private async roleFor(input: A2APrepareInput, saved: A2ATarget | undefined, contextKey: string, signal: AbortSignal): Promise<{ roleId: string; summary: A2ARoleSkills; promptPrefix: string } | undefined> {
+  private async roleFor(input: A2APrepareInput, saved: A2ATarget | undefined): Promise<{ roleId: string; summary: A2ARoleSkills; promptPrefix: string } | undefined> {
     const roleId = this.roleIdFor(input, saved);
-    if (!roleId) {
-      if (input.roleLockPath) throw new Error('A role lock requires a role identity');
-      return undefined;
-    }
+    if (!roleId) return undefined;
     if (saved && (!saved.roleSkills || saved.roleId !== roleId)) throw new Error('An existing context cannot change its role');
     const configuration = this.options.roleSkills;
     if (!configuration || !Object.hasOwn(configuration.profiles, roleId)) throw new Error('The saved role is no longer configured on this host');
-    await mkdir(join(configuration.cacheRoot, 'locks'), { recursive: true, mode: 0o700 });
-    const lockRootInfo = await lstat(join(configuration.cacheRoot, 'locks'));
-    if (!lockRootInfo.isDirectory() || lockRootInfo.isSymbolicLink()) throw new Error('The host role locks directory must be a real directory');
-    const lockRoot = await realpath(join(configuration.cacheRoot, 'locks'));
-    const existingPath = saved?.roleSkills?.lockPath ?? input.roleLockPath;
-    let lockPath: string;
-    if (existingPath) {
-      const info = await lstat(existingPath);
-      const actual = await realpath(existingPath), tail = relative(lockRoot, actual);
-      if (!info.isFile() || info.isSymbolicLink() || tail === '' || tail === '..' || tail.startsWith(`..${sep}`) || isAbsolute(tail)) throw new Error('Role lock must be an existing regular file inside the host locks directory');
-      // Preserve a saved summary byte-for-byte when a migrated cache retains
-      // the old root as a compatible alias. Fresh contexts use canonical paths.
-      lockPath = saved?.roleSkills?.lockPath ?? actual;
-      if (saved?.roleSkills && input.roleLockPath && await realpath(input.roleLockPath) !== actual) throw new Error('An existing context cannot change its role lock');
-    } else {
-      lockPath = join(lockRoot, `a2a-${createHash('sha256').update(contextKey).digest('hex')}.json`);
-    }
-    const lock: RoleSkillLock = await resolveRoleSkills({ profilePath: configuration.profiles[roleId], cacheRoot: configuration.cacheRoot, lockPath, signal });
-    const summary = a2aRoleSkillsSchema.parse({ roleId: lock.roleId, roleVersion: lock.roleVersion, lockPath,
-      roleDirectory: lock.roleDirectory, ...(lock.entryGuidePath ? { entryGuidePath: lock.entryGuidePath } : {}),
-      skills: lock.skills.map(({ key, skillId, sourceId, name, revision, directory, guidePath }) => ({ key, skillId, sourceId, name, revision, directory, guidePath })) });
-    if (saved?.roleSkills && JSON.stringify(saved.roleSkills) !== JSON.stringify(summary)) throw new Error('Saved role skill identity differs from its verified lock');
-    const instructions = lock.instructionsPath ? await readFile(lock.instructionsPath, 'utf8') : '';
-    if (Buffer.byteLength(instructions) > 65536) throw new Error('Role instructions exceed the host prompt budget');
-    const guides = summary.skills.map(skill => `- ${skill.key}: ${skill.guidePath} (revision=${skill.revision})`).join('\n');
-    return { roleId, summary, promptPrefix: `宿主已加载角色 ${roleId}，本任务技能锁：${lockPath}。仅使用此锁及下列缓存技能，不重新检索或切换版本；续派和恢复沿用同一锁。先读取适用指南及其配套资源。\n${guides}\n${instructions}\n\n上游任务：\n` };
+    const cwd = input.cwd ?? saved?.cwd ?? this.options.defaultCwd;
+    if (!cwd) throw new Error('A role needs a working directory that holds its skills');
+    // Skills are read from the working directory as they are; a continuation sees the current files, not a pinned copy.
+    const loaded = await loadRoleSkills({ profilePath: configuration.profiles[roleId], cwd });
+    const summary: A2ARoleSkills = { roleId: loaded.roleId, roleVersion: loaded.roleVersion, roleDirectory: loaded.roleDirectory,
+      ...(loaded.entryGuidePath ? { entryGuidePath: loaded.entryGuidePath } : {}),
+      skills: loaded.skills.map(({ key, name, directory, guidePath }) => ({ key, name, directory, guidePath })) };
+    if (Buffer.byteLength(loaded.instructions) > 65536) throw new Error('Role instructions exceed the host prompt budget');
+    const guides = summary.skills.map(skill => `- ${skill.key}: ${skill.guidePath}`).join('\n');
+    return { roleId, summary, promptPrefix: `宿主已加载角色 ${roleId}。本会话工作目录 ${cwd} 的 .agents/skills 提供下列技能，先读取适用指南及其配套资源；不要重新检索或安装技能。\n${guides}\n${loaded.instructions}\n\n上游任务：\n` };
   }
 
   isRunning(taskId: string): boolean { return this.active.has(taskId); }
@@ -302,7 +278,7 @@ export class A2ASessionExecutor implements AgentExecutor {
         if (saved?.state === 'deleted') throw Object.assign(new Error('Session was deleted'), { code: 'SESSION_DELETED' });
         if (saved?.roleSkills) submitted();
         let role;
-        try { role = await this.roleFor(input, saved, key, controller.signal); }
+        try { role = await this.roleFor(input, saved); }
         catch (error) { throw new RoleSkillLoadingError(error); }
         controller.signal.throwIfAborted();
         const agentPreset = input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset;
@@ -324,11 +300,10 @@ export class A2ASessionExecutor implements AgentExecutor {
         if (role) { target.roleId = role.roleId; target.roleSkills = role.summary; promptPrefix = role.promptPrefix; }
         // A path agent's role is read on this host, inside the session's real cwd. A continuation already carries it in its history.
         if (input.agentFile && !saved?.sessionId) {
-          if (role) throw Object.assign(new Error('A path agent cannot also take a host role bound to its preset'), { code: 'AGENT_FILE_INVALID' });
           let agent;
           try { agent = await readAgentFile(input.agentFile, target.cwd ?? ''); }
           catch (error) { throw Object.assign(new Error(`Cannot load path agent: ${error instanceof Error ? error.message : String(error)}`), { code: 'AGENT_FILE_INVALID' }); }
-          promptPrefix = agentPromptPrefix(agent);
+          promptPrefix += agentPromptPrefix(agent);
         }
         this.store.saveTarget(context.contextId, target, context.context);
       } finally {

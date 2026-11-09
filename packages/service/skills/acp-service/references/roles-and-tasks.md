@@ -1,12 +1,12 @@
 # 角色管理、固定角色调用与临时任务
 
-这是统一 API 技能的任务路由。`resident-agent` 若已安装，用于创建和维护专职角色；本技能负责实际接口调用。领域方法仍由角色引用的技能负责。创建角色是管理阶段，日常调用不重复创建、部署或预热角色。
+这是统一 API 技能的任务路由。`resident-agent` 若已安装，用于创建和维护专职角色；本技能负责实际接口调用。领域方法仍由角色引用的技能负责。创建角色是管理阶段，日常调用不重复创建或部署角色。
 
 ## 三种工作
 
 | 请求 | 操作 | 所需信息 |
 | --- | --- | --- |
-| 创建固定角色 | 配置角色与宿主，再登记 resident_agent 目标 | 职责、网络技能源、缓存、预设、工作根目录及交付约定 |
+| 创建固定角色 | 配置角色与宿主，再登记 resident_agent 目标 | 职责、技能分发目录、预设、工作根目录及交付约定 |
 | 调用固定角色 | `execution_submit` 到已有 resident_agent target | targetId、完整任务要求；cwd/preset/role 由目标固定 |
 | 一次性临时任务 | `execution_submit` 到已有 agent_host target | targetId、执行端 cwd、preset、完整任务要求；无需创建角色 |
 
@@ -31,9 +31,9 @@
 
 ## 创建与更新角色（管理阶段）
 
-1. 复用当前网关、宿主及认证配置，明确职责、工具权限、读写目录、输入和交付。技能通过能力网络检索，精确记录来源及名称/标识；发现结果不等于实际加载。
-2. 创建薄 `ROLE.md` 与网络技能 profile。profile 原生字段为 `id/version/instructionsPath/network/skills/entrySkill`；skills 每项包含 `key/name`，可用 `sourceId/skillId` 消除歧义，并可声明 `nodeUrl/assetsManifest`。不要把登记清单误当原生 profile，也不要把领域脚本和模板写入 persona。源码示例见工程 `.1agents/roles/ppt-beautifier`；项目运行数据统一放在 `./.1agents/`。
-3. 在执行宿主 `a2a.roleSkills` 配置可信的 `cacheRoot`、`profiles: {逻辑roleId:绝对profile路径}`；可选 `presetRoles` 仅为专用 preset 自动绑定。通用 preset 不隐式改成某领域角色。DSH/Codex 共用宿主加载入口；运行依赖和工具仍由宿主管理。
+1. 复用当前网关、宿主及认证配置，明确职责、工具权限、读写目录、输入和交付。技能名即工作目录 `.agents/skills/<name>` 的目录名；能力网络或分发目录只是来源，发现结果不等于已放进工作目录。
+2. 创建薄 `ROLE.md` 与角色 profile。profile 字段为 `id/version/instructionsPath/skills/entrySkill`；skills 每项包含 `key/name`，`name` 即 `.agents/skills/<name>` 目录名，profile 不允许其他字段。不要把登记清单误当原生 profile，也不要把领域脚本和模板写入 persona。源码示例见工程 `.1agents/roles/ppt-beautifier`；项目运行数据统一放在 `./.1agents/`。
+3. 在执行宿主 `a2a.roleSkills` 配置可信的 `profiles: {逻辑roleId:绝对profile路径}`；可选 `presetRoles` 仅为专用 preset 自动绑定。通用 preset 不隐式改成某领域角色。DSH/Codex 共用宿主加载入口；运行依赖和工具仍由宿主管理。
 4. 有专用预设时安装/更新该预设；也可使用已可用的通用预设配合目标绑定的 roleId。凭据只在受保护宿主/网关配置。需要重载共享宿主时先确认没有运行中会话。
 5. 复用已登记 connection，通过可信本机管理入口登记或更新 resident_agent target。最小登记参数如下，值均需替换为真实部署值：
 
@@ -47,18 +47,18 @@
     "cwd": "/absolute/existing/role-workspace",
     "agentPreset": "installed-preset",
     "roleId": "host-configured-role-id",
-    "skillPolicy": "network_pinned"
+    "loadRole": true
   }
 }
 ```
 
 `execution_target_update` 参数是 `targetId/expectedConfigVersion?/patch`；`patch.binding` 按整体替换，保留未改的 cwd/preset/role/目录限制。目标管理方法只开放可信本机管理入口，不能当远端公开任务 API。
 
-6. 在管理阶段预热并校验完整技能包、资源及资产，核验宿主配置；只有用户授权实际试单时才测试模型执行和通知闭环。HTTP 200、目标已登记或 preset 可见仅证明对应管理步骤。
+6. 在管理阶段用 `acp-service roles sync` 把技能（含资源）放进工作目录，或用 `roles check` 核验，并核验宿主配置；只有用户授权实际试单时才测试模型执行和通知闭环。HTTP 200、目标已登记或 preset 可见仅证明对应管理步骤。
 
-目录约定：角色定义为 `.1agents/roles/<role>`，技能缓存与锁为 `.1agents/cache/roles`，本地技能源为 `.1agents/skills`，角色 bundle/工作目录/产物/状态为 `.1agents/runtime/<role>`，项目网关账本与通知为 `.1agents/state/a2a-gateway`；私密配置在 `.1agents/config`，不提交 Git。
+目录约定：角色定义为 `.1agents/roles/<role>`，角色技能在其工作目录的 `.agents/skills`（`.claude/skills` 软链过去），角色 bundle/工作目录/产物/状态为 `.1agents/runtime/<role>`，项目网关账本与通知为 `.1agents/state/a2a-gateway`；私密配置在 `.1agents/config`，不提交 Git。
 
-工程统一更新入口：`node scripts/update-role-skills.mjs --config .1agents/config/role-skills.local.json`。部署环境也可用 `acp-service roles sync --profile PROFILE --cache-root CACHE [--lock EXISTING]` 管理缓存。新任务解析当前版本；同任务续派、返工与恢复使用原锁。更新不会安装二进制依赖或隐式派模型任务。
+技能放进角色的工作目录：`acp-service roles sync --profile PROFILE --cwd 工作目录 --source 分发目录` 把 profile 点名的技能（含大文件资源）从分发目录复制到 `工作目录/.agents/skills/`，并把 `工作目录/.claude/skills` 软链到它；`roles check` 只核验与补链。DSH、Codex 在会话开始时读 `.agents/skills`，Claude Code 读 `.claude/skills`。技能不再经能力网络下载、不再锁定版本，新旧任务和续派都读目录当前内容；漂移由验收规则兜底。Skill Manager 只作分发源数据。
 
 ## 调用固定角色
 

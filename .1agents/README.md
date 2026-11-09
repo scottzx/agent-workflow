@@ -13,20 +13,12 @@
   roles/wechat-mp-draft-uploader/ # Git：公众号草稿上传，优先 Grok，标准模式备份
   roles/wechat-stock-replenisher/ # Git：AP感应式角色说明及声明示例
   config/
-    role-skills.example.json    # Git：更新配置示例
     project-discovery.example.json # Git：可选项目探查配置示例
     wechat-stock.example.json   # Git：公众号候补补库配置示例
-    role-skills.local.json      # 本机配置，忽略提交
-  skills/ppt/                   # 独立维护的完整技能源，忽略提交
-  cache/roles/                  # 本机版本缓存，忽略提交
-    catalog/ppt/                # 发布给 Skill Manager 的轻量投影
-    skills/<identity>/<revision>/  # 提供方原始完整包和校验回执
-    assets/<sha256>/blob         # 模板、图片等独立资产
-    roles/<role>/<digest>/       # profile、角色说明和全部技能的可用快照
-    locks/                      # 任务锁、更新预热锁；已有锁不覆盖
-    current/                    # 最近一次成功更新入口，不替换任务锁
-    updates/                    # 成功或失败更新回执
+  skills/ppt/                   # 独立维护的技能分发源，忽略提交
   runtime/ppt-beautifier/        # 本机运行数据，忽略提交
+    workspace/.agents/skills/   # 角色会话读取的技能（roles sync 写入）
+    workspace/.claude/skills    # 指向 ../.agents/skills 的软链，供 Claude Code
     agent-bundle/               # 宿主加载的角色 bundle
     host-bundle/                # 本机宿主挂载配置
     workspace/                  # 执行 PWD、任务目录及产物
@@ -41,7 +33,7 @@ Git 只跟踪角色声明、说明及示例配置。技能包、缓存、素材�
 
 本机 macOS 的 launchd 不能打开 Documents 目录内的服务启动日志，三个启动器的 stdout/stderr 保存在 `~/Library/Logs/1agents/`，权限为目录 0700、文件 0600。该系统日志例外不改变角色任务的实际 PWD、技能缓存或产物位置。
 
-本地完整技能源在 `.1agents/skills/ppt` 维护；发布投影和运行快照都是可校验缓存，不能把修改缓存作为更新技能的方式。旧私有 skills 目录仅作历史备份。缓存丢失可重新获取当前版本；历史版本恢复依赖保留的任务锁、技能包和资产，不自动删除这些版本。
+技能分发源在 `.1agents/skills/ppt` 等目录维护；修改技能后用 `acp-service roles sync` 复制进角色工作目录。工作目录里的副本不是源，不在那里直接改。
 
 ## 可选项目与角色探查
 
@@ -60,28 +52,27 @@ Git 只跟踪角色声明、说明及示例配置。技能包、缓存、素材�
 
 快照位于 `.1agents/state/a2a-gateway/project-discovery/discovery.json`；Reader 失败或结果不完整时保留旧候选并标明 partial/stale 与诊断，不把旧快照冒记为最新成功。发现角色 profile 只说明存在候选，不代表宿主映射、技能加载、目录权限或模型已经就绪。登记角色/目标仍需显式管理操作；一键填入临时任务 cwd 和自动注册不在本次范围。Reader 缺失不影响手填目录或普通派单。
 
-## 统一更新
+## 角色技能
 
-根据 [role-skills.example.json](config/role-skills.example.json) 建立本机 `.1agents/config/role-skills.local.json`，填入执行机器上的真实绝对路径。在独立开发/部署阶段完成构建，再执行：
+角色的技能放在它的工作目录里：`<cwd>/.agents/skills/<name>/`。DSH 和 Codex 在会话开始时读这个目录，Claude Code 读 `<cwd>/.claude/skills`，后者是指向 `../.agents/skills` 的软链。宿主不再经能力网络下载技能，也不再锁定版本；同一角色的新任务、续派、返工和恢复读到的都是目录当前内容，漂移由验收规则兜底，需要版本控制的是验收规则和要求。
+
+分发源（例如 `training/rsi-training/scenarios/ppt`，或 Skill Manager 的来源）只是源数据。大文件资源在建角色时随技能目录一起复制，之后工作目录可离线使用：
 
 ```sh
-pnpm build
-node scripts/update-role-skills.mjs --config .1agents/config/role-skills.local.json
+acp-service roles sync --profile .1agents/roles/ppt-beautifier/profile.json \
+  --cwd .1agents/runtime/ppt-beautifier/workspace \
+  --source /path/to/skills-distribution
+acp-service roles check --profile .1agents/roles/ppt-beautifier/profile.json --cwd .1agents/runtime/ppt-beautifier/workspace
 ```
 
-该入口发布当前技能源、注册或刷新能力网络来源、下载验证并预热新角色版本，最后写成功回执与 current 入口。它不调用模型、不派任务、不修改旧任务锁。更新失败回滚本次发布投影并保留失败证据；不可变资产及已缓存版本保留。目录切换存在短暂不可读窗口，不承诺无停顿交换；执行中的任务继续读本地锁，下载冲突或缓存校验失败时不启动模型。
+`sync` 把 profile 点名的技能逐个复制（先写临时目录再替换，源与目标是同一目录时跳过），然后校验并补软链；`check` 只校验与补链。若 `.claude/skills` 已是真实目录，只为这些技能各补一条软链；若它是指向别处的链接则报错，不覆盖。技能名同时是目录名，只允许字母数字及 `._-`。
 
-Skill Manager 当前限制单文件 8 MiB、技能包 32 MiB。发布工具将 PPTX、PNG、PDF 拆成按 SHA256 定位的独立资产，轻量包用 `assets-manifest.json` 引用；宿主恢复同一相对路径。指南、脚本与索引按原字节缓存，完整包复算提供方 revision，大资产另核对大小和 SHA256。UTF-8 读取会丢弃 BOM 的提供方行为按清单字节数恢复，并仍须通过整包 revision；绝不忽略 hash 不符。
+## 接单规则
 
-## 接单与版本规则
+- 通用 A2A 宿主通过 `roleSkills: {profiles, presetRoles?}` 配置可信 profile；请求只传 `roleId`，不能替换 profile 或目录。profile 只有 `id/version/instructionsPath/skills/entrySkill`，skills 每项只有 `key/name`。
+- 角色会话的工作目录（请求 `cwd`、续跑的已存 `cwd` 或宿主默认 `cwd`）里缺任何一个 profile 点名的技能，会话在启动模型之前失败，校验码 `role-skills-unavailable`。
+- 宿主在第一条消息前加上角色说明和各技能的 `SKILL.md` 路径。路径智能体（`agentFile`）可以和宿主角色同时使用，两段前缀依次拼接。
+- 固定目标设 `binding.loadRole: true` 时，网关把 `binding.roleId` 转发给宿主，宿主加载该角色及工作目录里的技能；不设时 `roleId` 只是标签。旧无角色会话不会中途升级。固定 PPT preset 可通过宿主 presetRoles 自动选择角色；通用 Codex/standard 不受影响。
+- 系统结果 metadata 记录实际角色和各技能目录。
 
-- 新任务解析当前网络版本，锁定 profile、角色说明、技能身份/revision、完整资源与资产。
-- 同一任务的制作、独立验收、返工、续派和恢复共用父任务锁；不重新解析 latest。PPT 父任务的冷缓存准备也在受理后的后台完成。
-- 通用 A2A 宿主通过 `roleSkills: {cacheRoot, profiles, presetRoles?}` 配置可信 profile；请求只传 `roleId` 和可选已有父锁，不能替换 profile、网络或缓存根目录。
-- 固定目标声明 `binding.skillPolicy="network_pinned"` 后，网关转发该目标绑定的 roleId。旧配置仍兼容；旧无角色会话不会中途升级。固定 PPT preset 可通过宿主 presetRoles 自动选择角色；通用 Codex/standard 不受影响。
-- 宿主先验缓存与锁，再进入 DSH 或 Codex 执行会话，并注入准确指南入口。二者共用同一宿主加载流程，不依赖主会话是否给它传递了 MCP。搜索/读取来自能力网络与 MCP 共用的技能目录协议。
-- 系统结果 metadata 记录实际角色、技能版本和锁路径；独立验收也可核对同一绑定。
-
-手动缓存核验：`acp-service roles sync --profile .1agents/roles/ppt-beautifier/profile.json --cache-root .1agents/cache/roles --lock .1agents/cache/roles/locks/EXISTING.json`。已有锁完全离线核验；省略 `--lock` 为新缓存锁，解析当前版本。此命令不派模型任务。
-
-迁移目录时保留旧路径的受控兼容入口及历史文件原字节，不改写旧锁、冻结合同、任务回执或历史部署记录。已登记目标及历史执行上下文可继续保留旧 cwd/锁路径的词法地址，通过兼容链接访问实际迁入 `.1agents/` 的文件；不要为统一显示而强改已有目标的冻结 cwd，避免破坏续派。新建角色与目标优先使用上述新目录。确认所有引用已转移前，不删除旧入口。运行环境、MCP 工具权限和二进制依赖仍由宿主管理；技能热更不隐式安装依赖。
+运行环境、MCP 工具权限和二进制依赖仍由宿主管理；同步技能不隐式安装依赖。

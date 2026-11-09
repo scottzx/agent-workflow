@@ -390,6 +390,20 @@ test('fixed resident targets cannot be overridden and resolve their configured e
   assert.equal(accepted.attempts[0].targetSnapshot.targetName, 'PPT role');
 });
 
+test('loadRole forwards the bound roleId to the host, and a bare roleId stays a label', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  await gateway.invoke('execution_target_create', { targetId: 'labelled', kind: 'resident_agent', name: 'Label only', connectionId: 'remote:local',
+    binding: { cwd: '/fixed-role', agentPreset: 'standard', roleId: 'ppt' } });
+  await gateway.invoke('execution_target_create', { targetId: 'loading', kind: 'resident_agent', name: 'Loads role', connectionId: 'remote:local',
+    binding: { cwd: '/fixed-role', agentPreset: 'standard', roleId: 'ppt', loadRole: true } });
+  await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'labelled', input: { prompt: 'a' } });
+  await until(async () => f.backend.runs.length, count => count === 1);
+  // This host has no role configured, so a forwarded roleId is refused before any run starts.
+  const forwarded = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'loading', input: { prompt: 'b' } }) as any;
+  assert.equal(forwarded.error, 'Unknown host role');
+  assert.equal(f.backend.runs.length, 1);
+});
+
 test('a lost acceptance response is persisted as unknown and cannot cause another execution round', async t => {
   const f = await fixture(t), gateway = f.gateway();
   // Execute the real host request, then lose its reply at the adapter boundary.

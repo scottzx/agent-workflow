@@ -87,7 +87,8 @@ test('the host prefixes a new session with the path agent and leaves continuatio
   assert.equal(outside.state, TaskState.TASK_STATE_FAILED);
   assert.equal(runs.length, 2);
   const combined = (metadata: Record<string, unknown>) => SendMessageRequest.fromJSON({ message: { messageId: randomUUID(), role: 'ROLE_USER', parts: [{ text: 'x' }] }, metadata: { '1agents': metadata } });
-  assert.throws(() => parseA2AInput(combined({ cwd: root, agentFile, roleLockPath: join(root, 'lock.json') }), { ...options, roleSkills: { cacheRoot: root, profiles: {} } }), /cannot be combined with a host role/);
+  // A path agent and a host role may now be combined: the role's skills sit in the same cwd.
+  assert.doesNotThrow(() => parseA2AInput(combined({ cwd: root, agentFile, roleId: 'maker' }), { ...options, roleSkills: { profiles: { maker: join(root, 'profile.json') } } }));
   assert.throws(() => parseA2AInput(combined({ cwd: root, agentFile: 'agents/restore-executor.md' }), options), /absolute path/);
 });
 

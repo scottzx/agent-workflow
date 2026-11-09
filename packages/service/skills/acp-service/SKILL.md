@@ -55,7 +55,7 @@ acp-service --skill install acp-service --agent codex --scope repo
 
 ## 异步调用纪律
 
-常驻角色可由宿主按能力网络加载并锁定技能版本。任务使用宿主回执中的角色/技能锁与缓存入口，不在主会话另行检索、下载或复验；同一任务续派沿用原锁。更新与缓存管理在派单前的独立部署阶段完成，详见项目 `.1agents/README.md`；`acp-service roles sync --help` 可查看显式缓存入口。
+常驻角色的技能放在其工作目录的 `.agents/skills/`（Claude Code 经 `.claude/skills` 软链读取），由 DSH、Codex 或 Claude Code 在会话开始时自行加载；宿主只在第一条消息前加角色说明和技能指南路径。不再有技能锁，续派读目录当前内容。技能的复制与更新在派单前的独立阶段用 `acp-service roles sync` 完成，详见项目 `.1agents/README.md`。
 
 开发、部署与回归先独立完成。所有任务提交并保存回执后必须立即结束本轮；只有实际通知唤醒后才单次读取回执、记录结论、ack 并答复。禁止主会话主动轮询 get/list/inbox、sleep/wait 等完成、读取子会话日志/进程，或重复文件/hash/图像/事实验收。用户明确要求单次查询/取消时只执行该动作；受理未知不自动重派。此纪律限定主会话调用，不关闭后台网关的状态核对能力。
 

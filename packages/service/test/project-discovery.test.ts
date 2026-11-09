@@ -7,7 +7,7 @@ import { performance } from 'node:perf_hooks';
 import test, { type TestContext } from 'node:test';
 import { DISCOVERY_METHODS, ProjectRoleDiscovery, projectDiscoveryConfigSchema } from '../src/execution/project-discovery.js';
 
-const profile = { id: 'ppt', version: '1', instructionsPath: 'ROLE.md', network: { agentUrl: 'http://127.0.0.1:36909' },
+const profile = { id: 'ppt', version: '1', instructionsPath: 'ROLE.md',
   skills: [{ key: 'slides', name: 'presentations' }] };
 const call = async (discovery: ProjectRoleDiscovery, method: string, params: unknown = {}): Promise<any> => discovery.invoke(method, params);
 async function role(project: string, name = 'ppt', value: unknown = profile) {
