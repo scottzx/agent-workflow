@@ -8,6 +8,7 @@ import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import { A2APreflightError, bindA2AExecution, runA2APreflight, unbindA2AExecution, type A2ABackend, type A2AExecutionRef, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
+import { modelSelectionOf } from './preset-route.js';
 
 import type { Diagnostics } from './diagnostics.js';
 import { consumeProcessReady, readProcessCapacity, readSessionRestore } from './process-admission.js';
@@ -163,7 +164,7 @@ export class DshA2ABackend implements A2ABackend {
       signal?.throwIfAborted();
       if (previous == null) throw sessionError('SESSION_NOT_FOUND', `Session ${input.sessionId} not found`);
     }
-    if (previous !== undefined && previous.meta.id !== input.sessionId) throw sessionError('SESSION_CONFLICT', 'Existing session identity conflicts');
+    if (previous != null && previous.meta.id !== input.sessionId) throw sessionError('SESSION_CONFLICT', 'Existing session identity conflicts');
     const requestedCwd = input.cwd ?? previous?.meta.cwd ?? process.cwd();
     if (!isAbsolute(requestedCwd)) throw new Error('A2A cwd must be an absolute directory on the DSH host');
     const cwd = await realpath(requestedCwd);
@@ -174,7 +175,7 @@ export class DshA2ABackend implements A2ABackend {
     signal?.throwIfAborted();
     if (!preflight.ok) throw new A2APreflightError(preflight);
     const agentPreset = input.agentPreset ?? previous?.meta.agentPreset;
-    if (input.sessionId !== undefined && previous !== undefined) {
+    if (input.sessionId !== undefined && previous != null) {
       if (previous.meta.cwd === undefined || await realpath(previous.meta.cwd) !== cwd) throw sessionError('SESSION_CONFLICT', 'Existing session cwd conflicts');
       if (input.agentPreset !== undefined && input.agentPreset !== previous.meta.agentPreset) throw sessionError('SESSION_CONFLICT', 'Existing session preset conflicts');
       // create() only reuses blank Sessions on current DSH; resolve the saved
@@ -228,9 +229,10 @@ export class DshA2ABackend implements A2ABackend {
       const agent = await this.agent(sessionId);
       // sessionController.selectModel also saves the choice as the host's default model.
       // A task only chooses for its own session, so current DSH selects on the agent directly.
-      if (typeof agent.model?.select === 'function') {
+      const model = modelSelectionOf(agent);
+      if (model) {
         await this.ctx.llm.resolveCallConfig?.(selected);
-        agent.model.select(selected);
+        model.select(selected);
       } else ({ selected } = await this.ctx.sessionController.selectModel({ sessionId, ...selected }));
     }
     catch (error) { throw Object.assign(sessionError('MODEL_UNAVAILABLE', `DSH did not select ${input.provider}/${input.model}`), { cause: error }); }

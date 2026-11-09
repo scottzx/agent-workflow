@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { apply } from '../dist/index.js';
 
 test('bundle registers ACP-only presets and releases them with its lifetime', async () => {
- const dir=mkdtempSync(join(tmpdir(),'dsh-acp-preset-')); const effects=[]; const routes=[]; const presets=new Map();
- const ctx={provide: (key, value) => { ctx[key] = value; effects.push(() => delete ctx[key]); },get: key => key==='dshHomePath' ? (...p)=>join(dir,...p) : undefined, llm:{registerAdapter: names=>{routes.push(...names);return ()=>{};}}, effect: async setup=>{effects.push(await setup());}, webServer:{register:()=>()=>{}}, agentPresets:{register:async definition=>{presets.set(definition.id,definition);return ()=>presets.delete(definition.id);}}};
+ const dir=mkdtempSync(join(tmpdir(),'dsh-acp-preset-')); const effects=[]; const routes=[]; const presets=new Map(); const listeners=new Map();
+ const ctx={provide: (key, value) => { ctx[key] = value; effects.push(() => delete ctx[key]); },get: key => key==='dshHomePath' ? (...p)=>join(dir,...p) : undefined, llm:{registerAdapter: names=>{routes.push(...names);return ()=>{};}}, effect: async setup=>{effects.push(await setup());}, webServer:{register:()=>()=>{}}, on: (name, listener)=>{listeners.set(name, listener); return ()=>listeners.delete(name);}, agentPresets:{register:async definition=>{presets.set(definition.id,definition);return ()=>presets.delete(definition.id);}}};
  try {
   await apply(ctx, { agents: ['codex', 'grok-build'], serviceMode: 'external' });
   assert.deepEqual(routes,['1agents-acp']);
@@ -17,6 +17,7 @@ test('bundle registers ACP-only presets and releases them with its lifetime', as
   assert.equal(codex.plugins[0].config.includeRuntimeContext,false);
   assert.equal(codex.plugins[1].name,'@1agents/acp-service/dsh/preset');
   assert.equal(codex.plugins[1].config.agent,'codex');
+  assert.ok(listeners.get('agent-preset/selected'),'a preset selected on a running session records the ACP route');
  } finally { for(const dispose of effects) await dispose?.(); rmSync(dir,{recursive:true,force:true}); }
  assert.equal(presets.size,0);
 });
@@ -44,6 +45,7 @@ test('default bundle imports service-discovered harness names and labels, then d
  const ctx = { provide: (key, value) => { ctx[key] = value; effects.push(() => delete ctx[key]); }, get: () => undefined, effect: async setup => { effects.push(await setup()); },
   llm: { registerAdapter: (_names, value) => { adapter = value; return () => {}; } },
   webServer: { register: () => () => {} },
+  on: () => () => {},
   agentPresets: { register: async preset => { presets.set(preset.id, preset); return () => presets.delete(preset.id); } },
  };
  try {
