@@ -10,7 +10,6 @@
 1acp/.1agents/
   README.md                     # Git：目录与维护约定
   roles/ppt-beautifier/          # Git：角色说明、技能引用和版本策略
-  roles/wechat-mp-draft-uploader/ # Git：公众号草稿上传，优先 Grok，标准模式备份
   roles/wechat-stock-replenisher/ # Git：AP感应式角色说明及声明示例
   config/
     project-discovery.example.json # Git：可选项目探查配置示例

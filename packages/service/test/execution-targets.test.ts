@@ -112,7 +112,7 @@ test('read-only probe descriptor creates no job and cannot claim unperformed che
   assert.equal(result.performed, false); assert.equal(result.probeRequired, true);
   assert.equal(result.health.targetStatus, 'unknown'); assert.deepEqual(result.health.checkedScope, []);
   assert.throws(() => directory.recordProbe({ ...probe(directory.resolve('ppt', { prompt: 'A' })), checkedScope: [] }), /explicit checked scope/);
-  assert.equal(Object.keys(TARGET_METHODS).length, 11);
+  assert.equal(Object.keys(TARGET_METHODS).length, 12);
 });
 
 test('workflow registration works independently but P1 execution is explicitly unsupported', async t => {
@@ -184,4 +184,34 @@ test('controlled remote endpoint reload invalidates health and does not re-enabl
   directory.reloadRemoteEndpoints();
   assert.equal(directory.getConnection('local').enabled, false);
   assert.equal(directory.getTarget('ppt').configVersion, 1);
+});
+
+test('a fixed role without a preset runs on standard, may name a default model and lets each task pick another', async t => {
+  const { directory } = await fixture(t);
+  const created = directory.invoke('execution_target_create', { targetId: 'plain', kind: 'resident_agent', name: 'Plain', connectionId: 'local',
+    binding: { cwd: '/work/ppt', roleId: 'ppt-maker' } }) as any;
+  assert.equal(created.binding.agentPreset, 'standard');
+  assert.equal(directory.resolve('plain', { prompt: 'x' }).agentPreset, 'standard');
+  directory.invoke('execution_target_create', { targetId: 'routed', kind: 'resident_agent', name: 'Routed', connectionId: 'local',
+    binding: { cwd: '/work/ppt', roleId: 'ppt-maker', provider: 'minimax-cn', model: 'MiniMax-M3' } });
+  assert.deepEqual(directory.resolve('routed', { prompt: 'x', provider: 'deepseek-account', model: 'deepseek-flash' }).input,
+    { prompt: 'x', provider: 'deepseek-account', model: 'deepseek-flash' });
+  assert.throws(() => directory.invoke('execution_target_create', { targetId: 'half', kind: 'resident_agent', name: 'Half', connectionId: 'local',
+    binding: { cwd: '/work/ppt', roleId: 'ppt-maker', provider: 'minimax-cn' } }), /set together/);
+  assert.throws(() => directory.invoke('execution_target_create', { targetId: 'acp', kind: 'resident_agent', name: 'ACP', connectionId: 'local',
+    binding: { cwd: '/work/ppt', roleId: 'ppt-maker', agentPreset: 'oneagents-acp-grok-build', provider: 'minimax-cn', model: 'MiniMax-M3' } }), /DSH-native/);
+  assert.throws(() => directory.invoke('execution_target_create', { ...host, targetId: 'host-model', binding: { provider: 'a', model: 'b' } }), /path agent or a fixed role/);
+});
+
+test('fork copies a target under a new ID with only the changed binding fields, leaving the original alone', async t => {
+  const { directory } = await fixture(t);
+  directory.invoke('execution_target_create', resident);
+  const fork = directory.invoke('execution_target_fork', { targetId: 'ppt', newTargetId: 'ppt-grok',
+    patch: { name: 'PPT on Grok', binding: { agentPreset: 'oneagents-acp-grok-build' } } }) as any;
+  assert.equal(fork.targetId, 'ppt-grok'); assert.equal(fork.configVersion, 1); assert.equal(fork.name, 'PPT on Grok');
+  assert.deepEqual(fork.binding, { ...resident.binding, agentPreset: 'oneagents-acp-grok-build' });
+  assert.equal((directory.invoke('execution_target_get', { targetId: 'ppt' }) as any).binding.agentPreset, 'ppt');
+  assert.throws(() => directory.invoke('execution_target_fork', { targetId: 'ppt', newTargetId: 'ppt-grok' }), /already used/);
+  assert.throws(() => directory.invoke('execution_target_fork', { targetId: 'ppt', newTargetId: 'ppt-bad', patch: { binding: { roleId: undefined, cwd: undefined } } }), /cwd and roleId/);
+  assert.ok(Object.hasOwn(TARGET_METHODS, 'execution_target_fork'));
 });

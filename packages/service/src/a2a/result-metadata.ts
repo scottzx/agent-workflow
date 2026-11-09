@@ -144,7 +144,11 @@ export async function createA2AResultMetadata(input: {
     const root = target?.preflight?.ok && target.preflight.jobDirectory;
     // A manifest the gateway announced by default is optional: no admitted directory or manifest means no artifacts,
     // and a bad one is reported in `validation` without failing a task that otherwise completed.
-    const implicit = Boolean(target?.cwd) && isDefaultJobDirectory(target!.cwd, dirname(contract.artifactManifestPath));
+    // The gateway may name cwd through a symlink while the host stores the resolved path, so compare both spellings.
+    const real = async (path: string) => realpath(path).catch(() => path);
+    const manifestDirectory = dirname(contract.artifactManifestPath);
+    const implicit = Boolean(target?.cwd) && (isDefaultJobDirectory(target!.cwd, manifestDirectory)
+      || isDefaultJobDirectory(await real(target!.cwd), await real(manifestDirectory)));
     if (!root) {
       if (implicit) return metadata;
       throw new A2AResultValidationError('artifact-job-directory-not-admitted');

@@ -81,6 +81,15 @@ const connectionUpdate = z.object({ connectionId: id, expectedConnectionVersion:
     provider: z.enum(['a2a', 'activepieces']).optional(), enabled: z.boolean().optional(),
   }).strict() }).strict();
 const targetDelete = targetRef.extend({ expectedConfigVersion: version.optional() });
+/** Copy a target under a new ID. `patch.binding` is merged into the copied binding, so only the fields being changed are given. */
+const targetFork = z.object({ targetId: id, newTargetId: id,
+  patch: targetUpdate.shape.patch.extend({ binding: executionTargetBindingSchema.partial().optional() }).strict().optional() }).strict();
+/** The preset a fixed role runs on when its binding names none. */
+export const DEFAULT_RESIDENT_PRESET = 'standard';
+function withDefaults<T extends { kind: string; binding: z.infer<typeof executionTargetBindingSchema> }>(target: T): T {
+  return target.kind === 'resident_agent' && !target.binding.agentPreset
+    ? { ...target, binding: { ...target.binding, agentPreset: DEFAULT_RESIDENT_PRESET } } : target;
+}
 const connectionDelete = connectionRef.extend({ expectedConnectionVersion: version.optional() });
 export const TARGET_METHODS = {
   execution_connection_list: { description: '列出人工登记的执行连接及派生端点，不返回凭据。', parameters: z.toJSONSchema(empty) },
@@ -93,6 +102,7 @@ export const TARGET_METHODS = {
   execution_target_create: { description: '登记通用宿主、固定角色或工作流，不部署或运行能力。仅可信本机管理入口可调用。', parameters: z.toJSONSchema(executionTargetConfigSchema) },
   execution_target_update: { description: '修改或启停执行目标并递增配置版本。仅可信本机管理入口可调用。', parameters: z.toJSONSchema(targetUpdate) },
   execution_target_delete: { description: '删除目标且不取消历史任务，编号永久保留。仅可信本机管理入口可调用。', parameters: z.toJSONSchema(targetDelete) },
+  execution_target_fork: { description: '把已有目标复制成新编号的副本，可同时修改名称、默认预设或默认模型等；patch.binding 只写要改的字段。原目标不变。仅可信本机管理入口可调用。', parameters: z.toJSONSchema(targetFork) },
   execution_target_probe: { description: '读取只读探测要求和当前健康视图；调用方适配器可执行 agent-card/preflight 检查，目录自身不调用模型。', parameters: z.toJSONSchema(targetRef) },
 };
 
@@ -237,7 +247,7 @@ export class TargetDirectory {
       if (connection.provider !== 'a2a') throw new Error('Agent targets require an a2a connection');
       if (binding.flowId || binding.flowVersion) throw new Error('Agent targets cannot bind a workflow');
       if (target.kind === 'resident_agent' && (!binding.cwd || !binding.agentPreset || !binding.roleId))
-        throw new Error('resident_agent requires fixed cwd, agentPreset and roleId');
+        throw new Error('resident_agent requires fixed cwd and roleId');
       if (binding.agentFile) {
         if (target.kind !== 'agent_host' || !binding.cwd || !binding.agentPreset || binding.roleId || binding.driver)
           throw new Error('A path agent is an agent_host with fixed cwd and agentPreset and no roleId or driver');
@@ -246,7 +256,12 @@ export class TargetDirectory {
           throw new Error('agentFile must be a .md file inside cwd');
         if ((binding.provider === undefined) !== (binding.model === undefined)) throw new Error('provider and model must be fixed together');
         if (binding.provider && binding.agentPreset.startsWith('oneagents-acp-')) throw new Error('provider and model apply only to DSH-native presets');
-      } else if (binding.provider || binding.model) throw new Error('Only a path agent can fix provider and model');
+      } else if (binding.provider || binding.model) {
+        // A fixed role may name a default model; each task can still pass its own provider and model.
+        if (target.kind !== 'resident_agent') throw new Error('Only a path agent or a fixed role can set provider and model');
+        if ((binding.provider === undefined) !== (binding.model === undefined)) throw new Error('provider and model must be set together');
+        if (binding.agentPreset!.startsWith('oneagents-acp-')) throw new Error('provider and model apply only to DSH-native presets');
+      }
       else if (target.kind === 'agent_host' && (binding.cwd || binding.agentPreset || binding.roleId || binding.driver))
         throw new Error('agent_host takes cwd and preset per task, not a fixed role binding');
       if (binding.cwd && binding.allowedDirectories) this.checkDirectory(binding.cwd, binding.allowedDirectories);
@@ -280,7 +295,8 @@ export class TargetDirectory {
       // Even an identical value is not an allowed caller override; the binding is authoritative.
       if (resolvedInput.cwd !== undefined || resolvedInput.agentPreset !== undefined || resolvedInput.roleId !== undefined || resolvedInput.driver !== undefined)
         throw new Error(`${target.binding.agentFile ? 'A path agent' : 'resident_agent'} input cannot override its fixed cwd, preset, role or driver`);
-      if (target.binding.provider && (resolvedInput.provider !== undefined || resolvedInput.model !== undefined))
+      // A path agent's model is part of the agent; a fixed role's model is only a default that a task may replace.
+      if (target.binding.agentFile && target.binding.provider && (resolvedInput.provider !== undefined || resolvedInput.model !== undefined))
         throw new Error('A path agent input cannot override its fixed provider and model');
       cwd = target.binding.cwd!; agentPreset = target.binding.agentPreset!;
     } else {
@@ -359,7 +375,7 @@ export class TargetDirectory {
       this.commit(next); return { deleted: true, connectionId };
     }
     if (method === 'execution_target_create') {
-      const config = executionTargetConfigSchema.parse(params);
+      const config = withDefaults(executionTargetConfigSchema.parse(params));
       if (next.usedTargetIds.includes(config.targetId)) throw new Error('Target ID already used; deleted IDs cannot be reused');
       const target = { ...config, configVersion: 1, createdAt: now, updatedAt: now };
       this.validateTarget(target, this.getConnection(target.connectionId)); next.targets.push(target); next.usedTargetIds.push(target.targetId);
@@ -368,11 +384,20 @@ export class TargetDirectory {
     if (method === 'execution_target_update') {
       const { targetId, patch, expectedConfigVersion } = targetUpdate.parse(params), previous = this.getTarget(targetId);
       if (expectedConfigVersion !== undefined && previous.configVersion !== expectedConfigVersion) throw new Error('Target version conflict');
-      const candidate = executionTargetSchema.parse({ ...previous, ...patch, configVersion: previous.configVersion + 1, updatedAt: now });
+      const candidate = withDefaults(executionTargetSchema.parse({ ...previous, ...patch, configVersion: previous.configVersion + 1, updatedAt: now }));
       this.validateTarget(candidate, this.getConnection(candidate.connectionId));
       if (Object.entries(patch).every(([key, value]) => JSON.stringify(previous[key as keyof ExecutionTarget]) === JSON.stringify(value))) return previous;
       next.targets[next.targets.findIndex(item => item.targetId === targetId)] = candidate;
       this.commit(next); return clone(candidate);
+    }
+    if (method === 'execution_target_fork') {
+      const { targetId, newTargetId, patch = {} } = targetFork.parse(params), previous = this.getTarget(targetId);
+      if (next.usedTargetIds.includes(newTargetId)) throw new Error('Target ID already used; deleted IDs cannot be reused');
+      const { configVersion: _version, createdAt: _created, updatedAt: _updated, ...config } = previous;
+      const target = withDefaults(executionTargetSchema.parse({ ...config, ...patch, targetId: newTargetId,
+        binding: { ...previous.binding, ...patch.binding }, configVersion: 1, createdAt: now, updatedAt: now }));
+      this.validateTarget(target, this.getConnection(target.connectionId)); next.targets.push(target); next.usedTargetIds.push(target.targetId);
+      this.commit(next); return clone(target);
     }
     if (method === 'execution_target_delete') {
       const { targetId, expectedConfigVersion } = targetDelete.parse(params), previous = this.getTarget(targetId);
