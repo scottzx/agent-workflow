@@ -28,7 +28,8 @@ export function archiveContentDigest(archive) {
     ? null : digest(execFileSync('tar', ['-xOf', archive, name], { maxBuffer: 16 * 1024 * 1024 }))]))));
 }
 
-export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 8, delayMs = 5_000 } = {}) {
+// A freshly published version took about three minutes to become readable on 2026-11-09, so wait up to five.
+export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 30, delayMs = 10_000 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const resolved = await fetcher(name, version, dependency);
