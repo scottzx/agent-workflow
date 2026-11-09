@@ -96,14 +96,14 @@ const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.t
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   cwd: string.refine(value => path.posix.isAbsolute(value), 'cwd must be an absolute remote path'),
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
-  roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(),
+  roleId: string.optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
   clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
   provider: string.optional(), model: string.optional(), initiatedBy: actorSchema.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
 const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
@@ -426,11 +426,8 @@ export class RemoteAgentGateway {
       const withArtifacts = <T>(declared: T, add: (found: NonNullable<typeof artifacts>) => T): T => artifacts ? add(artifacts) : declared;
       let requirements = withArtifacts(declaredRequirements, found => ({ ...declaredRequirements, jobDirectory: found.directory }));
       let resultContract = withArtifacts(declaredResult, found => ({ ...(declaredResult ?? { jobId: job.jobId }), artifactManifestPath: found.manifest }));
-      const networkRole = resolved.target.binding.skillPolicy === 'network_pinned' ? resolved.target.binding.roleId : undefined;
-      if (resolved.target.binding.skillPolicy && !networkRole) throw new Error('Network skill policy requires a fixed roleId');
+      const boundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
-      const roleLockPath = fields.roleLockPath === undefined ? undefined
-        : z.string().min(1).refine(path.isAbsolute, 'Expected an absolute role lock path').parse(fields.roleLockPath);
       try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
       catch (error) {
         // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
@@ -450,7 +447,7 @@ export class RemoteAgentGateway {
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '') }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
           ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
-          ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
+          ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
           ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
           execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
         configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
@@ -1189,7 +1186,7 @@ export class RemoteAgentGateway {
         clientRequestId: input.clientRequestId, title: previous.title, initiatedBy: input.initiatedBy,
         input: { ...(target.kind === 'agent_host' ? { cwd: previous.cwd, ...(previous.agentPreset ? { agentPreset: previous.agentPreset } : {}) } : {}), prompt: input.prompt,
           ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
-          ...(input.roleId ? { roleId: input.roleId } : {}), ...(input.roleLockPath ? { roleLockPath: input.roleLockPath } : {}),
+          ...(input.roleId ? { roleId: input.roleId } : {}),
           ...(input.lifecycle ? { lifecycle: input.lifecycle } : previous.lifecycle ? { lifecycle: previous.lifecycle } : {}),
           ...(input.provider !== undefined ? { provider: input.provider } : {}), ...(input.model !== undefined ? { model: input.model } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });

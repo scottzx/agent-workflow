@@ -85,9 +85,9 @@ DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`p
 | 方法 | 参数与用途 |
 | --- | --- |
 | `remote_agent_preflight` | `remote, originSessionId, cwd`；可选任务目录、必需输入和运行时依赖，仅检查、不创建会话 |
-| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract, clientRequestId, roleId, roleLockPath, lifecycle, provider, model`；新建远端任务/上下文/DSH 会话。省略 `lifecycle` 为 one-shot（2026-10-31 起）。`provider`、`model` 见下文「standard 选模型」 |
+| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract, clientRequestId, roleId, lifecycle, provider, model`；新建远端任务/上下文/DSH 会话。省略 `lifecycle` 为 one-shot（2026-10-31 起）。`provider`、`model` 见下文「standard 选模型」 |
 | `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale。进程名额排队时仍是 submitted，并带 `capacity`、`taskSlot` 和 `processSlot`。指定过模型的 `standard` 任务带实际使用的 `provider`、`model` |
-| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath, autoResume, lifecycle, provider, model`；复用远端会话，创建新 taskId；已有角色/锁不能更换。已关闭会话默认接回，get 返回 `resumed: true`。`historyReplayed` 只说明宿主有没有把历史重新推给它的客户端（`session/load` 推，导入会话的 `session/resume` 不推），两者都是同一种接回。`autoResume: false` 不向远端发送，返回 `SESSION_CLOSED` |
+| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, autoResume, lifecycle, provider, model`；复用远端会话，创建新 taskId；已有角色不能更换。已关闭会话默认接回，get 返回 `resumed: true`。`historyReplayed` 只说明宿主有没有把历史重新推给它的客户端（`session/load` 推，导入会话的 `session/resume` 不推），两者都是同一种接回。`autoResume: false` 不向远端发送，返回 `SESSION_CLOSED` |
 | `remote_agent_cancel` | 任务定位字段；只取消这项任务自己的执行，不能释放已经完成的会话进程 |
 | `remote_agent_close` | `remote, originSessionId`，以及 `taskId`、`contextId`、`sessionId` 三选一；可选 `force`。普通关闭 ACP 进程，保留会话记录和绑定，不删除。进行中返回 `SESSION_BUSY`；`force: true` 先取消再关闭。宿主没有关闭能力时返回 `UNSUPPORTED`，且不把任务记成已关闭。`standard` 不发送 `session/close`。可选 `mode: "delete"` 还删除 ACP 会话记录，之后 message 返回 `SESSION_DELETED`；仅在网关 `sessionLifecycle.allowDelete: true` 时接受，否则返回 `DELETE_DISABLED`。不删 DSH 会话历史 |
 | `remote_agent_sessions` | 无业务参数。按 `prewarm`、`job`、`user-opened` 和未标注列进程租约，并给出两本账。只读，不关闭，也不给已经在跑且没有来源的进程补标签 |
@@ -195,7 +195,7 @@ notice 继续保留在 inbox；主 Agent 真正处理结果后才调用 `remote_
 
 响应在 `result.task`，包含 `id`、`contextId` 和已有的 `metadata.1agents.sessionId/cwd/agentPreset`。`returnImmediately: true` 返回受理任务；配置网络角色的冷下载和会话准备可在受理后进行，首回执可能尚无 sessionId。普通无角色任务保持会话准备后返回的时序；省略则默认等待终态或需要输入状态。
 
-`metadata.1agents` 的调用输入支持 `cwd/workspace/agentPreset/preflight/resultContract/roleId/roleLockPath`。cwd 和 workspace 不可同时传，cwd 为远端现有绝对目录，workspace 为配置别名；省略位置与预设按远端默认值处理。roleId 必须在宿主可信映射中；roleLockPath 仅接受宿主缓存 locks 目录内已存在、身份与字节校验通过的父锁，不能通过任务参数覆盖 profile、网络或缓存根。
+`metadata.1agents` 的调用输入支持 `cwd/workspace/agentPreset/preflight/resultContract/roleId`。cwd 和 workspace 不可同时传，cwd 为远端现有绝对目录，workspace 为配置别名；省略位置与预设按远端默认值处理。roleId 必须在宿主可信映射中，角色技能从会话 cwd 的 `.agents/skills` 读取。
 
 同一会话的新任务在 `message.contextId` 传已保存 context ID；保存的 cwd/preset 不能改变。已完成 task 不可重新打开。原 task 为 input-required 时可传 `message.taskId`，配合新的 `messageId` 继续；活跃 task 上的 follow-up 被拒绝。
 

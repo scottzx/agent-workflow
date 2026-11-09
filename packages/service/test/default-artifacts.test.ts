@@ -74,3 +74,13 @@ test('a caller-declared manifest keeps its strict behaviour', async () => {
   await assert.rejects(createA2AResultMetadata({ taskId: 't', contextId: 'c', requestId: 'r', startedAt: new Date().toISOString(), outcome: 'completed',
     target: { sessionId: 's', cwd, preflight } as any, contract: { jobId: 'j', artifactManifestPath: join(directory, 'missing.json') } }), /artifact-manifest-or-file-unavailable/);
 });
+
+test('a default manifest named through a symlinked cwd is still optional', async () => {
+  const cwd = await project(), link = join(await project(), 'workspace-link');
+  await symlink(cwd, link);
+  const preflight = await runA2APreflight({ cwd, jobDirectory: defaultJobDirectory(cwd, 'job-l') });
+  const metadata = await createA2AResultMetadata({ taskId: 't', contextId: 'c', requestId: 'r', startedAt: new Date().toISOString(), outcome: 'completed',
+    target: { sessionId: 's', cwd, preflight } as any, contract: { jobId: 'job-l', artifactManifestPath: defaultManifestPath(link, 'job-l', 'attempt-1') } });
+  assert.equal(metadata.outcome, 'completed'); assert.deepEqual(metadata.artifacts, []);
+  assert.equal(metadata.validation.status, 'not-requested');
+});

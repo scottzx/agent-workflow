@@ -1,18 +1,16 @@
 # PPT 美化大师常驻角色
 
-这是 DSH 角色 bundle，永久声明 `ppt-beautifier` 角色及其作用域内的模型路由。宿主持续运行，每份上游 A2A 派单创建独立任务会话；同一 `contextId` 的后续指令复用该任务会话。该 bundle 只增加角色，不更改现有默认预设，不启用 A2A，也不携带凭据。
+这是 `ppt-beautifier` 固定角色的配置说明。角色不再带专属 DSH 预设或模型路由：固定目标默认跑在 DSH 的 `standard` 预设上，宿主按 `roleId` 在第一条消息前加上角色说明和技能指南路径，技能读自工作目录的 `.agents/skills`。每份上游 A2A 派单创建独立任务会话；同一 `contextId` 的后续指令复用该任务会话。
 
 ## 当前部署目录
 
-- 角色定义：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/roles/ppt-beautifier`
-- 角色 bundle：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/agent-bundle`
-- 技能完整源：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/skills/ppt`
-- 锁定技能缓存：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/cache/roles`
-- 执行工作目录：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace`
-- 角色状态及归档：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/state`
-- 项目网关登记、任务账本与通知：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/state/a2a-gateway`
+- 角色定义：`/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/roles/ppt-beautifier`
+- 技能分发源：`/Users/scott/Documents/01-开发项目/1agents/training/rsi-training/scenarios/ppt`
+- 执行工作目录：`/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace`（技能在其中的 `.agents/skills`，`.claude/skills` 是指向它的软链）
+- 角色状态及归档：`/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/state`
+- 项目网关登记、任务账本与通知：`/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/state/a2a-gateway`
 
-当前角色挂载专属模型路由、薄 persona、原生 bash、文件读写及搜索；技能由宿主按网络版本加载并冻结到本任务锁。目录和维护规则见 [项目 Agent 数据目录](../../.1agents/README.md)。下文 0.2.x 设计绑定、复制部署和归档路径为历史记录；新任务使用宿主注入的锁定指南入口。
+目录和维护规则见 [项目 Agent 数据目录](../../.1agents/README.md)。
 
 ## 0.2.0 设计绑定
 
@@ -60,35 +58,22 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 
 对应快照为同一 `state/design-releases` 目录下的 `design-role-0.2.1.tar.gz` 与 `design-role-0.2.1.manifest.json`，沿用上述白名单并包含新增布局参考，归档内使用 `design-binding-0.2.1.json`。恢复时选择同一设计版本的归档、manifest与binding；原 `0.2.0` 绑定和备份保持原样，可按上述授权恢复流程回退。
 
-## 角色专属模型
+## 预设与模型
 
-`0.2.0` 沿用 `0.1.2` 的模型路由实现：`model-route.js` 在该预设作用域注册 `system-prompt/assemble` 与 `agent/request` waterfall，使用已配置的 `minimax-cn/MiniMax-M3`。两处都先调用 `next()`，再同步 prompt 变量与实际请求路由，保留其余请求控制项并清除前一模型的 reasoning effort。它不调用 `session/selectModel`、不读取或保存宿主默认模型，不注册任何根作用域事件。其他预设不加载此插件。
+固定目标 `binding.agentPreset` 是默认预设，不写时为 `standard`。模型是可选项：
 
-`node --test model-route.test.mjs` 检查请求配置保留、默认模型无访问、作用域分离、与会话模型选择 waterfall 的组合及卸载清理。模拟测试不代替真实宿主的请求日志检查。安装后检查新 PPT 会话的实际 request header 为预期 provider/model。
+- 不指定时，会话用宿主的默认模型。
+- 每次派单可在 `input.provider` 和 `input.model` 临时指定，两者一起给，只对 DSH 原生预设（如 `standard`）有效；`oneagents-acp-*` 预设通过 `session/set_config_option` 换模型。
+- 目标也可以在 `binding.provider`、`binding.model` 写一个默认模型，单次派单仍可覆盖。
 
-## 安装与验证
-
-通过当前 DSH Web 宿主的已授权 Remote API 安装角色 bundle，不能把 HTTP 成功或包安装成功当成预设已激活。
+改默认预设或默认模型用 `execution_target_update`；想保留原目标、另做一份不同配置的，用 `execution_target_fork` 复制一份副本，例如：
 
 ```json
-{
-  "type": "client-request",
-  "rpcId": "<INSTALL_REQUEST_ID>",
-  "method": "pluginManager/installBundle",
-  "payload": {
-    "args": {
-      "spec": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/agent-bundle",
-      "options": { "enabled": true }
-    }
-  }
-}
+{ "targetId": "ppt-beautifier", "newTargetId": "ppt-beautifier-grok",
+  "patch": { "name": "PPT 美化大师（Grok）", "binding": { "agentPreset": "oneagents-acp-grok-build" } } }
 ```
 
-向 `/api/pluginManager/installBundle` POST 该消息，认证由部署进程在内存中读取既有受保护凭据后附加，不写入 bundle、命令行参数或报告。检查 `result.ok: true` 和 `result.value.application`。若为 `applied`，继续查询预设；若为 `restart-required`，先确认宿主没有运行中的会话，再重启受管理的 DSH Web。实际部署返回过 `restart-required`，不能假定热加载成功。随后调用 `/api/agentPresets/list` 确认 `ppt-beautifier` 无 `broken`，并以新会话的请求头验证角色版本和模型路由。已有任务保留旧预设 revision，新任务使用当前 revision。
-
-本地 bundle 安装后通过链接引用源目录。更新已安装 bundle 不应重复添加安装项；重复安装可能返回 `already-installed`。更新源文件后仍须按宿主要求重载，并通过上述预设查询和实际请求日志确认生效。
-
-宿主提供 `read_image`，但实际模型 route 必须声明图片输入才能逐页视觉检查。请给执行会话配置可读图模型；若采用文本模型，应明确将预览交上游实际检查，不能宣称角色已看图。
+`patch.binding` 只写要改的字段，其余沿用原目标；原目标不变，新目标版本从 1 开始。
 
 ## A2A 接入
 
@@ -100,8 +85,9 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 {
   "remote": "ppt-beautifier",
   "originSessionId": "<REAL_PARENT_SESSION_ID>",
-  "cwd": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace/<JOB_ID>",
-  "agentPreset": "ppt-beautifier",
+  "cwd": "/Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace",
+  "agentPreset": "standard",
+  "roleId": "ppt-maker",
   "title": "PPT 美化任务",
   "prompt": "请读取 <ABSOLUTE_CONTRACT_PATH>，按合同导入原稿并美化，输出可编辑 PPTX，逐页渲染并实际检查，最终答复附已存在的 PPTX 与预览链接。"
 }
@@ -123,6 +109,14 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 
 角色规则以 [ROLE.md](ROLE.md) 为准，同步到角色 workspace/ROLE.md。页数可通过交付输入 `slideCount` 指定；省略时由事实脚本按内容规划，后续制作、预览、机器校验及独立验收按冻结脚本的实际 N 页执行。既有六页合同与产物不变。
 
-## 网络技能与缓存（0.4.0）
+## 技能
 
-当前角色说明和技能引用由 [.1agents/roles/ppt-beautifier](../../.1agents/roles/ppt-beautifier) 维护。persona 只保留接单与加载规则；设计方法通过能力网络统一更新。旧私有 skills 目录作为历史备份保留，新任务使用宿主注入的任务锁和 `.1agents/cache/roles` 内的版本快照。完整源在 `.1agents/skills/ppt` 独立维护；操作及恢复规则见 [角色与缓存说明](../../.1agents/README.md)。上文 0.2.x 本地复制方式为历史部署记录。
+角色说明和技能清单由 [.1agents/roles/ppt-beautifier](../../.1agents/roles/ppt-beautifier) 维护。技能放在工作目录的 `.agents/skills`，修改技能源后执行：
+
+```sh
+acp-service roles sync --profile .1agents/roles/ppt-beautifier/profile.json \
+  --cwd .1agents/runtime/ppt-beautifier/workspace \
+  --source /Users/scott/Documents/01-开发项目/1agents/training/rsi-training/scenarios/ppt
+```
+
+不再网络下载、缓存或锁定版本，续派读目录当前内容。

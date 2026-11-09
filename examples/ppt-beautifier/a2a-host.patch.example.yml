@@ -9,16 +9,13 @@
       enabled: true
       tokenEnv: DSH_PPT_A2A_TOKEN
       publicUrl: http://127.0.0.1:3080
-      stateDirectory: /Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/state/a2a
-      defaultCwd: /Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace
-      defaultAgentPreset: ppt-beautifier
+      stateDirectory: /Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/state/a2a
+      defaultCwd: /Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/runtime/ppt-beautifier/workspace
+      defaultAgentPreset: standard
       roleSkills:
-        cacheRoot: /Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/cache/roles
         profiles:
-          ppt-maker: /Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/roles/ppt-beautifier/profile.json
-          ppt-reviewer: /Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/roles/ppt-beautifier/profile.json
-          ppt-backup: /Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/roles/ppt-beautifier/profile.json
-        presetRoles:
-          ppt-beautifier: ppt-maker
+          ppt-maker: /Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/roles/ppt-beautifier/profile.json
+          ppt-reviewer: /Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/roles/ppt-beautifier/profile.json
+          ppt-backup: /Users/scott/Documents/01-开发项目/1agents/network/1acp/.1agents/roles/ppt-beautifier/profile.json
       pushNotificationOrigins:
         - '<GATEWAY_CALLBACK_ORIGIN>'

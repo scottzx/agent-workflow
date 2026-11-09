@@ -14,7 +14,7 @@ async function fixture(t: TestContext) {
   const project = join(root, 'project'), roleDirectory = join(project, '.1agents', 'roles', 'designer');
   await mkdir(roleDirectory, { recursive: true });
   await writeFile(join(roleDirectory, 'profile.json'), JSON.stringify({ id: 'designer', version: '1.0.0',
-    network: { agentUrl: 'http://127.0.0.1:1' }, skills: [{ key: 'slides', name: 'Slides' }] }));
+    skills: [{ key: 'slides', name: 'Slides' }] }));
   const output = join(root, 'reader-output.json'), calls = join(root, 'reader-calls.jsonl'), pid = join(root, 'reader.pid');
   const behavior = join(root, 'reader-behavior.txt'), reader = join(root, 'fake-reader.cjs');
   await writeFile(output, JSON.stringify({ projects: [{ workspace: project }], hasMore: false }));

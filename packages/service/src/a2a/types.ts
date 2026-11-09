@@ -5,13 +5,11 @@ import { z } from 'zod';
 import type { A2AExecutionRef } from './execution-binding.js';
 
 const roleText = z.string().min(1).max(4096).refine(value => !value.includes('\0'));
-const rolePath = roleText.refine(isAbsolute, 'Expected an absolute role cache path');
-/** Host-authored summary of a verified, immutable role/skill lock. */
+const rolePath = roleText.refine(isAbsolute, 'Expected an absolute role path');
+/** Host-authored summary of the role skills a session was given: each one sits in the session's `.agents/skills`. */
 export const a2aRoleSkillsSchema = z.object({
-  roleId: roleText, roleVersion: roleText, lockPath: rolePath, roleDirectory: rolePath,
-  entryGuidePath: rolePath.optional(),
-  skills: z.array(z.object({ key: roleText, skillId: roleText, sourceId: roleText, name: roleText,
-    revision: z.string().regex(/^[a-f0-9]{64}$/), directory: rolePath, guidePath: rolePath }).strict()).min(1).max(100),
+  roleId: roleText, roleVersion: roleText, roleDirectory: rolePath, entryGuidePath: rolePath.optional(),
+  skills: z.array(z.object({ key: roleText, name: roleText, directory: rolePath, guidePath: rolePath }).strict()).min(1).max(100),
 }).strict();
 export type A2ARoleSkills = z.infer<typeof a2aRoleSkillsSchema>;
 
@@ -73,7 +71,6 @@ export interface A2APrepareInput {
   /** Only selects a host-configured profile; clients cannot supply profile or cache configuration. */
   roleId?: string;
   /** Optional existing parent lock under the host cache's locks directory. */
-  roleLockPath?: string;
   /** A path agent's agents/*.md inside cwd; its body prefixes the first message of a new session. Not combined with roleId. */
   agentFile?: string;
   /** Standard presets only, passed together. Omitted keeps the session's current or host-default model. */
