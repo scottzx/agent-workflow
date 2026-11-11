@@ -30,8 +30,21 @@ test('discovers native harnesses in PATH and user directories without mistaking 
   assert.equal(statuses.get('grok-build')?.chat_ready, true);
   assert.equal(statuses.get('claude')?.type, 'claudecode');
   assert.equal(statuses.get('claude')?.chat_ready, true);
-  assert.equal(statuses.get('antigravity')?.installed, true);
+  assert.equal(statuses.get('antigravity')?.installed, false);
+  assert.equal(statuses.get('antigravity')?.acp_capable, true);
+  assert.equal(statuses.get('antigravity')?.integrated, true);
+  assert.equal(statuses.get('antigravity')?.cc_transport, 'acp');
+  assert.equal(statuses.get('antigravity')?.binary, 'agy_acp_server.par');
   assert.equal(statuses.get('antigravity')?.chat_ready, false);
+  const server = f.executable('bin/agy_acp_server.par');
+  const ready = f.scan().get('antigravity');
+  assert.equal(ready?.installed, true);
+  assert.equal(ready?.path, server);
+  assert.equal(ready?.chat_ready, true);
+  const launch = createServiceAgentRegistry(f.options).resolve('antigravity');
+  assert.ok(Array.isArray(launch));
+  assert.equal(launch[0], server);
+  assert.deepEqual(launch.slice(1), process.platform === 'linux' ? ['--uid='] : []);
   chmodSync(grok, 0o644);
   assert.equal(f.scan().get('grok-build')?.chat_ready, false);
 });
@@ -140,7 +153,15 @@ test('native ACP discovery checks the launch binary, not only a display CLI alia
 test('Windows lookup handles PATHEXT and PATH separators', t => {
   const f = fixture(t);
   const target = f.executable('bin/gemini.CMD');
-  assert.equal(findAgentBinary('gemini', { ...f.options, platform: 'win32', env: { PATH: `${f.home}/missing;${f.home}/bin`, PATHEXT: '.EXE;.CMD' } }), target);
+  const win = { ...f.options, platform: 'win32' as const, env: { PATH: `${f.home}/missing;${f.home}/bin`, PATHEXT: '.EXE;.CMD' } };
+  assert.equal(findAgentBinary('gemini', win), target);
+  f.executable('bin/agy');
+  assert.equal(discoverAgents(win).find(agent => agent.id === 'antigravity')?.installed, false);
+  const exe = f.executable('bin/agy_acp_server.exe');
+  const antigravity = discoverAgents(win).find(agent => agent.id === 'antigravity');
+  assert.equal(antigravity?.binary, 'agy_acp_server.exe');
+  assert.equal(antigravity?.installed, true);
+  assert.equal(antigravity?.path, exe);
 });
 
 test('service launch registry preserves unknown commands and runtime aliases', () => {
