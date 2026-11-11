@@ -121,14 +121,21 @@ function localLaunch(id: string, options: DiscoveryOptions): string[] | undefine
   return binary ? [binary, ...argv.slice(1)] : undefined;
 }
 
+/** Antigravity's ACP runtime is a separate download from the `agy` CLI. */
+function discoveryBinary(id: string, descriptor: { binary: string } | undefined, argv: string[] | string | undefined, platform: NodeJS.Platform): string {
+  if (id === 'antigravity') return platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par';
+  return descriptor?.binary ?? (Array.isArray(argv) && !['npx', 'uvx'].includes(argv[0]) ? argv[0] : id);
+}
+
 /** Fresh filesystem snapshot. An installed CLI may use the runtime's adapter download fallback on launch; scanning never downloads or authenticates. */
 export function discoverAgents(options: DiscoveryOptions = {}): AgentStatus[] {
   const descriptors = new Map(catalogDescriptors.map(d => [d.type === 'claudecode' ? 'claude' : d.type, d]));
   const supportedAgents = new Set(registry.list());
+  const platform = options.platform ?? process.platform;
   return [...new Set([...supportedAgents, ...descriptors.keys()])].map(id => {
     const descriptor = descriptors.get(id);
     const argv = registry.resolve(id);
-    const binary = descriptor?.binary ?? (Array.isArray(argv) && !['npx', 'uvx'].includes(argv[0]) ? argv[0] : id);
+    const binary = discoveryBinary(id, descriptor, argv, platform);
     const path = findAgentBinary(binary, options);
     const supported = supportedAgents.has(id);
     return {

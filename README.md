@@ -45,7 +45,7 @@ Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, 
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-The current npm release is `0.10.0`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+The current npm release is `0.10.1`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
 dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
@@ -126,6 +126,8 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 ## Package releases
 
 Only `@1agents/acp-service` is published.
+
+Version 0.10.1 treats Antigravity as an integrated ACP agent. Discovery looks for `agy_acp_server.par` (or `agy_acp_server.exe` on Windows), not the separate `agy` CLI. The runtime still cancels Antigravity's fixed-choice questions, so those have to be answered in an interactive client. See [changelog/2026-11-11.md](changelog/2026-11-11.md).
 
 Version 0.10.0 loads role skills from the session's working directory instead of downloading and pinning them (see [Roles and skills](#roles-and-skills)), runs fixed roles on the `standard` preset with optional per-task models, adds `execution_target_fork`, and lets a path agent be combined with a host role. It is a breaking release: the role lock and cache are gone, together with `roleLockPath`, `roleSkills.cacheRoot`, the profile `network`/`sourceId`/`skillId`/`nodeUrl`/`assetsManifest` fields and `binding.skillPolicy` (now `binding.loadRole: true`). Contexts saved with a lock no longer load. See [changelog/2026-11-09.md](changelog/2026-11-09.md).
 
