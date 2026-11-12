@@ -11,7 +11,7 @@ import {
 } from '@a2a-js/sdk/server';
 import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
-import { DirectoryLease } from './lease.js';
+import { DirectoryLease, isStorageBusy } from './lease.js';
 import type { A2ATarget } from './types.js';
 import { a2aRoleSkillsSchema } from './types.js';
 import { a2aPreflightReportSchema } from './preflight.js';
@@ -189,8 +189,10 @@ function parsePush(value: unknown, taskId: string, scope: Scope): StoredPushNoti
 export class FileA2AStore {
   readonly taskStore: TaskStore;
   readonly pushStore: PushNotificationStore;
+  /** `read-only` loaded another live owner's records and rejects every mutation. */
+  readonly mode: 'read-write' | 'read-only';
   private readonly directory: string;
-  private readonly lease: DirectoryLease;
+  private readonly lease?: DirectoryLease;
   private readonly memory = new InMemoryTaskStore();
   private readonly tasks = new Map<string, CachedTask>();
   private readonly pushes = new Map<string, StoredPushNotificationConfig[]>();
@@ -198,13 +200,25 @@ export class FileA2AStore {
   private readonly ready: Promise<unknown>;
   private closed = false;
 
-  constructor(directory: string) {
+  /** Exclusive by default. `onConflict: 'readonly'` attaches without a lease when a live owner already holds the directory. */
+  static open(directory: string, options?: { onConflict?: 'throw' | 'readonly' }): FileA2AStore {
+    try { return new FileA2AStore(directory); }
+    catch (error) {
+      if (options?.onConflict === 'readonly' && isStorageBusy(error)) return new FileA2AStore(directory, 'read-only');
+      throw error;
+    }
+  }
+
+  constructor(directory: string, mode: 'read-write' | 'read-only' = 'read-write') {
+    this.mode = mode;
     this.directory = resolve(directory);
-    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    if (mode === 'read-write') {
+      mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+      chmodSync(this.directory, 0o700);
+    }
     const stat = lstatSync(this.directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('A2A storage directory must be a real directory');
-    chmodSync(this.directory, 0o700);
-    this.lease = new DirectoryLease(this.directory);
+    if (mode === 'read-write') this.lease = new DirectoryLease(this.directory);
     try {
       const loads: Promise<void>[] = [];
       for (const name of readdirSync(this.directory)) {
@@ -230,7 +244,7 @@ export class FileA2AStore {
 
     this.taskStore = {
       save: async (task, context) => {
-        this.assertOpen();
+        this.assertWritable();
         const scope = scopeOf(context);
         // Roundtrip through JSON as well as the SDK codec so cached metadata
         // cannot retain references owned by the caller or non-JSON values.
@@ -268,7 +282,7 @@ export class FileA2AStore {
 
     this.pushStore = {
       save: async (taskId, context, supplied) => {
-        this.assertOpen();
+        this.assertWritable();
         text(taskId, 'task ID');
         const scope = scopeOf(context);
         if (supplied.taskId && supplied.taskId !== taskId) throw new RequestMalformedError('Push task ID mismatch');
@@ -296,7 +310,7 @@ export class FileA2AStore {
       load: async (taskId, context) => this.loadPush(taskId, context).map(entry => entry.config),
       loadWithMetadata: async (taskId, context) => this.loadPush(taskId, context),
       delete: async (taskId, context, configId) => {
-        this.assertOpen();
+        this.assertWritable();
         text(taskId, 'task ID');
         const scope = scopeOf(context);
         // Match the SDK default: omitted configId refers to the task ID.
@@ -340,7 +354,7 @@ export class FileA2AStore {
   }
 
   saveTarget(contextId: string, target: A2ATarget, context: ServerCallContext): void {
-    this.assertOpen();
+    this.assertWritable();
     text(contextId, 'context ID');
     const scope = scopeOf(context);
     const normalized = parseTarget(target);
@@ -351,6 +365,8 @@ export class FileA2AStore {
   /** Persist failure for interrupted executions. A restart never reruns work. */
   async recoverInterrupted(recover?: (task: Task, context: ServerCallContext) => Promise<SafeError | undefined>): Promise<void> {
     this.assertOpen();
+    // A follower must not mark the owner's in-flight tasks as failed.
+    if (this.mode === 'read-only') return;
     await this.ready;
     for (const { scope, task } of [...this.tasks.values()]) {
       if (task.status && terminalStates.has(task.status.state)) continue;
@@ -376,7 +392,7 @@ export class FileA2AStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.lease.close();
+    this.lease?.close();
   }
 
   private loadPush(taskId: string, context: ServerCallContext): StoredPushNotificationConfig[] {
@@ -387,6 +403,11 @@ export class FileA2AStore {
 
   private assertOpen(): void {
     if (this.closed) throw new Error('A2A store is closed');
+  }
+
+  private assertWritable(): void {
+    this.assertOpen();
+    if (this.mode === 'read-only') throw new Error('A2A storage is read-only because another instance owns it');
   }
 
   private readJson(path: string): unknown {
@@ -409,7 +430,7 @@ export class FileA2AStore {
     const id = text(source.id, 'stored resource ID');
     const kind = source.kind as Kind;
     if (fileName(kind, scope, id) !== name) throw new Error('A2A storage record filename does not match its scope');
-    chmodSync(path, 0o600);
+    if (this.mode === 'read-write') chmodSync(path, 0o600);
     return { version: 1, kind, scope, id, value: source.value };
   }
 

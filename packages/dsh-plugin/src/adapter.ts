@@ -7,7 +7,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId } from '@deepseek-ai/dsh-llm';
 import { LlmError } from '@deepseek-ai/dsh-llm';
-import type { Diagnostics } from './diagnostics.js';
+import type { DiagnosticLog } from './diagnostics.js';
 import type {} from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-user-questions';
 import type {} from '@deepseek-ai/dsh-commands';
@@ -147,7 +147,7 @@ export class AcpAdapter implements LlmAdapter {
   private readonly sessionSettings: AgentSessionSettings;
   /** MCP servers offered when a session is created or restored, such as the A2A hand-back tool. */
   mcpServersFor?: (sessionId: string) => McpServer[];
-  constructor(private ctx: Context, private config: Config, private readonly diagnostics?: Diagnostics, private readonly processRequests?: ProcessRequestClient) {
+  constructor(private ctx: Context, private config: Config, private readonly diagnostics?: DiagnosticLog, private readonly processRequests?: ProcessRequestClient) {
     this.state = new State(config.stateDirectory);
     this.sessionSettings = new AgentSessionSettings(config.stateDirectory);
   }

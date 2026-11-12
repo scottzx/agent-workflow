@@ -10,7 +10,7 @@ import { A2APreflightError, bindA2AExecution, runA2APreflight, unbindA2AExecutio
 import { toSafeError } from '@1agents/acp-service/runtime';
 import { modelSelectionOf } from './preset-route.js';
 
-import type { Diagnostics } from './diagnostics.js';
+import type { DiagnosticLog } from './diagnostics.js';
 import { consumeProcessReady, readProcessCapacity, readSessionRestore } from './process-admission.js';
 
 export interface SessionControl {
@@ -108,7 +108,7 @@ async function waitForIdle(agent: Agent, signal: AbortSignal): Promise<void> {
 export class DshA2ABackend implements A2ABackend {
   private readonly executions = new Map<string, Promise<void>>();
   /** @param ctx DSH plugin context that owns session-controller and execution event registrations. */
-  constructor(private readonly ctx: Context, private readonly diagnostics?: Diagnostics, private readonly sessions?: SessionControl) {}
+  constructor(private readonly ctx: Context, private readonly diagnostics?: DiagnosticLog, private readonly sessions?: SessionControl) {}
 
   async close(target: A2ATarget): Promise<{ processReleased: true | 'pending'; acp?: boolean }> {
     if (!target.agentPreset?.startsWith('oneagents-acp-')) return { processReleased: true, acp: false };

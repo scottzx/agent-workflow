@@ -160,6 +160,29 @@ test('A2A restart marks every unfinished scoped execution failed and keeps termi
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('a live owner keeps the lock while a follower reads and cannot write or recover', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'a2a-readonly-'));
+  const owner = new FileA2AStore(directory);
+  const own = context();
+  await owner.taskStore.save(task('working', { state: TaskState.TASK_STATE_WORKING }), own);
+  const follower = FileA2AStore.open(directory, { onConflict: 'readonly' });
+  try {
+    assert.equal(follower.mode, 'read-only');
+    assert.equal((await follower.taskStore.load('working', own))?.status?.state, TaskState.TASK_STATE_WORKING);
+    await assert.rejects(follower.taskStore.save(task('working', { state: TaskState.TASK_STATE_FAILED }), own), /read-only/);
+    assert.throws(() => follower.saveTarget('conversation-1', { sessionId: 's', cwd: directory }, own), /read-only/);
+    await follower.recoverInterrupted();
+    assert.equal((await owner.taskStore.load('working', own))?.status?.state, TaskState.TASK_STATE_WORKING);
+    follower.close();
+    assert.equal((await owner.taskStore.load('working', own))?.id, 'working');
+    assert.equal(readdirSync(join(directory, '.lock')).length, 1);
+  } finally {
+    follower.close();
+    owner.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('A2A store refuses concurrent instances and invalid callbacks, and fails closed on corrupt scope', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'a2a-validation-'));
   let store = new FileA2AStore(directory);

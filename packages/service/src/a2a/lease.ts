@@ -1,4 +1,7 @@
 /** Single-writer directory lease shared by A2A records and plugin diagnostics. */
+export function isStorageBusy(error: unknown): boolean {
+  return error instanceof Error && error.message === 'A2A storage directory is already in use by another instance';
+}
 import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';

@@ -20,7 +20,7 @@ export type { ExecutorTicketArgs, ExecutorTicketChannel, ExecutorTicketScope, Ex
 export { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 export { A2AAutomation } from './automation.js';
 export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';
-export { DirectoryLease } from './lease.js';
+export { DirectoryLease, isStorageBusy } from './lease.js';
 export { CapacityGovernor, CapacityError } from '../capacity.js';
 export { CapacityQueue } from '../capacity-queue.js';
 export type { CapacityOptions, CapacityLease, CapacitySnapshot } from '../capacity.js';

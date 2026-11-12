@@ -51,6 +51,8 @@ export interface A2AServerOptions extends A2AExecutionOptions {
   path?: string;
   /** Webhook destinations must belong to one of these exact HTTP(S) origins. */
   pushNotificationOrigins?: string[];
+  /** `readonly` keeps a second host up when another live instance already owns the directory. */
+  storage?: { onConflict?: 'throw' | 'readonly' };
 }
 
 function allowedCallback(config: TaskPushNotificationConfig, origins: Set<string>): void {
@@ -188,6 +190,8 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
   taskSession: (taskId: string) => string | undefined;
   /** Hand a taken-over session's result back to the workflow as a new completed snapshot. */
   resubmit: (input: { sessionId: string; summary: string }) => Promise<A2AResubmission>;
+  /** `read-only` when another live instance owns the state directory. */
+  mode: 'read-write' | 'read-only';
   close: () => Promise<void>;
 }> {
   if (!options.token?.trim()) throw new Error('A2A requires a bearer token');
@@ -208,8 +212,8 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
     securityRequirements: [{ schemes: { bearerAuth: { list: [] } } }],
     defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
     skills: [{ id: 'dsh-session', name: 'DSH session task', description: 'Create or resume a session using metadata.1agents.cwd, workspace and agentPreset; retain contextId to continue collaboration.', tags: ['dsh', 'project', 'role', 'async'] }] });
-  const store = new FileA2AStore(options.stateDirectory);
-  try { await store.recoverInterrupted(async (task, context) => {
+  const store = FileA2AStore.open(options.stateDirectory, { onConflict: options.storage?.onConflict ?? 'throw' });
+  try { if (store.mode === 'read-write') await store.recoverInterrupted(async (task, context) => {
     const message = task.history.findLast(message => message.role === Role.ROLE_USER);
     const target = store.loadTarget(task.contextId, context);
     if (!message || !target) return;
@@ -396,7 +400,7 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
     void pending.then(clean, clean);
     return pending;
   };
-  return { path, card, handler, cardHandler,
+  return { path, card, handler, cardHandler, mode: store.mode,
     sessionTask: sessionId => a2aSessionTask({ store, executor }, sessionId),
     taskSession: taskId => a2aTaskSession({ store }, taskId),
     resubmit: input => {
