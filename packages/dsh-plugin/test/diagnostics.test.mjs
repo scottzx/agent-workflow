@@ -85,6 +85,23 @@ test('diagnostic writes cannot acknowledge a backend failure or publish uncommit
   assert.equal(diagnostics.find('test-session', 'request-1').outcomeUnknown, false);
 });
 
+test('a follower keeps diagnostics in memory and does not take or release the owner lock', async t => {
+  const root = await directory(t), first = await openDiagnostics(root);
+  t.after(() => first.close());
+  const id = await first.diagnostics.begin(identity()); await first.diagnostics.settle(id, quota());
+  const follower = await openDiagnostics(root, { onConflict: 'readonly' });
+  t.after(() => follower.close());
+  assert.equal(follower.mode, 'read-only');
+  assert.equal(follower.diagnostics.find('test-session', 'request-1'), undefined);
+  const local = await follower.diagnostics.begin(identity());
+  await follower.diagnostics.settle(local, quota());
+  assert.equal(follower.diagnostics.find('test-session', 'request-1').category, 'quota');
+  await follower.close();
+  assert.equal(first.diagnostics.find('test-session', 'request-1').category, 'quota');
+  const names = await import('node:fs/promises').then(fs => fs.readdir(join(root, '.lock')));
+  assert.equal(names.length, 1);
+});
+
 test('diagnostic owner rejects a concurrent writer and releases the lease after close', async t => {
   const root = await directory(t), first = await openDiagnostics(root);
   t.after(() => first.close());

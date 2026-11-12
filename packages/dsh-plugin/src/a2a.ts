@@ -2,7 +2,7 @@
 import { createA2AServer, type A2AServerOptions } from '@1agents/acp-service/a2a';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
-import type { Diagnostics } from './diagnostics.js';
+import type { DiagnosticLog } from './diagnostics.js';
 import { DshA2ABackend, type SessionControl } from './a2a-executor.js';
 
 /** Optional host configuration; omitted configuration leaves A2A disabled. */
@@ -23,7 +23,7 @@ export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token
 export type A2AHostControls = Pick<Awaited<ReturnType<typeof createA2AServer>>, 'sessionTask' | 'taskSession' | 'resubmit'>;
 
 /** Routes and in-flight turns are released with the owning Cordis plugin. */
-export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string, diagnostics?: Diagnostics, sessions?: SessionControl,
+export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string, diagnostics?: DiagnosticLog, sessions?: SessionControl,
   expose?: (host: A2AHostControls | undefined) => void): Promise<() => Promise<void>> {
   if (options.enabled === false) return async () => {};
   const token = options.token ?? process.env[options.tokenEnv ?? 'DSH_A2A_TOKEN'];
@@ -33,7 +33,9 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
     const { workbench: _workbench, ...serverOptions } = options;
     const server = await createA2AServer({ ...serverOptions, token, backend: new DshA2ABackend(ctx, diagnostics, sessions),
       stateDirectory: options.stateDirectory ?? stateDirectory,
-      publicUrl: options.publicUrl ?? `http://127.0.0.1:${ctx.webServer.port}` });
+      publicUrl: options.publicUrl ?? `http://127.0.0.1:${ctx.webServer.port}`,
+      storage: { onConflict: 'readonly' } });
+    if (server.mode === 'read-only') console.warn('oneagents-acp A2A storage is read-only because another instance owns it');
     const routes: (() => void)[] = [];
     try {
       routes.push(ctx.webServer.register({ kind: 'exact', path: '/.well-known/agent-card.json', handler: server.cardHandler }));

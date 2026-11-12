@@ -40,8 +40,9 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   };
   if (config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
   if (!Number.isSafeInteger(config.reconnectAttempts) || config.reconnectAttempts < 0 || !Number.isSafeInteger(config.reconnectDelayMs) || config.reconnectDelayMs < 1) throw new Error('Invalid ACP reconnect policy');
-  const diagnosticOwner = await openDiagnostics(resolve(input.diagnosticsDirectory ?? join(config.stateDirectory, 'diagnostics')));
+  const diagnosticOwner = await openDiagnostics(resolve(input.diagnosticsDirectory ?? join(config.stateDirectory, 'diagnostics')), { onConflict: 'readonly' });
   const { diagnostics } = diagnosticOwner;
+  if (diagnosticOwner.mode === 'read-only') console.warn('oneagents-acp diagnostics are read-only because another instance owns the storage');
   let closeA2A: (() => Promise<void>) | undefined;
   const processRequests = input.a2a?.workbench ? createWorkbenchProcessClient(input.a2a.workbench) : undefined;
   const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);

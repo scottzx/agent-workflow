@@ -6,7 +6,7 @@ import * as StorageDomain from '@deepseek-ai/dsh-storage-domain';
 import { randomUUID } from 'node:crypto';
 import { z } from 'dsh-zod';
 import { defineDomain, domainTable, type Domain, type DomainFacility } from '@deepseek-ai/dsh-storage-domain';
-import { DirectoryLease } from '@1agents/acp-service/a2a';
+import { DirectoryLease, isStorageBusy } from '@1agents/acp-service/a2a';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 
 const identitySchema = z.object({
@@ -35,6 +35,16 @@ const recordSchema = z.object({
 const spec = defineDomain({ name: 'oneagents_acp_diagnostics', version: 1,
   tables: { attempts: domainTable<string, z.infer<typeof recordSchema>>(recordSchema) } });
 export type DiagnosticIdentity = z.infer<typeof identitySchema>;
+type DiagnosticRecord = z.infer<typeof recordSchema>;
+/** Methods the adapter and A2A backend actually call. A follower may implement them in memory. */
+export interface DiagnosticLog {
+  begin(identity: DiagnosticIdentity): Promise<string>;
+  submitted(id: string): Promise<void>;
+  confirmed(id: string): Promise<void>;
+  settle(id: string, error?: SafeError): Promise<void>;
+  find(sessionId: string, requestId: string, turn?: number, turnStartSeq?: number): SafeError | undefined;
+  close(): Promise<void>;
+}
 
 /** Shared by the owned Adapter and A2A backend; every mutating method awaits durability. */
 export class Diagnostics {
@@ -118,11 +128,77 @@ export class Diagnostics {
   async close(): Promise<void> { this.closed = true; await this.chain; await this.domain.close(); }
 }
 
+/** Process-local diagnostics. Used when another instance already owns the directory, so chat can continue without writing its files. */
+class MemoryDiagnostics implements DiagnosticLog {
+  private serial = 0;
+  private readonly records = new Map<string, DiagnosticRecord>();
+  private closed = false;
+  begin(identity: DiagnosticIdentity): Promise<string> {
+    if (this.closed) return Promise.reject(new Error('ACP diagnostics are closed'));
+    const snapshot = identitySchema.parse(identity);
+    const serial = this.serial + 1;
+    if (!Number.isSafeInteger(serial)) return Promise.reject(new Error('ACP diagnostic sequence exhausted'));
+    const id = randomUUID();
+    this.records.set(id, { id, serial, identity: snapshot, phase: 'prepared' });
+    this.serial = serial;
+    return Promise.resolve(id);
+  }
+  submitted(id: string): Promise<void> {
+    return this.update(id, record => {
+      if (record.phase !== 'prepared' && record.phase !== 'submitted') throw new Error('ACP diagnostic attempt already confirmed');
+      return { ...record, phase: 'submitted' };
+    });
+  }
+  confirmed(id: string): Promise<void> {
+    return this.update(id, record => {
+      if (record.phase === 'settled') throw new Error('ACP diagnostic attempt already settled');
+      return { ...record, phase: 'confirmed' };
+    });
+  }
+  settle(id: string, error?: SafeError): Promise<void> {
+    const safe = error === undefined ? undefined : errorSchema.parse({
+      category: error.category, retryable: error.retryable, outcomeUnknown: error.outcomeUnknown, origin: error.origin,
+      ...(error.providerCode === undefined ? {} : { providerCode: error.providerCode }),
+      ...(error.code === undefined ? {} : { code: error.code }),
+      ...(error.detailCode === undefined ? {} : { detailCode: error.detailCode }),
+    });
+    return this.update(id, record => {
+      if (record.phase === 'settled') throw new Error('ACP diagnostic attempt already settled');
+      return { ...record, phase: 'settled', ...(safe === undefined ? {} : { error: safe }) };
+    });
+  }
+  find(sessionId: string, requestId: string, turn?: number, turnStartSeq?: number): SafeError | undefined {
+    const records = [...this.records.values()].filter(record => record.identity.sessionId === sessionId && record.identity.requestIds.includes(requestId)
+      && (turn === undefined || record.identity.turn === turn)
+      && (turnStartSeq === undefined || record.identity.turnStartSeq === turnStartSeq));
+    const record = records.sort((a, b) => b.serial - a.serial)[0];
+    if (!record) return;
+    return record.error ? toSafeError(record.error, { trustedProjection: true, origin: 'dsh', operationId: requestId })
+      : toSafeError(undefined, { origin: 'dsh', operationId: requestId, outcomeUnknown: record.phase === 'submitted' });
+  }
+  async close(): Promise<void> { this.closed = true; }
+  private update(id: string, change: (record: DiagnosticRecord) => DiagnosticRecord): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('ACP diagnostics are closed'));
+    const current = this.records.get(id);
+    if (!current) return Promise.reject(new Error('ACP diagnostic attempt is missing'));
+    this.records.set(id, change(current));
+    return Promise.resolve();
+  }
+}
+
 /** Own the official storage plugins until A2A and native calls have drained. */
-export async function openDiagnostics(directory: string): Promise<{ diagnostics: Diagnostics; close: () => Promise<void> }> {
+export async function openDiagnostics(directory: string, options?: { onConflict?: 'throw' | 'readonly' }): Promise<{ diagnostics: DiagnosticLog; close: () => Promise<void>; mode: 'read-write' | 'read-only' }> {
+  let lease: DirectoryLease;
+  try { lease = new DirectoryLease(directory); }
+  catch (error) {
+    if (options?.onConflict === 'readonly' && isStorageBusy(error)) {
+      const diagnostics = new MemoryDiagnostics();
+      return { diagnostics, mode: 'read-only', close: () => diagnostics.close() };
+    }
+    throw error;
+  }
   // The host's shared facility can close concurrently during root teardown.
   // This private composition gives the consumer an explicit drain-before-close order.
-  const lease = new DirectoryLease(directory);
   const storage = new Context();
   try {
     await storage.plugin(Storage);
@@ -131,7 +207,7 @@ export async function openDiagnostics(directory: string): Promise<{ diagnostics:
     await mounted.await();
     const diagnostics = await Diagnostics.open(storage.storageDomain);
     let closing: Promise<void> | undefined;
-    return { diagnostics, close: () => closing ??= (async () => {
+    return { diagnostics, mode: 'read-write', close: () => closing ??= (async () => {
       try { await diagnostics.close(); } finally { try { await storage.fiber.dispose(); } finally { lease.close(); } }
     })() };
   } catch {
