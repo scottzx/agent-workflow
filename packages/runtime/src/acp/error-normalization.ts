@@ -535,8 +535,12 @@ function localOperationalMessage(error: unknown): string | undefined {
   return undefined;
 }
 
+function isLocalAuthFailure(error: unknown): boolean {
+  return error instanceof AuthPolicyError || isAcpAuthRequiredPayload(extractAcpError(error));
+}
+
 function localSafeCategory(error: unknown, code?: string, detailCode?: string): SafeErrorCategory {
-  if (error instanceof AuthPolicyError || isAcpAuthRequiredPayload(extractAcpError(error))) {
+  if (isLocalAuthFailure(error)) {
     return "auth";
   }
   if (isTimeoutLike(error)) {
