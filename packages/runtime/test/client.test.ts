@@ -448,10 +448,9 @@ test("AcpClient authenticates Cursor with the CLI login and no client credential
   assert.equal(other.selectAuthMethod?.([{ id: "cursor_login" }]), undefined);
   await assert.rejects(
     async () =>
-      await other.authenticateIfRequired?.(
-        { agent: { request: async () => {} } },
-        [{ id: "cursor_login" }],
-      ),
+      await other.authenticateIfRequired?.({ agent: { request: async () => {} } }, [
+        { id: "cursor_login" },
+      ]),
     AuthPolicyError,
   );
 });
