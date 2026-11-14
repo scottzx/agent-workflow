@@ -27,7 +27,7 @@ export interface CapacityOptions {
   memoryProvider?: () => CapacityMemoryReading;
 }
 export interface CapacityRequest { kind: CapacityKind; source: CapacitySource; id: string; origin?: ProcessLeaseOrigin }
-export interface CapacityLimits { soft: number; hard: number; basis: 'hardware-estimate' | 'configured' }
+export interface CapacityLimits { soft: number; hard: number; basis: 'hardware-estimate' | 'package' | 'configured' }
 export interface CapacitySnapshot {
   limits: CapacityLimits;
   used: number;
@@ -78,6 +78,9 @@ const stateMessage = 'ACP capacity state is unavailable; check the local host ca
 const pidIsValid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const validKind = (value: unknown): value is CapacityKind => value === 'process' || value === 'task';
 const validSource = (value: unknown): value is CapacitySource => value === 'automatic' || value === 'interactive';
+
+/** Shipped admission limits. Every host sharing one capacity directory uses these unless it sets the same override. */
+export const packageCapacityLimits = { soft: 8, hard: 12 } as const;
 
 /** Allow roughly one automatic agent per two CPUs and 3 GiB, then keep at least one manual slot. */
 export function estimateCapacityLimits(): CapacityLimits {
@@ -161,13 +164,12 @@ export class CapacityGovernor {
 
   constructor(options: CapacityOptions = {}) {
     this.directory = resolveCapacityDirectory(options);
-    const estimate = estimateCapacityLimits();
     const soft = limit(options.softLimit ?? process.env.ACP_CAPACITY_SOFT_LIMIT, 'ACP capacity soft limit');
     const hard = limit(options.hardLimit ?? process.env.ACP_CAPACITY_HARD_LIMIT, 'ACP capacity hard limit');
     this.limits = {
-      soft: soft ?? (hard === undefined ? estimate.soft : Math.min(estimate.soft, hard - 1)),
-      hard: hard ?? Math.max(estimate.hard, (soft ?? estimate.soft) + 1),
-      basis: soft === undefined && hard === undefined ? 'hardware-estimate' : 'configured',
+      soft: soft ?? packageCapacityLimits.soft,
+      hard: hard ?? packageCapacityLimits.hard,
+      basis: soft === undefined && hard === undefined ? 'package' : 'configured',
     };
     if (this.limits.soft < 1 || this.limits.hard <= this.limits.soft || !Number.isSafeInteger(this.limits.hard)) {
       throw new Error('ACP capacity hard limit must exceed the soft limit and reserve at least one interactive slot');
