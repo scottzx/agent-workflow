@@ -260,6 +260,8 @@ test('host configuration validates limits, preserves manual room and supports me
   t.after(() => names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; }));
   const estimated = estimateCapacityLimits();
   assert.equal(estimated.basis, 'hardware-estimate'); assert.ok(estimated.soft >= 1); assert.ok(estimated.hard > estimated.soft);
+  const packaged = new CapacityGovernor({ directory: fixture(t).directory, memoryProvider: () => ({ totalBytes: 10 * 1024 ** 2, availableBytes: 10 * 1024 ** 2 }) });
+  assert.deepEqual((await packaged.snapshot('task')).limits, { soft: 8, hard: 12, basis: 'package' });
   for (const options of [{ softLimit: 0 }, { softLimit: -1 }, { hardLimit: 1 }, { softLimit: 3, hardLimit: 3 },
     { hardLimit: 2.5 }, { softLimit: NaN }, { hardLimit: Infinity }, { softLimit: Number.MAX_SAFE_INTEGER },
     { memoryReserveBytes: -1 }, { estimatedInstanceBytes: 0 }, { directory: '' }]) {

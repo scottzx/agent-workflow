@@ -323,6 +323,18 @@ const SAFE_MESSAGES: Record<SafeErrorCategory, string> = {
   unknown: "ACP execution failed.",
 };
 
+/** Local operational sentences. Only an exact code or exact message is shown; provider text is never copied. */
+const LOCAL_OPERATIONAL_MESSAGES = {
+  ACP_CAPACITY_SOFT_LIMIT:
+    "Automatic ACP capacity is full; retry after an active task or process finishes.",
+  ACP_CAPACITY_HARD_LIMIT:
+    "Device ACP capacity is full; retry after an active task or process finishes.",
+  ACP_CAPACITY_MEMORY_LIMIT:
+    "Available device memory is below the ACP startup reserve; retry after memory is freed.",
+  ACP_CAPACITY_STATE_UNAVAILABLE:
+    "ACP capacity state is unavailable; check the local host capacity state before retrying.",
+} as const;
+
 const SAFE_CODES = new Set<string>([
   ...OUTPUT_ERROR_CODES,
   "ACP_BACKEND_MISSING",
@@ -509,8 +521,22 @@ function safeLocalCode(error: unknown): string | undefined {
   return undefined;
 }
 
+function localOperationalMessage(error: unknown): string | undefined {
+  const known = new Set<string>(Object.values(LOCAL_OPERATIONAL_MESSAGES));
+  for (const record of safeErrorRecords(error)) {
+    const code = record.code;
+    if (typeof code === "string" && Object.hasOwn(LOCAL_OPERATIONAL_MESSAGES, code)) {
+      return LOCAL_OPERATIONAL_MESSAGES[code as keyof typeof LOCAL_OPERATIONAL_MESSAGES];
+    }
+    if (typeof record.message === "string" && known.has(record.message)) {
+      return record.message;
+    }
+  }
+  return undefined;
+}
+
 function localSafeCategory(error: unknown, code?: string, detailCode?: string): SafeErrorCategory {
-  if (error instanceof AuthPolicyError) {
+  if (error instanceof AuthPolicyError || isAcpAuthRequiredPayload(extractAcpError(error))) {
     return "auth";
   }
   if (isTimeoutLike(error)) {
@@ -643,7 +669,7 @@ export function toSafeError(error: unknown, options: SafeErrorOptions = {}): Saf
   const category = safeCategory(error, projected, provider, code, detailCode);
   const safe: SafeError = {
     ...safeOptionalFields(projected, options, provider, code, detailCode),
-    message: SAFE_MESSAGES[category],
+    message: localOperationalMessage(error) ?? SAFE_MESSAGES[category],
     category,
     retryable:
       projected?.retryable === true ||

@@ -34,6 +34,42 @@ test("safe errors retain bounded native provider causes without provider text", 
   }
 });
 
+test("local capacity and authentication failures keep distinct public messages", () => {
+  const scenarios = [
+    [
+      { code: "ACP_CAPACITY_SOFT_LIMIT", message: canary },
+      "Automatic ACP capacity is full; retry after an active task or process finishes.",
+    ],
+    [
+      { code: "ACP_CAPACITY_HARD_LIMIT", message: canary },
+      "Device ACP capacity is full; retry after an active task or process finishes.",
+    ],
+    [
+      { code: "ACP_CAPACITY_MEMORY_LIMIT", message: canary },
+      "Available device memory is below the ACP startup reserve; retry after memory is freed.",
+    ],
+    [
+      new Error(
+        "ACP capacity state is unavailable; check the local host capacity state before retrying.",
+      ),
+      "ACP capacity state is unavailable; check the local host capacity state before retrying.",
+    ],
+    [
+      { code: -32000, message: "Authentication required", data: { message: canary } },
+      "Provider authentication required.",
+    ],
+  ] as const;
+  for (const [error, message] of scenarios) {
+    const safe = toSafeError(error);
+    assert.equal(safe.message, message);
+    assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_/);
+  }
+  assert.equal(
+    toSafeError(new Error(`ACP capacity state is unavailable ${canary}`)).message,
+    "ACP execution failed.",
+  );
+});
+
 test("unknown and conflicting causes never become quota from prose or arbitrary data", () => {
   for (const error of [
     new Error("quota exhausted: usageLimitExceeded " + canary),
