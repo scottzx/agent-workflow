@@ -85,6 +85,7 @@ import {
   ensureCopilotAcpSupport,
   isClaudeAcpCommand,
   isCopilotAcpCommand,
+  isCursorAcpCommand,
   isDevinAcpCommand,
   isGeminiAcpCommand,
   isQoderAcpCommand,
@@ -2522,6 +2523,9 @@ export class AcpClient {
   }
 
   private selectAgentManagedAuthMethod(methodId: string): AuthSelection | undefined {
+    if (methodId === "cursor_login" && this.usesCursorCliLogin()) {
+      return { methodId, source: "agent" };
+    }
     if (!this.isGrokBuildAcpCommand() || methodId !== "cached_token") {
       return undefined;
     }
@@ -2529,6 +2533,15 @@ export class AcpClient {
       methodId,
       source: "agent",
     };
+  }
+
+  /** Cursor stores the login itself; `cursor_login` has no client credential. */
+  private usesCursorCliLogin(): boolean {
+    const { command, args } = resolveAgentCommandParts(
+      this.options.agentCommand,
+      this.options.agentArgv,
+    );
+    return isCursorAcpCommand(command, args);
   }
 
   private isGrokBuildAcpCommand(): boolean {

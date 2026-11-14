@@ -70,8 +70,8 @@ type ClientInternals = {
   selectAuthMethod?: (methods: Array<{ id: string }>) =>
     | {
         methodId: string;
-        credential: string;
-        source: "env" | "config";
+        credential?: string;
+        source: "env" | "config" | "agent";
       }
     | undefined;
   resolveAgentLaunchPlan?: () => Promise<{
@@ -418,6 +418,41 @@ test("AcpClient selects Grok Build cached_token as agent-managed auth", async ()
 
       assert.equal(authenticatedMethod, "cached_token");
     },
+  );
+});
+
+test("AcpClient authenticates Cursor with the CLI login and no client credential", async () => {
+  for (const agentCommand of ["cursor-agent acp", "/usr/local/bin/agent acp"]) {
+    const client = makeClient({ agentCommand, authPolicy: "fail" });
+    const internals = asInternals(client);
+    assert.deepEqual(internals.selectAuthMethod?.([{ id: "cursor_login" }]), {
+      methodId: "cursor_login",
+      source: "agent",
+    });
+    let authenticatedMethod: string | undefined;
+    await internals.authenticateIfRequired?.(
+      {
+        agent: {
+          request: async (method: string, { methodId }: { methodId: string }) => {
+            assert.equal(method, "authenticate");
+            authenticatedMethod = methodId;
+          },
+        },
+      },
+      [{ id: "cursor_login" }],
+    );
+    assert.equal(authenticatedMethod, "cursor_login");
+  }
+
+  const other = asInternals(makeClient({ agentCommand: "custom-acp-server", authPolicy: "fail" }));
+  assert.equal(other.selectAuthMethod?.([{ id: "cursor_login" }]), undefined);
+  await assert.rejects(
+    async () =>
+      await other.authenticateIfRequired?.(
+        { agent: { request: async () => {} } },
+        [{ id: "cursor_login" }],
+      ),
+    AuthPolicyError,
   );
 });
 
