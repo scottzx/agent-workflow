@@ -20,6 +20,8 @@ rejected before sending the model change. Choose the full advertised ID to resol
 the ambiguity. Unknown model names are also rejected. Treat advertised IDs as
 opaque, including any slashes or bracketed settings.
 
+Cursor advertises `cursor_login` and rejects `session/new` until the client calls `authenticate` with that method. The login lives in the CLI, not in an ACP credential. `acpx` sends `cursor_login` for `cursor-agent acp` and `agent acp` without looking up an API key. Sign in first with `agent login` (or pass `CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN` on the agent process). A different adapter that merely advertises `cursor_login` is left unchanged.
+
 If your Cursor install exposes ACP as `agent acp` instead of `cursor-agent acp`, override the built-in command in config:
 
 ```json

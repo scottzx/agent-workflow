@@ -94,7 +94,7 @@ Friendly agent names resolve to commands:
 - `codex` -> `npx -y @agentclientprotocol/codex-acp` (ACPX-owned package range)
 - `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range; see `agents/Claude.md`)
 - `gemini` -> `gemini --acp`
-- `cursor` -> `cursor-agent acp`
+- `cursor` -> `cursor-agent acp` (calls `authenticate` with `cursor_login` before creating a session; sign in with `agent login` first. See `agents/Cursor.md`)
 - `copilot` -> `copilot --acp --stdio`
 - `antigravity` -> `agy_acp_server.par` (`--uid=` on Linux; `agy_acp_server.exe` on Windows). Install the official runtime/helper pair and configure its own sign-in first; see [Antigravity](https://github.com/openclaw/acpx/blob/main/agents/Antigravity.md). Fixed-choice interaction questions are cancelled, including with `--approve-all`, host permission callbacks, and existing custom launchers; acpx cannot supply user answers through permission approval.
 - `devin` -> `devin acp`
@@ -317,6 +317,8 @@ Behavior:
 - `--no-fs`: disable ACP filesystem callbacks so compatible agents use their native file operations. This is a protocol callback policy, not an OS sandbox for the agent's own filesystem access.
 - `--no-terminal`: disable the ACP terminal callback. This is a protocol callback policy, not an OS sandbox for the agent's own process access.
 - `--verbose`: verbose ACP/debug logs to stderr
+
+Cursor ACP rejects `session/new` until `authenticate` uses method `cursor_login`. That method uses the existing CLI login (`agent login`, or `CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN` on the agent process). `acpx` sends it for `cursor-agent acp` and `agent acp` and does not require an ACP auth credential. Other agents that advertise the same method id are not treated as Cursor.
 
 Cursor may advertise bracketed model IDs such as `composer-2.5[fast=false]`. An exact
 advertised ID always wins. Only Cursor accepts a bare model name through a unique

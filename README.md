@@ -38,14 +38,14 @@ pnpm build && pnpm test
 Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.10.0
+dsh plugin --profile web add @1agents/acp-service@^0.10.3
 ```
 
 Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, then create a session with an **ACP · Agent** preset and an existing workspace. The plugin starts or reuses its local ACP service automatically. Replace `web` with your profile name; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-The current npm release is `0.10.2`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+The current npm release is `0.10.3`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
 dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
@@ -70,7 +70,7 @@ The plugin currently accepts text prompts. Available controls depend on the sele
 ## Standalone CLI
 
 ```sh
-npm install -g @1agents/acp-service@^0.10.0
+npm install -g @1agents/acp-service@^0.10.3
 acp-service --help
 acp-service serve --host 127.0.0.1 --port 36812 --no-report
 ```
@@ -127,6 +127,8 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 Only `@1agents/acp-service` is published.
 
+Version 0.10.3 sends Cursor's `cursor_login` authentication before creating a session, using the existing `agent login` session instead of an ACP API credential. Without that call, selecting Cursor Agent failed immediately and the UI only showed “ACP execution failed.” See [changelog/2026-11-14.md](changelog/2026-11-14.md).
+
 Version 0.10.2 lets a second DSH process start when another live instance already owns the diagnostic and A2A directories. The follower reads existing A2A records, rejects writes, and keeps its own diagnostics in memory instead of failing plugin startup. See [changelog/2026-11-12.md](changelog/2026-11-12.md).
 
 Version 0.10.1 treats Antigravity as an integrated ACP agent. Discovery looks for `agy_acp_server.par` (or `agy_acp_server.exe` on Windows), not the separate `agy` CLI. The runtime still cancels Antigravity's fixed-choice questions, so those have to be answered in an interactive client. See [changelog/2026-11-11.md](changelog/2026-11-11.md).
@@ -143,10 +145,10 @@ Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasonin
 
 ```sh
 # Ordinary CLI installation:
-npm install -g @1agents/acp-service@^0.10.0
+npm install -g @1agents/acp-service@^0.10.3
 acp-service --help
 # DSH installation (run from its checkout):
-pnpm dsh plugin --profile web add @1agents/acp-service@^0.10.0
+pnpm dsh plugin --profile web add @1agents/acp-service@^0.10.3
 ```
 
 The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.
