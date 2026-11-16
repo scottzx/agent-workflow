@@ -8,6 +8,7 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { isDefaultJobDirectory } from './job-directory.js';
+import { roleIdFromPublication } from '../execution/spaces.js';
 import type { A2APreflightInput, A2APreflightReport } from './types.js';
 
 const absolutePath = z.string().min(1).max(4096).refine(value => isAbsolute(value) && !value.includes('\0'), 'Expected an absolute host path');
@@ -16,6 +17,8 @@ const nodeModule = z.string().regex(/^(?:@[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+(?:\
 export const a2aPreflightRequirementsSchema = z.object({
   allowedDirectories: z.array(absolutePath).min(1).max(100).optional(),
   jobDirectory: absolutePath.optional(),
+  artifactSpace: absolutePath.optional(),
+  rolePublication: absolutePath.optional(),
   requiredFiles: z.array(absolutePath).max(64).optional(),
   python: z.object({ executable: absolutePath, modules: z.array(pythonModule).max(32) }).strict().optional(),
   node: z.object({ executable: absolutePath, modules: z.array(nodeModule).max(32).optional(), moduleRoot: absolutePath.optional() }).strict().optional(),
@@ -23,6 +26,7 @@ export const a2aPreflightRequirementsSchema = z.object({
 export const a2aPreflightInputSchema = a2aPreflightRequirementsSchema.extend({ cwd: absolutePath }).strict();
 export const a2aPreflightReportSchema = z.object({
   ok: z.boolean(), checkedAt: z.string(), cwd: absolutePath, jobDirectory: absolutePath.optional(),
+  artifactSpace: absolutePath.optional(), rolePublication: absolutePath.optional(),
   checks: z.array(z.object({ id: z.string(), ok: z.boolean(), detail: z.string().optional() }).strict()),
 }).strict();
 export class A2APreflightError extends Error {
@@ -111,6 +115,34 @@ export async function runA2APreflight(raw: A2APreflightInput): Promise<A2APrefli
     try { await handle.writeFile('a2a preflight\n'); await handle.sync(); }
     finally { await handle.close(); await unlink(probe); }
     report.jobDirectory = directory;
+    return directory;
+  });
+  if (input.rolePublication) await check('rolePublication', async () => {
+    if (!cwdOk) throw new Error('Cannot create a role publication directory without a cwd');
+    const roleId = roleIdFromPublication(input.cwd, input.rolePublication!) ?? roleIdFromPublication(report.cwd, input.rolePublication!);
+    if (!roleId) throw new Error('rolePublication must be <cwd>/.1agents/roles/<roleId>/published');
+    const expected = join(report.cwd, '.1agents', 'roles', roleId, 'published');
+    await ensureDefaultJobDirectory(report.cwd, expected);
+    report.rolePublication = await realpath(expected);
+    return report.rolePublication;
+  });
+  if (input.artifactSpace) await check('artifactSpace', async () => {
+    if (!cwdOk) throw new Error('Cannot admit an artifact space without a cwd');
+    const directory = await realpath(input.artifactSpace!);
+    if (!(await stat(directory)).isDirectory()) throw new Error('artifact space must already exist and be a directory');
+    if (report.jobDirectory && directory === report.jobDirectory) throw new Error('artifact space must not be the job directory');
+    const roleMarker = `${sep}.1agents${sep}roles${sep}`;
+    if (directory.includes(roleMarker) || directory.endsWith(`${sep}.1agents${sep}roles`)) throw new Error('artifact space must not be a role directory');
+    const temporaryRoots = await Promise.all(['/tmp', tmpdir()].map(path => realpath(path).catch(() => undefined)));
+    const allowed = input.allowedDirectories ? await Promise.all(input.allowedDirectories.map(root => realpath(root).catch(() => undefined))) : [];
+    if (![report.cwd, ...temporaryRoots, ...allowed].filter((path): path is string => path !== undefined).some(root => within(root, directory))) {
+      throw new Error('artifact space is outside the admitted roots');
+    }
+    const probe = join(directory, `.a2a-preflight-${randomUUID()}`);
+    const handle = await open(probe, 'wx', 0o600);
+    try { await handle.writeFile('a2a preflight\n'); await handle.sync(); }
+    finally { await handle.close(); await unlink(probe); }
+    report.artifactSpace = directory;
     return directory;
   });
   for (const [index, file] of (input.requiredFiles ?? []).entries()) await check(`requiredFile.${index}`, async () => {

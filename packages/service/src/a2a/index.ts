@@ -2,7 +2,7 @@
 export { createA2AServer } from './server.js';
 export type { A2AServerOptions } from './server.js';
 export { A2AResubmitError } from './resubmit.js';
-export { WORKBENCH_UI_PATH, isAgentRequest, sameOriginBrowser, serveWorkbenchPage } from './workbench-ui.js';
+export { WorkbenchUi, WORKBENCH_UI_PATH, isAgentRequest, sameOriginBrowser, serveWorkbenchPage } from './workbench-ui.js';
 export type { A2AResubmission, A2AResubmitCode, A2ASessionTask } from './resubmit.js';
 export { FileA2AStore } from './store.js';
 export type { A2ABackend, A2ACloseResult, A2APrepareInput, A2ARunResult, A2ASessionStatus, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport, A2ARoleSkills } from './types.js';

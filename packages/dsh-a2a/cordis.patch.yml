@@ -1,0 +1,10 @@
+- id: oneagents-dsh-a2a
+  name: '@1agents/dsh-a2a'
+  config:
+    host: 127.0.0.1
+    port: 3080
+    publicUrl: http://127.0.0.1:3080
+    tokenEnv: DSH_A2A_TOKEN
+    runtime:
+      command: dsh
+      args: ['--profile', 'headless']

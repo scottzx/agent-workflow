@@ -17,7 +17,7 @@ import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.j
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
 import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
-import { artifactInstructions, defaultJobDirectory, defaultManifestPath } from './job-directory.js';
+import { artifactInstructions, defaultJobDirectory, defaultManifestPath, spaceInstructions } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
 import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
@@ -28,6 +28,8 @@ import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema }
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { invokeTicket, reopenForContinue, TICKET_METHODS } from '../execution/ticket.js';
+import { continueByConvention, HANDOFF_METHODS, invokeHandoff } from '../execution/handoff.js';
+import { rolePublicationDirectory } from '../execution/spaces.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
@@ -110,7 +112,8 @@ const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
   clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
-  parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(),
+  parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(), caseId: string.optional(),
+  handoffId: string.optional(),
   replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional() }).strict();
 const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
 const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
@@ -145,6 +148,7 @@ const EXECUTION_METHODS = {
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
   ...TICKET_METHODS,
+  ...HANDOFF_METHODS,
 };
 
 export const REMOTE_AGENT_METHODS = {
@@ -369,6 +373,16 @@ export class RemoteAgentGateway {
         resultMetadata: Task.fromJSON(raw.task).metadata?.['1agents']?.result } : {}) };
   }
   private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; deliveryRecoveryInput?: PptDeliveryRecoveryInput; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
+    if (input.handoffId) {
+      const handoff = this.ledger.findHandoff(input.originSessionId, input.handoffId);
+      if (!handoff || handoff.status === 'rejected' || handoff.status === 'proposed') throw new Error('Handoff must be accepted before it opens a job');
+      if (input.targetId !== handoff.toTargetId) throw new Error('Handoff target does not match');
+      if (input.purpose && input.purpose !== handoff.purpose) throw new Error('Handoff purpose does not match');
+      if (input.caseId && input.caseId !== handoff.caseId) throw new Error('Handoff case does not match');
+      if (handoff.status === 'taken' && handoff.childJobId) return this.ledgerView(input.originSessionId, handoff.childJobId);
+      input = { ...input, purpose: handoff.purpose, caseId: handoff.caseId, resultRevision: input.resultRevision ?? handoff.artifactRevision,
+        parentJobRef: { sourceId: this.ledger.sourceId, jobId: handoff.fromJobId }, parentAttemptId: handoff.fromAttemptId };
+    }
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
     if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
@@ -382,8 +396,12 @@ export class RemoteAgentGateway {
     const development = this.developmentFor(resolved.target, options.jobId);
     const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(development ? { development } : {}), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
-    if (prepared.idempotent) return this.ledgerView(input.originSessionId, prepared.job.jobId);
+    if (prepared.idempotent) {
+      if (input.handoffId) this.ledger.markHandoffTaken(input.originSessionId, input.handoffId, prepared.job.jobId);
+      return this.ledgerView(input.originSessionId, prepared.job.jobId);
+    }
     const { job, attempt } = prepared;
+    if (input.handoffId) this.ledger.markHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
     let sent = false;
     try {
       if (reportRequest !== undefined) {
@@ -436,6 +454,16 @@ export class RemoteAgentGateway {
         artifacts = undefined; requirements = declaredRequirements; resultContract = declaredResult;
         await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       }
+      const publicationRole = boundRole ?? explicitRole ?? job.roleId;
+      const publication = publicationRole && resolved.cwd ? rolePublicationDirectory(resolved.cwd, publicationRole) : undefined;
+      const caseSpace = job.caseId && resolved.cwd ? this.ledger.artifactSpace(input.originSessionId, job.caseId) : undefined;
+      const optional = { ...(caseSpace ? { artifactSpace: caseSpace.root } : {}), ...(publication ? { rolePublication: publication } : {}) };
+      if (Object.keys(optional).length && resolved.cwd) {
+        try {
+          await this.checkDispatch(resolved.remote, resolved.cwd, { ...requirements, ...optional }, resolved.endpoint);
+          requirements = { ...requirements, ...optional };
+        } catch { /* A refused shared space or role directory does not block the task's own job directory. */ }
+      }
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
       const fresh = this.targets.resolve(input.targetId, input.input);
@@ -444,7 +472,9 @@ export class RemoteAgentGateway {
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '') }] },
+        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '')
+          + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
+            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication }) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
           ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
@@ -1101,9 +1131,17 @@ export class RemoteAgentGateway {
     }
     if (method === 'execution_review') {
       const { originSessionId, jobId, ...review } = executionReviewSchema.parse(params);
-      return this.ledger.acceptance(originSessionId, jobId, review);
+      const recorded = this.ledger.acceptance(originSessionId, jobId, review);
+      if (review.reviewStatus === 'accepted') continueByConvention(this.ledger, originSessionId, jobId);
+      return recorded;
     }
-    if (Object.hasOwn(TICKET_METHODS, method)) return invokeTicket(this.ledger, method, params);
+    if (Object.hasOwn(HANDOFF_METHODS, method)) return invokeHandoff(this.ledger, method, params);
+    if (Object.hasOwn(TICKET_METHODS, method)) {
+      const ticket = invokeTicket(this.ledger, method, params);
+      const body = params && typeof params === 'object' ? params as { originSessionId?: string; jobId?: string; status?: string } : {};
+      if (method === 'ticket_close' && body.status === 'closed' && body.originSessionId && body.jobId) continueByConvention(this.ledger, body.originSessionId, body.jobId);
+      return ticket;
+    }
     if (method === 'execution_unwatch') {
       const input = executionUnwatchSchema.parse(params);
       this.ledger.unwatch(input.originSessionId, input.jobId, input.reason);

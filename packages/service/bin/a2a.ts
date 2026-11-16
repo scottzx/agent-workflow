@@ -20,7 +20,12 @@ Methods: remote_agent_preflight, remote_agent_spawn, remote_agent_get, remote_ag
          remote_agent_cancel, remote_agent_close, remote_agent_sessions, remote_agent_list, remote_agent_inbox, remote_agent_ack,
          session_bind, session_send, session_delivery_get, session_delivery_resolve,
          execution_project_scan, execution_project_list,
-         execution_discovery_config_get, execution_discovery_config_update
+         execution_discovery_config_get, execution_discovery_config_update,
+         handoff_propose, handoff_decide, handoff_offer, handoff_space, handoff_get
+
+handoff_* records a ledger edge. It does not open the next job; after
+handoff_decide accepts, call execution_submit with the returned handoffId.
+There is no acp-service handoff subcommand.
 
 Project discovery requires trusted gateway projectDiscovery configuration.
 It defaults to manual; scan/list only cache role candidates, without registering

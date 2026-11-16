@@ -72,10 +72,11 @@ function within(root: string, path: string): boolean {
   return rel !== '' && !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
 }
 
-/** Resolve aliases such as /tmp once, then reject symlinks below the admitted job root. */
-async function scopedFile(root: string, path: string): Promise<string> {
+/** Resolve aliases such as /tmp once, then reject symlinks below an admitted root. The manifest itself stays in the job root. */
+async function scopedFile(roots: string[], path: string): Promise<string> {
   const canonical = await realpath(path);
-  if (!within(root, canonical)) throw new A2AResultValidationError('artifact-outside-job-directory');
+  const root = roots.find(item => within(item, canonical));
+  if (!root) throw new A2AResultValidationError('artifact-outside-job-directory');
   // A symlink pointing back into the scope is rejected too: the receipt describes a real file.
   let current = path;
   for (;;) {
@@ -88,8 +89,8 @@ async function scopedFile(root: string, path: string): Promise<string> {
   return canonical;
 }
 
-async function verifiedArtifacts(root: string, manifestPath: string): Promise<A2AVerifiedArtifact[]> {
-  const manifestFile = await scopedFile(root, manifestPath);
+async function verifiedArtifacts(root: string, extraRoots: string[], manifestPath: string): Promise<A2AVerifiedArtifact[]> {
+  const manifestFile = await scopedFile([root], manifestPath);
   const manifest = await open(manifestFile, constants.O_RDONLY | constants.O_NOFOLLOW);
   let source: unknown;
   try {
@@ -102,7 +103,7 @@ async function verifiedArtifacts(root: string, manifestPath: string): Promise<A2
   const output: A2AVerifiedArtifact[] = [];
   const seen = new Set<string>();
   for (const item of parsed.data.artifacts) {
-    const path = await scopedFile(root, item.path);
+    const path = await scopedFile([root, ...extraRoots], item.path);
     if (seen.has(path)) throw new A2AResultValidationError('duplicate-artifact');
     seen.add(path);
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -158,7 +159,14 @@ export async function createA2AResultMetadata(input: {
       throw new A2AResultValidationError('job-directory-changed');
     }
     if (implicit && !(await lstat(contract.artifactManifestPath).catch(() => undefined))) return metadata;
-    try { metadata.artifacts = await verifiedArtifacts(root, contract.artifactManifestPath); }
+    const admittedSpace = target?.preflight?.artifactSpace;
+    const extraRoots = admittedSpace && await realpath(admittedSpace) === admittedSpace ? [admittedSpace] : [];
+    if (admittedSpace && !extraRoots.length) {
+      const code = 'artifact-space-changed';
+      if (implicit) { metadata.validation = { status: 'failed', code }; return metadata; }
+      throw new A2AResultValidationError(code);
+    }
+    try { metadata.artifacts = await verifiedArtifacts(root, extraRoots, contract.artifactManifestPath); }
     catch (error) {
       const code = error instanceof A2AResultValidationError ? error.code : 'artifact-manifest-or-file-unavailable';
       if (implicit) { metadata.validation = { status: 'failed', code }; return metadata; }

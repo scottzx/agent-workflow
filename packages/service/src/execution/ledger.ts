@@ -1,5 +1,7 @@
 /** Durable Job/Attempt facts. This module does not execute or schedule work. */
 import { createHash, randomUUID } from 'node:crypto';
+import type { Handoff, HandoffConvention } from './handoff.js';
+import type { ArtifactSpace } from './spaces.js';
 import { TicketError, type Ticket, type TicketChange } from './ticket.js';
 
 export type ExecutionStatus = 'not_started' | 'submitted' | 'working' | 'input_required' | 'auth_required' | 'completed' | 'failed' | 'canceled' | 'rejected' | 'unknown';
@@ -56,6 +58,8 @@ export interface LedgerJob {
   originKind: 'session' | 'legacy'; originRef: string; targetId: string; roleId?: string;
   currentAttemptId: string; executionStatus: ExecutionStatus; inFlightAttemptIds: string[]; unresolvedAttemptIds: string[];
   parentJobRef?: JobRef; parentAttemptId?: string; purpose?: string; resultRevision?: string; replacesJobRef?: JobRef;
+  /** Set when the job is part of a case that can share an artifact space and handoffs. Absent on older jobs. */
+  caseId?: string;
   jobVersion: number; createdAt: string | null; updatedAt: string; provenance: 'native' | 'legacy'; migratedAt?: string;
   /** Who asked for the task. originSessionId stays the access scope, and many callers share a default one. */
   initiatedBy?: LedgerActor;
@@ -71,12 +75,16 @@ export interface LedgerState {
   acceptances: Record<string, BusinessAcceptance[]>;
   /** Task tickets by executor jobId; absent in state written before tickets existed. */
   tickets?: Record<string, Ticket>;
+  /** Absent in state written before handoffs existed. */
+  handoffs?: Handoff[];
+  conventions?: HandoffConvention[];
+  artifactSpaces?: ArtifactSpace[];
 }
 export interface LedgerPrepareInput {
   originSessionId: string; targetSnapshot: LedgerTargetSnapshot; input: unknown; clientRequestId?: string;
   /** Trusted adapter only: hash the caller request before adding current-attempt defaults. */
   requestDigestInput?: unknown;
-  jobId?: string; parentJobRef?: JobRef; parentAttemptId?: string; purpose?: string; title?: string;
+  jobId?: string; parentJobRef?: JobRef; parentAttemptId?: string; purpose?: string; title?: string; caseId?: string;
   operation?: string; resultRevision?: string; replacesJobRef?: JobRef; initiatedBy?: LedgerActor;
 }
 export interface LedgerObservation {
@@ -135,9 +143,11 @@ export class JobLedger {
     if (initial) {
       if (initial.version !== 1 || !initial.sourceId || !initial.jobs || !initial.attempts || !initial.requests || !Array.isArray(initial.events)
         || !Number.isSafeInteger(initial.nextSequence) || !initial.acceptances) throw new Error('Invalid execution ledger state');
-      this.state = { ...clone(initial), tickets: clone(initial.tickets ?? {}) };
+      this.state = { ...clone(initial), tickets: clone(initial.tickets ?? {}), handoffs: clone(initial.handoffs ?? []),
+        conventions: clone(initial.conventions ?? []), artifactSpaces: clone(initial.artifactSpaces ?? []) };
     } else {
-      this.state = { version: 1, sourceId: randomUUID(), jobs: {}, attempts: {}, requests: {}, events: [], nextSequence: 1, acceptances: {}, tickets: {} };
+      this.state = { version: 1, sourceId: randomUUID(), jobs: {}, attempts: {}, requests: {}, events: [], nextSequence: 1, acceptances: {}, tickets: {},
+        handoffs: [], conventions: [], artifactSpaces: [] };
     }
   }
   snapshot(): LedgerState { return clone(this.state); }
@@ -199,7 +209,7 @@ export class JobLedger {
     const request = { operation, targetId: input.targetSnapshot.targetId,
       input: input.requestDigestInput === undefined ? input.input : input.requestDigestInput, jobId: input.jobId,
       parentJobRef: input.parentJobRef, parentAttemptId: input.parentAttemptId, purpose: input.purpose,
-      title: input.title, resultRevision: input.resultRevision, replacesJobRef: input.replacesJobRef };
+      title: input.title, resultRevision: input.resultRevision, replacesJobRef: input.replacesJobRef, caseId: input.caseId };
     const digest = createHash('sha256').update(canonical(request)).digest('hex');
     const requestKey = input.clientRequestId === undefined ? undefined : canonical([this.state.sourceId, input.originSessionId, operation, input.clientRequestId]);
     return { operation, digest, requestKey };
@@ -230,6 +240,8 @@ export class JobLedger {
         }
         if (input.parentJobRef && canonical(input.parentJobRef) !== canonical(job.parentJobRef ?? null)
           || input.parentAttemptId && input.parentAttemptId !== job.parentAttemptId) throw new Error('A job cannot change its parent');
+        if (input.caseId && job.caseId && input.caseId !== job.caseId) throw new Error('A job cannot change its case');
+        if (input.caseId && !job.caseId) job.caseId = input.caseId;
       } else {
         if (Boolean(input.parentJobRef) !== Boolean(input.parentAttemptId)) throw new Error('parentJobRef and parentAttemptId are required together');
         if (input.parentJobRef) {
@@ -245,6 +257,7 @@ export class JobLedger {
           ...(input.parentJobRef ? { parentJobRef: clone(input.parentJobRef), parentAttemptId: input.parentAttemptId } : {}),
           ...(input.purpose ? { purpose: input.purpose } : {}), ...(input.resultRevision ? { resultRevision: input.resultRevision } : {}),
           ...(input.replacesJobRef ? { replacesJobRef: clone(input.replacesJobRef) } : {}),
+          ...(input.caseId ? { caseId: input.caseId } : {}),
           ...(input.initiatedBy ? { initiatedBy: clone(input.initiatedBy) } : {}) };
         state.jobs[job.jobId] = job;
       }
@@ -442,6 +455,79 @@ export class JobLedger {
         this.event(state, job, attempt.attemptId, 'attempt.rewatched', {});
       }
       return clone(attempt);
+    });
+  }
+  handoffsFor(originSessionId: string, jobId: string): Handoff[] {
+    this.job(this.state, originSessionId, jobId);
+    return clone((this.state.handoffs ?? []).filter(item => item.fromJobId === jobId || item.childJobId === jobId));
+  }
+  conventionsFor(originSessionId: string): HandoffConvention[] {
+    return clone((this.state.conventions ?? []).filter(item => item.originSessionId === originSessionId));
+  }
+  artifactSpace(originSessionId: string, caseId: string): ArtifactSpace | undefined {
+    return clone((this.state.artifactSpaces ?? []).find(item => item.originSessionId === originSessionId && item.caseId === caseId));
+  }
+  findHandoff(originSessionId: string, handoffId: string): Handoff | undefined {
+    const handoff = (this.state.handoffs ?? []).find(item => item.handoffId === handoffId);
+    const job = handoff ? this.state.jobs[handoff.fromJobId] : undefined;
+    if (!handoff || !job || job.originSessionId !== originSessionId) return undefined;
+    return clone(handoff);
+  }
+  /** Trusted handoff module: append or replace one edge and record it on the from-job. Binds caseId if the job has none. */
+  commitHandoff(originSessionId: string, handoff: Handoff, event: string): Handoff {
+    return this.mutate(state => {
+      const job = this.job(state, originSessionId, handoff.fromJobId);
+      if (job.caseId && job.caseId !== handoff.caseId) throw new Error('Job is already bound to another case');
+      job.caseId ??= handoff.caseId;
+      const list = state.handoffs ??= [];
+      const index = list.findIndex(item => item.handoffId === handoff.handoffId);
+      if (index >= 0) list[index] = clone(handoff); else list.push(clone(handoff));
+      this.event(state, job, handoff.fromAttemptId, event, { handoffId: handoff.handoffId, status: handoff.status,
+        toTargetId: handoff.toTargetId, purpose: handoff.purpose, caseId: handoff.caseId, artifactRevision: handoff.artifactRevision,
+        artifactDigest: handoff.artifactDigest, ...(handoff.childJobId ? { childJobId: handoff.childJobId } : {}),
+        ...(handoff.conventionId ? { conventionId: handoff.conventionId } : {}) });
+      return handoff;
+    });
+  }
+  markHandoffTaken(originSessionId: string, handoffId: string, childJobId: string): Handoff {
+    return this.mutate(state => {
+      const handoff = (state.handoffs ?? []).find(item => item.handoffId === handoffId);
+      if (!handoff) throw new Error('Handoff not found');
+      const job = this.job(state, originSessionId, handoff.fromJobId);
+      if (handoff.status === 'taken') {
+        if (handoff.childJobId !== childJobId) throw new Error('Handoff already opened a different job');
+        return clone(handoff);
+      }
+      if (handoff.status !== 'accepted') throw new Error('Only an accepted handoff opens a job');
+      const child = this.job(state, originSessionId, childJobId);
+      if (child.parentJobRef?.jobId !== handoff.fromJobId || child.parentAttemptId !== handoff.fromAttemptId
+        || child.targetId !== handoff.toTargetId || child.purpose !== handoff.purpose || child.caseId !== handoff.caseId) {
+        throw new Error('Child job does not match the handoff');
+      }
+      handoff.status = 'taken'; handoff.childJobId = childJobId; handoff.updatedAt = now();
+      this.event(state, job, handoff.fromAttemptId, 'handoff.taken', { handoffId, childJobId, toTargetId: handoff.toTargetId, purpose: handoff.purpose });
+      return clone(handoff);
+    });
+  }
+  commitConvention(convention: HandoffConvention): HandoffConvention {
+    return this.mutate(state => {
+      const list = state.conventions ??= [];
+      const prior = convention.clientRequestId ? list.find(item => item.originSessionId === convention.originSessionId && item.clientRequestId === convention.clientRequestId) : undefined;
+      if (prior) return clone(prior);
+      list.push(clone(convention));
+      return convention;
+    });
+  }
+  commitArtifactSpace(space: ArtifactSpace): ArtifactSpace {
+    return this.mutate(state => {
+      const list = state.artifactSpaces ??= [];
+      const prior = list.find(item => item.originSessionId === space.originSessionId && item.caseId === space.caseId);
+      if (prior) {
+        if (prior.root !== space.root) throw new Error('Artifact space for this case already has a different root');
+        return clone(prior);
+      }
+      list.push(clone(space));
+      return space;
     });
   }
   ticket(originSessionId: string, jobId: string): Ticket {

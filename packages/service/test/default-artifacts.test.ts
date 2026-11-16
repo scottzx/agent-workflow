@@ -68,6 +68,26 @@ test('a bad default manifest is recorded in validation and does not fail the tas
   assert.ok((await readFile(f.manifest, 'utf8')).includes('secret.txt'));
 });
 
+test('a file in an admitted artifact space verifies, and a role directory does not become one', async () => {
+  const cwd = await project(), space = join(cwd, 'shared'); await mkdir(space);
+  const f = await admitted(cwd, 'job-shared');
+  const report = await runA2APreflight({ cwd, jobDirectory: f.directory, artifactSpace: space, rolePublication: join(cwd, '.1agents', 'roles', 'author', 'published') });
+  assert.equal(report.ok, true);
+  assert.equal(report.artifactSpace, space);
+  assert.equal(report.rolePublication, join(cwd, '.1agents', 'roles', 'author', 'published'));
+  const file = join(space, 'deck.md'); await writeFile(file, 'shared\n');
+  await writeFile(f.manifest, JSON.stringify({ artifacts: [{ path: file, mediaType: 'text/markdown' }] }));
+  const result = await createA2AResultMetadata({ taskId: 't', contextId: 'c', requestId: 'r', startedAt: new Date().toISOString(), outcome: 'completed',
+    target: { sessionId: 's', cwd, preflight: report } as any, contract: { jobId: 'job-shared', artifactManifestPath: f.manifest } });
+  assert.equal(result.validation.status, 'passed');
+  assert.equal(result.artifacts[0]?.path, file);
+  const roleFile = join(report.rolePublication!, 'note.md'); await writeFile(roleFile, 'role\n');
+  await writeFile(f.manifest, JSON.stringify({ artifacts: [{ path: roleFile }] }));
+  const refused = await createA2AResultMetadata({ taskId: 't', contextId: 'c', requestId: 'r', startedAt: new Date().toISOString(), outcome: 'completed',
+    target: { sessionId: 's', cwd, preflight: report } as any, contract: { jobId: 'job-shared', artifactManifestPath: f.manifest } });
+  assert.equal(refused.validation.code, 'artifact-outside-job-directory');
+});
+
 test('a caller-declared manifest keeps its strict behaviour', async () => {
   const cwd = await project(), directory = join(cwd, 'declared'); await mkdir(directory);
   const preflight = await runA2APreflight({ cwd, jobDirectory: directory });

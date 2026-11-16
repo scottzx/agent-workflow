@@ -35,6 +35,7 @@ export interface AcpTaskSummary {
     parentJobRef?: AcpJobRef;
     parentAttemptId?: string;
     purpose?: string;
+    caseId?: string;
     targetId: string;
     execution?: AcpExecution;
     executionStatus: string;
@@ -174,9 +175,11 @@ export interface AcpTaskEvent {
 }
 export interface AcpDependency {
     from: string;
-    to: string;
-    kind: 'parent' | 'depends_on' | 'replaces';
+    to?: string;
+    kind: 'parent' | 'depends_on' | 'replaces' | 'handoff';
     label?: string;
+    handoffId?: string;
+    status?: 'proposed' | 'accepted' | 'taken' | 'rejected';
 }
 export interface AcpProcessQuestion {
     id: string;
@@ -268,6 +271,7 @@ export interface AcpTaskDetail extends AcpTaskSummary {
     processRequests?: AcpProcessRequest[];
     events: AcpTaskEvent[];
     dependencies?: AcpDependency[];
+    legalNext?: { conventionId: string; toTargetId: string; purpose: string; requireHuman: boolean; when: 'acceptance_accepted' | 'ticket_closed'; achieved: boolean }[];
     artifacts?: { revision: string; digest?: string; artifacts: unknown[] }[];
 }
 export interface AcpDecisionInput {

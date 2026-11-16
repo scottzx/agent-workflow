@@ -99,7 +99,7 @@ preset 必须在执行宿主真实可用；要用普通 DSH 时显式选 `standa
 
 ## 账本、通知与处理
 
-提交参数共同使用 `originSessionId/targetId/input`，建议稳定 `clientRequestId`；返回后保存 `sourceId/jobId/attemptId` 及可用的 `remote/taskId/contextId/sessionId`，立即结束本轮。受理未知不自动换编号重派。父子任务用 `parentJobRef:{sourceId,jobId}` 和可选 `parentAttemptId/purpose/resultRevision/replacesJobRef` 关联，不另造“外层任务”术语。
+提交参数共同使用 `originSessionId/targetId/input`，建议稳定 `clientRequestId`；返回后保存 `sourceId/jobId/attemptId` 及可用的 `remote/taskId/contextId/sessionId`，立即结束本轮。受理未知不自动换编号重派。父子任务用 `parentJobRef:{sourceId,jobId}` 和可选 `parentAttemptId/purpose/resultRevision/replacesJobRef` 关联，不另造“外层任务”术语。交给另一个角色用下面的交接，不用 `execution_continue` 换目标。
 
 | 操作 | 方法与关键参数 |
 | --- | --- |
@@ -118,3 +118,91 @@ preset 必须在执行宿主真实可用；要用普通 DSH 时显式选 `standa
 | 领域交付通知，含 sourceId/jobId/attemptId | `execution_get` 或 `execution_inbox` | `execution_ack {originSessionId,noticeId}` |
 
 业务接受和通知 ack 分开记录，均不能替代执行成功或独立验收证据。通知正文和已有产物不等于最终交付通过。主会话不主动轮询、不读子会话日志、不重复验收；真实通知后只核对合同要求的回执/新报告、记录结论并确认。现稿 PPT 只验收及 Codex 四步计数另用 [专用流程](async-caller.md)，普通任务不套用其报告字段与结论。
+
+## 交接
+
+交接是账本上的一条边，不是继续同一张任务，也不是执行者会话里的工具。主会话通过 DreamMate 的 `a2a-gateway`，或 `acp-service a2a invoke <method>`，调用下面的方法。没有 `acp-service handoff` 子命令。执行中的 ACP 会话只有 `oneagents-review` 的交回和任务单工具，不能在那里调用 `handoff_*`。
+
+先取当前轮次已经记下来的版本，不要自己编 digest：
+
+```sh
+acp-service a2a invoke execution_get <<'JSON'
+{"originSessionId":"actual-parent-session-id","jobId":"returned-job-id"}
+JSON
+```
+
+`resultRevision` 和 `resultDigest` 必须与这次 `execution_get` 的当前结果一致。然后只提议，不派下一单：
+
+```sh
+acp-service a2a invoke handoff_propose <<'JSON'
+{
+  "originSessionId": "actual-parent-session-id",
+  "jobId": "returned-job-id",
+  "attemptId": "returned-attempt-id",
+  "caseId": "case-1",
+  "toTargetId": "maker",
+  "purpose": "make",
+  "artifactRevision": "returned-result-revision",
+  "artifactDigest": "returned-64-hex-digest",
+  "reason": "文稿已核对，可以制作"
+}
+JSON
+```
+
+`toTargetId` 必须是另一个已登记目标。提议返回 `status: "proposed"` 时，等人或教练接受；返回 `accepted` 只说明有一条已经达成、且不要求人再点的约定对上了，仍然没有下一张任务。
+
+```sh
+acp-service a2a invoke handoff_decide <<'JSON'
+{
+  "originSessionId": "actual-parent-session-id",
+  "handoffId": "returned-handoff-id",
+  "decision": "accept",
+  "decidedBy": {"kind": "person"},
+  "note": "同意交给制作"
+}
+JSON
+```
+
+`decision` 为 `accept` 或 `reject`。接受之后才开下一张任务，并带上同一个 `handoffId`。网关会核对目标、目的和父任务，调用方不要再自己填一套对不上的父子关系：
+
+```sh
+acp-service a2a invoke execution_submit <<'JSON'
+{
+  "originSessionId": "actual-parent-session-id",
+  "targetId": "maker",
+  "handoffId": "returned-handoff-id",
+  "clientRequestId": "stable-handoff-submit-id",
+  "input": {"prompt": "按交接带来的这一版产物继续，只写本任务目录或已登记的共享产物空间。"}
+}
+JSON
+```
+
+保存返回的子任务 `jobId` 后立即结束本轮。`handoff_get` 读取这件事上的交接、当前允许的下一跳和已登记的共享产物空间，不派单。
+
+约定不是流程图。一条约定只说「这件事在验收通过或任务单关闭后，可以交给哪个目标」：
+
+```sh
+acp-service a2a invoke handoff_offer <<'JSON'
+{
+  "originSessionId": "actual-parent-session-id",
+  "caseId": "case-1",
+  "fromTargetId": "author",
+  "toTargetId": "maker",
+  "toPurpose": "make",
+  "when": "acceptance_accepted",
+  "requireHuman": false
+}
+JSON
+```
+
+`when` 只能是 `acceptance_accepted` 或 `ticket_closed`。达成且只有一条不要求人确认的约定成立时，账本会记下已接受的交接；两条同时成立时不挑选。无论哪种，都要再 `execution_submit` 带 `handoffId` 才有下一张任务。
+
+三处目录不要混用。任务目录 `<cwd>/.1agents/jobs/<jobId>/` 只属于这一张任务。角色公开目录 `<cwd>/.1agents/roles/<roleId>/published/` 给其他角色看。共享产物空间是一个已经存在的宿主绝对路径，按 `caseId` 登记，几张任务可以在那里写要交接的文件：
+
+```sh
+acp-service a2a invoke handoff_space <<'JSON'
+{"originSessionId":"actual-parent-session-id","caseId":"case-1","root":"/absolute/existing/shared"}
+JSON
+```
+
+登记不创建目录。第一张任务提交时带上同一个 `caseId`，之后的交接和派单才能看见这块空间。宿主拒绝这块目录时，任务仍可在自己的任务目录里跑，提示里就不会出现共享路径。

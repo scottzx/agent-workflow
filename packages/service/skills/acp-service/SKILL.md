@@ -1,6 +1,7 @@
 ---
 name: acp-service
-description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通过 A2A 调用固定角色、派发临时任务、查询父子任务和执行轮次、记录业务验收及处理通知，并回投 Codex/DSH 原会话。也用于项目/角色候选探查、目标登记、网络技能缓存和更新接口接入；不用于无关的系统巡检或模型配置。
+version: 0.10.6
+description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通过 A2A 调用固定角色、派发临时任务、查询父子任务和执行轮次、记录业务验收及处理通知，并回投 Codex/DSH 原会话。也用于把已记录产物交给另一个角色（handoff_propose、handoff_decide、handoff_offer）、登记共享产物空间、项目/角色候选探查、目标登记和网络技能更新。用户说交接、下一跳、交给另一个角色、共享产物或 caseId 时使用。不用于无关的系统巡检或模型配置；执行中的 ACP 会话没有 handoff 工具。
 ---
 
 # ACP Service
@@ -21,6 +22,7 @@ description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通�
 | 调用已登记的固定角色 | `execution_submit`，指定 resident_agent 的 targetId | [角色管理与任务调用](references/roles-and-tasks.md) |
 | 派发一次性临时任务，无需创建角色 | 向 agent_host 目标 `execution_submit`；兼容 `remote_agent_spawn` | [角色管理与任务调用](references/roles-and-tasks.md) |
 | 查询任务/执行轮次、续派、关闭、记录验收、处理通知 | `execution_*`；按通知类型选择 ack | [角色管理与任务调用](references/roles-and-tasks.md) |
+| 把已记录产物交给另一个角色，或登记共享产物空间 | 主会话调用 `handoff_*`；接受后再 `execution_submit` 并带 `handoffId` | [交接](references/roles-and-tasks.md#交接) |
 | 把消息或 A2A 完成通知送回已存在的 Codex/DSH 主会话 | 配置 gateway `sessionHosts`，使用 `session_bind`、`session_send` 和投递查询工具 | [原会话排队投递](references/a2a.md#原会话排队投递本次新增) |
 | 为其他 A2A 客户端开放 DSH 能力 | DSH `a2a` 配置、Agent Card、标准 JSON-RPC/SSE | [A2A 调度与收件箱](references/a2a.md) |
 
@@ -71,6 +73,7 @@ acp-service --skill install acp-service --agent codex --scope repo
 3. 调用已登记目标的 `execution_submit`（或兼容 `remote_agent_spawn`），保存 job/attempt/task/context/session 与实际预设；受理不等于完成。随后立即结束本轮。
 4. 真实通知唤醒后，只读取一次交付回执及本次合同要求的新报告，核对身份与版本绑定，保存处理结论，再按通知类型 ack。需要业务接受时另记 `execution_review`。独立角色的验收不由主会话重复执行。
 5. 统一账本任务使用 `execution_continue` 保留 job、新建 attempt；独立工作重新 submit。兼容流程用 `remote_agent_message` 复用远端会话并返回新 taskId。关闭父任务用 `execution_cancel`，需要时指定 cascade，详见 API 路由。
+6. 要把这一轮产物交给另一个角色时，先 `handoff_get` 或 `execution_get` 取当前 `resultRevision` 与 `resultDigest`，再 `handoff_propose`。提议和接受都不派单；`handoff_decide` 接受后，另调 `execution_submit` 并带上返回的 `handoffId`。不要在执行中的 ACP 会话里找 handoff 工具，那里没有。
 
 ```json
 {
