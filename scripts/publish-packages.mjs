@@ -28,8 +28,10 @@ export function archiveContentDigest(archive) {
     ? null : digest(execFileSync('tar', ['-xOf', archive, name], { maxBuffer: 16 * 1024 * 1024 }))]))));
 }
 
-// A freshly published version took about three minutes to become readable on 2026-11-09, so wait up to five.
-export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 30, delayMs = 10_000 } = {}) {
+// A freshly published version took about three minutes to become readable on 2026-11-09; on
+// 2026-11-17 it took 5m04s, so the old five-minute budget expired a few seconds early and failed a
+// release whose tarball was already on the registry. Wait ten minutes before calling it missing.
+export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 60, delayMs = 10_000 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const resolved = await fetcher(name, version, dependency);
