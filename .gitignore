@@ -9,6 +9,8 @@ release/
 .corepack/
 packages/service/vendor/
 .dsh-build-cache.tgz
+# pnpm's local content-addressable store; it is a machine cache, never a source file.
+.pnpm-store/
 /.cache/roles
 /roles
 
