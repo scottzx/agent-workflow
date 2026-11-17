@@ -22,3 +22,6 @@ packages/service/vendor/
 .1agents/config/*
 !.1agents/config/*.example.json
 !.1agents/config/*.example.yml
+# Copies of runtime assets that land in the working directory, not project sources.
+dsh-image-gen/
+/skills/
