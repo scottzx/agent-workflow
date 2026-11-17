@@ -14,6 +14,39 @@ import type { A2APreflightInput, A2APreflightReport } from './types.js';
 const absolutePath = z.string().min(1).max(4096).refine(value => isAbsolute(value) && !value.includes('\0'), 'Expected an absolute host path');
 const pythonModule = z.string().regex(/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/).max(200);
 const nodeModule = z.string().regex(/^(?:@[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/).max(200);
+
+/**
+ * The sandbox profile of an execution target. It is configuration, not a workbench shape: only a target that runs
+ * commands (ffmpeg, downloads) needs one. The profile names what the environment may reach; it never names host
+ * credentials or the container socket.
+ */
+export const sandboxProfileSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  image: z.string().trim().min(1).max(500).optional(),
+  network: z.enum(['none', 'bridge']).default('none'),
+  /** Paths inside the sandbox the task may write. They must live inside the admitted roots. */
+  writableRoots: z.array(absolutePath).max(20).optional(),
+  /** Environment variable names the sandbox may pass through. A credential-shaped name is refused. */
+  env: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
+}).strict();
+export type SandboxProfile = z.infer<typeof sandboxProfileSchema>;
+
+/** Host paths a sandbox must never see: the container socket, private keys and the host credential stores. */
+const FORBIDDEN_SANDBOX_PATHS = ['/var/run/docker.sock', '/run/docker.sock', '/var/run/containerd', '/etc/ssh', '/root/.ssh', '/Users'];
+const FORBIDDEN_ENV = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|APIKEY|API_KEY|SESSION)/i;
+
+/** True when this profile would hand the sandbox something it must not have. */
+export function sandboxViolation(profile: SandboxProfile): string | undefined {
+  if (profile.network !== 'none' && profile.network !== 'bridge') return 'sandbox network must be none or bridge';
+  for (const root of profile.writableRoots ?? []) {
+    if (FORBIDDEN_SANDBOX_PATHS.some(forbidden => root === forbidden || root.startsWith(`${forbidden}/`))) {
+      return `sandbox may not write to ${root}`;
+    }
+  }
+  for (const name of profile.env ?? []) if (FORBIDDEN_ENV.test(name)) return `sandbox may not receive ${name}`;
+  return undefined;
+}
+
 export const a2aPreflightRequirementsSchema = z.object({
   allowedDirectories: z.array(absolutePath).min(1).max(100).optional(),
   jobDirectory: absolutePath.optional(),
@@ -22,6 +55,8 @@ export const a2aPreflightRequirementsSchema = z.object({
   requiredFiles: z.array(absolutePath).max(64).optional(),
   python: z.object({ executable: absolutePath, modules: z.array(pythonModule).max(32) }).strict().optional(),
   node: z.object({ executable: absolutePath, modules: z.array(nodeModule).max(32).optional(), moduleRoot: absolutePath.optional() }).strict().optional(),
+  /** The sandbox this target runs in, when it runs commands. */
+  sandbox: sandboxProfileSchema.optional(),
 }).strict();
 export const a2aPreflightInputSchema = a2aPreflightRequirementsSchema.extend({ cwd: absolutePath }).strict();
 export const a2aPreflightReportSchema = z.object({
@@ -145,12 +180,23 @@ export async function runA2APreflight(raw: A2APreflightInput): Promise<A2APrefli
     report.artifactSpace = directory;
     return directory;
   });
-  for (const [index, file] of (input.requiredFiles ?? []).entries()) await check(`requiredFile.${index}`, async () => {
+  if (input.requiredFiles) for (const [index, file] of (input.requiredFiles ?? []).entries()) await check(`requiredFile.${index}`, async () => {
     const actual = await realpath(file);
     if (!(await stat(actual)).isFile()) throw new Error('Required input is not a regular file');
     const handle = await open(actual, 'r');
     await handle.close();
     return actual;
+  });
+  if (input.sandbox) await check('sandbox', async () => {
+    const violation = sandboxViolation(input.sandbox!);
+    if (violation) throw new Error(violation);
+    // Every path the sandbox may write must live inside the admitted roots, so the sandbox cannot reach the host.
+    const admitted = [report.cwd, report.jobDirectory, report.artifactSpace, ...(input.allowedDirectories ?? [])].filter((value): value is string => Boolean(value));
+    for (const root of input.sandbox!.writableRoots ?? []) {
+      const actual = await realpath(root).catch(() => root);
+      if (!admitted.some(base => within(base, actual))) throw new Error(`sandbox root ${root} is outside the admitted roots`);
+    }
+    return `sandbox ${input.sandbox!.name}; network=${input.sandbox!.network}`;
   });
   if (input.python) await check('python', async () => {
     const executable = await realpath(input.python!.executable);

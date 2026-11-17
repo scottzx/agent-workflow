@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { sandboxProfileSchema, sandboxViolation, type SandboxProfile } from '../a2a/preflight.js';
 
 const id = z.string().trim().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9.:_-]*$/);
 const text = z.string().trim().min(1).max(4096);
@@ -38,6 +39,8 @@ export const executionTargetBindingSchema = z.object({
   agentFile: absolutePath.optional(),
   // A path agent on a DSH-native preset may fix its model; both are passed together and checked against the host catalog.
   provider: id.optional(), model: text.optional(),
+  /** The sandbox this target runs commands in. Only a target that runs commands needs one. */
+  sandbox: sandboxProfileSchema.optional(),
 }).strict();
 export const executionTargetConfigSchema = z.object({
   targetId: id, kind: z.enum(['agent_host', 'resident_agent', 'workflow']), name: text,
@@ -123,6 +126,8 @@ export interface ExecutionTargetSnapshot {
   agentPreset?: string;
   input: Record<string, unknown>;
   directoryPolicy?: { allowedDirectories: string[]; executorVerificationRequired: true };
+  /** The sandbox this target runs commands in, when it has one. */
+  sandbox?: SandboxProfile;
 }
 
 /** Use inside the gateway's single-owner lease; targets.json is not a transaction with gateway.json. */
@@ -267,6 +272,14 @@ export class TargetDirectory {
       if (binding.cwd && binding.allowedDirectories) this.checkDirectory(binding.cwd, binding.allowedDirectories);
       if (binding.agentPreset && binding.allowedPresets && !binding.allowedPresets.includes(binding.agentPreset))
         throw new Error('Fixed preset is outside the allowed preset scope');
+      // A sandbox profile is configuration for a target that runs commands; it never reaches the host credentials.
+      if (binding.sandbox) {
+        const violation = sandboxViolation(binding.sandbox);
+        if (violation) throw new Error(violation);
+        if (binding.sandbox.writableRoots?.length && binding.cwd) {
+          for (const root of binding.sandbox.writableRoots) this.checkDirectory(root, binding.sandbox.writableRoots!);
+        }
+      }
     }
   }
 
@@ -314,7 +327,8 @@ export class TargetDirectory {
       throw new Error('Requested preset is outside allowedPresets');
     return clone({ target, connection, configVersion: target.configVersion, connectionVersion: connection.connectionVersion,
       remote: connection.remote, endpoint: connection.endpoint!, cwd, agentPreset, input: resolvedInput,
-      ...(target.binding.allowedDirectories ? { directoryPolicy: { allowedDirectories: target.binding.allowedDirectories, executorVerificationRequired: true as const } } : {}) });
+      ...(target.binding.allowedDirectories ? { directoryPolicy: { allowedDirectories: target.binding.allowedDirectories, executorVerificationRequired: true as const } } : {}),
+      ...(target.binding.sandbox ? { sandbox: clone(target.binding.sandbox) } : {}) });
   }
 
   getHealth(targetId: string): TargetHealth | undefined {

@@ -2,6 +2,7 @@ import { render } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { acpTaskService, loginRequired, session } from './api';
 import { AgentModule } from './AgentModule';
+import { CaseModule } from './CaseModule';
 import { executionLabels, taskDepth } from './model';
 import { AcpTaskDetailPanel } from './TaskDetail';
 import type { AcpTaskFilter, AcpTaskList, AcpTaskSummary } from './types';
@@ -67,7 +68,8 @@ function Login({ onDone }: { onDone: () => void }) {
 /** The table and detail read one ACP projection; neither writes task states. */
 function Workbench({ onLogout }: { onLogout?: () => void }) {
     const route = useRoute();
-    const [module, setModule] = useState<'tasks' | 'agents'>('tasks');
+    // A thing is the first screen of the workbench; tasks and agents are its other views.
+    const [module, setModule] = useState<'cases' | 'tasks' | 'agents'>('cases');
     const [filter, setFilter] = useState<AcpTaskFilter>('all');
     const [offset, setOffset] = useState(0);
     const [payload, setPayload] = useState<AcpTaskList | null>(null);
@@ -83,7 +85,8 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
         activeRequest.current = false;
         setLoading(true);
         const load = async () => {
-            if (activeRequest.current || document.hidden) return;
+            // Load once even in a background tab; visibility only suppresses later polling.
+            if (activeRequest.current) return;
             activeRequest.current = true;
             try {
                 const next = await acpTaskService.list(filter, offset, PAGE_SIZE);
@@ -131,6 +134,9 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                 <div class="acp-workbench-title">
                     <h1>{text('任务工作台', 'Task workbench')}</h1>
                     <nav class="acp-module-switch" aria-label={text('工作台模块', 'Workbench modules')}>
+                        <button type="button" aria-pressed={module === 'cases'} onClick={() => setModule('cases')}>
+                            {text('事情', 'Cases')}
+                        </button>
                         <button type="button" aria-pressed={module === 'tasks'} onClick={() => setModule('tasks')}>
                             {text('任务', 'Tasks')}
                         </button>
@@ -168,6 +174,8 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                         navigateAcpTask({ jobId, full: false });
                     }}
                 />
+            ) : module === 'cases' ? (
+                <CaseModule refreshKey={refreshKey} />
             ) : (
                 <>
                     <nav class="acp-workbench-views" aria-label={text('任务视图', 'Task views')}>

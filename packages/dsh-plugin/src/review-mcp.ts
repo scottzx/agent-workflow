@@ -5,12 +5,15 @@
  */
 import { createInterface } from 'node:readline';
 import { SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
+import { HANDOFF_TOOLS } from './handoff-spec.js';
 import { TICKET_TOOLS } from './ticket-spec.js';
 
-const url = process.env.ONEAGENTS_REVIEW_URL, ticketUrl = process.env.ONEAGENTS_TICKET_URL, session = process.env.ONEAGENTS_REVIEW_SESSION, token = process.env.ONEAGENTS_REVIEW_TOKEN;
+const url = process.env.ONEAGENTS_REVIEW_URL, ticketUrl = process.env.ONEAGENTS_TICKET_URL, handoffUrl = process.env.ONEAGENTS_HANDOFF_URL, session = process.env.ONEAGENTS_REVIEW_SESSION, token = process.env.ONEAGENTS_REVIEW_TOKEN;
 const tools = [{ name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
   inputSchema: { type: 'object', properties: { summary: { type: 'string', description: SUMMARY_DESCRIPTION } }, required: ['summary'], additionalProperties: false } },
   ...(ticketUrl ? TICKET_TOOLS.map(spec => ({ name: spec.name, description: spec.description,
+    inputSchema: { type: 'object', properties: spec.parameters, required: Object.keys(spec.parameters), additionalProperties: false } })) : []),
+  ...(handoffUrl ? HANDOFF_TOOLS.map(spec => ({ name: spec.name, description: spec.description,
     inputSchema: { type: 'object', properties: spec.parameters, required: Object.keys(spec.parameters), additionalProperties: false } })) : [])];
 
 const write = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -18,7 +21,8 @@ const write = (message: unknown) => process.stdout.write(`${JSON.stringify(messa
 async function call(name: string, args: unknown): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
   const summary = (args as { summary?: unknown } | undefined)?.summary;
   if (name === SUBMIT_TOOL && (typeof summary !== 'string' || !summary.trim())) return { content: [{ type: 'text', text: 'summary is required' }], isError: true };
-  const target = name === SUBMIT_TOOL ? url : ticketUrl;
+  const handoff = HANDOFF_TOOLS.some(spec => spec.name === name);
+  const target = name === SUBMIT_TOOL ? url : handoff ? handoffUrl : ticketUrl;
   if (!target || !session || !token) return { content: [{ type: 'text', text: 'This MCP server was started without its DSH session binding' }], isError: true };
   try {
     const response = await fetch(target, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Oneagents-Session': session },

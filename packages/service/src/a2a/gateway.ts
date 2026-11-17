@@ -1,6 +1,7 @@
 /** Main-agent tools backed by standard A2A, with a durable completion inbox. */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -17,7 +18,7 @@ import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.j
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
 import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
-import { artifactInstructions, defaultJobDirectory, defaultManifestPath, spaceInstructions } from './job-directory.js';
+import { artifactInstructions, defaultJobDirectory, defaultManifestPath, snapshotInstructions, spaceInstructions } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
 import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
@@ -28,12 +29,16 @@ import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema }
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { invokeTicket, reopenForContinue, TICKET_METHODS } from '../execution/ticket.js';
-import { continueByConvention, HANDOFF_METHODS, invokeHandoff } from '../execution/handoff.js';
+import { continueByConvention, decideHandoff, HANDOFF_METHODS, invokeHandoff, offerConvention, proposeByFact, type Handoff, type HandoffSnapshot } from '../execution/handoff.js';
 import { rolePublicationDirectory } from '../execution/spaces.js';
+import { caseOpenSchema, CaseError, openCase, projectCase, requireCase } from '../execution/cases.js';
+import { factRecordSchema, factSatisfied, receiptRecordSchema, recordFact, recordReceipt } from '../execution/externals.js';
+import { SnapshotError, SnapshotStore } from '../execution/snapshots.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { answerProcessRequest, createProcessRequest, expireProcessRequest, processRequestAnswerSchema, processRequestCreateSchema, processRequestSchema, ProcessRequestError, projectProcessRequest, sameProcessRequest, type ProcessRequest } from '../execution/process-request.js';
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
 import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
+import { workbenchCases, getWorkbenchCase } from '../execution/case-view.js';
 import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
 import { agentNamePattern, listAgentFiles } from '../execution/agent-files.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
@@ -58,7 +63,10 @@ const configSchema = z.object({
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
-  workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
+  workbench: z.object({ /** Omit on a trusted network: the page opens without login and the API needs no bearer. */ token: string.optional(), reviewerId: string.default('local-owner'), reviewerName: string.optional(),
+    /** Who may decide each gate. A gate with nobody named falls back to the reviewer. */
+    gateReviewers: z.object({ handoff: string.optional(), publish: string.optional(), acceptance: string.optional() }).strict().optional(),
+    publicBaseUrl: endpoint.optional(),
     /** Shared with a host that serves this page itself (DSH). Over the bearer API, only its relayed page requests may publish or decide reviews. */
     pageRelaySecret: z.string().min(32).optional(),
     allowedOrigins: z.array(string).optional(),
@@ -91,8 +99,8 @@ export type A2AGatewayConfig = z.input<typeof configSchema>;
 type Config = z.output<typeof configSchema>;
 
 const originFields = { originSessionId: string };
-/** Who acted: a person, or a coach agent naming its session. */
-const actorSchema = z.object({ kind: z.enum(['person', 'coach']), agent: string.optional(), sessionId: string.optional() }).strict();
+/** Who acted: a person, or a coach agent naming its session. A person also carries the reviewer's id. */
+const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: string.optional(), agent: string.optional(), sessionId: string.optional() }).strict();
 const taskFields = { ...originFields, remote: string, taskId: string };
 const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'Prompt must contain text');
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
@@ -127,6 +135,7 @@ const executionReviewSchema = executionJobSchema.extend({ attemptId: string, res
 const workbenchContinueSchema = z.object({ prompt: string }).strict();
 const workbenchAcceptSchema = z.object({ note: string.optional() }).strict();
 const executionUnwatchSchema = executionJobSchema.extend({ reason: string }).strict();
+const caseGetSchema = z.object({ originSessionId: string, caseId: string }).strict();
 /** The coach answers an executor's process request: the same answer as the workbench page, naming who decided and why. */
 const processAnswerSchema = executionJobSchema.extend({ requestId: string, clientRequestId: string,
   outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']), note: string.optional(), stopTask: z.literal(true).optional(),
@@ -147,6 +156,8 @@ const EXECUTION_METHODS = {
   execution_process_answer: { description: '回答任务上的一条过程请求，和工作台页面同一记录；decidedBy 写明是人还是教练（教练写明所在的智能体会话），note 写理由。', parameters: z.toJSONSchema(processAnswerSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
+  case_open: { description: '开一件事：写下目标，登记进账本。之后 handoff_space、handoff_offer 和带 caseId 的提交都只能引用已存在的一件事，不会隐式创建。', parameters: z.toJSONSchema(caseOpenSchema) },
+  case_get: { description: '读取一件事：目标、共享产物空间、其下的任务、交接、约定和待确认。不派单，不决定。', parameters: z.toJSONSchema(caseGetSchema) },
   ...TICKET_METHODS,
   ...HANDOFF_METHODS,
 };
@@ -236,6 +247,7 @@ export class RemoteAgentGateway {
   readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
   private readonly stateFile: string;
+  private readonly snapshots: SnapshotStore;
   private readonly state: State;
   private readonly clients = new Map<string, Promise<Client>>();
   private readonly probeCards = new Map<string, { until: number; result: Promise<unknown> }>();
@@ -267,6 +279,7 @@ export class RemoteAgentGateway {
     // directory: local restarts must never mark remote executions failed.
     this.lease = new FileA2AStore(path.join(this.config.stateDirectory, 'lease'));
     this.stateFile = path.join(this.config.stateDirectory, 'gateway.json');
+    this.snapshots = new SnapshotStore(path.join(this.config.stateDirectory, 'handoff-snapshots'));
     try {
       this.state = JSON.parse(readFileSync(this.stateFile, 'utf8')) as State;
       if (![1, 2].includes(this.state.version) || !Array.isArray(this.state.jobs) || !Array.isArray(this.state.notices)) throw new Error('Invalid gateway state');
@@ -367,10 +380,37 @@ export class RemoteAgentGateway {
       ...(this.state.executionCancellations?.[attempt.attemptId] ? { cancellation: structuredClone(this.state.executionCancellations[attempt.attemptId]) } : {}), attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
       backendRunRef: attempt.backendRunRef, phase: attempt.phase, stale: attempt.stale,
       resultSummary: view.result?.resultSummary, artifactLinks: view.result?.artifactLinks ?? [],
-      resultDigest: view.result?.resultDigest, resultRevision: view.result?.resultRevision,
+      resultDigest: view.result?.resultDigest, resultRevision: view.result?.resultRevision ?? view.resultRevision,
       ...(raw ? { remote: raw.remote, taskId: raw.taskId, contextId: raw.contextId,
         sessionId: Task.fromJSON(raw.task).metadata?.['1agents']?.sessionId,
         resultMetadata: Task.fromJSON(raw.task).metadata?.['1agents']?.result } : {}) };
+  }
+  /**
+   * Freeze the bytes a handoff talks about. The files are copied into the gateway's snapshot store and addressed
+   * by their digest, so a later round of the source job cannot change what an accepted handoff points at.
+   */
+  private async freezeHandoff(handoff: Handoff): Promise<HandoffSnapshot[]> {
+    if (handoff.snapshots) return handoff.snapshots;
+    const attempt = this.ledger.getAttempt(handoff.fromAttemptId);
+    const files: { digest: string; name: string; mediaType?: string; bytes: Buffer }[] = [];
+    for (const raw of attempt.result?.resultArtifacts ?? []) {
+      const artifact = raw as { path?: string; sha256?: string; size?: number; mediaType?: string };
+      if (!artifact.sha256 || !artifact.path) continue;
+      const bytes = await this.artifactBytes(handoff.fromJobId, artifact);
+      files.push({ digest: artifact.sha256, name: path.basename(artifact.path),
+        ...(artifact.mediaType ? { mediaType: artifact.mediaType } : {}), bytes });
+    }
+    const snapshots = await this.snapshots.freeze({ caseId: handoff.caseId, handoffId: handoff.handoffId, files });
+    const origin = this.ledger.originOf(handoff.fromJobId);
+    if (origin) this.ledger.commitHandoff(origin, { ...handoff, snapshots, updatedAt: new Date().toISOString() }, 'handoff.snapshots_frozen');
+    return snapshots;
+  }
+  /** The verified bytes of one artifact: the local copy when it still matches, otherwise the host's own copy. */
+  private async artifactBytes(jobId: string, artifact: { path?: string; sha256?: string; size?: number }): Promise<Buffer> {
+    if (!artifact.path || !artifact.sha256) throw new Error('This artifact has no verified receipt');
+    const local = await readFile(artifact.path).catch(() => undefined);
+    if (local && createHash('sha256').update(local).digest('hex') === artifact.sha256) return local;
+    return (await this.workbenchArtifact(jobId, artifact.sha256)).content;
   }
   private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; deliveryRecoveryInput?: PptDeliveryRecoveryInput; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
     if (input.handoffId) {
@@ -379,10 +419,19 @@ export class RemoteAgentGateway {
       if (input.targetId !== handoff.toTargetId) throw new Error('Handoff target does not match');
       if (input.purpose && input.purpose !== handoff.purpose) throw new Error('Handoff purpose does not match');
       if (input.caseId && input.caseId !== handoff.caseId) throw new Error('Handoff case does not match');
+      // The accepted version is the one the handoff names. Another version needs a new proposal.
+      if (input.resultRevision && input.resultRevision !== handoff.artifactRevision) throw new Error('Handoff version does not match; propose the new version instead');
       if (handoff.status === 'taken' && handoff.childJobId) return this.ledgerView(input.originSessionId, handoff.childJobId);
-      input = { ...input, purpose: handoff.purpose, caseId: handoff.caseId, resultRevision: input.resultRevision ?? handoff.artifactRevision,
-        parentJobRef: { sourceId: this.ledger.sourceId, jobId: handoff.fromJobId }, parentAttemptId: handoff.fromAttemptId };
+      const frozen = handoff.snapshots ?? [];
+      const snapshot = { caseId: handoff.caseId, handoffId: handoff.handoffId, revision: handoff.artifactRevision, digest: handoff.artifactDigest,
+        files: frozen.map(item => ({ digest: item.digest, name: item.name, size: item.size,
+          ...(item.mediaType ? { mediaType: item.mediaType } : {}), path: this.snapshots.absolutePath(item.storedPath) })) };
+      input = { ...input, purpose: handoff.purpose, caseId: handoff.caseId, resultRevision: handoff.artifactRevision,
+        parentJobRef: { sourceId: this.ledger.sourceId, jobId: handoff.fromJobId }, parentAttemptId: handoff.fromAttemptId,
+        ...(frozen.length ? { input: { ...input.input, handoffSnapshot: snapshot } } : {}) };
     }
+    // A task may only join a thing that exists; it never creates one by naming it.
+    if (input.caseId) requireCase(this.ledger, input.originSessionId, input.caseId);
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
     if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
@@ -435,6 +484,8 @@ export class RemoteAgentGateway {
       if (provider && isAcpAgentPreset(resolved.agentPreset)) throw new Error('provider and model apply only to standard presets; oneagents-acp-* presets switch models through session/set_config_option');
       const preflight = fields.preflight === undefined ? undefined : a2aPreflightRequirementsSchema.parse(fields.preflight);
       const declaredRequirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
+      // The sandbox profile travels with the requirements: the host provisions the environment the target names.
+      const sandboxed = resolved.sandbox ? { ...declaredRequirements, sandbox: resolved.sandbox } : declaredRequirements;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
       const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
       // Unless the caller declared its own artifact location, every task gets <cwd>/.1agents/jobs/<jobId>/ and a
@@ -442,7 +493,7 @@ export class RemoteAgentGateway {
       let artifacts = !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && resolved.cwd
         ? { directory: defaultJobDirectory(resolved.cwd, job.jobId), manifest: defaultManifestPath(resolved.cwd, job.jobId, attempt.attemptId) } : undefined;
       const withArtifacts = <T>(declared: T, add: (found: NonNullable<typeof artifacts>) => T): T => artifacts ? add(artifacts) : declared;
-      let requirements = withArtifacts(declaredRequirements, found => ({ ...declaredRequirements, jobDirectory: found.directory }));
+      let requirements = withArtifacts(sandboxed, found => ({ ...sandboxed, jobDirectory: found.directory }));
       let resultContract = withArtifacts(declaredResult, found => ({ ...(declaredResult ?? { jobId: job.jobId }), artifactManifestPath: found.manifest }));
       const boundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
@@ -451,7 +502,7 @@ export class RemoteAgentGateway {
         // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
         // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
         if (!artifacts) throw error;
-        artifacts = undefined; requirements = declaredRequirements; resultContract = declaredResult;
+        artifacts = undefined; requirements = sandboxed; resultContract = declaredResult;
         await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       }
       const publicationRole = boundRole ?? explicitRole ?? job.roleId;
@@ -474,7 +525,8 @@ export class RemoteAgentGateway {
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '')
           + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
-            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication }) }] },
+            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication })
+          + snapshotInstructions(input.input?.handoffSnapshot) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
           ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
           ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
@@ -849,9 +901,12 @@ export class RemoteAgentGateway {
   acceptWorkbenchTask(jobId: string, note?: string) {
     const task = this.workbenchTask(jobId);
     if (!task.canAccept) throw new Error('只有已完成、还没有结论的任务可以标记已阅。');
+    // A gate belongs to the person it names; the page may not decide it for someone else.
+    const reviewer = this.gateReviewer('acceptance');
+    if (reviewer !== this.config.workbench!.reviewerId) throw new Error(`这道验收关口的负责人是 ${reviewer}。`);
     const result = this.ledger.getAttempt(task.currentAttemptId).result!;
     this.ledger.acceptance(task.originSessionId, jobId, { attemptId: task.currentAttemptId, resultRevision: result.resultRevision!, resultDigest: result.resultDigest!,
-      reviewStatus: 'accepted', ...(note ? { note } : {}), decidedBy: { kind: 'person' } });
+      reviewStatus: 'accepted', ...(note ? { note } : {}), decidedBy: { kind: 'person', id: reviewer } });
     return this.workbenchTask(jobId);
   }
   async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
@@ -1062,6 +1117,18 @@ export class RemoteAgentGateway {
       return this.targets.invoke(method, params);
     }
     if (method === 'execution_submit') return this.submitExecution(executionSubmitSchema.parse(params));
+    if (method === 'case_open') {
+      const input = caseOpenSchema.parse(params);
+      // This channel is an agent's. It may not write that a person opened the case.
+      if (input.createdBy?.kind === 'person') throw new Error('A person opens a case on the workbench page, not through this channel');
+      return openCase(this.ledger, input);
+    }
+    if (method === 'case_get') {
+      const input = caseGetSchema.parse(params);
+      const record = projectCase(this.ledger, input.originSessionId, input.caseId);
+      if (!record) throw new Error('No such case');
+      return record;
+    }
     if (method === 'execution_continue') {
       const input = executionContinueSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
       const replay = this.ledger.replay({ originSessionId: input.originSessionId, jobId: job.jobId,
@@ -1135,7 +1202,14 @@ export class RemoteAgentGateway {
       if (review.reviewStatus === 'accepted') continueByConvention(this.ledger, originSessionId, jobId);
       return recorded;
     }
-    if (Object.hasOwn(HANDOFF_METHODS, method)) return invokeHandoff(this.ledger, method, params);
+    if (Object.hasOwn(HANDOFF_METHODS, method)) {
+      const result = invokeHandoff(this.ledger, method, params);
+      // The bytes a handoff talks about are frozen once, so a later round of the source job cannot change them.
+      if ((method === 'handoff_propose' || method === 'handoff_decide') && result && typeof result === 'object' && 'handoffId' in result) {
+        await this.freezeHandoff(result as Handoff);
+      }
+      return result;
+    }
     if (Object.hasOwn(TICKET_METHODS, method)) {
       const ticket = invokeTicket(this.ledger, method, params);
       const body = params && typeof params === 'object' ? params as { originSessionId?: string; jobId?: string; status?: string } : {};
@@ -1269,13 +1343,16 @@ export class RemoteAgentGateway {
     if (!taskId) throw new Error('Missing A2A event task ID');
     await Promise.allSettled(this.state.jobs.filter(job => job.taskId === taskId).map(job => this.refresh(job)));
   }
-  private workbenchProjection() {
+  private workbenchSource() {
     const config = this.config.workbench;
     if (!config) throw new Error('Workbench is not configured');
     const runs = Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[];
     const reportRuns = Object.values(this.state.reportReviews ?? {});
-    return workbenchSnapshot({ ledger: this.ledger.snapshot(), runs, reportRuns, reviews: [...runs.flatMap(run => run.humanReviews ?? []), ...reportRuns.flatMap(run => run.humanReviews)],
-      processRequests: this.state.processRequests ?? [], actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
+    return { ledger: this.ledger.snapshot(), runs, reportRuns, reviews: [...runs.flatMap(run => run.humanReviews ?? []), ...reportRuns.flatMap(run => run.humanReviews)],
+      processRequests: this.state.processRequests ?? [], actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) };
+  }
+  private workbenchProjection() {
+    return workbenchSnapshot(this.workbenchSource());
   }
   private workbench<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.workbenchQueue.then(operation);
@@ -1295,6 +1372,117 @@ export class RemoteAgentGateway {
     this.save();
   }
   workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
+  /** Who may decide each gate. A gate with nobody named belongs to the reviewer. */
+  private gateReviewer(gate: 'handoff' | 'publish' | 'acceptance'): string {
+    const config = this.config.workbench!;
+    return config.gateReviewers?.[gate] ?? config.reviewerId;
+  }
+  /** The gates and their people, so the page can show who may press which button. */
+  private gateReviewers() {
+    return { handoff: this.gateReviewer('handoff'), publish: this.gateReviewer('publish'), acceptance: this.gateReviewer('acceptance') };
+  }
+  /** One thing is the first screen of the workbench: the cases this scope can see. */
+  workbenchCaseList(query: { limit?: number; offset?: number } = {}) {
+    const { list } = workbenchCases(this.workbenchSource(), this.workbenchProjection());
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0)), limit = Math.min(200, Math.max(1, Math.trunc(query.limit ?? 50)));
+    return { ...list, items: list.items.slice(offset, offset + limit), offset, limit,
+      origins: [...new Set(list.items.map(item => item.originSessionId))], reviewers: this.gateReviewers() };
+  }
+  private workbenchCaseDetails() { return workbenchCases(this.workbenchSource(), this.workbenchProjection()).details; }
+  /** One case, in the scope this page may see. */
+  workbenchCase(caseId: string, originSessionId?: string) {
+    const details = this.workbenchCaseDetails();
+    const found = Object.values(details).find(item => item.caseId === caseId && (!originSessionId || item.originSessionId === originSessionId));
+    if (!found) throw new Error('Case not found in authorized scope');
+    return { ...structuredClone(found), reviewers: this.gateReviewers() };
+  }
+  /** Open a thing from the page. The page's reviewer is its creator. */
+  openWorkbenchCase(input: unknown) {
+    return this.workbench(async () => {
+      const config = this.config.workbench!;
+      const parsed = z.object({ originSessionId: string, caseId: string.optional(), goal: z.string().trim().min(1).max(4000),
+        title: z.string().trim().min(1).max(200).optional() }).strict().parse(input);
+      return openCase(this.ledger, { ...parsed, createdBy: { kind: 'person', id: config.reviewerId } });
+    });
+  }
+  /** Register a convention on a case, from the page. It states what may follow; it dispatches nothing. */
+  async registerWorkbenchConvention(caseId: string, input: unknown) {
+    return this.workbench(async () => {
+      const scope = this.workbenchCase(caseId);
+      const parsed = z.object({ fromPurpose: string.optional(), fromTargetId: string.optional(), toTargetId: string, toPurpose: string,
+        when: z.enum(['acceptance_accepted', 'ticket_closed', 'fact_reached']), requireHuman: z.boolean().optional(),
+        condition: z.object({ metric: string, operator: z.enum(['gte', 'lte', 'gt', 'lt']), value: z.number().finite() }).strict().optional() }).strict().parse(input);
+      return offerConvention(this.ledger, { originSessionId: scope.originSessionId, caseId, ...parsed });
+    });
+  }
+  /**
+   * Accept or reject a handoff proposal. Only a person on the workbench page does this; the decision carries the
+   * configured reviewer, and the bytes are frozen before the decision is written down.
+   */
+  async decideWorkbenchHandoff(caseId: string, handoffId: string, input: unknown) {
+    return this.workbench(async () => {
+      const config = this.config.workbench!;
+      const scope = this.workbenchCase(caseId);
+      const decision = z.object({ decision: z.enum(['accept', 'reject']), note: z.string().trim().max(4000).optional() }).strict().parse(input);
+      // A gate belongs to the person it names; the page may not decide it for someone else.
+      const reviewer = this.gateReviewer('handoff');
+      if (reviewer !== config.reviewerId) throw new Error(`这道交接关口的负责人是 ${reviewer}。`);
+      const edge = scope.edges.find(item => item.handoffId === handoffId);
+      if (!edge) throw new Error('Handoff not found in this case');
+      const handoff = this.ledger.findHandoff(scope.originSessionId, handoffId);
+      if (!handoff) throw new Error('Handoff not found');
+      // Freeze first: a decision that cannot deliver the bytes is not written down.
+      if (decision.decision === 'accept') await this.freezeHandoff(handoff);
+      const decided = decideHandoff(this.ledger, { originSessionId: scope.originSessionId, handoffId,
+        decision: decision.decision, ...(decision.note ? { note: decision.note } : {}),
+        decidedBy: { kind: 'person', id: reviewer } }, { allowPerson: true, reviewerId: reviewer });
+      return { handoff: decided, case: this.workbenchCase(caseId) };
+    });
+  }
+  /** Record that these bytes went out through a channel. Only a caller holding a credential may write this. */
+  async recordWorkbenchReceipt(caseId: string, input: unknown, actor: { kind: 'person' | 'coach' | 'application'; id?: string; agent?: string }) {
+    return this.workbench(async () => {
+      // Publishing is a gate: a person who is not named for it may not register a receipt.
+      const reviewer = this.gateReviewer('publish');
+      if (actor.kind === 'person' && actor.id !== reviewer) throw new Error(`登记发布回执的负责人是 ${reviewer}。`);
+      const scope = this.workbenchCase(caseId);
+      const parsed = receiptRecordSchema.omit({ originSessionId: true, caseId: true, recordedBy: true }).parse(input);
+      return recordReceipt(this.ledger, { ...parsed, originSessionId: scope.originSessionId, caseId, recordedBy: actor });
+    });
+  }
+  /** Record a measured number. The gateway compares it with the case's thresholds and only proposes. */
+  async recordWorkbenchFact(caseId: string, input: unknown, actor: { kind: 'person' | 'coach' | 'application'; id?: string; agent?: string }) {
+    return this.workbench(async () => {
+      const scope = this.workbenchCase(caseId);
+      const parsed = factRecordSchema.omit({ originSessionId: true, caseId: true, recordedBy: true }).parse(input);
+      const fact = recordFact(this.ledger, { ...parsed, originSessionId: scope.originSessionId, caseId, recordedBy: actor });
+      const proposals = this.factProposals(scope.originSessionId, caseId);
+      return { fact, proposals };
+    });
+  }
+  /** A threshold that has been reached proposes the next hop. It never decides it and never dispatches. */
+  private factProposals(originSessionId: string, caseId: string) {
+    const facts = this.ledger.factsFor(originSessionId, caseId);
+    const rules = this.ledger.conventionsFor(originSessionId).filter(rule => rule.caseId === caseId && rule.when === 'fact_reached' && rule.condition);
+    const proposals = [];
+    for (const rule of rules) {
+      const reached = facts.some(fact => fact.metric === rule.condition!.metric
+        && factSatisfied(fact.value, rule.condition!.operator, rule.condition!.value));
+      if (!reached) continue;
+      const proposal = proposeByFact(this.ledger, originSessionId, caseId, rule, `事实达到约定条件：${rule.condition!.metric} ${rule.condition!.operator} ${rule.condition!.value}`);
+      if (proposal) proposals.push(proposal);
+    }
+    return proposals;
+  }
+  /** The frozen bytes of an accepted handoff. The digest is checked again on every read. */
+  async workbenchCaseArtifact(caseId: string, handoffId: string, digest: string) {
+    const scope = this.workbenchCase(caseId);
+    const edge = scope.edges.find(item => item.handoffId === handoffId);
+    const snapshot = edge?.snapshots?.find(item => item.digest === digest);
+    if (!snapshot) throw new WorkbenchArtifactError(404, 'artifact-not-found');
+    const content = await this.snapshots.read(snapshot.storedPath, digest);
+    return { content, name: snapshot.name, ...(snapshot.mediaType ? { mediaType: snapshot.mediaType } : {}) };
+  }
   workbenchAgents() {
     const residents = this.targets.listTargets().filter(target => target.kind === 'resident_agent').map(target => ({
       targetId: target.targetId, name: target.name, ...(target.binding.roleId ? { roleId: target.binding.roleId } : {}),
@@ -1349,7 +1537,12 @@ export class RemoteAgentGateway {
   }
   createWorkbenchAgent(input: unknown) { return this.workbench(async () => ({ draft: this.agents.create(input), ...this.workbenchAgents() })); }
   updateWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ draft: this.agents.update(agentId, input), ...this.workbenchAgents() })); }
-  publishWorkbenchAgent(agentId: string, input: unknown) { return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() })); }
+  async publishWorkbenchAgent(agentId: string, input: unknown) {
+    // Publishing is a gate too: it belongs to the person it names.
+    const reviewer = this.gateReviewer('publish');
+    if (reviewer !== this.config.workbench!.reviewerId) throw new Error(`发布放行的负责人是 ${reviewer}。`);
+    return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() }));
+  }
   workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
   /** Read-only transcript from the stored A2A history of the job's attempts; the same scope check as the task detail. */
   workbenchChat(jobId: string, query: { limit?: number; before?: number } = {}) {
@@ -1700,8 +1893,9 @@ function authenticated(req: IncomingMessage, token: string): boolean {
   const expected = Buffer.from(`Bearer ${token}`), supplied = Buffer.from(req.headers.authorization ?? '');
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
-/** Publishing and review decisions are a person's acts, made on the workbench page. */
-const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/, /^\/workbench\/tasks\/[^/]+\/acceptance$/];
+/** Publishing, review decisions and handoff decisions are a person's acts, made on the workbench page. */
+const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/, /^\/workbench\/tasks\/[^/]+\/acceptance$/,
+  /^\/workbench\/cases\/[^/]+\/handoffs\/[^/]+\/decisions$/];
 function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
   if (!secret) return false;
   const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
@@ -1795,6 +1989,58 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
+        }
+        if (pathname === '/workbench/cases') {
+          if (req.method === 'GET') {
+            const query = z.object({ limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
+            return json(res, 200, gateway.workbenchCaseList(query));
+          }
+          if (req.method === 'POST') {
+            if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+            try { return json(res, 200, await gateway.openWorkbenchCase(await body(req))); }
+            catch (error) {
+              if (error instanceof CaseError) return json(res, error.code === 'conflict' ? 409 : error.code === 'not_found' ? 404 : 400, { error: error.code, message: error.message });
+              if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
+              throw error;
+            }
+          }
+          return json(res, 405, { error: 'Method not allowed' });
+        }
+        const caseRoute = /^\/workbench\/cases\/([^/]+)(.*)$/.exec(pathname);
+        if (caseRoute) {
+          const caseId = decodeURIComponent(caseRoute[1]!), rest = caseRoute[2] ?? '';
+          const handoffDecision = /^\/handoffs\/([^/]+)\/decisions$/.exec(rest);
+          const handoffArtifact = /^\/handoffs\/([^/]+)\/artifacts\/([a-f0-9]{64})$/.exec(rest);
+          try {
+            if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchCase(caseId));
+            if (rest === '/conventions' && req.method === 'POST') return json(res, 200, await gateway.registerWorkbenchConvention(caseId, await body(req)));
+            // A page writes as the person on it; a bearer call is the application holding the workbench credential.
+            const writer = page ? { kind: 'person' as const, id: gateway.config.workbench!.reviewerId }
+              : { kind: 'application' as const, agent: 'workbench-api' };
+            if (rest === '/receipts' && req.method === 'POST') return json(res, 200, await gateway.recordWorkbenchReceipt(caseId, await body(req), writer));
+            if (rest === '/facts' && req.method === 'POST') return json(res, 200, await gateway.recordWorkbenchFact(caseId, await body(req), writer));
+            if (handoffDecision && req.method === 'POST') {
+              // Only a person on the page decides a handoff; the A2A channel may not write that a person agreed.
+              if (!page && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) return json(res, 403, { error: 'page_action_required', message: '交接的接受和拒绝只能由人在工作台页面发起。' });
+              return json(res, 200, await gateway.decideWorkbenchHandoff(caseId, decodeURIComponent(handoffDecision[1]!), await body(req)));
+            }
+            if (handoffArtifact && req.method === 'GET') {
+              if (url.search) return json(res, 404, { error: 'No workbench route' });
+              const file = await gateway.workbenchCaseArtifact(caseId, decodeURIComponent(handoffArtifact[1]!), handoffArtifact[2]!);
+              res.writeHead(200, { 'Content-Type': artifactContentType(file.name, file.mediaType), 'Content-Length': file.content.length,
+                'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600',
+                'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+                'Content-Security-Policy': "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'" });
+              return void res.end(file.content);
+            }
+            return json(res, 404, { error: 'No workbench route' });
+          } catch (error) {
+            if (error instanceof WorkbenchArtifactError) return json(res, error.status, { error: error.code });
+            if (error instanceof CaseError) return json(res, error.code === 'conflict' ? 409 : error.code === 'not_found' ? 404 : 400, { error: error.code, message: error.message });
+            if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
+            if (error instanceof SnapshotError) return json(res, error.code === 'changed' ? 409 : 404, { error: error.code, message: error.message });
+            return json(res, 404, { error: error instanceof Error ? error.message : 'Case not found' });
+          }
         }
         if (pathname === '/workbench/agents/register-path') {
           if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });

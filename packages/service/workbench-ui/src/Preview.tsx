@@ -30,6 +30,11 @@ export function artifactUrl(jobId: string, artifact: ArtifactRef): string | unde
     return new URL(`/workbench/ui/api/tasks/${encodeURIComponent(jobId)}/artifacts/${artifact.sha256}`, location.origin).href;
 }
 
+/** The frozen bytes of an accepted handoff. The gateway re-checks the digest on every read. */
+export function snapshotUrl(caseId: string, handoffId: string, digest: string): string {
+    return new URL(`/workbench/ui/api/cases/${encodeURIComponent(caseId)}/handoffs/${encodeURIComponent(handoffId)}/artifacts/${digest}`, location.origin).href;
+}
+
 function artifactName(artifact: ArtifactRef, url?: string): string {
     return (
         artifact.path?.split('/').pop() ||

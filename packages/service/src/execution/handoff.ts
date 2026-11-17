@@ -8,13 +8,26 @@ import { z } from 'zod';
 import type { LedgerActor, LedgerJob, LedgerJobView } from './ledger.js';
 import { JobLedger } from './ledger.js';
 import { TicketError } from './ticket.js';
+import { requireCase } from './cases.js';
+import { factSatisfied, type FactOperator } from './externals.js';
 
 const id = z.string().trim().min(1).max(512);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const text = z.string().trim().min(1).max(4000);
-export const handoffWhenSchema = z.enum(['acceptance_accepted', 'ticket_closed']);
+export const handoffWhenSchema = z.enum(['acceptance_accepted', 'ticket_closed', 'fact_reached']);
 export type HandoffWhen = z.infer<typeof handoffWhenSchema>;
 export type HandoffStatus = 'proposed' | 'accepted' | 'taken' | 'rejected';
+
+/** One frozen file: the bytes that were accepted, addressed by their digest. */
+export interface HandoffSnapshot {
+  digest: string;
+  name: string;
+  size: number;
+  mediaType?: string;
+  /** Path inside the gateway's snapshot store, relative to its root. */
+  storedPath: string;
+  frozenAt: string;
+}
 
 export interface Handoff {
   handoffId: string;
@@ -32,6 +45,8 @@ export interface Handoff {
   childJobId?: string;
   decidedBy?: LedgerActor;
   note?: string;
+  /** The accepted bytes, frozen by digest. Present once the handoff was accepted. */
+  snapshots?: HandoffSnapshot[];
   createdAt: string;
   updatedAt: string;
 }
@@ -47,6 +62,8 @@ export interface HandoffConvention {
   toPurpose: string;
   when: HandoffWhen;
   requireHuman: boolean;
+  /** The threshold a measured fact is compared against, when `when` is 'fact_reached'. */
+  condition?: { metric: string; operator: FactOperator; value: number };
   clientRequestId?: string;
   recordedAt: string;
 }
@@ -64,7 +81,7 @@ export interface LegalNext {
   achieved: boolean;
 }
 
-const actorSchema = z.object({ kind: z.enum(['person', 'coach']), agent: z.string().optional(), sessionId: z.string().optional() }).strict()
+const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: id.optional(), agent: z.string().optional(), sessionId: z.string().optional() }).strict()
   .refine(actor => actor.kind === 'coach' || (!actor.agent && !actor.sessionId), 'Only a coach names an agent session');
 const proposeFields = {
   caseId: id, toTargetId: id, purpose: id, artifactRevision: id, artifactDigest: digest, reason: text,
@@ -75,10 +92,20 @@ const proposeByExecutorSchema = z.object({ jobId: id, attemptId: id, sessionId: 
 const decideSchema = z.object({ originSessionId: id, handoffId: id, decision: z.enum(['accept', 'reject']),
   note: z.string().trim().max(4000).optional(), decidedBy: actorSchema }).strict();
 const offerSchema = z.object({ originSessionId: id, caseId: id, fromPurpose: id.optional(), fromTargetId: id.optional(),
-  toTargetId: id, toPurpose: id, when: handoffWhenSchema, requireHuman: z.boolean().optional(), clientRequestId: id.optional() }).strict();
+  toTargetId: id, toPurpose: id, when: handoffWhenSchema, requireHuman: z.boolean().optional(), clientRequestId: id.optional(),
+  condition: z.object({ metric: id, operator: z.enum(['gte', 'lte', 'gt', 'lt']), value: z.number().finite() }).strict().optional() }).strict();
 const spaceSchema = z.object({ originSessionId: id, caseId: id,
   root: z.string().min(1).max(4096).refine(value => value.startsWith('/') && !value.includes('\0') && !value.split('/').includes('..'), 'artifact space must be an absolute remote path') }).strict();
 const readSchema = z.object({ originSessionId: id, jobId: id }).strict();
+const readByExecutorSchema = z.object({ jobId: id, attemptId: id, sessionId: id }).strict();
+
+/** Who may record the decision, and as whom. */
+export interface DecideOptions {
+  /** The workbench page records a person's decision. The A2A channel may not. */
+  allowPerson?: boolean;
+  /** The configured reviewer this decision belongs to. */
+  reviewerId?: string;
+}
 
 function applies(rule: HandoffConvention, job: Pick<LedgerJob, 'originSessionId' | 'caseId' | 'purpose' | 'targetId'>): boolean {
   return rule.originSessionId === job.originSessionId && rule.caseId === job.caseId
@@ -92,8 +119,12 @@ function ticketClosed(ledger: JobLedger, origin: string, jobId: string): boolean
   catch (error) { if (error instanceof TicketError) return false; throw error; }
 }
 
-function achieved(rule: HandoffConvention, view: LedgerJobView, closed: boolean): boolean {
+function achieved(rule: HandoffConvention, view: LedgerJobView, closed: boolean, facts: { metric: string; value: number }[]): boolean {
   if (rule.when === 'ticket_closed') return closed;
+  if (rule.when === 'fact_reached') {
+    if (!rule.condition) return false;
+    return facts.some(fact => fact.metric === rule.condition!.metric && factSatisfied(fact.value, rule.condition!.operator, rule.condition!.value));
+  }
   const acceptance = view.businessAcceptance;
   return acceptance?.reviewStatus === 'accepted'
     && acceptance.resultDigest === view.result?.resultDigest
@@ -105,9 +136,10 @@ export function legalNextFor(ledger: JobLedger, originSessionId: string, jobId: 
   const view = ledger.get(originSessionId, jobId);
   if (!view.caseId) return [];
   const closed = ticketClosed(ledger, originSessionId, jobId);
+  const facts = ledger.factsFor(originSessionId, view.caseId).map(fact => ({ metric: fact.metric, value: fact.value }));
   return ledger.conventionsFor(originSessionId).filter(rule => applies(rule, view)).map(rule => ({
     conventionId: rule.conventionId, toTargetId: rule.toTargetId, purpose: rule.toPurpose,
-    requireHuman: rule.requireHuman, when: rule.when, achieved: achieved(rule, view, closed),
+    requireHuman: rule.requireHuman, when: rule.when, achieved: achieved(rule, view, closed, facts),
   }));
 }
 
@@ -118,8 +150,13 @@ function sameProposal(existing: Handoff, input: z.infer<typeof proposeByOriginSc
 
 /** Record a proposal. A single matching convention with requireHuman false accepts it. Nothing here opens a job. */
 export function proposeHandoff(ledger: JobLedger, originSessionId: string, raw: unknown): Handoff {
-  const input = proposeByOriginSchema.parse({ ...(raw as object), originSessionId });
+  const body = raw && typeof raw === 'object' ? { ...(raw as Record<string, unknown>) } : {};
+  // The executor's own fields name who is calling; they are not part of the proposal.
+  delete body.via; delete body.sessionId;
+  const input = proposeByOriginSchema.parse({ ...body, originSessionId });
   const view = ledger.get(originSessionId, input.jobId);
+  if (view.caseId && view.caseId !== input.caseId) fail('Handoff must name the case of its job');
+  requireCase(ledger, originSessionId, input.caseId);
   const attempt = view.attempts.find(item => item.attemptId === input.attemptId) ?? fail('Attempt does not belong to this job');
   if (attempt.attemptId !== view.currentAttemptId) fail('Handoff must name the job\'s current attempt');
   if (input.toTargetId === view.targetId) fail('Handoff must name a different target; continue the same job to revise');
@@ -132,23 +169,34 @@ export function proposeHandoff(ledger: JobLedger, originSessionId: string, raw: 
   const open = existing.find(item => item.status !== 'rejected' && item.toTargetId === input.toTargetId && item.purpose === input.purpose && item.artifactDigest === input.artifactDigest);
   if (open) return open;
   const closed = ticketClosed(ledger, originSessionId, input.jobId);
+  const facts = ledger.factsFor(originSessionId, input.caseId).map(fact => ({ metric: fact.metric, value: fact.value }));
   const matches = ledger.conventionsFor(originSessionId).filter(rule => applies(rule, { ...view, caseId: input.caseId })
-    && rule.toTargetId === input.toTargetId && rule.toPurpose === input.purpose && achieved(rule, { ...view, caseId: input.caseId }, closed));
-  if (matches.filter(rule => !rule.requireHuman).length > 1) fail('More than one achieved convention matches this handoff; a person must choose');
+    && rule.toTargetId === input.toTargetId && rule.toPurpose === input.purpose && achieved(rule, { ...view, caseId: input.caseId }, closed, facts));
+  // A threshold that has been reached only proposes: it never decides that work moves on by itself.
+  const automatic = matches.filter(rule => !rule.requireHuman && rule.when !== 'fact_reached');
+  if (automatic.length > 1) fail('More than one achieved convention matches this handoff; a person must choose');
   const now = new Date().toISOString();
   const handoff: Handoff = {
     handoffId: randomUUID(), caseId: input.caseId, fromJobId: input.jobId, fromAttemptId: input.attemptId,
     toTargetId: input.toTargetId, purpose: input.purpose, artifactRevision: input.artifactRevision, artifactDigest: input.artifactDigest,
-    reason: input.reason, status: matches.some(rule => !rule.requireHuman) ? 'accepted' : 'proposed',
+    reason: input.reason, status: automatic.length ? 'accepted' : 'proposed',
     ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
-    ...(matches.some(rule => !rule.requireHuman) ? { conventionId: matches.find(rule => !rule.requireHuman)!.conventionId } : {}),
+    ...(automatic.length ? { conventionId: automatic[0]!.conventionId } : {}),
     createdAt: now, updatedAt: now,
   };
   return ledger.commitHandoff(originSessionId, handoff, handoff.status === 'accepted' ? 'handoff.accepted' : 'handoff.proposed');
 }
 
-export function decideHandoff(ledger: JobLedger, raw: unknown): Handoff {
+/**
+ * Record a decision. A person's decision comes from the workbench page and carries the configured reviewer;
+ * this channel may record a coach's decision only, so an agent cannot write that a person agreed.
+ */
+export function decideHandoff(ledger: JobLedger, raw: unknown, options: DecideOptions = {}): Handoff {
   const input = decideSchema.parse(raw);
+  if (input.decidedBy.kind === 'person') {
+    if (!options.allowPerson) fail('A person decides on the workbench page, not through this channel');
+    if (options.reviewerId && input.decidedBy.id !== options.reviewerId) fail('This decision belongs to another reviewer');
+  }
   const current = ledger.findHandoff(input.originSessionId, input.handoffId) ?? fail('Handoff not found');
   if (current.status === 'taken') fail('A taken handoff already opened a job');
   if (current.status === 'rejected') return input.decision === 'reject' ? current : fail('A rejected handoff cannot be accepted');
@@ -167,7 +215,9 @@ export function continueByConvention(ledger: JobLedger, originSessionId: string,
   const view = ledger.get(originSessionId, jobId);
   if (!view.caseId || !view.result?.resultAvailable || !view.result.resultDigest || !view.result.resultRevision) return undefined;
   const closed = ticketClosed(ledger, originSessionId, jobId);
-  const ready = ledger.conventionsFor(originSessionId).filter(rule => applies(rule, view) && !rule.requireHuman && achieved(rule, view, closed));
+  const facts = ledger.factsFor(originSessionId, view.caseId).map(fact => ({ metric: fact.metric, value: fact.value }));
+  const ready = ledger.conventionsFor(originSessionId).filter(rule => applies(rule, view) && !rule.requireHuman
+    && rule.when !== 'fact_reached' && achieved(rule, view, closed, facts));
   if (ready.length !== 1) return undefined;
   const rule = ready[0]!;
   const digest = view.result.resultDigest;
@@ -182,19 +232,40 @@ export function continueByConvention(ledger: JobLedger, originSessionId: string,
   }, 'handoff.accepted');
 }
 
+/**
+ * A measured fact reached a threshold. This only proposes the next hop; it never decides it and never dispatches.
+ */
+export function proposeByFact(ledger: JobLedger, originSessionId: string, caseId: string, rule: HandoffConvention, reason: string): Handoff | undefined {
+  const view = ledger.list(originSessionId).find(job => job.caseId === caseId);
+  if (!view || !view.result?.resultAvailable || !view.result.resultDigest || !view.result.resultRevision) return undefined;
+  const existing = ledger.handoffsFor(originSessionId, view.jobId);
+  if (existing.some(item => item.conventionId === rule.conventionId && item.status !== 'rejected')) return undefined;
+  const now = new Date().toISOString();
+  return ledger.commitHandoff(originSessionId, {
+    handoffId: randomUUID(), caseId, fromJobId: view.jobId, fromAttemptId: view.currentAttemptId,
+    toTargetId: rule.toTargetId, purpose: rule.toPurpose, artifactRevision: view.result.resultRevision, artifactDigest: view.result.resultDigest,
+    reason, status: 'proposed', conventionId: rule.conventionId, createdAt: now, updatedAt: now,
+  }, 'handoff.proposed');
+}
+
 export function offerConvention(ledger: JobLedger, raw: unknown): HandoffConvention {
   const input = offerSchema.parse(raw);
   if (input.fromTargetId && input.fromTargetId === input.toTargetId) fail('A convention must name a different target');
+  if (input.when === 'fact_reached' && !input.condition) fail('A fact threshold needs a condition');
+  if (input.when !== 'fact_reached' && input.condition) fail('Only a fact threshold carries a condition');
+  requireCase(ledger, input.originSessionId, input.caseId);
   return ledger.commitConvention({
     conventionId: randomUUID(), originSessionId: input.originSessionId, caseId: input.caseId,
     ...(input.fromPurpose ? { fromPurpose: input.fromPurpose } : {}), ...(input.fromTargetId ? { fromTargetId: input.fromTargetId } : {}),
     toTargetId: input.toTargetId, toPurpose: input.toPurpose, when: input.when, requireHuman: input.requireHuman ?? false,
+    ...(input.condition ? { condition: input.condition } : {}),
     ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}), recordedAt: new Date().toISOString(),
   });
 }
 
 export function grantArtifactSpace(ledger: JobLedger, raw: unknown) {
   const input = spaceSchema.parse(raw);
+  requireCase(ledger, input.originSessionId, input.caseId);
   return ledger.commitArtifactSpace({ ...input, recordedAt: new Date().toISOString() });
 }
 
@@ -206,12 +277,13 @@ export function readHandoff(ledger: JobLedger, raw: unknown) {
     caseId: view.caseId, handoffs: ledger.handoffsFor(input.originSessionId, input.jobId),
     legalNext: legalNextFor(ledger, input.originSessionId, input.jobId),
     ...(space ? { artifactSpace: space.root } : {}),
+    artifactRevision: view.result?.resultRevision, artifactDigest: view.result?.resultDigest,
   };
 }
 
 export const HANDOFF_METHODS = {
   handoff_propose: { description: '提议把当前轮次已记录的产物交给另一个执行目标。只写账本，不派下一单。唯一匹配且不要求人确认的约定会直接接受；多条匹配则拒绝代选。', parameters: z.toJSONSchema(proposeByOriginSchema) },
-  handoff_decide: { description: '人或教练接受或拒绝一条提议。接受后仍要另调 execution_submit 并带上 handoffId，才会开下一张任务。', parameters: z.toJSONSchema(decideSchema) },
+  handoff_decide: { description: '人或教练接受或拒绝一条提议。接受后仍要另调 execution_submit 并带上 handoffId，才会开下一张任务。本通道不能代写人的决定：kind 只能是 coach，人的决定在工作台页面上做。', parameters: z.toJSONSchema(decideSchema) },
   handoff_offer: { description: '登记一条约定：某件事在验收通过或任务单关闭后可以交给哪个目标。这不是流程图，多条同时成立时不会自动挑选。', parameters: z.toJSONSchema(offerSchema) },
   handoff_space: { description: '把一个已有的宿主目录登记为这件事的共享产物空间。不创建目录，也不把它当成角色公开目录或某个任务的私有目录。', parameters: z.toJSONSchema(spaceSchema) },
   handoff_get: { description: '读取这件事上的交接、当前允许的下一跳，以及已登记的共享产物空间。不派单。', parameters: z.toJSONSchema(readSchema) },
@@ -224,13 +296,19 @@ export function invokeHandoff(ledger: JobLedger, method: string, params: unknown
       const body = params && typeof params === 'object' ? params as Record<string, unknown> : {};
       if (typeof body.originSessionId === 'string') return proposeHandoff(ledger, body.originSessionId, params);
       const executor = proposeByExecutorSchema.parse(params);
-      const origin = ledger.executorOrigin(executor.jobId, executor.attemptId, executor.sessionId);
+      const origin = ledger.executorHandoffOrigin(executor.jobId, executor.attemptId, executor.sessionId);
       return proposeHandoff(ledger, origin, { ...executor, originSessionId: origin });
     }
     case 'handoff_decide': return decideHandoff(ledger, params);
     case 'handoff_offer': return offerConvention(ledger, params);
     case 'handoff_space': return grantArtifactSpace(ledger, params);
-    case 'handoff_get': return readHandoff(ledger, params);
+    case 'handoff_get': {
+      const body = params && typeof params === 'object' ? params as Record<string, unknown> : {};
+      if (typeof body.originSessionId === 'string') return readHandoff(ledger, params);
+      const executor = readByExecutorSchema.parse(params);
+      const origin = ledger.executorHandoffOrigin(executor.jobId, executor.attemptId, executor.sessionId);
+      return readHandoff(ledger, { originSessionId: origin, jobId: executor.jobId });
+    }
     default: throw new Error(`Unknown handoff method: ${method}`);
   }
 }

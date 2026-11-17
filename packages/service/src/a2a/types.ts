@@ -24,6 +24,8 @@ export interface A2APreflightRequirements {
   requiredFiles?: string[];
   python?: { executable: string; modules: string[] };
   node?: { executable: string; modules?: string[]; moduleRoot?: string };
+  /** The sandbox this target runs commands in, when it has one. */
+  sandbox?: { name: string; image?: string; network: 'none' | 'bridge'; writableRoots?: string[]; env?: string[] };
 }
 export interface A2APreflightInput extends A2APreflightRequirements { cwd: string }
 export interface A2APreflightReport {

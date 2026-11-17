@@ -7,6 +7,7 @@ import type { HumanReviewRequest, HumanReviewStatus } from './human-review.js';
 import { projectProcessRequest, type ProcessRequest } from './process-request.js';
 import { describeTaskDevelopment, projectWorkbenchAgents, type AgentDraft, type AgentRelease, type AgentTaskRef, type ResidentAgentRef, type WorkbenchAgentRow } from './agent-registry.js';
 import type { Handoff, HandoffConvention, LegalNext } from './handoff.js';
+import { factSatisfied, type FactOperator } from './externals.js';
 
 export interface WorkbenchServiceInfo {
   kind: 'a2a' | 'gateway_workflow' | 'activepieces' | 'unknown';
@@ -23,6 +24,8 @@ export interface AcpTaskSummary {
   parentAttemptId?: string; purpose?: string; targetId: string; currentAttemptId: string;
   executionStatus: string; displayStatus: string; phase: string; createdAt: string | null; updatedAt: string;
   stale: boolean; reviewStatus?: HumanReviewStatus; pendingReviewId?: string; pendingProcessRequestId?: string; progressSummary: string;
+  /** A handoff this task proposed that nobody has answered yet. */
+  pendingHandoffId?: string;
   channel: 'trial' | 'formal' | 'standalone'; agentId?: string; agentName?: string; agentPhase?: 'developing' | 'published';
   inFlightAttemptIds: string[]; unresolvedAttemptIds: string[]; execution: WorkbenchExecution;
   /** The origin session's execution_review for the current result, if one was recorded. */
@@ -70,16 +73,22 @@ function runDescription(run: PptDeliveryRun): string {
   return ({ summary: '文稿作者正在生成或修订文字稿。', make: '制作角色正在根据确认的文字稿设计 PPT。', validate: '正在检查制作产物的文件与结构。',
     review: '独立验收角色正在核对事实和页面效果。', finished: '交付已完成，可查看最终产物。' })[run.stage];
 }
-function legalNext(ledger: LedgerState, job: LedgerJob): LegalNext[] {
+/** The next hops this job may take, with the condition each one waits for. A threshold compares measured facts. */
+export function legalNextForJob(ledger: LedgerState, job: LedgerJob): LegalNext[] {
   if (!job.caseId) return [];
   const attempt = ledger.attempts[job.currentAttemptId];
   const acceptance = [...(ledger.acceptances[job.jobId] ?? [])].reverse().find(item => item.attemptId === job.currentAttemptId && item.resultDigest === attempt?.result?.resultDigest && item.resultRevision === attempt?.result?.resultRevision);
   const closed = ledger.tickets?.[job.jobId]?.status === 'closed';
+  const facts = (ledger.facts ?? []).filter(item => item.originSessionId === job.originSessionId && item.caseId === job.caseId)
+    .map(item => ({ metric: item.metric, value: item.value }));
   const applies = (rule: HandoffConvention) => rule.originSessionId === job.originSessionId && rule.caseId === job.caseId
     && (!rule.fromPurpose || rule.fromPurpose === job.purpose) && (!rule.fromTargetId || rule.fromTargetId === job.targetId) && rule.toTargetId !== job.targetId;
   return (ledger.conventions ?? []).filter(applies).map(rule => ({
     conventionId: rule.conventionId, toTargetId: rule.toTargetId, purpose: rule.toPurpose, requireHuman: rule.requireHuman, when: rule.when,
-    achieved: rule.when === 'ticket_closed' ? Boolean(closed) : acceptance?.reviewStatus === 'accepted' && attempt?.result?.resultAvailable === true,
+    achieved: rule.when === 'ticket_closed' ? Boolean(closed)
+      : rule.when === 'fact_reached' ? Boolean(rule.condition && facts.some(fact => fact.metric === rule.condition!.metric
+        && factSatisfied(fact.value, rule.condition!.operator as FactOperator, rule.condition!.value)))
+      : acceptance?.reviewStatus === 'accepted' && attempt?.result?.resultAvailable === true,
   }));
 }
 function byNewest<T extends { updatedAt: string }>(items: T[]): T[] { return items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
@@ -238,6 +247,7 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
     : attempt?.diagnostic || (run ? runDescription(run) : attempt?.result?.resultSummary || stateDescriptions[job.executionStatus] || '等待同步执行进展。');
   const execution = executionView(attempt, job.targetId, Boolean(run));
   const development = describeTaskDevelopment(attempt?.targetSnapshot?.development, { targetId: job.targetId, resident: execution.kind === 'resident', residentName: execution.targetName });
+  const pendingHandoff = (ledger.handoffs ?? []).find(item => item.fromJobId === job.jobId && item.status === 'proposed');
   return { sourceId: job.sourceId, jobId: job.jobId, title: job.title ?? `${purposeNames[job.purpose ?? ''] ?? '执行任务'} ${job.jobId.slice(0, 8)}`,
     channel: development.channel, ...(development.agentId ? { agentId: development.agentId, agentName: development.name, agentPhase: development.phase } : {}),
     originSessionId: job.originSessionId, ...(job.caseId ? { caseId: job.caseId } : {}), ...(job.parentJobRef ? { parentJobRef: job.parentJobRef } : {}), ...(job.parentAttemptId ? { parentAttemptId: job.parentAttemptId } : {}),
@@ -246,6 +256,7 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
     inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds], execution,
     ...(review ? { reviewStatus: review.status } : {}), ...(pending && review.reviewerId === actorId ? { pendingReviewId: review.reviewId } : {}),
     ...(pendingRequest ? { pendingProcessRequestId: pendingRequest.requestId } : {}), progressSummary,
+    ...(pendingHandoff ? { pendingHandoffId: pendingHandoff.handoffId } : {}),
     ...(acceptance ? { businessAcceptance: structuredClone(acceptance) } : {}), ...(blocked.length ? { blockedTools: blocked } : {}),
     ...(job.executionStatus === 'failed' && !run && !job.parentJobRef && !job.unresolvedAttemptIds.length ? { canContinue: true } : {}),
     ...(job.executionStatus === 'completed' && !run && !job.parentJobRef && !acceptance && attempt?.result?.resultAvailable && attempt.result.resultRevision && attempt.result.resultDigest ? { canAccept: true } : {}),
@@ -297,7 +308,7 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
         label: handoff.status === 'taken' ? '已交接' : handoff.status === 'accepted' ? '待开下一单' : '提议交接',
         handoffId: handoff.handoffId, status: handoff.status });
     }
-    const next = legalNext(ledger, job);
+    const next = legalNextForJob(ledger, job);
     // Only this explicit domain workflow supplies its own stage ordering. Parent refs alone never imply dependencies.
     if (run) {
       const last = (purpose: string) => [...run.children].reverse().find(item => item.purpose === purpose)?.child.jobId;
@@ -362,7 +373,7 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
 export function listWorkbenchTasks(snapshot: WorkbenchSnapshot, query: WorkbenchListQuery = {}) {
   const filter = query.filter ?? 'all', offset = Math.max(0, Math.trunc(query.offset ?? 0)), limit = Math.min(200, Math.max(1, Math.trunc(query.limit ?? 50)));
   const rootIds = new Set(snapshot.tasks.filter(task => !task.parentJobRef || !Object.hasOwn(snapshot.details, task.parentJobRef.jobId)).map(task => task.jobId));
-  const needsPerson = (task: AcpTaskSummary) => Boolean(task.pendingReviewId || task.pendingProcessRequestId);
+  const needsPerson = (task: AcpTaskSummary) => Boolean(task.pendingReviewId || task.pendingProcessRequestId || task.pendingHandoffId);
   const isWorking = (task: AcpTaskSummary) => task.displayStatus === 'resuming' || !needsPerson(task) && task.displayStatus !== 'unwatched' && ['working', 'submitted', 'not_started'].includes(task.executionStatus);
   const isFailed = (task: AcpTaskSummary) => task.unresolvedAttemptIds.length > 0 || task.displayStatus === 'tool_blocked' || task.displayStatus === 'unwatched' || ['failed', 'rejected', 'unknown', 'auth_required', 'input_required'].includes(task.executionStatus) && !['awaiting_human', 'resuming'].includes(task.displayStatus);
   const roots = snapshot.tasks.filter(task => rootIds.has(task.jobId));

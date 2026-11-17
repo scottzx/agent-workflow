@@ -1,0 +1,486 @@
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { acpCaseService } from './api';
+import { acpCaseHash, parseAcpCaseHash } from './model';
+import type { AcpCaseDetail, AcpCaseEdge, AcpCaseList, AcpInboxItem } from './types';
+import { ArtifactDrawer, ArtifactItem, snapshotUrl } from './Preview';
+import { date, EmptyState, ErrorState, errorText, Status, taskStatus, text } from './ui';
+
+/**
+ * The workbench's first screen is a thing: what it is for, who is working on it, what waits for a person, and
+ * which version each decision is about. The canvas only projects the ledger: happened edges are solid, proposals
+ * are dashed, and a convention that has not fired is written on the current node instead of drawn as a path.
+ */
+
+function CaseRoute() {
+    const read = () => parseAcpCaseHash(location.hash) ?? {};
+    const [route, setRoute] = useState(read);
+    useEffect(() => {
+        const update = () => setRoute(read());
+        window.addEventListener('hashchange', update);
+        return () => window.removeEventListener('hashchange', update);
+    }, []);
+    return route;
+}
+
+export function navigateCase(caseId: string, originSessionId?: string) {
+    location.hash = acpCaseHash({ caseId, originSessionId });
+}
+
+const edgeLabels: Record<AcpCaseEdge['status'], [string, string]> = {
+    proposed: ['提议', 'Proposed'],
+    accepted: ['已接受，待开下一单', 'Accepted, not opened yet'],
+    taken: ['已交接', 'Handed over'],
+    rejected: ['已拒绝', 'Rejected'],
+};
+
+function EdgeRow({
+    edge,
+    caseId,
+    onDecide,
+    busy,
+    onPreview,
+}: {
+    edge: AcpCaseEdge;
+    caseId: string;
+    onDecide: (edge: AcpCaseEdge, decision: 'accept' | 'reject') => void;
+    busy: boolean;
+    onPreview: (artifact: { url: string; name: string; mediaType?: string }) => void;
+}) {
+    const label = edgeLabels[edge.status];
+    return (
+        <li class={`acp-case-edge${edge.happened ? ' is-happened' : ' is-proposed'}`}>
+            <span class="acp-case-edge-line" aria-hidden="true" />
+            <div>
+                <strong>
+                    {text(label[0], label[1])} · {edge.toTargetId} / {edge.purpose}
+                </strong>
+                <small class="acp-muted">
+                    {edge.reason} · {text('版本', 'revision')} {edge.artifactRevision} · {edge.artifactDigest.slice(0, 12)}
+                </small>
+                {edge.decidedBy && (
+                    <small class="acp-muted">
+                        {text('决定人', 'Decided by')}{' '}
+                        {edge.decidedBy.kind === 'person' ? edge.decidedBy.id || text('本机用户', 'Local user') : edge.decidedBy.agent || edge.decidedBy.sessionId}
+                    </small>
+                )}
+                {edge.snapshots?.length ? (
+                    <span class="acp-artifact-row">
+                        <small class="acp-muted">{text('已冻结', 'Frozen')}</small>
+                        {edge.snapshots.map(item => (
+                            <a
+                                key={item.digest}
+                                href={snapshotUrl(caseId, edge.handoffId, item.digest)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={event => {
+                                    event.preventDefault();
+                                    onPreview({ url: snapshotUrl(caseId, edge.handoffId, item.digest), name: item.name, mediaType: item.mediaType });
+                                }}
+                            >
+                                {item.name}
+                            </a>
+                        ))}
+                    </span>
+                ) : null}
+            </div>
+            {edge.status === 'proposed' && (
+                <div class="acp-review-buttons">
+                    <button type="button" class="acp-button acp-primary" disabled={busy} onClick={() => onDecide(edge, 'accept')}>
+                        {text('接受这一版', 'Accept this version')}
+                    </button>
+                    <button type="button" class="acp-button" disabled={busy} onClick={() => onDecide(edge, 'reject')}>
+                        {text('拒绝', 'Reject')}
+                    </button>
+                </div>
+            )}
+        </li>
+    );
+}
+
+function InboxRow({ item, onOpen }: { item: AcpInboxItem; onOpen: (item: AcpInboxItem) => void }) {
+    const kind = item.kind === 'review' ? text('审核', 'Review') : item.kind === 'process_request' ? text('过程请求', 'Request') : text('交接提议', 'Handoff');
+    return (
+        <li class="acp-inbox-row">
+            <span class="acp-mode-label">{kind}</span>
+            <div>
+                <strong>{item.title}</strong>
+                <small class="acp-muted">
+                    {item.summary}
+                    {item.revision ? ` · ${item.revision}` : ''}
+                </small>
+            </div>
+            {item.kind === 'handoff' ? null : (
+                <button type="button" class="acp-link" onClick={() => onOpen(item)}>
+                    {text('去处理', 'Open')}
+                </button>
+            )}
+        </li>
+    );
+}
+
+function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: () => void }) {
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState('');
+    const [message, setMessage] = useState('');
+    const [artifact, setArtifact] = useState<{ url: string; name: string; path?: string; mediaType?: string } | null>(null);
+    const decide = async (edge: AcpCaseEdge, decision: 'accept' | 'reject') => {
+        setBusy(true);
+        setError('');
+        setMessage('');
+        try {
+            await acpCaseService.decideHandoff(detail.caseId, edge.handoffId, { decision });
+            setMessage(decision === 'accept' ? text('已接受这一版交接。', 'Handoff accepted.') : text('已拒绝这次交接。', 'Handoff rejected.'));
+            onChanged();
+        } catch (err) {
+            setError(errorText(err));
+        } finally {
+            setBusy(false);
+        }
+    };
+    return (
+        <section class="acp-detail acp-case-detail">
+            <header class="acp-detail-header">
+                <div class="acp-detail-tools">
+                    <div>
+                        <strong>{detail.title || detail.goal || detail.caseId}</strong>
+                    </div>
+                    <div>
+                        <button type="button" class="acp-button" onClick={onChanged}>
+                            {text('刷新', 'Refresh')}
+                        </button>
+                    </div>
+                </div>
+                <p class="acp-channel-line">
+                    <span>{detail.goal}</span>
+                </p>
+                <small class="acp-muted">
+                    {text('创建于', 'Created')} {date(detail.createdAt)} · {detail.originSessionId}
+                    {detail.legacy ? ` · ${text('旧记录投影', 'projected from older records')}` : ''}
+                </small>
+                {detail.artifactSpace && (
+                    <small class="acp-muted">
+                        {text('共享产物空间', 'Shared artifact space')} <code>{detail.artifactSpace}</code>
+                    </small>
+                )}
+            </header>
+            <div class="acp-detail-content">
+                {error && <p class="acp-decision-error">{error}</p>}
+                {message && <p class="acp-decision-message">{message}</p>}
+
+                <section class="acp-detail-section">
+                    <h3>
+                        {text('待我确认', 'Waiting for me')} ({detail.inbox.filter(item => item.canDecide).length})
+                    </h3>
+                    {detail.inbox.length ? (
+                        <ul class="acp-stage-list acp-inbox-list">
+                            {detail.inbox.map(item => (
+                                <InboxRow key={`${item.kind}-${item.id}`} item={item} onOpen={() => navigateCase(detail.caseId, detail.originSessionId)} />
+                            ))}
+                        </ul>
+                    ) : (
+                        <p class="acp-muted">{text('这件事暂时没有等待确认的事。', 'Nothing on this case is waiting for a decision.')}</p>
+                    )}
+                </section>
+
+                <section class="acp-detail-section">
+                    <h3>{text('交接', 'Handoffs')}</h3>
+                    {detail.edges.length ? (
+                        <ul class="acp-stage-list acp-case-edges">
+                            {detail.edges.map(edge => (
+                                <EdgeRow key={edge.handoffId} edge={edge} caseId={detail.caseId} onDecide={decide} busy={busy} onPreview={setArtifact} />
+                            ))}
+                        </ul>
+                    ) : (
+                        <p class="acp-muted">{text('还没有交接。', 'No handoff yet.')}</p>
+                    )}
+                </section>
+
+                <section class="acp-detail-section">
+                    <h3>{text('约定', 'Conventions')}</h3>
+                    {detail.conventions.length ? (
+                        <ul class="acp-stage-list">
+                            {detail.conventions.map(rule => (
+                                <li key={rule.conventionId}>
+                                    <span>{rule.achieved ? '✓' : '·'}</span>
+                                    <div>
+                                        <strong>
+                                            {rule.toTargetId} / {rule.toPurpose}
+                                        </strong>
+                                        <small class="acp-muted">
+                                            {rule.when === 'acceptance_accepted'
+                                                ? text('验收通过后可交', 'May follow an accepted result')
+                                                : rule.when === 'ticket_closed'
+                                                  ? text('任务单关闭后可交', 'May follow a closed ticket')
+                                                  : text('事实达到阈值后可交', 'May follow a measured fact')}
+                                            {rule.condition ? `：${rule.condition.metric} ${rule.condition.operator} ${rule.condition.value}` : ''}
+                                        </small>
+                                        <small class="acp-muted">
+                                            {rule.requireHuman
+                                                ? text('需要人确认', 'A person confirms')
+                                                : text('验收通过即自动成立交接', 'Acceptance alone makes the handoff happen')}
+                                        </small>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    ) : (
+                        <p class="acp-muted">{text('还没有约定。', 'No convention yet.')}</p>
+                    )}
+                </section>
+
+                <section class="acp-detail-section">
+                    <h3>{text('任务', 'Tasks')}</h3>
+                    <ul class="acp-stage-list">
+                        {detail.tasks.map(task => (
+                            <li key={task.jobId}>
+                                <span />
+                                <div>
+                                    <strong>{task.title || task.jobId}</strong>
+                                    <small class="acp-muted">
+                                        {task.targetId} · {task.progressSummary}
+                                    </small>
+                                </div>
+                                <Status value={taskStatus(task)} />
+                            </li>
+                        ))}
+                    </ul>
+                </section>
+
+                <section class="acp-detail-section">
+                    <h3>{text('产物', 'Artifacts')}</h3>
+                    {detail.artifacts.length ? (
+                        detail.artifacts.map((group, index) => (
+                            <div class="acp-artifact-group" key={`${group.revision}-${index}`}>
+                                <strong>
+                                    {group.revision}
+                                    {group.digest ? ` · ${group.digest.slice(0, 12)}` : ''}
+                                </strong>
+                                <div>
+                                    {group.artifacts.map((item, position) => {
+                                        const artifactItem = item as { path?: string; url?: string; mediaType?: string; sha256?: string };
+                                        return (
+                                            <ArtifactItem
+                                                key={`${group.revision}-${position}`}
+                                                jobId={group.jobId}
+                                                artifact={artifactItem}
+                                                onPreview={() =>
+                                                    setArtifact({
+                                                        url: artifactItem.url ?? '',
+                                                        name: artifactItem.path?.split('/').pop() ?? text('产物', 'Artifact'),
+                                                        path: artifactItem.path,
+                                                        mediaType: artifactItem.mediaType,
+                                                    })
+                                                }
+                                            />
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        ))
+                    ) : (
+                        <p class="acp-muted">{text('还没有产物。', 'No artifact yet.')}</p>
+                    )}
+                </section>
+
+                <section class="acp-detail-section">
+                    <h3>{text('发布回执', 'Publication receipts')}</h3>
+                    {detail.receipts.length ? (
+                        <ul class="acp-stage-list">
+                            {detail.receipts.map(receipt => (
+                                <li key={receipt.receiptId}>
+                                    <span />
+                                    <div>
+                                        <strong>
+                                            {receipt.channel} · {receipt.remoteId}
+                                        </strong>
+                                        <small class="acp-muted">
+                                            {receipt.artifactDigest.slice(0, 16)} · {date(receipt.publishedAt)}
+                                        </small>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    ) : (
+                        <p class="acp-muted">{text('还没有回执。', 'No receipt yet.')}</p>
+                    )}
+                </section>
+
+                <section class="acp-detail-section">
+                    <h3>{text('外部事实', 'External facts')}</h3>
+                    {detail.facts.length ? (
+                        <ul class="acp-stage-list">
+                            {detail.facts.map(fact => (
+                                <li key={fact.factId}>
+                                    <span />
+                                    <div>
+                                        <strong>
+                                            {fact.metric} {fact.value}
+                                            {fact.unit ? ` ${fact.unit}` : ''}
+                                        </strong>
+                                        <small class="acp-muted">
+                                            {fact.source} · {date(fact.observedAt)}
+                                        </small>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    ) : (
+                        <p class="acp-muted">{text('还没有事实。', 'No fact yet.')}</p>
+                    )}
+                </section>
+            </div>
+            {artifact && (
+                <ArtifactDrawer
+                    jobId=""
+                    artifact={{ path: artifact.path, url: artifact.url, mediaType: artifact.mediaType }}
+                    onClose={() => setArtifact(null)}
+                />
+            )}
+        </section>
+    );
+}
+
+export function CaseModule({ refreshKey }: { refreshKey: number }) {
+    const route = CaseRoute();
+    const [payload, setPayload] = useState<AcpCaseList | null>(null);
+    const [detail, setDetail] = useState<AcpCaseDetail | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+    const [goal, setGoal] = useState('');
+    const [origin, setOrigin] = useState('');
+    const [creating, setCreating] = useState(false);
+    const activeRequest = useRef(false);
+
+    const load = useCallback(async () => {
+        if (activeRequest.current) return;
+        activeRequest.current = true;
+        try {
+            const next = await acpCaseService.list(0, 100);
+            setPayload(next);
+            setError('');
+            if (!origin && next.origins.length) setOrigin(next.origins[0]!);
+        } catch (err) {
+            setError(errorText(err));
+        } finally {
+            activeRequest.current = false;
+            setLoading(false);
+        }
+    }, [origin]);
+
+    useEffect(() => {
+        void load();
+        const interval = window.setInterval(() => void load(), 5000);
+        return () => window.clearInterval(interval);
+    }, [load, refreshKey]);
+
+    useEffect(() => {
+        if (!route.caseId) {
+            setDetail(null);
+            return;
+        }
+        let live = true;
+        void acpCaseService
+            .get(route.caseId)
+            .then(next => live && setDetail(next))
+            .catch(err => live && setError(errorText(err)));
+        return () => {
+            live = false;
+        };
+    }, [route.caseId, refreshKey]);
+
+    const open = async () => {
+        if (!goal.trim() || !origin) return;
+        setCreating(true);
+        setError('');
+        try {
+            await acpCaseService.open({ originSessionId: origin, goal: goal.trim() });
+            setGoal('');
+            await load();
+        } catch (err) {
+            setError(errorText(err));
+        } finally {
+            setCreating(false);
+        }
+    };
+
+    const rows = payload?.items ?? [];
+    return (
+        <div class={`acp-workbench-body${route.caseId ? ' has-case-detail' : ''}`}>
+            <div class="acp-workbench-table">
+                {error && <ErrorState title={text('事情读取失败', 'Could not load cases')} message={error} onRetry={() => void load()} />}
+                <form class="acp-case-create" onSubmit={event => { event.preventDefault(); void open(); }}>
+                    <label>
+                        {text('新事情的目标', 'What is this thing for')}
+                        <input
+                            type="text"
+                            value={goal}
+                            placeholder={text('例如：本周公众号选题与发布', 'e.g. this week’s topics and publication')}
+                            onInput={event => setGoal(event.currentTarget.value)}
+                        />
+                    </label>
+                    <label>
+                        {text('归属会话', 'Scope')}
+                        <select value={origin} onChange={event => setOrigin(event.currentTarget.value)}>
+                            {(payload?.origins ?? []).map(item => (
+                                <option key={item} value={item}>
+                                    {item}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <button type="submit" class="acp-button acp-primary" disabled={creating || !goal.trim() || !origin}>
+                        {text('开一件事', 'Open a case')}
+                    </button>
+                </form>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>{text('目标', 'Goal')}</th>
+                            <th>{text('任务', 'Tasks')}</th>
+                            <th>{text('待我确认', 'Waiting for me')}</th>
+                            <th>{text('归属会话', 'Scope')}</th>
+                            <th>{text('最近进展', 'Last activity')}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {!loading && !rows.length && (
+                            <tr>
+                                <td colSpan={5} class="acp-muted">
+                                    {text('还没有事情。开一件事，之后它的任务、交接和待确认都在这里。', 'No case yet. Open one; its tasks, handoffs and decisions live here.')}
+                                </td>
+                            </tr>
+                        )}
+                        {rows.map(item => (
+                            <tr key={`${item.originSessionId}-${item.caseId}`} class={`acp-task-row${route.caseId === item.caseId ? ' is-selected' : ''}`}>
+                                <td>
+                                    <button
+                                        type="button"
+                                        class="acp-link acp-name-link"
+                                        title={item.goal}
+                                        onClick={() => navigateCase(item.caseId, item.originSessionId)}
+                                    >
+                                        <span class="acp-title-text">{item.title || item.goal || item.caseId}</span>
+                                        <small title={item.caseId}>{item.caseId}</small>
+                                    </button>
+                                </td>
+                                <td>{item.taskCount}</td>
+                                <td>{item.pendingCount || '—'}</td>
+                                <td class="acp-muted">{item.originSessionId}</td>
+                                <td class="acp-task-updated">{date(item.lastActivityAt)}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            {route.caseId && (
+                <div class="acp-case-panel">
+                    {detail ? (
+                        <CaseDetail detail={detail} onChanged={() => { void load(); }} />
+                    ) : (
+                        <EmptyState title={text('读取这件事', 'Reading the case')} />
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}

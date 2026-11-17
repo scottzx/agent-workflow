@@ -2,9 +2,13 @@ import type {
     AcpAgentCatalog,
     AcpAgentDraftInput,
     AcpAgentPathInput,
+    AcpCaseDetail,
+    AcpCaseList,
     AcpChatPage,
+    AcpConventionInput,
     AcpDecisionInput,
     AcpDshSession,
+    AcpHandoffDecisionInput,
     AcpProcessAnswerInput,
     AcpTaskDetail,
     AcpTaskFilter,
@@ -54,6 +58,29 @@ export const session = {
     status: () => call<{ authenticated: boolean; loginRequired?: boolean }>('/session'),
     login: (token: string) => post<{ authenticated: boolean }>('/session', { token }),
     logout: () => call<{ authenticated: boolean }>('/session', { method: 'DELETE' }),
+};
+
+export const acpCaseService = {
+    list: (offset = 0, limit = 100): Promise<AcpCaseList> => {
+        const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+        return call(`/cases?${params}`);
+    },
+    get: (caseId: string): Promise<AcpCaseDetail> => call(`/cases/${encodeURIComponent(caseId)}`),
+    /** Opens a thing. The page's reviewer is its creator. */
+    open: (input: { originSessionId: string; goal: string; title?: string; caseId?: string }): Promise<unknown> =>
+        post('/cases', input),
+    /** Accepts or rejects one handoff proposal. Only the page may do this. */
+    decideHandoff: (caseId: string, handoffId: string, input: AcpHandoffDecisionInput): Promise<unknown> =>
+        post(`/cases/${encodeURIComponent(caseId)}/handoffs/${encodeURIComponent(handoffId)}/decisions`, input),
+    /** Registers what may follow this thing. It dispatches nothing. */
+    registerConvention: (caseId: string, input: AcpConventionInput): Promise<unknown> =>
+        post(`/cases/${encodeURIComponent(caseId)}/conventions`, input),
+    /** Records that these bytes went out through a channel. */
+    recordReceipt: (caseId: string, input: { channel: string; remoteId: string; artifactDigest: string; artifactRevision?: string; url?: string }): Promise<unknown> =>
+        post(`/cases/${encodeURIComponent(caseId)}/receipts`, input),
+    /** Records one measured number. */
+    recordFact: (caseId: string, input: { metric: string; value: number; unit?: string; source: string }): Promise<unknown> =>
+        post(`/cases/${encodeURIComponent(caseId)}/facts`, input),
 };
 
 export const acpTaskService = {

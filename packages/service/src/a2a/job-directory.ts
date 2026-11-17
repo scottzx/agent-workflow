@@ -30,3 +30,17 @@ export function spaceInstructions(input: { originSessionId: string; jobId: strin
   if (input.caseId) lines.push(`这件事的 caseId 是 ${input.caseId}。交给另一个角色时调用 handoff_propose（originSessionId=${input.originSessionId}，jobId=${input.jobId}，attemptId=${input.attemptId}），只提议，不派下一单。`);
   return `\n\n---\n[空间]\n${lines.join('\n')}`;
 }
+
+/**
+ * The frozen bytes of an accepted handoff. The next task reads these files, not the source task's directory:
+ * the source may run another round later, and that must not change what this handoff delivered.
+ */
+export function snapshotInstructions(snapshot: unknown): string {
+  if (!snapshot || typeof snapshot !== 'object') return '';
+  const value = snapshot as { revision?: string; digest?: string; files?: { digest?: string; name?: string; path?: string }[] };
+  const files = value.files ?? [];
+  if (!files.length) return '';
+  const lines = files.map(file => `- ${file.name ?? '产物'} sha256=${file.digest ?? ''} 路径 ${file.path ?? ''}`);
+  return `\n\n---\n[交接快照] 这次交接接受的版本是 ${value.revision ?? ''}（digest ${value.digest ?? ''}）。以下文件已按 digest 冻结，是这一版的确切字节：\n${lines.join('\n')}\n`
+    + '读这些文件，不要去读来源任务的目录；来源任务之后可能再跑一轮，那一轮的字节不属于这次交接。';
+}

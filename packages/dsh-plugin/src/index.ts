@@ -16,10 +16,12 @@ import { selectAcpRoute } from './preset-route.js';
 import { registerNativeApprovals } from './native-approvals.js';
 import type {} from '@deepseek-ai/dsh-tools';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { WORKBENCH_UI_PATH, type ExecutorTicketArgs } from '@1agents/acp-service/a2a';
+import type { ExecutorTicketArgs } from '@1agents/acp-service/a2a';
 import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
-import { workbenchHandler } from './workbench.js';
 import { createTicketGateway, runTicketTool, ticketTools } from './ticket-tools.js';
+import { HANDOFF_PATH } from './handoff-spec.js';
+import { handoffTools } from './handoff-tools.js';
+import { runHandoffTool } from './handoff-executor.js';
 import { TICKET_PATH } from './ticket-spec.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
@@ -96,7 +98,6 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   });
   if (input.a2a) {
     const review = await ReviewHandBack.open(join(home, 'plugins', '1agents-acp', 'review.secret'), input.a2a.workbench);
-    ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: WORKBENCH_UI_PATH, handler: workbenchHandler(ctx, { workbench: input.a2a!.workbench, host: () => review.host }) }));
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: REVIEW_SUBMIT_PATH, handler: review.handler }));
     ctx.effect(() => ctx.tools.register(defineTool({
       name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
@@ -112,9 +113,13 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     if (input.a2a.workbench) {
       const gateway = createTicketGateway(input.a2a.workbench);
       for (const tool of ticketTools(gateway)) ctx.effect(() => ctx.tools.register(tool));
+      // The executor may propose the next hop. It never dispatches it; a person decides on the workbench page.
+      for (const tool of handoffTools(gateway)) ctx.effect(() => ctx.tools.register(tool));
       // ACP agents call the same tools through their session's MCP server, which comes back here.
       ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: TICKET_PATH,
         handler: review.ticketHandler((sessionId, tool, args) => runTicketTool(gateway, sessionId, tool, args as ExecutorTicketArgs, 'mcp')) }));
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: HANDOFF_PATH,
+        handler: review.handoffHandler((sessionId, tool, args) => runHandoffTool(gateway, sessionId, tool, args, 'mcp')) }));
     }
     // ACP agents reach the same hand-back and ticket tools through a per-session MCP server. It is offered to every ACP
     // session: the connection is opened once and reused, often before a turn binds the session to its A2A task or a

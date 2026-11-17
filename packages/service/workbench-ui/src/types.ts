@@ -289,6 +289,136 @@ export interface AcpDshSession {
     task?: { taskId: string; jobId?: string; state: string; running: boolean; resubmittable: boolean };
 }
 
+export interface AcpCaseActor {
+    kind: 'person' | 'coach';
+    id?: string;
+    agent?: string;
+    sessionId?: string;
+}
+
+/** One thing: its goal, its tasks and what waits for a person. */
+export interface AcpCaseSummary {
+    caseId: string;
+    originSessionId: string;
+    goal: string;
+    title?: string;
+    createdAt: string;
+    createdBy?: AcpCaseActor;
+    updatedAt: string;
+    legacy?: boolean;
+    taskCount: number;
+    pendingCount: number;
+    artifactSpace?: string;
+    lastActivityAt: string;
+}
+
+/** An edge on the canvas: it happened, or it is only proposed. */
+export interface AcpCaseEdge {
+    handoffId: string;
+    fromJobId: string;
+    fromAttemptId: string;
+    toTargetId: string;
+    purpose: string;
+    status: 'proposed' | 'accepted' | 'taken' | 'rejected';
+    happened: boolean;
+    artifactRevision: string;
+    artifactDigest: string;
+    reason: string;
+    note?: string;
+    decidedBy?: AcpCaseActor;
+    childJobId?: string;
+    snapshots?: { digest: string; name: string; size: number; mediaType?: string }[];
+    createdAt: string;
+    updatedAt: string;
+}
+
+/** A standing convention: what may follow this thing, and whether a person has to confirm. */
+export interface AcpCaseConvention {
+    conventionId: string;
+    fromPurpose?: string;
+    fromTargetId?: string;
+    toTargetId: string;
+    toPurpose: string;
+    when: 'acceptance_accepted' | 'ticket_closed' | 'fact_reached';
+    requireHuman: boolean;
+    achieved: boolean;
+    condition?: { metric: string; operator: string; value: number };
+    recordedAt: string;
+}
+
+export interface AcpInboxItem {
+    kind: 'review' | 'process_request' | 'handoff';
+    id: string;
+    caseId?: string;
+    jobId: string;
+    title: string;
+    summary: string;
+    revision?: string;
+    digest?: string;
+    createdAt: string;
+    canDecide: boolean;
+}
+
+export interface AcpCaseArtifact {
+    revision: string;
+    digest?: string;
+    jobId: string;
+    artifacts: AcpArtifact[];
+}
+
+export interface AcpCaseReceipt {
+    receiptId: string;
+    channel: string;
+    remoteId: string;
+    artifactDigest: string;
+    artifactRevision?: string;
+    url?: string;
+    publishedAt: string;
+}
+
+export interface AcpCaseFact {
+    factId: string;
+    metric: string;
+    value: number;
+    unit?: string;
+    source: string;
+    observedAt: string;
+}
+
+export interface AcpCaseDetail extends AcpCaseSummary {
+    tasks: AcpTaskSummary[];
+    edges: AcpCaseEdge[];
+    conventions: AcpCaseConvention[];
+    artifacts: AcpCaseArtifact[];
+    receipts: AcpCaseReceipt[];
+    facts: AcpCaseFact[];
+    inbox: AcpInboxItem[];
+}
+
+export interface AcpCaseList {
+    items: AcpCaseSummary[];
+    total: number;
+    counts: { all: number; pending: number };
+    offset: number;
+    limit: number;
+    origins: string[];
+}
+
+export interface AcpHandoffDecisionInput {
+    decision: 'accept' | 'reject';
+    note?: string;
+}
+
+export interface AcpConventionInput {
+    fromPurpose?: string;
+    fromTargetId?: string;
+    toTargetId: string;
+    toPurpose: string;
+    when: 'acceptance_accepted' | 'ticket_closed' | 'fact_reached';
+    requireHuman?: boolean;
+    condition?: { metric: string; operator: 'gte' | 'lte' | 'gt' | 'lt'; value: number };
+}
+
 export interface AcpChatPage {
     items: { id: string; createdAt: number; kind: 'user' | 'assistant_text'; content: string }[];
     hasMore: boolean;

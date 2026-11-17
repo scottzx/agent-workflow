@@ -36,7 +36,19 @@ test('one matching convention accepts the proposal, two matches refuse to choose
   achieved.ledger.acceptance('root', achieved.job.jobId, { attemptId: achieved.attempt.attemptId, resultRevision: 'r1', resultDigest: digest, reviewStatus: 'accepted', decidedBy: { kind: 'person' } });
   const accepted = proposeHandoff(achieved.ledger, 'root', proposal(achieved.job.jobId, achieved.attempt.attemptId));
   assert.equal(accepted.status, 'accepted');
-  assert.equal(decideHandoff(achieved.ledger, { originSessionId: 'root', handoffId: accepted.handoffId, decision: 'accept', decidedBy: { kind: 'person' } }).handoffId, accepted.handoffId);
+
+  const waiting = completed();
+  offerConvention(waiting.ledger, { originSessionId: 'root', caseId: 'case-1', fromTargetId: 'author', toTargetId: 'maker', toPurpose: 'make', when: 'acceptance_accepted', requireHuman: true });
+  const proposed = proposeHandoff(waiting.ledger, 'root', proposal(waiting.job.jobId, waiting.attempt.attemptId));
+  assert.equal(proposed.status, 'proposed', 'a convention that asks for a person only proposes');
+  assert.throws(() => decideHandoff(waiting.ledger, { originSessionId: 'root', handoffId: proposed.handoffId, decision: 'accept', decidedBy: { kind: 'person' } }),
+    /A person decides on the workbench page/, 'the agent channel may not write that a person agreed');
+  assert.throws(() => decideHandoff(waiting.ledger, { originSessionId: 'root', handoffId: proposed.handoffId, decision: 'accept', decidedBy: { kind: 'person', id: 'someone-else' } },
+    { allowPerson: true, reviewerId: 'owner' }), /belongs to another reviewer/);
+  const decided = decideHandoff(waiting.ledger, { originSessionId: 'root', handoffId: proposed.handoffId, decision: 'accept', decidedBy: { kind: 'person', id: 'owner' } },
+    { allowPerson: true, reviewerId: 'owner' });
+  assert.equal(decided.status, 'accepted');
+  assert.equal(decided.decidedBy?.id, 'owner');
 
   const other = completed();
   offerConvention(other.ledger, { originSessionId: 'root', caseId: 'case-1', toTargetId: 'maker', toPurpose: 'make', when: 'acceptance_accepted', requireHuman: false });
@@ -61,7 +73,7 @@ test('only an accepted handoff can be marked taken, and the child must match it'
   const child = ledger.prepare({ originSessionId: 'root', caseId: 'case-1', targetSnapshot: { targetId: 'maker' }, input: {}, purpose: 'make', resultRevision: 'r1',
     parentJobRef: { sourceId: ledger.sourceId, jobId: job.jobId }, parentAttemptId: attempt.attemptId });
   assert.throws(() => ledger.markHandoffTaken('root', handoff.handoffId, child.job.jobId), /accepted/);
-  decideHandoff(ledger, { originSessionId: 'root', handoffId: handoff.handoffId, decision: 'accept', decidedBy: { kind: 'person' } });
+  decideHandoff(ledger, { originSessionId: 'root', handoffId: handoff.handoffId, decision: 'accept', decidedBy: { kind: 'coach', sessionId: 'coach-session' } });
   const taken = ledger.markHandoffTaken('root', handoff.handoffId, child.job.jobId);
   assert.equal(taken.status, 'taken');
   assert.equal(taken.childJobId, child.job.jobId);

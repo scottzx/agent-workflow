@@ -2,6 +2,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Handoff, HandoffConvention } from './handoff.js';
 import type { ArtifactSpace } from './spaces.js';
+import type { CaseRecord } from './cases.js';
+import { caseKey } from './cases.js';
+import type { CaseFact, CaseReceipt } from './externals.js';
 import { TicketError, type Ticket, type TicketChange } from './ticket.js';
 
 export type ExecutionStatus = 'not_started' | 'submitted' | 'working' | 'input_required' | 'auth_required' | 'completed' | 'failed' | 'canceled' | 'rejected' | 'unknown';
@@ -33,8 +36,8 @@ export interface LedgerResult {
   resultAvailable: boolean;
   observedAt: string;
 }
-/** Who acted: a person, or a coach agent naming its session. */
-export interface LedgerActor { kind: 'person' | 'coach'; agent?: string; sessionId?: string }
+/** Who acted: a person, a coach agent naming its session, or an application holding the workbench credential. */
+export interface LedgerActor { kind: 'person' | 'coach' | 'application'; id?: string; agent?: string; sessionId?: string }
 export interface BusinessAcceptance {
   attemptId: string; resultRevision: string; resultDigest: string;
   reviewStatus: 'pending' | 'accepted' | 'changes_requested'; note?: string; recordedAt: string;
@@ -79,6 +82,12 @@ export interface LedgerState {
   handoffs?: Handoff[];
   conventions?: HandoffConvention[];
   artifactSpaces?: ArtifactSpace[];
+  /** One thing, by (originSessionId, caseId). Absent in state written before cases existed. */
+  cases?: Record<string, CaseRecord>;
+  /** External receipts, one per (channel, remote id). */
+  receipts?: CaseReceipt[];
+  /** External facts. The platform stores the number; it does not judge it. */
+  facts?: CaseFact[];
 }
 export interface LedgerPrepareInput {
   originSessionId: string; targetSnapshot: LedgerTargetSnapshot; input: unknown; clientRequestId?: string;
@@ -144,10 +153,11 @@ export class JobLedger {
       if (initial.version !== 1 || !initial.sourceId || !initial.jobs || !initial.attempts || !initial.requests || !Array.isArray(initial.events)
         || !Number.isSafeInteger(initial.nextSequence) || !initial.acceptances) throw new Error('Invalid execution ledger state');
       this.state = { ...clone(initial), tickets: clone(initial.tickets ?? {}), handoffs: clone(initial.handoffs ?? []),
-        conventions: clone(initial.conventions ?? []), artifactSpaces: clone(initial.artifactSpaces ?? []) };
+        conventions: clone(initial.conventions ?? []), artifactSpaces: clone(initial.artifactSpaces ?? []),
+        cases: clone(initial.cases ?? {}), receipts: clone(initial.receipts ?? []), facts: clone(initial.facts ?? []) };
     } else {
       this.state = { version: 1, sourceId: randomUUID(), jobs: {}, attempts: {}, requests: {}, events: [], nextSequence: 1, acceptances: {}, tickets: {},
-        handoffs: [], conventions: [], artifactSpaces: [] };
+        handoffs: [], conventions: [], artifactSpaces: [], cases: {}, receipts: [], facts: [] };
     }
   }
   snapshot(): LedgerState { return clone(this.state); }
@@ -473,6 +483,10 @@ export class JobLedger {
     if (!handoff || !job || job.originSessionId !== originSessionId) return undefined;
     return clone(handoff);
   }
+  /** The scope a job belongs to. */
+  originOf(jobId: string): string | undefined {
+    return this.state.jobs[jobId]?.originSessionId;
+  }
   /** Trusted handoff module: append or replace one edge and record it on the from-job. Binds caseId if the job has none. */
   commitHandoff(originSessionId: string, handoff: Handoff, event: string): Handoff {
     return this.mutate(state => {
@@ -530,6 +544,53 @@ export class JobLedger {
       return space;
     });
   }
+  /** One thing. The record is written once; a second write with the same id keeps the first. */
+  commitCase(record: CaseRecord): CaseRecord {
+    return this.mutate(state => {
+      const list = state.cases ??= {};
+      const key = caseKey(record.originSessionId, record.caseId);
+      const prior = list[key];
+      if (prior) return clone(prior);
+      list[key] = clone(record);
+      return record;
+    });
+  }
+  findCase(originSessionId: string, caseId: string): CaseRecord | undefined {
+    const record = this.state.cases?.[caseKey(originSessionId, caseId)];
+    return record ? clone(record) : undefined;
+  }
+  casesFor(originSessionId?: string): CaseRecord[] {
+    return Object.values(this.state.cases ?? {})
+      .filter(record => !originSessionId || record.originSessionId === originSessionId)
+      .map(record => clone(record));
+  }
+  /** One external receipt per (channel, remote id). A different digest for the same key is a conflict. */
+  commitReceipt(receipt: CaseReceipt): CaseReceipt {
+    return this.mutate(state => {
+      const list = state.receipts ??= [];
+      const prior = list.find(item => item.originSessionId === receipt.originSessionId && item.caseId === receipt.caseId
+        && item.channel === receipt.channel && item.remoteId === receipt.remoteId);
+      if (prior) {
+        if (prior.artifactDigest !== receipt.artifactDigest) throw new Error('Receipt key already holds another digest');
+        return clone(prior);
+      }
+      list.push(clone(receipt));
+      return receipt;
+    });
+  }
+  receiptsFor(originSessionId: string, caseId: string): CaseReceipt[] {
+    return clone((this.state.receipts ?? []).filter(item => item.originSessionId === originSessionId && item.caseId === caseId));
+  }
+  commitFact(fact: CaseFact): CaseFact {
+    return this.mutate(state => {
+      const list = state.facts ??= [];
+      list.push(clone(fact));
+      return fact;
+    });
+  }
+  factsFor(originSessionId: string, caseId: string): CaseFact[] {
+    return clone((this.state.facts ?? []).filter(item => item.originSessionId === originSessionId && item.caseId === caseId));
+  }
   ticket(originSessionId: string, jobId: string): Ticket {
     this.job(this.state, originSessionId, jobId);
     const ticket = this.state.tickets![jobId];
@@ -569,6 +630,19 @@ export class JobLedger {
     const attempt = job && Object.hasOwn(this.state.attempts, job.currentAttemptId) ? this.state.attempts[job.currentAttemptId] : undefined;
     if (!attempt) throw new TicketError('没有这个任务');
     return { attemptId: attempt.attemptId, ...(attempt.backendRunRef?.sessionId !== undefined ? { sessionId: attempt.backendRunRef.sessionId } : {}) };
+  }
+  /**
+   * The origin of the job whose current attempt `attemptId` is, for a caller that only names the attempt and its
+   * session. Unlike a ticket operation this accepts a finished round: handing over the result of a completed round
+   * is exactly what a handoff proposal is for.
+   */
+  executorHandoffOrigin(jobId: string, attemptId: string, sessionId: string): string {
+    const job = Object.hasOwn(this.state.jobs, jobId) ? this.state.jobs[jobId] : undefined;
+    const attempt = Object.hasOwn(this.state.attempts, attemptId) ? this.state.attempts[attemptId] : undefined;
+    if (!job || !attempt || attempt.jobId !== jobId || job.currentAttemptId !== attemptId) throw new TicketError('这一轮执行不是该任务的当前轮次');
+    const recorded = attempt.backendRunRef?.sessionId;
+    if (recorded !== undefined && recorded !== sessionId) throw new TicketError('调用的会话不是执行这一轮的会话');
+    return job.originSessionId;
   }
   /** Each old Task gets one legacy Job; matching context IDs never merge jobs. */
   migrateLegacy(records: LegacyLedgerRecord[]): Array<{ remote: string; taskId: string; jobId: string; attemptId: string }> {
