@@ -17,7 +17,8 @@ async function endpoint(t, handler) {
   return { url, close };
 }
 async function unused(t) { const fixture = await endpoint(t); await fixture.close(); return fixture.url; }
-const options = serviceUrl => resolveServiceOptions({ serviceUrl });
+// Lifecycle tests exercise the legacy explicitly-owned mode. The production default is external.
+const options = serviceUrl => resolveServiceOptions({ serviceUrl, serviceMode: 'auto' });
 const health = url => fetch(`${url}/health`, { signal: AbortSignal.timeout(3000) });
 
 test('owned service starts before discovery and survives until its last concurrent lease is released', { timeout: 20000 }, async t => {
@@ -84,7 +85,7 @@ test('managed worker exits when its DSH parent is killed', { timeout: 20000 }, a
   const url = await unused(t);
   const fixture = join(directory, 'parent.mjs');
   const moduleUrl = new URL('../dist/service-process.js', import.meta.url).href;
-  await writeFile(fixture, `import {acquireService,resolveServiceOptions} from ${JSON.stringify(moduleUrl)};\nawait acquireService(resolveServiceOptions({serviceUrl:${JSON.stringify(url)}}));\nprocess.send('ready');\n`);
+  await writeFile(fixture, `import {acquireService,resolveServiceOptions} from ${JSON.stringify(moduleUrl)};\nawait acquireService(resolveServiceOptions({serviceUrl:${JSON.stringify(url)},serviceMode:'auto'}));\nprocess.send('ready');\n`);
   const parent = fork(fixture, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: [] });
   const exited = once(parent, 'exit');
   t.after(async () => { parent.kill('SIGKILL'); await exited; });
@@ -119,4 +120,32 @@ test('real Cordis startup failure releases the acquired service', { timeout: 200
   await assert.rejects(fiber.await(), /preset registration failed/);
   await fiber.dispose();
   await assert.rejects(health(url));
+});
+
+const darwin = process.platform === 'darwin';
+/** A launchd-managed daemon only exists on macOS; elsewhere these assertions cannot hold. */
+const launchdTest = darwin ? test : test.skip;
+
+launchdTest('launchd mode wakes a stopped manager and never owns the process', async () => {
+  const release = await acquireService(resolveServiceOptions({ serviceUrl: 'http://127.0.0.1:36812', serviceMode: 'launchd' }));
+  assert.equal(await fetch('http://127.0.0.1:36812/health').then(r => r.status), 200);
+  await release();
+  // The manager owns it, so releasing this host's lease must not stop the daemon.
+  assert.equal(await fetch('http://127.0.0.1:36812/health').then(r => r.status), 200,
+    'release must leave a manager-owned daemon running');
+});
+
+test('launchd mode accepts only a plain manager label', () => {
+  assert.equal(resolveServiceOptions({ serviceUrl: 'http://127.0.0.1:36812', serviceMode: 'launchd' }).serviceManagerLabel,
+    'com.1agents.acp-service');
+  // The label reaches launchctl as an argument, so reject anything that is not a label.
+  for (const label of ['../evil', 'com.1agents/acp', '', 'a b']) {
+    assert.throws(() => resolveServiceOptions({ serviceUrl: 'http://127.0.0.1:36812', serviceMode: 'launchd', serviceManagerLabel: label }),
+      /serviceManagerLabel/);
+  }
+});
+
+test('external mode connects without waking anything', async () => {
+  const release = await acquireService(resolveServiceOptions({ serviceUrl: 'http://127.0.0.1:36812', serviceMode: 'external' }));
+  await release();
 });

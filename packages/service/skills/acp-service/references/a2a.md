@@ -94,6 +94,7 @@ DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`p
 | `remote_agent_list` | `originSessionId`；列出该主会话派发的任务 |
 | `remote_agent_inbox` | `originSessionId`；读取未确认的完成/需要输入通知 |
 | `remote_agent_ack` | `originSessionId, noticeId`；确认已处理，重复确认安全 |
+| `handoff_propose` / `handoff_decide` / `handoff_offer` / `handoff_space` / `handoff_get` | 主会话把已记录产物交给另一个角色，或登记共享产物空间。参数、顺序和做不到的入口见 [交接](roles-and-tasks.md#交接) |
 
 ```sh
 acp-service a2a invoke remote_agent_spawn <<'JSON'

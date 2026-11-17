@@ -13,6 +13,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { McpServerStdio } from '@agentclientprotocol/sdk';
 import type { A2AHostControls } from './a2a.js';
+import { HANDOFF_PATH, HANDOFF_TOOLS, type HandoffTool } from './handoff-spec.js';
 import { TICKET_PATH, TICKET_TOOLS, type TicketTool } from './ticket-spec.js';
 
 export const SUBMIT_TOOL = 'submit_to_review';
@@ -69,6 +70,7 @@ export class ReviewHandBack {
       { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
       { name: 'ONEAGENTS_REVIEW_URL', value: new URL(REVIEW_SUBMIT_PATH, origin).href },
       { name: 'ONEAGENTS_TICKET_URL', value: new URL(TICKET_PATH, origin).href },
+      { name: 'ONEAGENTS_HANDOFF_URL', value: new URL(HANDOFF_PATH, origin).href },
       { name: 'ONEAGENTS_REVIEW_SESSION', value: sessionId },
       { name: 'ONEAGENTS_REVIEW_TOKEN', value: this.token(sessionId) },
     ] };
@@ -111,6 +113,18 @@ export class ReviewHandBack {
       if (!call) return;
       const tool = TICKET_TOOLS.find(spec => spec.name === call.body.tool)?.name, args = call.body.arguments ?? {};
       if (!tool || typeof args !== 'object' || Array.isArray(args)) return reply(400, { error: 'Unknown ticket tool or invalid arguments' });
+      try { reply(200, { text: await run(call.sessionId, tool, args as Record<string, unknown>) }); }
+      catch (error) { reply(409, { error: error instanceof Error ? error.message : String(error) }); }
+    };
+  }
+
+  /** The MCP server's handoff tool for its session; it proposes the next hop and never dispatches it. */
+  handoffHandler(run: (sessionId: string, tool: HandoffTool, args: Record<string, unknown>) => Promise<string>) {
+    return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const reply = replier(res), call = await this.authorized(req, reply);
+      if (!call) return;
+      const tool = HANDOFF_TOOLS.find(spec => spec.name === call.body.tool)?.name, args = call.body.arguments ?? {};
+      if (!tool || typeof args !== 'object' || Array.isArray(args)) return reply(400, { error: 'Unknown handoff tool or invalid arguments' });
       try { reply(200, { text: await run(call.sessionId, tool, args as Record<string, unknown>) }); }
       catch (error) { reply(409, { error: error instanceof Error ? error.message : String(error) }); }
     };

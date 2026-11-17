@@ -30,8 +30,12 @@ const SECURITY_HEADERS = {
  */
 function assetDirectory(): string | undefined {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  return [path.resolve(here, '../../workbench-ui'), path.resolve(here, '../../dist/workbench-ui')]
-    .find(directory => existsSync(path.join(directory, 'app.js')));
+  return [
+    path.resolve(here, '../../workbench-ui'),
+    path.resolve(here, '../../dist/workbench-ui'),
+    path.resolve(here, 'workbench-ui'),
+    path.resolve(here, '../workbench-ui'),
+  ].find(directory => existsSync(path.join(directory, 'app.js')));
 }
 
 function send(res: ServerResponse, status: number, type: string, payload: string | Buffer, headers: Record<string, string> = {}): void {

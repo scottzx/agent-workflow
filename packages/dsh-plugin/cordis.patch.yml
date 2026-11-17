@@ -4,7 +4,13 @@
     - id: oneagents-acp
       name: '@1agents/acp-service'
       config:
-        serviceMode: auto
+        # The ACP daemon is a shared local service. `launchd` wakes the registered
+        # service when nothing answers, then leaves its lifecycle to the service
+        # manager, so no DSH host owns it. Install the LaunchAgent once:
+        # `acp-service serve --host 127.0.0.1 --port 36812 --no-report` under
+        # label com.1agents.acp-service.
+        serviceMode: launchd
+        serviceManagerLabel: com.1agents.acp-service
         serviceUrl: http://127.0.0.1:36812
         reconnectAttempts: 5
         reconnectDelayMs: 1000

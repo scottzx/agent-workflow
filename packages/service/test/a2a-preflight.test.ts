@@ -122,3 +122,22 @@ test('directory policy verifies real root and cwd read/traverse permissions', as
   const cwdDenied = await runA2APreflight({ cwd: inaccessible, allowedDirectories: [root] });
   assert.equal(cwdDenied.ok, false); assert.equal(cwdDenied.checks.find(check => check.id === 'cwd')?.ok, false);
 });
+
+test('a sandbox profile is checked before dispatch, and never names host credentials or the container socket', async t => {
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), 'a2a-preflight-sandbox-')));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const ok = await runA2APreflight({ cwd, sandbox: { name: 'renderer', network: 'none', writableRoots: [cwd] } });
+  assert.equal(ok.ok, true);
+  assert.ok(ok.checks.some(check => check.id === 'sandbox' && check.ok));
+
+  const socket = await runA2APreflight({ cwd, sandbox: { name: 'renderer', network: 'none', writableRoots: ['/var/run/docker.sock'] } });
+  assert.equal(socket.ok, false);
+  assert.match(socket.checks.find(check => check.id === 'sandbox')?.detail ?? '', /may not write/);
+
+  const secret = await runA2APreflight({ cwd, sandbox: { name: 'renderer', network: 'none', env: ['DOCKER_AUTH_TOKEN'] } });
+  assert.equal(secret.ok, false);
+  assert.match(secret.checks.find(check => check.id === 'sandbox')?.detail ?? '', /may not receive/);
+
+  const outside = await runA2APreflight({ cwd, sandbox: { name: 'renderer', network: 'none', writableRoots: ['/etc'] } });
+  assert.equal(outside.ok, false, 'a sandbox root outside the admitted roots is refused');
+});

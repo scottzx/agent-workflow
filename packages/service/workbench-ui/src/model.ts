@@ -69,6 +69,11 @@ export interface AcpTaskRoute {
     full: boolean;
 }
 
+export interface AcpCaseRoute {
+    caseId?: string;
+    originSessionId?: string;
+}
+
 /** Hash routes never enter ttyd's terminal command/query parameters. */
 export function parseAcpTaskHash(hash: string): AcpTaskRoute | null {
     const match = /^#acp\/tasks(?:\/([^?]+))?(?:\?(.*))?$/.exec(hash);
@@ -91,6 +96,28 @@ export function acpTaskHash(route: AcpTaskRoute): string {
     if (route.reviewId) params.set('review', route.reviewId);
     if (!route.full) params.set('mode', 'drawer');
     return `#acp/tasks/${encodeURIComponent(route.jobId)}${params.size ? `?${params}` : ''}`;
+}
+
+/** The workbench's first screen is a thing, not a task: its own route names the case and its scope. */
+export function parseAcpCaseHash(hash: string): AcpCaseRoute | null {
+    const match = /^#acp\/cases(?:\/([^?]+))?(?:\?(.*))?$/.exec(hash);
+    if (!match) return null;
+    try {
+        const caseId = match[1] ? decodeURIComponent(match[1]) : undefined;
+        if (caseId && (caseId.length > 512 || /[\u0000-\u001f/]/.test(caseId))) return null;
+        const originSessionId = new URLSearchParams(match[2] || '').get('origin') || undefined;
+        if (originSessionId && (originSessionId.length > 512 || /[\u0000-\u001f]/.test(originSessionId))) return null;
+        return { caseId, originSessionId };
+    } catch {
+        return null;
+    }
+}
+
+export function acpCaseHash(route: AcpCaseRoute): string {
+    if (!route.caseId) return '#acp/cases';
+    const params = new URLSearchParams();
+    if (route.originSessionId) params.set('origin', route.originSessionId);
+    return `#acp/cases/${encodeURIComponent(route.caseId)}${params.size ? `?${params}` : ''}`;
 }
 
 export function latestReview(reviews: AcpReview[]): AcpReview | undefined {

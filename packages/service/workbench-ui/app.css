@@ -342,3 +342,21 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .fp-md.acp-md > :is(h1, h2, h3, h4) + * { margin-top: var(--space-2); }
 .fp-md.acp-md > * + :is(h1, h2, h3, h4) { margin-top: var(--space-5); }
 .fp-md.acp-md li + li { margin-top: var(--space-1); }
+
+/* A thing is the first screen of the workbench: its list on the left, its detail on the right. */
+.acp-case-create { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); }
+.acp-case-create label { display: grid; gap: 4px; font-size: 12px; color: var(--text-muted); flex: 1 1 240px; }
+.acp-case-create input, .acp-case-create select { padding: 6px 8px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-panel); color: var(--text-main); }
+.acp-case-panel { min-height: 0; display: flex; }
+.acp-case-panel .acp-detail { flex: 1; }
+/* With a case open, its list and its detail sit side by side and scroll on their own. */
+.has-case-detail { grid-template-columns: minmax(0, 1fr) minmax(360px, 46%); }
+.has-case-detail .acp-workbench-table { overflow-x: auto; }
+@media (max-width: 800px) { .has-case-detail { grid-template-columns: minmax(0, 1fr); } }
+/* A happened edge is solid; a proposal is dashed and names no destination job. */
+.acp-case-edges li { grid-template-columns: 24px 1fr auto; align-items: center; }
+.acp-case-edge-line { display: block; width: 24px; height: 0; border-top: 2px solid var(--text-secondary); }
+.acp-case-edge.is-proposed .acp-case-edge-line { border-top-style: dashed; border-top-color: var(--text-muted); }
+.acp-case-edge.is-happened .acp-case-edge-line { border-top-color: var(--success); }
+.acp-inbox-list li { grid-template-columns: max-content 1fr auto; align-items: center; }
+.acp-case-detail .acp-artifact-drawer { height: 50%; }

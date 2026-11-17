@@ -323,7 +323,8 @@ test('a person marks a finished top-level task as read from the page; a child or
   const accepted = await f.request(path, relayed({}));
   assert.equal(accepted.status, 200);
   const detail = await accepted.json() as any;
-  assert.deepEqual([detail.businessAcceptance.reviewStatus, detail.businessAcceptance.decidedBy, detail.businessAcceptance.resultRevision, detail.canAccept], ['accepted', { kind: 'person' }, 'result-1', undefined]);
+  // The acceptance names the reviewer: a decision on the page belongs to a person, and to that person.
+  assert.deepEqual([detail.businessAcceptance.reviewStatus, detail.businessAcceptance.decidedBy, detail.businessAcceptance.resultRevision, detail.canAccept], ['accepted', { kind: 'person', id: 'local-owner' }, 'result-1', undefined]);
   assert.equal((await f.request(path, relayed({}))).status, 409, 'already concluded');
 });
 

@@ -17,6 +17,10 @@
       "types": "./dist/imports.d.ts",
       "import": "./dist/imports.js"
     },
+    "./a2a": {
+      "types": "./dist/a2a.d.ts",
+      "import": "./dist/a2a.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [

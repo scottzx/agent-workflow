@@ -17,9 +17,15 @@ export type A2ARoleSkills = z.infer<typeof a2aRoleSkillsSchema>;
 export interface A2APreflightRequirements {
   allowedDirectories?: string[];
   jobDirectory?: string;
+  /** Shared deliverable directory for one case. Must already exist; never a role or job directory. */
+  artifactSpace?: string;
+  /** `<cwd>/.1agents/roles/<roleId>/published`. The host may create this exact path. */
+  rolePublication?: string;
   requiredFiles?: string[];
   python?: { executable: string; modules: string[] };
   node?: { executable: string; modules?: string[]; moduleRoot?: string };
+  /** The sandbox this target runs commands in, when it has one. */
+  sandbox?: { name: string; image?: string; network: 'none' | 'bridge'; writableRoots?: string[]; env?: string[] };
 }
 export interface A2APreflightInput extends A2APreflightRequirements { cwd: string }
 export interface A2APreflightReport {
@@ -27,6 +33,8 @@ export interface A2APreflightReport {
   checkedAt: string;
   cwd: string;
   jobDirectory?: string;
+  artifactSpace?: string;
+  rolePublication?: string;
   checks: { id: string; ok: boolean; detail?: string }[];
 }
 

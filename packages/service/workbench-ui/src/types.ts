@@ -35,6 +35,7 @@ export interface AcpTaskSummary {
     parentJobRef?: AcpJobRef;
     parentAttemptId?: string;
     purpose?: string;
+    caseId?: string;
     targetId: string;
     execution?: AcpExecution;
     executionStatus: string;
@@ -174,9 +175,11 @@ export interface AcpTaskEvent {
 }
 export interface AcpDependency {
     from: string;
-    to: string;
-    kind: 'parent' | 'depends_on' | 'replaces';
+    to?: string;
+    kind: 'parent' | 'depends_on' | 'replaces' | 'handoff';
     label?: string;
+    handoffId?: string;
+    status?: 'proposed' | 'accepted' | 'taken' | 'rejected';
 }
 export interface AcpProcessQuestion {
     id: string;
@@ -268,6 +271,7 @@ export interface AcpTaskDetail extends AcpTaskSummary {
     processRequests?: AcpProcessRequest[];
     events: AcpTaskEvent[];
     dependencies?: AcpDependency[];
+    legalNext?: { conventionId: string; toTargetId: string; purpose: string; requireHuman: boolean; when: 'acceptance_accepted' | 'ticket_closed'; achieved: boolean }[];
     artifacts?: { revision: string; digest?: string; artifacts: unknown[] }[];
 }
 export interface AcpDecisionInput {
@@ -283,6 +287,138 @@ export interface AcpDshSession {
     available: boolean;
     sessionId?: string;
     task?: { taskId: string; jobId?: string; state: string; running: boolean; resubmittable: boolean };
+}
+
+export interface AcpCaseActor {
+    kind: 'person' | 'coach';
+    id?: string;
+    agent?: string;
+    sessionId?: string;
+    /** `page` is the gateway's own page session; `relay` is a host forwarding with the shared secret. */
+    via?: 'page' | 'relay';
+}
+
+/** One thing: its goal, its tasks and what waits for a person. */
+export interface AcpCaseSummary {
+    caseId: string;
+    originSessionId: string;
+    goal: string;
+    title?: string;
+    createdAt: string;
+    createdBy?: AcpCaseActor;
+    updatedAt: string;
+    legacy?: boolean;
+    taskCount: number;
+    pendingCount: number;
+    artifactSpace?: string;
+    lastActivityAt: string;
+}
+
+/** An edge on the canvas: it happened, or it is only proposed. */
+export interface AcpCaseEdge {
+    handoffId: string;
+    fromJobId: string;
+    fromAttemptId: string;
+    toTargetId: string;
+    purpose: string;
+    status: 'proposed' | 'accepted' | 'taken' | 'rejected';
+    happened: boolean;
+    artifactRevision: string;
+    artifactDigest: string;
+    reason: string;
+    note?: string;
+    decidedBy?: AcpCaseActor;
+    childJobId?: string;
+    snapshots?: { digest: string; name: string; size: number; mediaType?: string }[];
+    createdAt: string;
+    updatedAt: string;
+}
+
+/** A standing convention: what may follow this thing, and whether a person has to confirm. */
+export interface AcpCaseConvention {
+    conventionId: string;
+    fromPurpose?: string;
+    fromTargetId?: string;
+    toTargetId: string;
+    toPurpose: string;
+    when: 'acceptance_accepted' | 'ticket_closed' | 'fact_reached';
+    requireHuman: boolean;
+    achieved: boolean;
+    condition?: { metric: string; operator: string; value: number };
+    recordedAt: string;
+}
+
+export interface AcpInboxItem {
+    kind: 'review' | 'process_request' | 'handoff';
+    id: string;
+    caseId?: string;
+    jobId: string;
+    title: string;
+    summary: string;
+    revision?: string;
+    digest?: string;
+    createdAt: string;
+    canDecide: boolean;
+}
+
+export interface AcpCaseArtifact {
+    revision: string;
+    digest?: string;
+    jobId: string;
+    artifacts: AcpArtifact[];
+}
+
+export interface AcpCaseReceipt {
+    receiptId: string;
+    channel: string;
+    remoteId: string;
+    artifactDigest: string;
+    artifactRevision?: string;
+    url?: string;
+    publishedAt: string;
+}
+
+export interface AcpCaseFact {
+    factId: string;
+    metric: string;
+    value: number;
+    unit?: string;
+    source: string;
+    observedAt: string;
+}
+
+export interface AcpCaseDetail extends AcpCaseSummary {
+    tasks: AcpTaskSummary[];
+    edges: AcpCaseEdge[];
+    conventions: AcpCaseConvention[];
+    artifacts: AcpCaseArtifact[];
+    receipts: AcpCaseReceipt[];
+    facts: AcpCaseFact[];
+    inbox: AcpInboxItem[];
+}
+
+export interface AcpCaseList {
+    items: AcpCaseSummary[];
+    total: number;
+    counts: { all: number; pending: number };
+    offset: number;
+    limit: number;
+    origins: string[];
+}
+
+export interface AcpHandoffDecisionInput {
+    decision: 'accept' | 'reject';
+    note?: string;
+}
+
+export interface AcpConventionInput {
+    fromPurpose?: string;
+    fromTargetId?: string;
+    toTargetId: string;
+    toPurpose: string;
+    when: 'acceptance_accepted' | 'ticket_closed' | 'fact_reached';
+    requireHuman?: boolean;
+    condition?: { metric: string; operator: 'gte' | 'lte' | 'gt' | 'lt'; value: number };
 }
 
 export interface AcpChatPage {

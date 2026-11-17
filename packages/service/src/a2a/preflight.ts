@@ -8,21 +8,60 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { isDefaultJobDirectory } from './job-directory.js';
+import { roleIdFromPublication } from '../execution/spaces.js';
 import type { A2APreflightInput, A2APreflightReport } from './types.js';
 
 const absolutePath = z.string().min(1).max(4096).refine(value => isAbsolute(value) && !value.includes('\0'), 'Expected an absolute host path');
 const pythonModule = z.string().regex(/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/).max(200);
 const nodeModule = z.string().regex(/^(?:@[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/).max(200);
+
+/**
+ * The sandbox profile of an execution target. It is configuration, not a workbench shape: only a target that runs
+ * commands (ffmpeg, downloads) needs one. The profile names what the environment may reach; it never names host
+ * credentials or the container socket.
+ */
+export const sandboxProfileSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  image: z.string().trim().min(1).max(500).optional(),
+  network: z.enum(['none', 'bridge']).default('none'),
+  /** Paths inside the sandbox the task may write. They must live inside the admitted roots. */
+  writableRoots: z.array(absolutePath).max(20).optional(),
+  /** Environment variable names the sandbox may pass through. A credential-shaped name is refused. */
+  env: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
+}).strict();
+export type SandboxProfile = z.infer<typeof sandboxProfileSchema>;
+
+/** Host paths a sandbox must never see: the container socket, private keys and the host credential stores. */
+const FORBIDDEN_SANDBOX_PATHS = ['/var/run/docker.sock', '/run/docker.sock', '/var/run/containerd', '/etc/ssh', '/root/.ssh', '/Users'];
+const FORBIDDEN_ENV = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|APIKEY|API_KEY|SESSION)/i;
+
+/** True when this profile would hand the sandbox something it must not have. */
+export function sandboxViolation(profile: SandboxProfile): string | undefined {
+  if (profile.network !== 'none' && profile.network !== 'bridge') return 'sandbox network must be none or bridge';
+  for (const root of profile.writableRoots ?? []) {
+    if (FORBIDDEN_SANDBOX_PATHS.some(forbidden => root === forbidden || root.startsWith(`${forbidden}/`))) {
+      return `sandbox may not write to ${root}`;
+    }
+  }
+  for (const name of profile.env ?? []) if (FORBIDDEN_ENV.test(name)) return `sandbox may not receive ${name}`;
+  return undefined;
+}
+
 export const a2aPreflightRequirementsSchema = z.object({
   allowedDirectories: z.array(absolutePath).min(1).max(100).optional(),
   jobDirectory: absolutePath.optional(),
+  artifactSpace: absolutePath.optional(),
+  rolePublication: absolutePath.optional(),
   requiredFiles: z.array(absolutePath).max(64).optional(),
   python: z.object({ executable: absolutePath, modules: z.array(pythonModule).max(32) }).strict().optional(),
   node: z.object({ executable: absolutePath, modules: z.array(nodeModule).max(32).optional(), moduleRoot: absolutePath.optional() }).strict().optional(),
+  /** The sandbox this target runs in, when it runs commands. */
+  sandbox: sandboxProfileSchema.optional(),
 }).strict();
 export const a2aPreflightInputSchema = a2aPreflightRequirementsSchema.extend({ cwd: absolutePath }).strict();
 export const a2aPreflightReportSchema = z.object({
   ok: z.boolean(), checkedAt: z.string(), cwd: absolutePath, jobDirectory: absolutePath.optional(),
+  artifactSpace: absolutePath.optional(), rolePublication: absolutePath.optional(),
   checks: z.array(z.object({ id: z.string(), ok: z.boolean(), detail: z.string().optional() }).strict()),
 }).strict();
 export class A2APreflightError extends Error {
@@ -113,12 +152,51 @@ export async function runA2APreflight(raw: A2APreflightInput): Promise<A2APrefli
     report.jobDirectory = directory;
     return directory;
   });
-  for (const [index, file] of (input.requiredFiles ?? []).entries()) await check(`requiredFile.${index}`, async () => {
+  if (input.rolePublication) await check('rolePublication', async () => {
+    if (!cwdOk) throw new Error('Cannot create a role publication directory without a cwd');
+    const roleId = roleIdFromPublication(input.cwd, input.rolePublication!) ?? roleIdFromPublication(report.cwd, input.rolePublication!);
+    if (!roleId) throw new Error('rolePublication must be <cwd>/.1agents/roles/<roleId>/published');
+    const expected = join(report.cwd, '.1agents', 'roles', roleId, 'published');
+    await ensureDefaultJobDirectory(report.cwd, expected);
+    report.rolePublication = await realpath(expected);
+    return report.rolePublication;
+  });
+  if (input.artifactSpace) await check('artifactSpace', async () => {
+    if (!cwdOk) throw new Error('Cannot admit an artifact space without a cwd');
+    const directory = await realpath(input.artifactSpace!);
+    if (!(await stat(directory)).isDirectory()) throw new Error('artifact space must already exist and be a directory');
+    if (report.jobDirectory && directory === report.jobDirectory) throw new Error('artifact space must not be the job directory');
+    const roleMarker = `${sep}.1agents${sep}roles${sep}`;
+    if (directory.includes(roleMarker) || directory.endsWith(`${sep}.1agents${sep}roles`)) throw new Error('artifact space must not be a role directory');
+    const temporaryRoots = await Promise.all(['/tmp', tmpdir()].map(path => realpath(path).catch(() => undefined)));
+    const allowed = input.allowedDirectories ? await Promise.all(input.allowedDirectories.map(root => realpath(root).catch(() => undefined))) : [];
+    if (![report.cwd, ...temporaryRoots, ...allowed].filter((path): path is string => path !== undefined).some(root => within(root, directory))) {
+      throw new Error('artifact space is outside the admitted roots');
+    }
+    const probe = join(directory, `.a2a-preflight-${randomUUID()}`);
+    const handle = await open(probe, 'wx', 0o600);
+    try { await handle.writeFile('a2a preflight\n'); await handle.sync(); }
+    finally { await handle.close(); await unlink(probe); }
+    report.artifactSpace = directory;
+    return directory;
+  });
+  if (input.requiredFiles) for (const [index, file] of (input.requiredFiles ?? []).entries()) await check(`requiredFile.${index}`, async () => {
     const actual = await realpath(file);
     if (!(await stat(actual)).isFile()) throw new Error('Required input is not a regular file');
     const handle = await open(actual, 'r');
     await handle.close();
     return actual;
+  });
+  if (input.sandbox) await check('sandbox', async () => {
+    const violation = sandboxViolation(input.sandbox!);
+    if (violation) throw new Error(violation);
+    // Every path the sandbox may write must live inside the admitted roots, so the sandbox cannot reach the host.
+    const admitted = [report.cwd, report.jobDirectory, report.artifactSpace, ...(input.allowedDirectories ?? [])].filter((value): value is string => Boolean(value));
+    for (const root of input.sandbox!.writableRoots ?? []) {
+      const actual = await realpath(root).catch(() => root);
+      if (!admitted.some(base => within(base, actual))) throw new Error(`sandbox root ${root} is outside the admitted roots`);
+    }
+    return `sandbox ${input.sandbox!.name}; network=${input.sandbox!.network}`;
   });
   if (input.python) await check('python', async () => {
     const executable = await realpath(input.python!.executable);

@@ -9,6 +9,8 @@ release/
 .corepack/
 packages/service/vendor/
 .dsh-build-cache.tgz
+# pnpm's local content-addressable store; it is a machine cache, never a source file.
+.pnpm-store/
 /.cache/roles
 /roles
 
@@ -20,3 +22,6 @@ packages/service/vendor/
 .1agents/config/*
 !.1agents/config/*.example.json
 !.1agents/config/*.example.yml
+# Copies of runtime assets that land in the working directory, not project sources.
+dsh-image-gen/
+/skills/
