@@ -37,7 +37,19 @@ export interface LedgerResult {
   observedAt: string;
 }
 /** Who acted: a person, a coach agent naming its session, or an application holding the workbench credential. */
-export interface LedgerActor { kind: 'person' | 'coach' | 'application'; id?: string; agent?: string; sessionId?: string }
+export interface LedgerActor {
+  kind: 'person' | 'coach' | 'application';
+  id?: string;
+  agent?: string;
+  sessionId?: string;
+  /**
+   * How this claim reached the ledger. `page` is the gateway's own page session; `relay` is a host
+   * forwarding for its page with the shared secret. The two are indistinguishable to the gateway when
+   * the caller runs as the same OS user, so the record says which one it was instead of implying both
+   * are the same proof.
+   */
+  via?: 'page' | 'relay';
+}
 export interface BusinessAcceptance {
   attemptId: string; resultRevision: string; resultDigest: string;
   reviewStatus: 'pending' | 'accepted' | 'changes_requested'; note?: string; recordedAt: string;

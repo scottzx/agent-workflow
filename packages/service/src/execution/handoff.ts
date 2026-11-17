@@ -81,7 +81,8 @@ export interface LegalNext {
   achieved: boolean;
 }
 
-const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: id.optional(), agent: z.string().optional(), sessionId: z.string().optional() }).strict()
+const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: id.optional(), agent: z.string().optional(), sessionId: z.string().optional(),
+  via: z.enum(['page', 'relay']).optional() }).strict()
   .refine(actor => actor.kind === 'coach' || (!actor.agent && !actor.sessionId), 'Only a coach names an agent session');
 const proposeFields = {
   caseId: id, toTargetId: id, purpose: id, artifactRevision: id, artifactDigest: digest, reason: text,

@@ -246,3 +246,45 @@ test('a receipt is written by the application that holds the credential, not by 
     .then(() => undefined, (error: Error) => error);
   assert.match(String((agentWrite as Error)?.message), /Unknown method/, 'the agent channel has no way to register a receipt');
 });
+
+test('accepting on the page makes the convention hold, and still opens nothing by itself', async t => {
+  const f = await fixture(t);
+  const opened = await f.request('/workbench/cases', f.post({ originSessionId: 'root', goal: '审核后移交' }));
+  const record = await opened.json() as any;
+  const digest = digestOf('draft');
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'root', caseId: record.caseId, title: '稿子', targetSnapshot: { targetId: 'author' }, input: {} });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1' }, { executionStatus: 'completed', resultRevision: 'r1', resultDigest: digest, artifactLinks: [] });
+  // A convention that waits for an accepted result and does not ask for a second person.
+  const rule = await f.request(`/workbench/cases/${record.caseId}/conventions`, f.post({ fromTargetId: 'author', toTargetId: 'legacy:local',
+    toPurpose: 'make', when: 'acceptance_accepted', requireHuman: false }, false));
+  assert.equal(rule.status, 200);
+  assert.equal(f.gateway.ledger.list('root').length, 1);
+
+  // Accepting is a person's act, so the page relay is required; a bare bearer call is refused.
+  const refused = await f.request(`/workbench/tasks/${prepared.job.jobId}/acceptance`, f.post({}, false));
+  assert.equal(refused.status, 403);
+  const accepted = await f.request(`/workbench/tasks/${prepared.job.jobId}/acceptance`, f.post({}));
+  assert.equal(accepted.status, 200, 'the page acceptance is what makes the convention hold');
+
+  const handoffs = f.gateway.ledger.handoffsFor('root', prepared.job.jobId);
+  assert.equal(handoffs.length, 1, 'the accepted result records one edge');
+  assert.equal(handoffs[0]!.status, 'accepted');
+  assert.equal(handoffs[0]!.artifactDigest, digest);
+  assert.equal(f.gateway.ledger.list('root').length, 1, 'recording the edge still opens nothing');
+});
+
+test('a decision records whether the gateway page or a host relay made it', async t => {
+  const f = await fixture(t);
+  const opened = await f.request('/workbench/cases', f.post({ originSessionId: 'root', goal: '来源留痕' }));
+  const record = await opened.json() as any;
+  const digest = digestOf('draft');
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'root', caseId: record.caseId, title: '稿子', targetSnapshot: { targetId: 'author' }, input: {} });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-1' }, { executionStatus: 'completed', resultRevision: 'r1', resultDigest: digest, artifactLinks: [] });
+
+  // A relayed request is a host forwarding for its page; the record says so instead of implying a click.
+  const accepted = await f.request(`/workbench/tasks/${prepared.job.jobId}/acceptance`, f.post({}));
+  assert.equal(accepted.status, 200);
+  assert.equal((await accepted.json() as any).businessAcceptance.decidedBy.via, 'relay');
+});

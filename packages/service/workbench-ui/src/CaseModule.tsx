@@ -26,6 +26,17 @@ export function navigateCase(caseId: string, originSessionId?: string) {
     location.hash = acpCaseHash({ caseId, originSessionId });
 }
 
+/**
+ * A decision names the reviewer either way; what differs is whether the gateway saw its own page
+ * session or a host forwarding for the page with the shared secret. A caller running as the same user
+ * can read that secret, so a relayed decision is marked instead of being shown as a verified click.
+ */
+function decisionSource(via?: 'page' | 'relay') {
+    if (via === 'page') return text('（网关页面）', ' (gateway page)');
+    if (via === 'relay') return text('（宿主转发，未核验点击）', ' (relayed, click unverified)');
+    return '';
+}
+
 const edgeLabels: Record<AcpCaseEdge['status'], [string, string]> = {
     proposed: ['提议', 'Proposed'],
     accepted: ['已接受，待开下一单', 'Accepted, not opened yet'],
@@ -61,6 +72,7 @@ function EdgeRow({
                     <small class="acp-muted">
                         {text('决定人', 'Decided by')}{' '}
                         {edge.decidedBy.kind === 'person' ? edge.decidedBy.id || text('本机用户', 'Local user') : edge.decidedBy.agent || edge.decidedBy.sessionId}
+                        {decisionSource(edge.decidedBy.via)}
                     </small>
                 )}
                 {edge.snapshots?.length ? (

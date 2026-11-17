@@ -100,7 +100,8 @@ type Config = z.output<typeof configSchema>;
 
 const originFields = { originSessionId: string };
 /** Who acted: a person, or a coach agent naming its session. A person also carries the reviewer's id. */
-const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: string.optional(), agent: string.optional(), sessionId: string.optional() }).strict();
+const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: string.optional(), agent: string.optional(), sessionId: string.optional(),
+  via: z.enum(['page', 'relay']).optional() }).strict();
 const taskFields = { ...originFields, remote: string, taskId: string };
 const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'Prompt must contain text');
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
@@ -911,7 +912,7 @@ export class RemoteAgentGateway {
     return this.workbenchTask(jobId);
   }
   /** A person marks the task's current result as read (已阅). This is the acceptance the conventions wait for. */
-  acceptWorkbenchTask(jobId: string, note?: string) {
+  acceptWorkbenchTask(jobId: string, note?: string, via: 'page' | 'relay' = 'page') {
     const task = this.workbenchTask(jobId);
     if (!task.canAccept) throw new Error('只有已完成、还没有结论的任务可以标记已阅。');
     // A gate belongs to the person it names; the page may not decide it for someone else.
@@ -919,11 +920,26 @@ export class RemoteAgentGateway {
     if (reviewer !== this.config.workbench!.reviewerId) throw new Error(`这道验收关口的负责人是 ${reviewer}。`);
     const result = this.ledger.getAttempt(task.currentAttemptId).result!;
     this.ledger.acceptance(task.originSessionId, jobId, { attemptId: task.currentAttemptId, resultRevision: result.resultRevision!, resultDigest: result.resultDigest!,
-      reviewStatus: 'accepted', ...(note ? { note } : {}), decidedBy: { kind: 'person', id: reviewer } });
+      reviewStatus: 'accepted', ...(note ? { note } : {}), decidedBy: { kind: 'person', id: reviewer, via } });
     // Same rule as the A2A acceptance: an accepted result makes the one convention that waited for it hold.
     // This only records the edge; opening the next task stays a separate, explicit submit.
     continueByConvention(this.ledger, task.originSessionId, jobId);
+    this.noticeDecision(task.title ?? jobId, `验收通过（${via === 'page' ? '网关页面' : '宿主转发'}）`, result.resultRevision, result.resultDigest);
     return this.workbenchTask(jobId);
+  }
+  /**
+   * Tell the person a decision was written in their name.
+   *
+   * The gateway cannot prove a click happened: a caller that runs as the same user can read the relay
+   * secret and post the same request a page would. The banner is the check that does not depend on
+   * that secret — if the person did not just decide this, they see it now instead of at review time.
+   */
+  private noticeDecision(title: string, what: string, revision?: string, digest?: string) {
+    const config = this.config.workbench;
+    if (!config?.desktopNotifications) return;
+    const version = revision ? `版本 ${revision}${digest ? `（${digest.slice(0, 8)}）` : ''}` : '';
+    notifyDesktop(`工作台决定 · ${title}`.slice(0, 120),
+      [what, version, '若不是你本人操作，请立即核对'].filter(Boolean).join('；').slice(0, 240), config.publicBaseUrl);
   }
   async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {
     this.workbenchTask(jobId);
@@ -1435,7 +1451,7 @@ export class RemoteAgentGateway {
    * Accept or reject a handoff proposal. Only a person on the workbench page does this; the decision carries the
    * configured reviewer, and the bytes are frozen before the decision is written down.
    */
-  async decideWorkbenchHandoff(caseId: string, handoffId: string, input: unknown) {
+  async decideWorkbenchHandoff(caseId: string, handoffId: string, input: unknown, via: 'page' | 'relay' = 'page') {
     return this.workbench(async () => {
       const config = this.config.workbench!;
       const scope = this.workbenchCase(caseId);
@@ -1451,7 +1467,10 @@ export class RemoteAgentGateway {
       if (decision.decision === 'accept') await this.freezeHandoff(handoff);
       const decided = decideHandoff(this.ledger, { originSessionId: scope.originSessionId, handoffId,
         decision: decision.decision, ...(decision.note ? { note: decision.note } : {}),
-        decidedBy: { kind: 'person', id: reviewer } }, { allowPerson: true, reviewerId: reviewer });
+        decidedBy: { kind: 'person', id: reviewer, via } }, { allowPerson: true, reviewerId: reviewer });
+      this.noticeDecision(`${scope.title ?? scope.caseId} · 交接`,
+        `${decision.decision === 'accept' ? '已接受' : '已拒绝'}交给 ${handoff.toTargetId}（${via === 'page' ? '网关页面' : '宿主转发'}）`,
+        handoff.artifactRevision, handoff.artifactDigest);
       return { handoff: decided, case: this.workbenchCase(caseId) };
     });
   }
@@ -2038,7 +2057,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             if (handoffDecision && req.method === 'POST') {
               // Only a person on the page decides a handoff; the A2A channel may not write that a person agreed.
               if (!page && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) return json(res, 403, { error: 'page_action_required', message: '交接的接受和拒绝只能由人在工作台页面发起。' });
-              return json(res, 200, await gateway.decideWorkbenchHandoff(caseId, decodeURIComponent(handoffDecision[1]!), await body(req)));
+              return json(res, 200, await gateway.decideWorkbenchHandoff(caseId, decodeURIComponent(handoffDecision[1]!), await body(req), page ? 'page' : 'relay'));
             }
             if (handoffArtifact && req.method === 'GET') {
               if (url.search) return json(res, 404, { error: 'No workbench route' });
@@ -2134,7 +2153,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           if (rest === '/acceptance' && req.method === 'POST') {
             const { note } = workbenchAcceptSchema.parse(await body(req));
             gateway.workbenchTask(jobId);
-            try { return json(res, 200, gateway.acceptWorkbenchTask(jobId, note)); }
+            try { return json(res, 200, gateway.acceptWorkbenchTask(jobId, note, page ? 'page' : 'relay')); }
             catch (error) { return json(res, 409, { error: 'accept_refused', message: error instanceof Error ? error.message : String(error) }); }
           }
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));

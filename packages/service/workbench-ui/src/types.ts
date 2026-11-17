@@ -294,6 +294,8 @@ export interface AcpCaseActor {
     id?: string;
     agent?: string;
     sessionId?: string;
+    /** `page` is the gateway's own page session; `relay` is a host forwarding with the shared secret. */
+    via?: 'page' | 'relay';
 }
 
 /** One thing: its goal, its tasks and what waits for a person. */
