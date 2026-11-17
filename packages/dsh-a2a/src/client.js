@@ -25,7 +25,9 @@ function WorkbenchIcon({ size }) {
 }
 
 export function apply(ctx) {
-  const t = key => ctx.locale.preferred(dictionaries, key);
+  // Same locale contract as the ACP client: register a namespace, then bind it.
+  ctx.effect(() => ctx.locale.register('oneagentsA2A', dictionaries));
+  const t = ctx.locale.bind('oneagentsA2A');
 
   // The gateway task workbench, served same-origin by this plugin's host half;
   // its take-over button asks to open a session here.
@@ -35,7 +37,9 @@ export function apply(ctx) {
       const onMessage = event => {
         if (event.origin !== location.origin || event.source !== frame.current?.contentWindow) return;
         const { type, sessionId } = event.data ?? {};
-        if (type === '1agents:open-session' && typeof sessionId === 'string' && sessionId) ctx.uiWorkspace.openSession(sessionId);
+        if (type === '1agents:open-session' && typeof sessionId === 'string' && sessionId) {
+          ctx.uiWorkspace?.openSession?.(sessionId);
+        }
       };
       window.addEventListener('message', onMessage);
       return () => window.removeEventListener('message', onMessage);

@@ -138,3 +138,58 @@ test('host workbench honours the host browser admission before doing any work', 
   // The page itself still loads so the host can render its own login prompt.
   assert.equal((await fetch(`${origin}${WORKBENCH_UI_PATH}/`)).status, 200);
 });
+
+test('client half uses only Host client APIs the declared inject provides', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../src/client.js', import.meta.url), 'utf8');
+  // `ctx.locale.preferred` does not exist on the Host client; using it threw during
+  // module registration and removed the whole sidebar panel.
+  assert.doesNotMatch(source, /locale\.preferred/);
+  assert.match(source, /ctx\.locale\.register\(/);
+  assert.match(source, /ctx\.locale\.bind\(/);
+  // Optional capabilities must not break the panel when a host omits them.
+  assert.match(source, /ctx\.uiWorkspace\?\./);
+  // Every service the module touches must be reachable through dsh.client.inject.
+  const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-locale'),
+    'ctx.locale needs @deepseek-ai/dsh-client-locale in dsh.client.inject');
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-sidebar'));
+});
+
+test('apply keeps the workbench page when another instance owns the A2A storage', async t => {
+  const { apply } = await import('../dist/index.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { startA2AService } = await import('../dist/server.js');
+
+  const directory = await mkdtemp(join(tmpdir(), 'a2a-shared-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // First instance owns the store.
+  const owner = await startA2AService({ port: 0, token: 'shared', stateDirectory: directory, publicUrl: 'http://127.0.0.1:3080' });
+  t.after(() => owner.close());
+
+  const registered = [];
+  const logged = [];
+  const ctx = {
+    effect: fn => { fn(); return () => {}; },
+    webServer: { register: route => { registered.push(route); return () => {}; } },
+    connection: { admit: () => ({ peer: { principal: { kind: 'owner' } } }) },
+    logger: { info() {}, warn() {}, error: message => logged.push(String(message)) },
+  };
+  const originalError = console.error;
+  console.error = message => logged.push(String(message));
+  try {
+    // Second instance: the listener must be skipped, not crash the plugin.
+    await apply(ctx, { port: 0, token: 'shared', stateDirectory: directory, workbench: { url: 'http://127.0.0.1:1' } });
+    // The degraded listener runs inside the effect, so its report lands after apply settles.
+    for (let i = 0; i < 50 && !logged.some(line => line.includes('A2A listener skipped')); i++) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  } finally { console.error = originalError; }
+
+  assert.deepEqual(registered.map(r => r.path), ['/workbench/ui'],
+    'the workbench route must still register when the listener is skipped');
+  assert.ok(logged.some(line => line.includes('A2A listener skipped')), 'the skip must be reported with its cause');
+  assert.ok(logged.some(line => line.includes('stateDirectory')), 'the message must name the fix');
+});

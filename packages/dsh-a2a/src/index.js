@@ -4,7 +4,8 @@ export { HeadlessDshBackend } from './executor.js';
 export { createHostWorkbench, WORKBENCH_UI_PATH } from './host-workbench.js';
 import { startA2AService } from './server.js';
 import { createHostWorkbench, WORKBENCH_UI_PATH } from './host-workbench.js';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dshSkillsDirectory, installAcpSkill, packagedSkillDirectory } from './install-skill.js';
 
@@ -55,7 +56,36 @@ export async function apply(ctx, config = {}) {
   if (port === false) return;
 
   await ctx.effect(async () => {
-    const service = await startA2AService({ ...serviceConfig, port: port ?? 3080 });
-    return () => service.close();
+    try {
+      const service = await startA2AService({ ...serviceConfig, port: port ?? 3080 });
+      return () => service.close();
+    } catch (error) {
+      // A2A storage admits one writer. A second DSH instance (another profile, or a
+      // desktop and a web host at once) reaches this point; the workbench page this
+      // plugin already mounted stays usable, so only the standalone listener is lost.
+      if (!isStorageBusy(error)) throw error;
+      const owner = await storageOwner(serviceConfig.stateDirectory);
+      console.error(`[dsh-a2a] A2A listener skipped: storage is held by pid ${owner ?? 'another process'}. `
+        + 'Set a distinct stateDirectory for this profile to run its own listener.');
+      return () => {};
+    }
   });
+}
+
+/** The shared A2A store reports a lost lease with this exact message. */
+function isStorageBusy(error) {
+  return error instanceof Error && error.message === 'A2A storage directory is already in use by another instance';
+}
+
+/** Best-effort owner pid for the diagnostic; the lock layout is the store's own. */
+async function storageOwner(stateDirectory) {
+  if (!stateDirectory) return undefined;
+  try {
+    const directory = join(stateDirectory, '.lock');
+    for (const name of await readdir(directory)) {
+      const lock = JSON.parse(await readFile(join(directory, name), 'utf8'));
+      if (typeof lock.pid === 'number') return lock.pid;
+    }
+  } catch { /* the lock may already be gone; the caller only logs it */ }
+  return undefined;
 }

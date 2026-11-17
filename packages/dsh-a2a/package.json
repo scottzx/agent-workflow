@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dsh-a2a",
-  "version": "0.2.1",
+  "version": "0.2.4",
   "description": "DSH headless runtime execution over a standalone A2A endpoint.",
   "type": "module",
   "license": "MIT",
@@ -37,6 +37,7 @@
     "client": {
       "platform": "web",
       "inject": [
+        "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-layout",
         "@deepseek-ai/dsh-client-ui-sidebar",
         "@deepseek-ai/dsh-client-ui-workspace"
