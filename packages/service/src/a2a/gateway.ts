@@ -219,7 +219,9 @@ interface ExecutionNotice { noticeId: string; messageId: string; originSessionId
 interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean; reason?: string;
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
-interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[] }
+interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[];
+  /** A shared space or role directory the host refused for a job; the task ran without it. */
+  artifactSpaceRefusals?: Record<string, { at: string; path: string; reason: string }> }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
 const actionable = new Set([...terminal, 'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED']);
 const wire = (task: Task): Record<string, any> => Task.toJSON(task) as Record<string, any>;
@@ -376,6 +378,7 @@ export class RemoteAgentGateway {
     const delivery = this.state.pptDeliveries?.runs[attempt.attemptId] as PptDeliveryRun | undefined;
     const report = this.state.reportReviews?.[attempt.attemptId];
     return { ...view, ...(delivery ? { deliveryProgress: deliveryProgress(delivery) } : {}),
+      ...(this.state.artifactSpaceRefusals?.[jobId] ? { artifactSpaceRefusal: this.state.artifactSpaceRefusals[jobId] } : {}),
       ...(report ? { reportProgress: { stage: report.stage, phase: report.phase, reportPath: report.reportPath, fileCheck: report.fileCheck, humanReview: report.humanReviews.at(-1) } } : {}),
       ...(this.state.executionCancellations?.[attempt.attemptId] ? { cancellation: structuredClone(this.state.executionCancellations[attempt.attemptId]) } : {}), attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
       backendRunRef: attempt.backendRunRef, phase: attempt.phase, stale: attempt.stale,
@@ -513,7 +516,17 @@ export class RemoteAgentGateway {
         try {
           await this.checkDispatch(resolved.remote, resolved.cwd, { ...requirements, ...optional }, resolved.endpoint);
           requirements = { ...requirements, ...optional };
-        } catch { /* A refused shared space or role directory does not block the task's own job directory. */ }
+        } catch (error) {
+          // A refused shared space must not block the task's own directory, but it must not vanish
+          // either: without the admission the agent cannot write there, and the caller would see a
+          // task that ran and silently ignored the space it was given.
+          const detail = error instanceof Error ? error.message : String(error);
+          const which = caseSpace ? `shared artifact space ${caseSpace.root}` : `role publication ${publication}`;
+          this.state.artifactSpaceRefusals = { ...(this.state.artifactSpaceRefusals ?? {}),
+            [job.jobId]: { at: new Date().toISOString(), path: caseSpace?.root ?? publication ?? '', reason: detail.slice(0, 500) } };
+          this.save();
+          console.error(`[a2a-gateway] ${which} refused for job ${job.jobId}: ${detail}`);
+        }
       }
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
@@ -897,7 +910,7 @@ export class RemoteAgentGateway {
     await this.invoke('execution_continue', { originSessionId: task.originSessionId, jobId, input: { prompt }, initiatedBy: { kind: 'person' } });
     return this.workbenchTask(jobId);
   }
-  /** A person marks the task's current result as read (已阅). */
+  /** A person marks the task's current result as read (已阅). This is the acceptance the conventions wait for. */
   acceptWorkbenchTask(jobId: string, note?: string) {
     const task = this.workbenchTask(jobId);
     if (!task.canAccept) throw new Error('只有已完成、还没有结论的任务可以标记已阅。');
@@ -907,6 +920,9 @@ export class RemoteAgentGateway {
     const result = this.ledger.getAttempt(task.currentAttemptId).result!;
     this.ledger.acceptance(task.originSessionId, jobId, { attemptId: task.currentAttemptId, resultRevision: result.resultRevision!, resultDigest: result.resultDigest!,
       reviewStatus: 'accepted', ...(note ? { note } : {}), decidedBy: { kind: 'person', id: reviewer } });
+    // Same rule as the A2A acceptance: an accepted result makes the one convention that waited for it hold.
+    // This only records the edge; opening the next task stays a separate, explicit submit.
+    continueByConvention(this.ledger, task.originSessionId, jobId);
     return this.workbenchTask(jobId);
   }
   async workbenchArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; name: string; mediaType?: string }> {

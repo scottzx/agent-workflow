@@ -26,6 +26,28 @@ export class HeadlessDshBackend {
   }
   async load(id) { return JSON.parse(await readFile(this.file(id), 'utf8')); }
   preflight(input) { return runA2APreflight(input); }
+  /**
+   * The directory this round writes into.
+   *
+   * `cwd` stays the role's own path, because that is where the agent reads its files from. The work
+   * directory is a different thing: the caller names it in the preflight, and the gateway defaults it
+   * to the task's own `<cwd>/.1agents/jobs/<jobId>/`. A caller may declare another one instead, which
+   * is how a shared artifact space outside the role's tree becomes writable.
+   */
+  static workDirectory(preflight, cwd) {
+    const declared = preflight?.jobDirectory;
+    return typeof declared === 'string' && declared.length > 0 ? declared : cwd;
+  }
+  /**
+   * Directories admitted beyond `cwd`: the work directory, the shared artifact space and a role's
+   * publication directory. They are recorded with the session so every later round can grant them
+   * again; the runtime otherwise refuses writes outside its workspace.
+   */
+  static grantedDirectories(preflight, cwd) {
+    const granted = [HeadlessDshBackend.workDirectory(preflight, cwd), preflight?.artifactSpace, preflight?.rolePublication]
+      .filter(path => typeof path === 'string' && path.length > 0);
+    return [...new Set(granted)];
+  }
   async prepare(input, { signal } = {}) {
     signal?.throwIfAborted();
     if (input.agentPreset && input.agentPreset !== 'standard') throw new Error('Only the configured DSH headless composition is supported');
@@ -35,9 +57,14 @@ export class HeadlessDshBackend {
     if (previous && previous.cwd !== cwd) throw new Error('Existing session cwd conflicts');
     const preflight = await this.preflight({ ...input.preflight, cwd });
     if (!preflight.ok) throw new Error('DSH workspace preflight failed');
+    const granted = HeadlessDshBackend.grantedDirectories(preflight, cwd);
     const record = previous ?? { sessionId: `dsh-a2a-${randomUUID()}`, cwd, agentPreset: 'standard' };
+    // `pwd` never moves: the role keeps reading from its own path. Only the granted roots grow.
+    record.workDirectory = HeadlessDshBackend.workDirectory(preflight, cwd);
+    // A continuation may admit a further directory; keep the union so no earlier grant is lost.
+    record.grantedDirectories = [...new Set([...(record.grantedDirectories ?? []), ...granted])];
     signal?.throwIfAborted();
-    if (!previous) await this.save(record);
+    await this.save(record);
     return { sessionId: record.sessionId, cwd, agentPreset: 'standard', preflight };
   }
   async run(target, prompt, options) {
@@ -50,7 +77,13 @@ export class HeadlessDshBackend {
       // Persist before launch: never silently replay a run after a crash.
       record.uncertain = true; await this.save(record);
       if (this.runtime.mode === 'sdk') return await runSdk(this.runtime, record, prompt, options, value => this.save(value));
-      const args = [...this.args, '--json', '--approval-policy', 'never', ...(record.runtimeSessionId ? ['--session-id', record.runtimeSessionId] : []), '-'];
+      // `pwd` stays the role's own path; the work directory (the task directory by default, or one the
+      // caller declared) and the shared artifact space are granted instead of becoming the working
+      // directory. Recorded per session, so a continuation keeps the same writable roots.
+      const added = (record.grantedDirectories ?? []).filter(path => path !== record.cwd)
+        .flatMap(path => ['--add-dir', path]);
+      const args = [...this.args, '--json', '--approval-policy', 'never', ...added,
+        ...(record.runtimeSessionId ? ['--session-id', record.runtimeSessionId] : []), '-'];
       let final, runtimeSessionId, invalid = false;
       const child = spawn(this.command, args, { cwd: record.cwd, env: { ...process.env, ...this.env }, stdio: ['pipe', 'pipe', 'pipe'] });
       const abort = () => { child.kill('SIGTERM'); };
