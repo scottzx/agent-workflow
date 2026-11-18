@@ -101,26 +101,7 @@ This plugin supports **text prompts**. Attachments and specialized external-tool
 
 The bundle's `oneagents-acp` row accepts `serviceUrl`, `serviceMode`, `serviceStartupTimeoutMs`, `serviceShutdownTimeoutMs`, `agents`, `stateDirectory`, `diagnosticsDirectory`, `reconnectAttempts` and `reconnectDelayMs`. Change it through the profile's `cordis.patch.yml`, not the DSH repository. Use a new session after changing endpoint or workspace. When `agents` is omitted, plugin startup fetches `GET /agents` from acp-service and registers presets for entries with `chat_ready: true`, using their service-provided names. Discovery runs on the service host. Restart the plugin after installing or removing a harness. An explicit `agents` list bypasses discovery and preserves manual registry selection; `[]` registers no presets. Service startup, connection errors and invalid inventory responses fail plugin initialization instead of selecting fallback agents.
 
-### Automatic session archiving
-
-The plugin can periodically archive silent DSH sessions. It is **off by default**; enable it through the same plugin row in `cordis.patch.yml`:
-
-```yaml
-- insert:
-    - id: oneagents-acp
-      name: '@1agents/acp-service'
-      config:
-        autoArchive:
-          enabled: true
-          # Defaults; all intervals are positive integer milliseconds.
-          inactivityMs: 604800000   # 7 days
-          scanIntervalMs: 86400000  # once a day
-          initialDelayMs: 60000     # first sweep one minute after startup
-```
-
-A session is silent when its last DSH activity is older than `inactivityMs`. Last activity is the later of DSH's own recency (creation time or last real user message) and the modification time of its durable session log, so a cold session with a recently written log is still considered active. The sweep uses DSH's own `workspaceRegistry.archiveSession(..., { stopActivity: true })`: the archive is durable, any running turn or background work is stopped the same way a user stop does, and archived sessions cannot wake or run model steps until restored.
-
-**Pinned sessions are exempt.** A pinned session is never auto-archived; pinning remains the explicit signal that you want to keep a conversation visible, so it must be archived manually. Already archived sessions and sessions whose turn started after a sweep began are skipped as well. A session is checked against the current DSH summary and stored-session listings, so the feature works for both open and cold sessions and does not itself open a session's event log.
+Silent-session archiving is **not** part of the plugin. It runs as a manual command, `acp-service dsh archive`, so nothing periodic is installed into DSH; see the [service README](../../service/README.md#archiving-silent-dsh-sessions). The plugin row has no archive configuration and installs no timer.
 
 Explicitly authorized unattended work can declare `sessionPolicies`, with an exact absolute `cwd`, ACP registry `agent`, and optional `initialModeId`. A policy matches only that workspace and Agent; wildcards and duplicate scopes are rejected. New sessions select the advertised native mode before sending any prompt; an unavailable mode fails without prompting. A stored ACP 设置 record for the same workspace and Agent is applied on that new session, and its mode replaces `initialModeId`. Existing sessions keep their native mode and any ACP settings already selected or imported. `permissionMode` (`approve-reads`, `approve-all`, `deny-all`) may still appear in older configs and is ignored: the bridge does not apply that three-state shield. Mode and reasoning effort come from ACP 设置 (`session/set_mode`, `session/set_config_option`) or from the native session an import resumes. For example, an authorized Codex video workspace can use `initialModeId: "agent-full-access"` without changing the host's global model or other workspaces. Remove the declaration when the authorized batch ends; existing native sessions retain their own stored mode.
 

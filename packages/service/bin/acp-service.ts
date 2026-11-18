@@ -66,6 +66,7 @@ function printUnifiedHelp(binName: string) {
   ticket show|events|proposal --job <id>  Read a job's task ticket and its events, or settle a proposal
   process list|answer --job <id>          Read a job's process requests, or answer one as the coach or a person
   trail --job <id>                        One task's record: who asked, what ran, who approved, what came out, who read it
+  dsh archive --days <n> [--dry-run]     Archive DSH sessions that have been silent for n days (manual; no timer)
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
 
   help = help.replace(/^Commands:/m, serverCommands);
@@ -175,6 +176,11 @@ async function main() {
   if (rawArgs[0] === 'rsi') {
     const { runRsiCli } = await import('./rsi.js');
     await runRsiCli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'dsh') {
+    const { runDshArchiveCli } = await import('./dsh.js');
+    await runDshArchiveCli(rawArgs.slice(1));
     return;
   }
   const isServe = rawArgs[0] === 'serve' || rawArgs[0] === 'run';

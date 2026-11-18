@@ -42,6 +42,32 @@ acp-service serve --host 127.0.0.1 --port 36812 --no-report
 
 The service uses **ACP v1 JSON-RPC 2.0 over WebSocket**. DSH is unnecessary for the standalone entry points. A2A delegation is opt-in and disabled by default; its configuration is documented below. Waking a calling system's main Agent after task completion requires that system's receiving host adapter.
 
+## Archiving silent DSH sessions
+
+`acp-service dsh archive` archives DSH sessions that have been idle for a chosen number of days. It is a manual command: it installs no timer into DSH, changes no plugin configuration, and runs only when invoked. Archiving hides a session from the workspace grouping; it never deletes the session or its log, and the session can be restored from DSH's archived list.
+
+```sh
+acp-service dsh archive --days 7 --dry-run   # list what would be archived
+acp-service dsh archive --days 7             # archive it
+```
+
+| Option | Meaning |
+|---|---|
+| `--days <n>` | Idle threshold in days; default `7`. |
+| `--url <origin>` | DSH Host origin. Repeatable, tried in order. Omitted, the command probes the machine's loopback listeners. |
+| `--dry-run` | Print the plan and change nothing. |
+| `--include-pinned` | Archive pinned sessions too. Pinned sessions are skipped by default. |
+| `--stop-activity` | Allow stopping a session's running work. Running sessions are skipped by default. |
+| `--json` | Machine-readable output. |
+
+**How "idle" is measured.** Last activity is the later of the Host's own recency (session creation time or its last real user message) and the modification time of the session's durable log file. A cold session whose log was written recently — a tool result, a title rewrite, a compaction — therefore does not count as silent.
+
+**Which sessions are skipped.** Already archived sessions, sessions with running work (unless `--stop-activity`), and pinned sessions (unless `--include-pinned`). A pin is the explicit "keep this visible" signal, so it stays a manual decision.
+
+**How it talks to DSH.** The command calls the running Host's own `workspace` service over its Typert RPC (`/api/workspace/archiveSession`), so the archive stays the Host's durable state. It authenticates as the Host's owner with a browser-session cookie minted from the local credential store (`$DSH_HOME/.credentials.yaml`), which is the same principal the DSH UI acts as on the machine that owns the Host.
+
+**Two Hosts, one DSH home.** A `dsh web` instance and the desktop app can share `$DSH_HOME`, and each holds the workspace registry in memory while rewriting the whole document on every change. Planning therefore reads the durable registry document, and the command **refuses to write** through a Host whose registry is missing entries the document records — that Host started before the newer archives were written, and its next write would drop them. Restart that instance so it reloads, then run the command again. Auto-discovery prefers a Host that already matches the document; an explicit `--url` is always honoured, and the safety check still applies to it.
+
 ## Bundled usage skill
 
 [ACP Service skill](skills/acp-service/SKILL.md) is distributed in this npm package and maintained with the source. It covers entry-point selection, ACP CLI/WebSocket sessions, DSH presets and native model controls, A2A delegation, task queries and the durable completion inbox. Detailed examples are included in its `references/` directory.
