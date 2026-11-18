@@ -47,7 +47,7 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   installAutoArchiveTimer(ctx, autoArchive, () => {
     void (async () => {
       const result = await sweepAutoArchive({
-        listSummaries: async signal => (await ctx.sessionController.list({}, signal)).items,
+        listSummaries: async signal => (signal ? await ctx.sessionController.list({}, signal) : await ctx.sessionController.list({})).items,
         listStored: () => ctx.sessionPersistence.list(),
         pinnedSessionIds: () => ctx.workspaceRegistry.pinnedSessionIds,
         archivedSessionIds: () => ctx.workspaceRegistry.archivedSessionIds,

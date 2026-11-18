@@ -170,7 +170,7 @@ export interface TimerContext {
   [key: string]: unknown;
   interval?: (callback: () => void, delay: number) => () => void;
   timeout?: (callback: () => void, delay: number) => () => void;
-  effect?: (callback: () => (() => void) | void) => void;
+  effect?: (callback: any) => any;
   logger?: { warn?: (...args: unknown[]) => void };
 }
 
@@ -219,8 +219,9 @@ export function installAutoArchiveTimer(
     const startTimer = setTimeout(() => { startInterval(); void run(); }, config.initialDelayMs);
     own(() => clearTimeout(startTimer));
   }
-  // Keep the timer owned by this fiber even when the host mixes timer methods
-  // onto a shared context; the plugin effect will dispose it on unload.
-  ctx.effect?.(() => disposeAll);
+  // Cordis invokes an effect body immediately and treats its *return value* as
+  // the cleanup. Returning `() => disposeAll` (not `disposeAll` itself) keeps
+  // the timers alive until the owning fiber is actually disposed.
+  ctx.effect?.(() => () => disposeAll);
   return disposeAll;
 }
