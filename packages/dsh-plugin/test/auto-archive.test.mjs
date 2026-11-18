@@ -137,14 +137,15 @@ test('sweep skips sessions that became active and reports failures', async () =>
   assert.equal(result.candidates, 3);
 });
 
-test('installAutoArchiveTimer is inert when disabled and disposes intervals', () => {
+test('installAutoArchiveTimer is inert when disabled and keeps timers alive until disposal', () => {
   let intervalCallback;
   let timeoutCallback;
   let effectCleanup;
-  const disposers = [];
+  const disposed = [];
   const ctx = {
-    interval: (cb, ms) => { assert.equal(ms, DEFAULT_AUTO_ARCHIVE.scanIntervalMs); intervalCallback = cb; const d = () => disposers.push('interval'); return d; },
-    timeout: (cb, ms) => { assert.equal(ms, DEFAULT_AUTO_ARCHIVE.initialDelayMs); timeoutCallback = cb; const d = () => disposers.push('timeout'); return d; },
+    interval: (cb, ms) => { assert.equal(ms, DEFAULT_AUTO_ARCHIVE.scanIntervalMs); intervalCallback = cb; return () => disposed.push('interval'); },
+    timeout: (cb, ms) => { assert.equal(ms, DEFAULT_AUTO_ARCHIVE.initialDelayMs); timeoutCallback = cb; return () => disposed.push('timeout'); },
+    // Cordis calls the effect body immediately; its RETURN VALUE is the cleanup.
     effect: cb => { effectCleanup = cb(); },
     logger: { warn: () => {} },
   };
@@ -154,7 +155,9 @@ test('installAutoArchiveTimer is inert when disabled and disposes intervals', ()
 
   let ticks = 0;
   const dispose = installAutoArchiveTimer(ctx, { ...DEFAULT_AUTO_ARCHIVE, enabled: true }, () => { ticks++; });
-  // Before the initial delay only the timeout is installed.
+  // The effect body must not have disposed the timers at installation time.
+  assert.deepEqual(disposed, []);
+  assert.equal(typeof effectCleanup, 'function');
   assert.equal(typeof timeoutCallback, 'function');
   assert.equal(intervalCallback, undefined);
   timeoutCallback(); // starts the interval and runs the first sweep
@@ -162,7 +165,11 @@ test('installAutoArchiveTimer is inert when disabled and disposes intervals', ()
   assert.equal(typeof intervalCallback, 'function');
   intervalCallback();
   assert.equal(ticks, 2);
+  // Only the explicit disposer or the fiber cleanup clears the timers.
+  assert.deepEqual(disposed, []);
   dispose();
-  assert.deepEqual(disposers, ['timeout', 'interval']);
-  assert.equal(typeof effectCleanup, 'function');
+  assert.deepEqual(disposed, ['timeout', 'interval']);
+  // The fiber cleanup is idempotent.
+  effectCleanup();
+  assert.deepEqual(disposed, ['timeout', 'interval']);
 });
