@@ -23,10 +23,9 @@ import { HANDOFF_PATH } from './handoff-spec.js';
 import { handoffTools } from './handoff-tools.js';
 import { runHandoffTool } from './handoff-executor.js';
 import { TICKET_PATH } from './ticket-spec.js';
-import { installAutoArchiveTimer, resolveAutoArchiveConfig, sweepAutoArchive, type AutoArchiveConfig } from './auto-archive.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
-export async function apply(ctx: Context, input: Partial<Config & ServiceOptions & { autoArchive?: Partial<AutoArchiveConfig> }> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
+export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
   const service = resolveServiceOptions(input);
@@ -43,21 +42,6 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   };
   if (config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
   if (!Number.isSafeInteger(config.reconnectAttempts) || config.reconnectAttempts < 0 || !Number.isSafeInteger(config.reconnectDelayMs) || config.reconnectDelayMs < 1) throw new Error('Invalid ACP reconnect policy');
-  const autoArchive = resolveAutoArchiveConfig(input.autoArchive);
-  installAutoArchiveTimer(ctx as any, autoArchive, () => {
-    void (async () => {
-      const result = await sweepAutoArchive({
-        listSummaries: async signal => (await ctx.sessionController.list({}, signal ?? new AbortController().signal)).items,
-        listStored: () => ctx.sessionPersistence.list(),
-        pinnedSessionIds: () => ctx.workspaceRegistry.pinnedSessionIds,
-        archivedSessionIds: () => ctx.workspaceRegistry.archivedSessionIds,
-        isActive: sessionId => ctx.agents.get(sessionId as SessionId)?.status === 'running',
-        archive: sessionId => ctx.workspaceRegistry.archiveSession(sessionId as SessionId, { stopActivity: true }),
-        log: message => ctx.logger.warn(message),
-      }, Date.now(), autoArchive.inactivityMs);
-      if (result.archived.length > 0) ctx.logger.info('auto-archive: archived %d silent session(s)', result.archived.length);
-    })().catch(error => ctx.logger.warn('auto-archive: sweep failed: %s', error));
-  });
   const diagnosticOwner = await openDiagnostics(resolve(input.diagnosticsDirectory ?? join(config.stateDirectory, 'diagnostics')), { onConflict: 'readonly' });
   const { diagnostics } = diagnosticOwner;
   if (diagnosticOwner.mode === 'read-only') console.warn('oneagents-acp diagnostics are read-only because another instance owns the storage');
