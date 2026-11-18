@@ -44,10 +44,10 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   if (config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
   if (!Number.isSafeInteger(config.reconnectAttempts) || config.reconnectAttempts < 0 || !Number.isSafeInteger(config.reconnectDelayMs) || config.reconnectDelayMs < 1) throw new Error('Invalid ACP reconnect policy');
   const autoArchive = resolveAutoArchiveConfig(input.autoArchive);
-  installAutoArchiveTimer(ctx, autoArchive, () => {
+  installAutoArchiveTimer(ctx as any, autoArchive, () => {
     void (async () => {
       const result = await sweepAutoArchive({
-        listSummaries: async signal => (signal ? await ctx.sessionController.list({}, signal) : await ctx.sessionController.list({})).items,
+        listSummaries: async signal => (await ctx.sessionController.list({}, signal ?? new AbortController().signal)).items,
         listStored: () => ctx.sessionPersistence.list(),
         pinnedSessionIds: () => ctx.workspaceRegistry.pinnedSessionIds,
         archivedSessionIds: () => ctx.workspaceRegistry.archivedSessionIds,

@@ -167,7 +167,6 @@ export async function sweepAutoArchive(
 export interface TimerContext {
   // DSH's Context carries host services as dynamic properties; the index
   // signature keeps this accepted by both real DSH types and host shims.
-  [key: string]: unknown;
   interval?: (callback: () => void, delay: number) => () => void;
   timeout?: (callback: () => void, delay: number) => () => void;
   effect?: (callback: any) => any;
