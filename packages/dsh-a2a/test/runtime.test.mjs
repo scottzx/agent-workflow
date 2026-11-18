@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -39,4 +40,41 @@ test('standalone A2A opens its own port without ACP or Host services and release
     assert.equal((await fetch(`${origin}/a2a`, { method: 'POST' })).status, 401);
   } finally { await service.close(); }
   const restarted = await startA2AService(config); await restarted.close();
+});
+test('a taken listen port moves forward and the agent card follows it', async t => {
+  const f = await fixture(t);
+  const held = createServer((_req, res) => { res.writeHead(200); res.end('held'); });
+  await new Promise(resolve => held.listen(0, '127.0.0.1', resolve));
+  const busy = held.address().port;
+  t.after(() => new Promise(resolve => { held.closeAllConnections(); held.close(() => resolve()); }));
+  const notes = [];
+  const original = console.error;
+  console.error = (...args) => notes.push(args.join(' '));
+  let service;
+  try {
+    service = await startA2AService({
+      port: busy, host: '127.0.0.1', publicUrl: `http://127.0.0.1:${busy}`, token: 'test',
+      stateDirectory: join(f.dir, 'fallback-state'), runtime: f.runtime,
+    });
+  } finally { console.error = original; }
+  t.after(() => service.close());
+  const actual = service.server.address().port;
+  assert.notEqual(actual, busy);
+  assert.equal(service.port, actual);
+  assert.equal(service.publicUrl, `http://127.0.0.1:${actual}`);
+  assert.ok(notes.some(line => line.includes(`${busy} is already in use`) && line.includes(String(actual))));
+  const card = await (await fetch(`http://127.0.0.1:${actual}/.well-known/agent-card.json`)).json();
+  assert.match(JSON.stringify(card), new RegExp(`http://127\\.0\\.0\\.1:${actual}/a2a`));
+  assert.equal(await (await fetch(`http://127.0.0.1:${busy}/`)).text(), 'held');
+});
+test('a listen error other than a taken port still fails before the store is acquired', async t => {
+  const f = await fixture(t);
+  const directory = join(f.dir, 'bad-port');
+  await assert.rejects(startA2AService({
+    port: 70_000, token: 'test', stateDirectory: directory, runtime: f.runtime,
+  }), /port|range/i);
+  const recovered = await startA2AService({
+    port: 0, publicUrl: 'http://127.0.0.1:3080', token: 'test', stateDirectory: directory, runtime: f.runtime,
+  });
+  await recovered.close();
 });

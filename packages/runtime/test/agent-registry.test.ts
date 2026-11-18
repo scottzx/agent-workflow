@@ -131,6 +131,12 @@ test("grok-build built-in runs the Grok Build ACP entrypoint", () => {
   assert.equal(resolveAgentCommand("grok-build"), "grok agent stdio");
 });
 
+test("codebuddy built-in launches the installed CodeBuddy ACP server", () => {
+  assert.equal(AGENT_REGISTRY.codebuddy, "codebuddy --acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.codebuddy, ["codebuddy", "--acp"]);
+  assert.equal(resolveAgentCommand("codebuddy"), "codebuddy --acp");
+});
+
 test("mux built-in runs the coder/mux ACP stdio bridge through npx", () => {
   assert.equal(AGENT_REGISTRY.mux, "npx -y mux@^0.28.0 acp");
   assert.equal(resolveAgentCommand("mux"), "npx -y mux@^0.28.0 acp");
@@ -168,6 +174,7 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
   ]);
   assert.deepEqual(agents.slice(7), [
     "antigravity",
+    "codebuddy",
     "devin",
     "droid",
     "fast-agent",

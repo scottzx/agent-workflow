@@ -31,6 +31,16 @@ export const catalogDescriptors = [
     "install_command": "curl -fsSL https://x.ai/cli/install.sh | bash"
   },
   {
+    "type": "codebuddy",
+    "label": "CodeBuddy Code",
+    "binary": "codebuddy",
+    "acp_capable": true,
+    "cli_capable": true,
+    "cc_transport": "cli-stream",
+    "integrated": true,
+    "install_command": "npm install -g @tencent-ai/codebuddy-code"
+  },
+  {
     "type": "cursor",
     "label": "Cursor Agent",
     "binary": "agent",

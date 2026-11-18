@@ -1235,6 +1235,7 @@ test("integration: built-in grok-build agent resolves to grok agent stdio", asyn
 });
 
 for (const [agent, acpArg] of [
+  ["codebuddy", "--acp"],
   ["fx", "acp"],
   ["junie", "--acp=true"],
   ["mcode", "acp"],

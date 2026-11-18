@@ -26,7 +26,7 @@ dsh-a2a ./dsh-a2a.local.json
 }
 ```
 
-服务在自己的端口提供 `/.well-known/agent-card.json` 和 `/a2a`。DSH 插件模式通过 Cordis effect 管理相同服务的生命周期；只应由一个实例启动服务，其他客户端连接其 A2A 地址。`publicUrl` 仅描述对外地址，监听由 `host` 和 `port` 决定。
+服务在自己的端口提供 `/.well-known/agent-card.json` 和 `/a2a`。DSH 插件模式通过 Cordis effect 管理相同服务的生命周期；只应由一个实例启动服务，其他客户端连接其 A2A 地址。`publicUrl` 仅描述对外地址，监听由 `host` 和 `port` 决定。配置端口已被占用时，从该端口起向后最多试 32 个端口，在第一个空闲端口监听；若 `publicUrl` 写的就是被占用的那个端口，agent card 改成实际监听端口。其它监听错误仍会失败。
 
 运行环境须安装支持 `--json`、`--session-id`、`--approval-policy never` 的 DSH headless。源码契约参考本机 DSH 0.2.2-rc.2。`runtime.command` 和 `runtime.args` 是管理员配置的可执行文件和参数数组，不经过 shell；可以显式指向安装版的命令入口。模型、工具、权限和凭据由 headless profile 配置，不继承 Web/Desktop 的全部设置。默认 headless 不读取 GUI 的保存登录，需按 DSH 官方配置启用所需认证。
 

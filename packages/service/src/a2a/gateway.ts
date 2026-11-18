@@ -1,6 +1,6 @@
 /** Main-agent tools backed by standard A2A, with a durable completion inbox. */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
@@ -77,6 +77,8 @@ const configSchema = z.object({
   /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
   capacityDirectory: z.string().min(1).optional(),
   /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
+  /** Retention days for active gateway state. Terminal tasks and completed records older than this are archived. Default 7 days. */
+  coldRetentionDays: z.number().int().min(1).max(365).default(7),
   sessionLifecycle: z.object({
     persistentIdleTtlSeconds: z.number().int().min(0).max(30 * 24 * 60 * 60).default(600),
     idleScanIntervalMs: z.number().int().min(50).max(10 * 60_000).default(60_000),
@@ -250,6 +252,8 @@ export class RemoteAgentGateway {
   readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
   private readonly stateFile: string;
+  private readonly archiveFile: string;
+  private lastArchivedAt = Number.NEGATIVE_INFINITY;
   private readonly snapshots: SnapshotStore;
   private readonly state: State;
   private readonly clients = new Map<string, Promise<Client>>();
@@ -282,6 +286,7 @@ export class RemoteAgentGateway {
     // directory: local restarts must never mark remote executions failed.
     this.lease = new FileA2AStore(path.join(this.config.stateDirectory, 'lease'));
     this.stateFile = path.join(this.config.stateDirectory, 'gateway.json');
+    this.archiveFile = path.join(this.config.stateDirectory, 'gateway-archive.json');
     this.snapshots = new SnapshotStore(path.join(this.config.stateDirectory, 'handoff-snapshots'));
     try {
       this.state = JSON.parse(readFileSync(this.stateFile, 'utf8')) as State;
@@ -336,6 +341,7 @@ export class RemoteAgentGateway {
         }
       }
       this.save();
+      this.archiveColdState();
       if (this.config.automation) this.automation = new A2AAutomation(this, this.config.automation);
       if (this.config.projectDiscovery) {
         this.projectDiscovery = new ProjectRoleDiscovery({ stateDirectory: path.join(this.config.stateDirectory, 'project-discovery'), config: this.config.projectDiscovery });
@@ -810,13 +816,182 @@ export class RemoteAgentGateway {
       run.humanReviews = run.humanReviews.map(review => review.status === 'pending' ? { ...review, status: 'canceled', updatedAt: run.updatedAt } : review);
       this.save(); this.updateReport(run);
     }
+    const previousStatus = record.status;
+    const previousTargets = JSON.stringify(record.targets);
     record.status = unresolved.length ? 'blocked' : 'completed';
     record.targets = ids.flatMap(id => this.ledger.get(origin, id).attempts).map(attempt => ({ jobId: attempt.jobId, attemptId: attempt.attemptId,
       executionStatus: attempt.executionStatus, submissionStatus: attempt.submissionStatus }));
     record.checkedAt = new Date().toISOString();
-    if (record.status === 'completed') record.completedAt = record.checkedAt;
-    this.save();
+    if (record.status === 'completed' && !record.completedAt) record.completedAt = record.checkedAt;
+    if (previousStatus !== record.status || previousTargets !== JSON.stringify(record.targets)) {
+      this.save();
+    }
   }
+
+  private writeArchive(data: {
+    jobs: Job[];
+    notices: NoticeRecord[];
+    cancellations: Record<string, ExecutionCancellation>;
+    pptRuns: Record<string, any>;
+    reportRuns: Record<string, ReportReviewRun>;
+  }): void {
+    let existing: {
+      version: 1;
+      jobs: Job[];
+      notices: NoticeRecord[];
+      cancellations: Record<string, ExecutionCancellation>;
+      pptRuns: Record<string, any>;
+      reportRuns: Record<string, ReportReviewRun>;
+      archivedAt: string;
+    } = {
+      version: 1,
+      jobs: [],
+      notices: [],
+      cancellations: {},
+      pptRuns: {},
+      reportRuns: {},
+      archivedAt: new Date(this.now()).toISOString(),
+    };
+    try {
+      if (existsSync(this.archiveFile)) {
+        existing = JSON.parse(readFileSync(this.archiveFile, "utf8"));
+        existing.jobs ??= [];
+        existing.notices ??= [];
+        existing.cancellations ??= {};
+        existing.pptRuns ??= {};
+        existing.reportRuns ??= {};
+      }
+    } catch {}
+
+    const jobKeys = new Set(existing.jobs.map(j => `${j.remote}:${j.taskId}:${j.originSessionId}`));
+    for (const j of data.jobs) {
+      const key = `${j.remote}:${j.taskId}:${j.originSessionId}`;
+      if (!jobKeys.has(key)) {
+        existing.jobs.push(j);
+        jobKeys.add(key);
+      }
+    }
+
+    const noticeKeys = new Set(existing.notices.map(n => n.notice.noticeId));
+    for (const n of data.notices) {
+      if (!noticeKeys.has(n.notice.noticeId)) {
+        existing.notices.push(n);
+        noticeKeys.add(n.notice.noticeId);
+      }
+    }
+
+    Object.assign(existing.cancellations, data.cancellations);
+    Object.assign(existing.pptRuns, data.pptRuns);
+    Object.assign(existing.reportRuns, data.reportRuns);
+    existing.archivedAt = new Date(this.now()).toISOString();
+
+    atomicJson(this.archiveFile, existing);
+  }
+
+  archiveColdState(retentionDays = this.config.coldRetentionDays): {
+    archivedJobs: number;
+    archivedNotices: number;
+    archivedCancellations: number;
+    archivedPptRuns: number;
+    archivedReportRuns: number;
+  } {
+    this.lastArchivedAt = this.now();
+    const cutoff = this.now() - retentionDays * 24 * 60 * 60 * 1000;
+
+    const pendingNoticeTaskIds = new Set(
+      this.state.notices
+        .filter(n => new Date(n.notice?.createdAt || 0).getTime() >= cutoff && !n.acknowledged && !n.delivered)
+        .map(n => n.notice.taskId)
+    );
+    const activeCancellationTaskIds = new Set(
+      Object.values(this.state.executionCancellations ?? {})
+        .filter(c => c.status !== "completed")
+        .flatMap(c => c.targets.map(t => t.jobId))
+    );
+
+    const remainingJobs: Job[] = [];
+    const coldJobs: Job[] = [];
+    for (const job of this.state.jobs) {
+      const isTerminal = terminal.has(taskState(job));
+      const jobTime = new Date(job.closedAt || job.checkedAt || 0).getTime();
+      const isCold = isTerminal && jobTime < cutoff;
+      const hasActiveRef = pendingNoticeTaskIds.has(job.taskId) || activeCancellationTaskIds.has(job.taskId) || activeCancellationTaskIds.has(job.ledgerJobId ?? "");
+      if (isCold && !hasActiveRef) {
+        coldJobs.push(job);
+      } else {
+        remainingJobs.push(job);
+      }
+    }
+
+    const remainingNotices: NoticeRecord[] = [];
+    const coldNotices: NoticeRecord[] = [];
+    for (const notice of this.state.notices) {
+      const noticeTime = new Date(notice.notice?.createdAt || 0).getTime();
+      if (noticeTime < cutoff) {
+        coldNotices.push(notice);
+      } else {
+        remainingNotices.push(notice);
+      }
+    }
+
+    const remainingCancellations: Record<string, ExecutionCancellation> = {};
+    const coldCancellations: Record<string, ExecutionCancellation> = {};
+    for (const [id, c] of Object.entries(this.state.executionCancellations ?? {})) {
+      const reqTime = new Date(c.completedAt || c.requestedAt || 0).getTime();
+      if (c.status === "completed" && reqTime < cutoff) {
+        coldCancellations[id] = c;
+      } else if (c.status === "blocked" && reqTime < cutoff) {
+        coldCancellations[id] = { ...c, status: "completed", completedAt: new Date(this.now()).toISOString(), diagnostics: [...c.diagnostics, "Auto-closed after cold retention timeout"] };
+      } else {
+        remainingCancellations[id] = c;
+      }
+    }
+
+    const remainingPptRuns: Record<string, any> = {};
+    const coldPptRuns: Record<string, any> = {};
+    for (const [id, run] of Object.entries((this.state.pptDeliveries?.runs ?? {}) as Record<string, PptDeliveryRun>)) {
+      const isTerminal = ["completed", "failed", "canceled"].includes(run.executionStatus) && !run.parentUpdatePending;
+      const runTime = new Date(run.updatedAt || run.createdAt || 0).getTime();
+      if (isTerminal && runTime < cutoff) {
+        coldPptRuns[id] = run;
+      } else {
+        remainingPptRuns[id] = run;
+      }
+    }
+
+    const remainingReportRuns: Record<string, ReportReviewRun> = {};
+    const coldReportRuns: Record<string, ReportReviewRun> = {};
+    for (const [id, run] of Object.entries(this.state.reportReviews ?? {})) {
+      const isTerminal = ["completed", "failed", "canceled"].includes(run.executionStatus);
+      const runTime = new Date(run.updatedAt || run.createdAt || 0).getTime();
+      if (isTerminal && runTime < cutoff) {
+        coldReportRuns[id] = run;
+      } else {
+        remainingReportRuns[id] = run;
+      }
+    }
+
+    const archivedCount = {
+      archivedJobs: coldJobs.length,
+      archivedNotices: coldNotices.length,
+      archivedCancellations: Object.keys(coldCancellations).length,
+      archivedPptRuns: Object.keys(coldPptRuns).length,
+      archivedReportRuns: Object.keys(coldReportRuns).length,
+    };
+
+    if (coldJobs.length || coldNotices.length || Object.keys(coldCancellations).length || Object.keys(coldPptRuns).length || Object.keys(coldReportRuns).length) {
+      this.writeArchive({ jobs: coldJobs, notices: coldNotices, cancellations: coldCancellations, pptRuns: coldPptRuns, reportRuns: coldReportRuns });
+      this.state.jobs = remainingJobs;
+      this.state.notices = remainingNotices;
+      this.state.executionCancellations = remainingCancellations;
+      if (this.state.pptDeliveries?.runs) this.state.pptDeliveries.runs = remainingPptRuns;
+      this.state.reportReviews = remainingReportRuns;
+      this.save();
+    }
+
+    return archivedCount;
+  }
+
   private async probeTarget(targetId: string) {
     const target = this.targets.getTarget(targetId), connection = this.targets.getConnection(target.connectionId);
     if (!target.enabled || !connection.enabled || target.kind === 'workflow') return this.targets.invoke('execution_target_probe', { targetId });
@@ -981,8 +1156,19 @@ export class RemoteAgentGateway {
     const report = await this.preflight(remote, { cwd, ...requirements }, pinnedEndpoint);
     if (!report.ok) throw new Error(`Remote preflight rejected dispatch: ${report.checks.filter(check => !check.ok).map(check => check.id).join(', ')}`);
   }
+  private findArchivedJob(params: z.output<typeof taskSchema>): Job | undefined {
+    try {
+      if (!existsSync(this.archiveFile)) return undefined;
+      const archive = JSON.parse(readFileSync(this.archiveFile, 'utf8'));
+      if (Array.isArray(archive.jobs)) {
+        return archive.jobs.find((value: Job) => value.remote === params.remote && value.taskId === params.taskId && value.originSessionId === params.originSessionId);
+      }
+    } catch {}
+    return undefined;
+  }
   private job(params: z.output<typeof taskSchema>): Job {
-    const job = this.state.jobs.find(value => value.remote === params.remote && value.taskId === params.taskId && value.originSessionId === params.originSessionId);
+    const job = this.state.jobs.find(value => value.remote === params.remote && value.taskId === params.taskId && value.originSessionId === params.originSessionId)
+      ?? this.findArchivedJob(params);
     if (!job) throw new Error('Task not found for this origin session');
     return job;
   }
@@ -1084,9 +1270,19 @@ export class RemoteAgentGateway {
       for (const run of Object.values(this.state.reportReviews ?? {})) {
         if (this.closed) break;
         if (this.state.executionCancellations?.[run.attemptId]) continue;
-        if (run.executionStatus === 'working' || run.humanReviews.some(review => review.resume?.status === 'pending') || ['completed', 'failed', 'canceled'].includes(run.executionStatus)) {
+        const terminalNoticeId = ['completed', 'failed', 'canceled'].includes(run.executionStatus)
+          ? createHash('sha256').update(JSON.stringify([run.sourceId, run.jobId, run.attemptId, reportRevision(run), run.executionStatus])).digest('hex')
+          : undefined;
+        const needsTerminalNotice = terminalNoticeId && !this.state.executionNotices?.some(notice => notice.noticeId === terminalNoticeId);
+        if (run.executionStatus === 'working' || run.humanReviews.some(review => review.resume?.status === 'pending') || needsTerminalNotice) {
           try { await this.advanceReport(run); }
-          catch (error) { run.resultSummary = `报告协调器等待处理：${error instanceof Error ? error.message : 'unknown error'}`; this.save(); }
+          catch (error) {
+            const summary = `报告协调器等待处理：${error instanceof Error ? error.message : 'unknown error'}`;
+            if (run.resultSummary !== summary) {
+              run.resultSummary = summary;
+              this.save();
+            }
+          }
         }
       }
       // The persisted notice owns its route. Later bindings must not double-deliver old webhooks.
@@ -1115,6 +1311,9 @@ export class RemoteAgentGateway {
       }
       await this.reconcileIdleSessions();
       await this.automation?.reconcileAcknowledgements();
+      if (this.now() - this.lastArchivedAt >= 24 * 60 * 60 * 1000) {
+        this.archiveColdState();
+      }
     })();
     this.reconciling = pending;
     try { await pending; } finally { this.reconciling = undefined; }
@@ -2245,11 +2444,27 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);
     if (registration && !registration.ok) console.error(`[a2a-gateway] DreamMate registration failed: ${registration.reason ?? 'unknown reason'}`);
     // Node's directory is ephemeral. Re-report after a Node restart; this never registers new execution targets.
+    let lastDreamMateReason: string | undefined;
     const reporting = options.report === false ? undefined : setInterval(() => {
       void reportToAgent(entry).then(result => {
-        if (!result.ok) console.error(`[a2a-gateway] DreamMate re-registration failed: ${result.reason ?? 'unknown reason'}`);
+        if (!result.ok) {
+          const reason = result.reason ?? 'unknown reason';
+          if (reason !== lastDreamMateReason) {
+            lastDreamMateReason = reason;
+            console.error(`[a2a-gateway] ${new Date().toISOString()} DreamMate re-registration failed: ${reason}`);
+          }
+        } else {
+          if (lastDreamMateReason !== undefined) {
+            console.error(`[a2a-gateway] ${new Date().toISOString()} DreamMate re-registration recovered`);
+            lastDreamMateReason = undefined;
+          }
+        }
       }).catch(error => {
-        console.error(`[a2a-gateway] DreamMate re-registration error: ${error instanceof Error ? error.message : String(error)}`);
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg !== lastDreamMateReason) {
+          lastDreamMateReason = msg;
+          console.error(`[a2a-gateway] ${new Date().toISOString()} DreamMate re-registration error: ${msg}`);
+        }
       });
     }, 15_000);
     reporting?.unref();

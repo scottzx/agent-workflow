@@ -49,6 +49,19 @@ test('discovers native harnesses in PATH and user directories without mistaking 
   assert.equal(f.scan().get('grok-build')?.chat_ready, false);
 });
 
+test('codebuddy is ready when its CLI is installed, without an auth handshake', t => {
+  const f = fixture(t);
+  f.options.env = { PATH: join(f.home, 'bin') };
+  assert.equal(f.scan().get('codebuddy')?.label, 'CodeBuddy Code');
+  assert.equal(f.scan().get('codebuddy')?.installed, false);
+  assert.equal(f.scan().get('codebuddy')?.chat_ready, false);
+  assert.equal(f.scan().get('codebuddy')?.install_command, 'npm install -g @tencent-ai/codebuddy-code');
+  const binary = f.executable('bin/codebuddy');
+  assert.equal(f.scan().get('codebuddy')?.path, binary);
+  assert.equal(f.scan().get('codebuddy')?.chat_ready, true);
+  assert.deepEqual(createServiceAgentRegistry(f.options).resolve('codebuddy'), [binary, '--acp']);
+});
+
 test('installed adapter is ready without native CLI, but missing package entry is not', t => {
   const f = fixture(t);
   const folder = join(f.home, 'node_modules/@agentclientprotocol/codex-acp');

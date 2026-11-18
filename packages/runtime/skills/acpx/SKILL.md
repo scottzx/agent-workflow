@@ -97,6 +97,7 @@ Friendly agent names resolve to commands:
 - `cursor` -> `cursor-agent acp` (calls `authenticate` with `cursor_login` before creating a session; sign in with `agent login` first. See `agents/Cursor.md`)
 - `copilot` -> `copilot --acp --stdio`
 - `antigravity` -> `agy_acp_server.par` (`--uid=` on Linux; `agy_acp_server.exe` on Windows). Install the official runtime/helper pair and configure its own sign-in first; see [Antigravity](https://github.com/openclaw/acpx/blob/main/agents/Antigravity.md). Fixed-choice interaction questions are cancelled, including with `--approve-all`, host permission callbacks, and existing custom launchers; acpx cannot supply user answers through permission approval.
+- `codebuddy` -> `codebuddy --acp` (install `@tencent-ai/codebuddy-code` and sign in with the CodeBuddy CLI first; acpx does not run its login. See `agents/CodeBuddy.md`)
 - `devin` -> `devin acp`
 - `droid` -> `droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
 - `fast-agent` -> `uvx fast-agent-mcp acp`

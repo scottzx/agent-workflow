@@ -19,6 +19,7 @@ The default agent for top-level commands like `acpx exec â€¦` and `acpx prompt â
 | `cursor`      | `cursor-agent acp`                             | [Cursor CLI](https://cursor.com/docs/cli/acp)                                                                   |
 | `copilot`     | `copilot --acp --stdio`                        | [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-chat/use-copilot-chat-in-the-command-line) |
 | `antigravity` | `agy_acp_server.par` (platform arguments)      | [Google Antigravity ACP](https://github.com/openclaw/acpx/blob/main/agents/Antigravity.md)                      |
+| `codebuddy`   | `codebuddy --acp`                              | [CodeBuddy Code](https://www.npmjs.com/package/@tencent-ai/codebuddy-code)                                      |
 | `devin`       | `devin acp`                                    | [Devin CLI](https://docs.devin.ai/cli/index)                                                                    |
 | `droid`       | `droid exec --output-format acp`               | [Factory Droid](https://www.factory.ai)                                                                         |
 | `fast-agent`  | `uvx fast-agent-mcp acp`                       | [fast-agent](https://fast-agent.ai/)                                                                            |
