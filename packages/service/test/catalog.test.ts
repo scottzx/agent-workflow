@@ -193,5 +193,5 @@ test('adapter fallback launches the npx found outside PATH without advertising a
   const command = createServiceAgentRegistry(f.options).resolve('codex');
   assert.ok(Array.isArray(command));
   assert.equal(command[0], runner);
-  assert.ok(command.some(value => value.startsWith('@agentclientprotocol/codex-acp')));
+  assert.ok(command.some(value => value.includes('@agentclientprotocol/codex-acp')));
 });

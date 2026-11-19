@@ -32,12 +32,22 @@ The observation retains the original error so hosts can release a reservation
 even when no child PID was created. A client closed during held compatibility
 probe admission reports the same failure without launching that probe.
 
-For embedded runtime session creation, a positive `timeoutMs` bounds ACP
-initialization. If the agent never completes the handshake, `ensureSession()`
+For embedded runtime session creation, a positive `timeoutMs` separately bounds ACP
+initialization and the following `session/new`, `session/load` or `session/resume`
+request. Each phase receives the full timeout; time spent initializing does not
+consume the session request's budget. If either phase stalls, `ensureSession()`
 rejects with `ACP_SESSION_INIT_FAILED` after closing the client and cleaning up
-its observed processes. Cleanup can extend beyond the initialization deadline.
-Omitting the timeout preserves unlimited initialization. This deadline does not
-bound the later `session/new` or `session/load` request.
+its observed processes. The error identifies the stalled phase. Cleanup can
+extend beyond the deadline. Omitting the timeout or setting it to zero preserves
+unlimited setup. A failed explicit resume does not create a replacement session.
+
+Runtime construction rejects finite default `timeoutMs` values above 2,147,483,647
+with `ACP_INVALID_RUNTIME_OPTION`, before session or agent work. The same bound
+applies to per-turn overrides: `startTurn()` throws synchronously, and `runTurn()`
+rejects when iteration starts, before prompt dispatch. Each turn uses the timeout
+value read at admission. The bound applies to raw milliseconds, including
+fractional overflow; supported values and existing omitted or zero behavior
+remain unchanged. An omitted override continues to inherit the runtime default.
 
 The host owns admission timeouts, cancellation and recovery. A callback that never
 settles can hold startup indefinitely; `close()` is not an admission-cancellation
@@ -89,6 +99,29 @@ every witnessed ancestor exits before the next one. Unavailable OS process
 information leaves unverified descendants untouched. Abrupt acpx death still
 requires separate host supervision.
 
+## Observe session protocol messages
+
+In-process runtimes can set `AcpRuntimeOptions.onAcpMessage` to observe inbound and
+outbound ACP messages on their owned session clients. The observer is installed
+before initialization and remains available during session setup, prompts, idle
+updates, reconnects, cold controls, and session discard. Health probes use separate
+clients and do not invoke it.
+Shared runtimes reject this option because their connection belongs to another
+process.
+
+Observations are best-effort: callback failures are ignored and asynchronous work
+is not awaited. Synchronous callback work runs on the protocol processing path
+and can delay it; move slow processing off that path. Treat messages as read-only.
+Outbound callbacks run before the transport write, so they do not prove delivery
+or agent acceptance. The callback is runtime-wide and has no separate session
+context; hosts must use the session identity present in protocol messages when
+available, and cannot assume every message has one.
+
+The existing client filters still apply: elicitation requests and their responses
+are omitted, as are session updates suppressed during history replay. Other
+messages can contain prompts, tool input and private data. The callback does not
+persist anything; the embedding host owns redaction, access and retention.
+
 ## Inspect models without a runtime store
 
 `inspectAgentModels()` from `acpx/runtime` launches an explicit `agentCommand`
@@ -102,8 +135,10 @@ capabilities. Runtime health probes disable their ACP filesystem and terminal
 callbacks while retaining the host permission policy; they ignore host
 `fs`/`terminal` options. Disabling those ACP callbacks is a protocol callback
 policy, not an OS sandbox for the agent's own filesystem or process access. Inspection inherits
-the process environment, with an optional trusted `agentProcessEnv` overlay; it
-does not isolate the agent process itself.
+the process environment, with an optional trusted `agentProcessEnv` overlay and
+the optional `agentProcessEnvAllow` and `agentProcessEnvBlock` inheritance lists
+described in [runtime-environment.md](runtime-environment.md); it does not
+isolate the agent process itself.
 
 Pass an optional `signal` to cancel. `timeoutMs` is a positive discovery deadline
 of at most 2,147,483,647 milliseconds and defaults to 120 seconds. Success,

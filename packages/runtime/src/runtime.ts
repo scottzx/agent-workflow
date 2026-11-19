@@ -1,4 +1,5 @@
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import { snapshotEnvNames } from "./acp/inherited-env.js";
 import { DEFAULT_AGENT_NAME } from "./agent-registry.js";
 import type { AcpControlAuthority } from "./async-control.js";
 import { capabilitiesFromRecord } from "./runtime/engine/controls.js";
@@ -52,6 +53,8 @@ export {
 } from "./runtime/public/handle-state.js";
 export type {
   AcpAgentRegistry,
+  AcpJsonRpcMessage,
+  AcpMessageDirection,
   AcpElicitationContext,
   AcpElicitationHandler,
   AcpElicitationMode,
@@ -118,6 +121,15 @@ type AcpxRuntimeLike = AcpRuntime & {
   doctor(): Promise<AcpRuntimeDoctorReport>;
 };
 
+function validateRuntimeTimeoutMs(timeoutMs: number | undefined): void {
+  if (timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 2_147_483_647) {
+    throw new AcpRuntimeError(
+      "ACP_INVALID_RUNTIME_OPTION",
+      "timeoutMs exceeds the maximum supported timer delay. Set timeoutMs to 2147483647 or less.",
+    );
+  }
+}
+
 export class AcpxRuntime implements AcpxRuntimeLike {
   private healthy = false;
   private shutdownTask?: Promise<void>;
@@ -136,8 +148,24 @@ export class AcpxRuntime implements AcpxRuntimeLike {
       }>;
     },
   ) {
-    if (options.agentProcessEnv) {
-      this.options = { ...options, agentProcessEnv: { ...options.agentProcessEnv } };
+    validateRuntimeTimeoutMs(options.timeoutMs);
+    if (
+      options.agentProcessEnv ||
+      options.agentProcessEnvAllow !== undefined ||
+      options.agentProcessEnvBlock !== undefined
+    ) {
+      this.options = {
+        ...options,
+        agentProcessEnv: options.agentProcessEnv ? { ...options.agentProcessEnv } : undefined,
+        agentProcessEnvAllow: snapshotEnvNames(
+          "agentProcessEnvAllow",
+          options.agentProcessEnvAllow,
+        ),
+        agentProcessEnvBlock: snapshotEnvNames(
+          "agentProcessEnvBlock",
+          options.agentProcessEnvBlock,
+        ),
+      };
     }
   }
 
@@ -299,6 +327,8 @@ export class AcpxRuntime implements AcpxRuntimeLike {
   }
 
   startTurn(input: AcpRuntimeTurnInput) {
+    const timeoutMs = input.timeoutMs;
+    validateRuntimeTimeoutMs(timeoutMs);
     const { handle, state } = this.resolveManagerHandle(input.handle);
     const managerPromise = this.getManager();
     const turnPromise = managerPromise.then((manager) =>
@@ -309,7 +339,7 @@ export class AcpxRuntime implements AcpxRuntimeLike {
         mode: input.mode,
         sessionMode: state.mode,
         requestId: input.requestId,
-        timeoutMs: input.timeoutMs,
+        timeoutMs,
         signal: input.signal,
         assertActive: input.assertActive,
         onElicitation: input.onElicitation,
@@ -342,6 +372,8 @@ export class AcpxRuntime implements AcpxRuntimeLike {
   }
 
   async *runTurn(input: AcpRuntimeTurnInput): AsyncIterable<AcpRuntimeEvent> {
+    const timeoutMs = input.timeoutMs;
+    validateRuntimeTimeoutMs(timeoutMs);
     const { handle, state } = this.resolveManagerHandle(input.handle);
     const manager = await this.getManager();
     yield* manager.runTurn({
@@ -351,7 +383,7 @@ export class AcpxRuntime implements AcpxRuntimeLike {
       mode: input.mode,
       sessionMode: state.mode,
       requestId: input.requestId,
-      timeoutMs: input.timeoutMs,
+      timeoutMs,
       signal: input.signal,
       assertActive: input.assertActive,
       onElicitation: input.onElicitation,

@@ -98,10 +98,20 @@ function localLaunch(id: string, options: DiscoveryOptions): string[] | undefine
   const argv = registry.resolve(id);
   if (!Array.isArray(argv)) return undefined;
   if (argv[0] === 'npx') {
+    // Adapter argv may carry the package spec in `--package=<spec>` with the
+    // bin selector as the first positional (runtime #922 shape), or keep the
+    // spec itself positional (legacy shape). Resolve the spec from either
+    // shape so local packages keep precedence over PATH shims and npx.
+    const packagedFlag = argv.find((arg, i) => i > 0 && arg.startsWith('--package='));
     const index = argv.findIndex((arg, i) => i > 0 && !arg.startsWith('-'));
-    if (index < 0) return undefined;
-    const extraArgs = argv.slice(index + 1);
-    const packaged = packageLaunch(argv[index], extraArgs, options);
+    const spec = packagedFlag
+      ? packagedFlag.slice('--package='.length)
+      : index >= 0
+        ? argv[index]
+        : undefined;
+    if (!spec) return undefined;
+    const extraArgs = index >= 0 ? argv.slice(index + 1) : [];
+    const packaged = packageLaunch(spec, extraArgs, options);
     if (packaged) return packaged;
     // Use the runtime's adapter entrypoint, rather than the display/native CLI.
     // Package lookup above honors the service's explicit search roots.

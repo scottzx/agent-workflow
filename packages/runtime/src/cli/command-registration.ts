@@ -73,9 +73,10 @@ class LocalAttributeOption extends Option {
 function addSessionsListOptions(command: Command): Command {
   return command
     .option("--local", "List local acpx session records instead of agent protocol sessions")
-    .option("--cursor <cursor>", "Opaque ACP session/list cursor", (value: string) =>
-      parseNonEmptyValue("Cursor", value),
-    )
+    .option("--cursor <cursor>", "Opaque ACP session/list cursor", (value: string) => {
+      parseNonEmptyValue("Cursor", value);
+      return value;
+    })
     .option("--filter-cwd <dir>", "Filter agent sessions by working directory", (value: string) =>
       parseNonEmptyValue("Filter cwd", value),
     );
@@ -328,7 +329,7 @@ export function registerFlowCommand(program: Command, config: ResolvedAcpxConfig
     .command("flow")
     .description("Run multi-step ACP workflows from flow files");
 
-  flowCommand
+  const runCommand = flowCommand
     .command("run")
     .description("Run a flow file")
     .argument("<file>", "Flow module path")
@@ -343,6 +344,7 @@ export function registerFlowCommand(program: Command, config: ResolvedAcpxConfig
       const { handleFlowRun } = await import("../flows/cli.js");
       await handleFlowRun(file, flags, this, config);
     });
+  addExecConfigOption(runCommand, "Default ACP session config option for flow nodes (repeatable)");
 }
 
 export function registerDefaultCommands(program: Command, config: ResolvedAcpxConfig): void {

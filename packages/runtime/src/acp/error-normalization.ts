@@ -25,7 +25,6 @@ import {
 } from "./error-shapes.js";
 
 const AUTH_REQUIRED_ACP_CODES = new Set([-32000]);
-const QUERY_CLOSED_BEFORE_RESPONSE_DETAIL = "query closed before response received";
 
 type ErrorMeta = {
   outputCode?: OutputErrorCode;
@@ -168,21 +167,6 @@ export function formatErrorMessage(error: unknown): string {
 }
 
 export { extractAcpError, isAcpResourceNotFoundError };
-
-export function isAcpQueryClosedBeforeResponseError(error: unknown): boolean {
-  const acp = extractAcpError(error);
-  if (!acp || acp.code !== -32603) {
-    return false;
-  }
-
-  const data = asRecord(acp.data);
-  const details = data?.details;
-  if (typeof details !== "string") {
-    return false;
-  }
-
-  return details.toLowerCase().includes(QUERY_CLOSED_BEFORE_RESPONSE_DETAIL);
-}
 
 function mapErrorCode(error: unknown): OutputErrorCode | undefined {
   if (error instanceof PermissionPromptUnavailableError) {
@@ -333,6 +317,7 @@ const LOCAL_OPERATIONAL_MESSAGES = {
     "Available device memory is below the ACP startup reserve; retry after memory is freed.",
   ACP_CAPACITY_STATE_UNAVAILABLE:
     "ACP capacity state is unavailable; check the local host capacity state before retrying.",
+  SESSION_RESUME_REQUIRED: "Persistent ACP session record could not be resumed.",
 } as const;
 
 const SAFE_CODES = new Set<string>([
@@ -527,6 +512,10 @@ function localOperationalMessage(error: unknown): string | undefined {
     const code = record.code;
     if (typeof code === "string" && Object.hasOwn(LOCAL_OPERATIONAL_MESSAGES, code)) {
       return LOCAL_OPERATIONAL_MESSAGES[code as keyof typeof LOCAL_OPERATIONAL_MESSAGES];
+    }
+    const detailCode = record.detailCode;
+    if (typeof detailCode === "string" && Object.hasOwn(LOCAL_OPERATIONAL_MESSAGES, detailCode)) {
+      return LOCAL_OPERATIONAL_MESSAGES[detailCode as keyof typeof LOCAL_OPERATIONAL_MESSAGES];
     }
     if (typeof record.message === "string" && known.has(record.message)) {
       return record.message;

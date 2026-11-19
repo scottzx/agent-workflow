@@ -89,33 +89,36 @@ The `@1agents/acp-service` host prefers adapter packages in its search roots, th
 
 Friendly agent names resolve to commands:
 
-- `pi` -> `npx pi-acp` (ACPX-owned package range; see `agents/Pi.md`)
+- `pi` -> `npx --package=pi-acp -- pi-acp` (ACPX-owned package range; see `agents/Pi.md`)
 - `openclaw` -> `openclaw acp` (see the [OpenClaw guide](https://github.com/openclaw/acpx/blob/main/agents/OpenClaw.md))
-- `codex` -> `npx -y @agentclientprotocol/codex-acp` (ACPX-owned package range)
-- `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range; see `agents/Claude.md`)
+- `codex` -> `npx -y --package=@agentclientprotocol/codex-acp -- codex-acp` (ACPX-owned package range)
+- `claude` -> `npx -y --package=@agentclientprotocol/claude-agent-acp -- claude-agent-acp` (ACPX-owned package range; see `agents/Claude.md`)
 - `gemini` -> `gemini --acp`
 - `cursor` -> `cursor-agent acp` (calls `authenticate` with `cursor_login` before creating a session; sign in with `agent login` first. See `agents/Cursor.md`)
 - `copilot` -> `copilot --acp --stdio`
+- `ante` -> `ante acp` (experimental). Requires Ante 0.2.1 or newer and a separately installed `ante-acp` on `PATH`. Prefer `exec` for fresh work; context is limited to the live ACP connection, with no reopening after disconnect. AskUser is excluded, and client-supplied MCP servers and extra directories are ignored. See [Ante](https://github.com/openclaw/acpx/blob/main/agents/Ante.md).
 - `antigravity` -> `agy_acp_server.par` (`--uid=` on Linux; `agy_acp_server.exe` on Windows). Install the official runtime/helper pair and configure its own sign-in first; see [Antigravity](https://github.com/openclaw/acpx/blob/main/agents/Antigravity.md). Fixed-choice interaction questions are cancelled, including with `--approve-all`, host permission callbacks, and existing custom launchers; acpx cannot supply user answers through permission approval.
 - `codebuddy` -> `codebuddy --acp` (install `@tencent-ai/codebuddy-code` and sign in with the CodeBuddy CLI first; acpx does not run its login. See `agents/CodeBuddy.md`)
+- `deepseek-harness` -> `dsh --profile acp` (DeepSeek Harness, separate from DeepSeek models; configure the provider in dsh first. Uses advertised `session/resume` without transcript replay, not `session/load`; see the [DeepSeek Harness guide](https://github.com/openclaw/acpx/blob/main/agents/DeepSeekHarness.md))
 - `devin` -> `devin acp`
 - `droid` -> `droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
-- `fast-agent` -> `uvx fast-agent-mcp acp`
+- `fast-agent` -> `uvx fast-agent-mcp acp` (operator-owned Python/tool environment; see [Fast Agent](https://github.com/openclaw/acpx/blob/main/agents/FastAgent.md) for patched-runtime selection and isolated recovery)
 - `fx` -> `fx acp` (install and authenticate a provider first; see the [fx guide](https://github.com/openclaw/acpx/blob/main/agents/Fx.md))
-- `grok-build` -> `grok agent stdio`
+- `grok-build` -> `grok agent stdio` (Grok Build CLI, distinct from Grok Bot cloud routines and their webhook triggers; see the [Grok Build guide](https://github.com/openclaw/acpx/blob/main/agents/GrokBuild.md)).
+- `goose` -> `goose acp` (install Goose and configure its provider first; see the [Goose guide](https://github.com/openclaw/acpx/blob/main/agents/Goose.md))
 - `iflow` -> `iflow --experimental-acp`
 - `junie` -> `junie --acp=true` (install and authenticate Junie first; see the [Junie guide](https://github.com/openclaw/acpx/blob/main/agents/Junie.md))
-- `kilocode` -> `npx -y @kilocode/cli acp`
+- `kilocode` -> `npx -y --package=@kilocode/cli -- kilo acp`
 - `kimi` -> `kimi acp`
 - `kiro` -> `kiro-cli-chat acp`
 - `mcode` -> `mcode acp` (install/authenticate MCode first; prefer `exec` for one-shot work, and require advertised ACP reload support for cross-invocation continuity)
-- `mux` -> `mux acp` via an ACPX-owned npm range
+- `mux` -> `npx -y --package=mux -- mux acp` via an ACPX-owned npm range
 - `octomind` -> `octomind acp developer:general` (install Octomind and sign in with `octomind login` or provider keys first; see the [Octomind guide](https://github.com/openclaw/acpx/blob/main/agents/Octomind.md))
-- `opencode` -> `npx -y opencode-ai acp`
+- `opencode` -> `npx -y --package=opencode-ai -- opencode acp`
 - `pool` -> `pool acp`
 - `qoder` -> `qodercli --acp`
-  Forwards Qoder-native `--allowed-tools` and `--max-turns` startup flags from `acpx` session options.
-- `qwen` -> `qwen --acp`
+  Forwards Qoder-native `--allowed-tools` and `--max-turns` startup flags from `acpx` session options. Custom `qoder --acp` launchers receive the same startup and shutdown handling.
+- `qwen` -> `qwen --acp` (Qwen Code, distinct from QwenWork; see the [Qwen Code guide](https://github.com/openclaw/acpx/blob/main/agents/Qwen.md) for text filesystem delegation and native file discovery)
 - `trae` -> `traecli acp serve`
 - `zeroclaw` -> `zeroclaw acp`
 
@@ -124,6 +127,7 @@ Rules:
 - Default agent is `codex` for top-level `prompt`, `exec`, and `sessions`.
 - Unknown positional agent tokens are treated as raw agent commands.
 - `--agent <command>` explicitly sets a raw ACP adapter command.
+- Claude package fallback uses the ACPX-owned adapter range. An adapter installed alongside ACPX takes precedence; update it and any explicitly selected native Claude executable separately. Existing custom launchers stay operator-controlled.
 - Do not combine a positional agent and `--agent` in the same command.
 - Gemini version checks, Copilot ACP support checks, and their startup diagnostics use the selected agent's working directory and child environment, including session environment and embedded runtime overrides.
 - Embedded host lifecycle admission also covers compatibility and diagnostic invocations. Correlate their events by `launchId`; one session can produce several adapter processes. Checks retire their owned processes and output pipes before settling.
@@ -408,7 +412,32 @@ Use `acpx config show` to inspect the resolved config and `acpx config init` to 
 For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 `ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
 Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
-child agents, but they do not trigger ACP auth-method selection on their own.
+child agents by default, but they do not trigger ACP auth-method selection on
+their own.
+
+## Embedded environment inheritance
+
+Embedding hosts can set `agentProcessEnvAllow` or `agentProcessEnvBlock` on
+`createAcpRuntime()` to keep parent variables, such as the host's own service
+credentials, out of agents, command probes, and ACP terminals. Both are off by
+default and the CLI does not set them, so without them children inherit the
+whole environment as before.
+
+- `agentProcessEnvAllow` keeps only process essentials (`PATH`, `HOME`, locale,
+  temp and similar names) plus the listed names. An empty list keeps only the
+  essentials and explicit grants.
+- `agentProcessEnvBlock` removes the listed names, applied after the allowlist.
+- Explicit grants still apply: `ACPX_AUTH_<METHOD_ID>` variables pass through
+  both lists, and `agentProcessEnv`, saved session `env`, and a terminal
+  request's own `env` are layered on top.
+
+A filtered provider key does not reach the agent. Agent-specific environment
+authentication that ACPX selects itself, such as Grok Build's `XAI_API_KEY` for
+`xai.api_key`, is skipped as well when the key is filtered. Keep such a key by
+listing it in the allowlist and leaving it off the blocklist, or pass it as an
+`ACPX_AUTH_*` grant (for Grok Build, `ACPX_AUTH_XAI_API_KEY`). See
+[`docs/runtime-environment.md`](https://github.com/openclaw/acpx/blob/main/docs/runtime-environment.md)
+and [`agents/GrokBuild.md`](https://github.com/openclaw/acpx/blob/main/agents/GrokBuild.md).
 
 ## Devin ACP compatibility
 
@@ -527,6 +556,8 @@ acpx flow run ./my-flow.flow.ts --default-agent claude
 Run artifacts persist under `~/.acpx/flows/runs/<runId>/`. Default per-step timeout is 15 minutes when `--timeout` is unset; flows that declare permission requirements fail fast before starting.
 
 Each attempt has one deadline across preparation, execution, and parsing. Callbacks receive `context.signal`; function actions also receive `context.runShell` to run commands whose processes and output streams the runner owns. A command's own timeout returns partial output with `timedOut: true`; enclosing node cancellation rejects after cleanup and prevents later managed commands. Admitted runtime writes finish before routing or final publication. Check the signal around custom asynchronous side effects: arbitrary JavaScript cannot be forcibly stopped, and completed effects are not rolled back. Persistent reconnects must load the same backend session or fail. See `docs/flows.md` for the command result and cancellation contracts.
+
+ACP nodes accept `modelId` and ordered `configOptions: [{ configId, value }]` before the first prompt. Global `--model` and repeatable `flow run --config-option key=value` provide defaults; node modelId wins and node config options execute last. Legacy node `model` metadata remains inert. Persistent handles pin their first settings, inherit omitted fields, and reject conflicting explicit settings. Use separate handles for different selections. Inspect bundle `requestedSettings` / `acceptedSettings` and adapter response receipts; `model.applied: false` means no model catalog was available. Option `reported: false` marks an acknowledged request whose accepted value was not supplied by the adapter catalog. Persistent creation controls are recorded in binding and step settings evidence, not in `events.ndjson`.
 
 ### Authoring a flow
 

@@ -135,7 +135,7 @@ is unchanged. Event-log files must be regular files, not symlink or hardlink ali
 
 The archive is plain JSON. Paths are stored relative to home, so an imported session lands at `~/<original-cwd-relative>` on the destination machine without embedding the source machine's absolute cwd. Override with `--cwd`.
 
-Imports keep the archive's provider session id, reopen the copied session as an idle local record, and clear source-machine process metadata. Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation. If the destination already has an active session for the same `(agent, cwd, name)` scope, import fails; pass `--name` or `--cwd` to choose a different scope. If a local record already uses the same provider session id, prune or remove that record before importing.
+Imports keep the archive's provider session id, reopen the copied session as an idle local record, and clear source-machine process metadata. The imported session launches with the destination's resolved agent command and arguments, not the launch arguments saved on the source machine. Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation. If the destination already has an active session for the same `(agent, cwd, name)` scope, import fails; pass `--name` or `--cwd` to choose a different scope. If a local record already uses the same provider session id, prune or remove that record before importing.
 
 An imported session becomes discoverable after its complete history has been written. If writing the history fails, the import leaves no local session that blocks retrying the archive.
 
@@ -168,6 +168,8 @@ Output:
 - `text` — summary plus the pruned ids and close/last-used time
 - `json` — `{ action, dryRun, count, bytesFreed, pruned }`
 - `quiet` — one pruned session id per line
+
+If a selected file cannot be deleted, pruning fails with the filesystem error instead of printing a success summary. Files already deleted are not restored.
 
 ## Queue ownership
 
@@ -224,7 +226,7 @@ acpx codex --no-wait 'after the current turn ends, write the release notes'
 
 ## Cancelling
 
-`Ctrl+C` during an active turn sends ACP `session/cancel` first, waits briefly for `stopReason=cancelled`, and only force-kills if cancellation does not finish in time.
+Foreground `Ctrl+C` cancels only that invocation's queued or active session prompt. It removes pending work or sends ACP `session/cancel` for its active turn, without force-killing the shared owner or cancelling another client's turn. See [Session control](session-control.md) for cancellation outcomes and detach-only observers.
 
 The `cancel` subcommand sends the same cooperative cancel without a terminal signal:
 
@@ -243,7 +245,7 @@ Saved sessions may include a cached adapter PID from the last connected helper p
 
 1. `acpx` respawns the agent.
 2. Attempts ACP `session/resume` with the saved provider session id when the agent advertises it, otherwise ACP `session/load`.
-3. Falls back to `session/new` if reconnecting fails, transparently updating the saved record.
+3. Starts a fresh session only when the reconnect policy permits it. Explicit resumes remain strict. Same-session recovery preserves the saved conversation. See [Reconnect and recovery](session-control.md) for the narrow empty-session recovery exception.
 
 This makes long-running scripted sessions resilient to crashes, OS restarts, and adapter upgrades. Metadata updates received while reconnecting, including available commands, remain available after saved settings are replayed.
 
@@ -283,13 +285,16 @@ Retained text and thought chunks keep their whitespace. `sessions history` joins
 and trims content for previews; the existing runtime retention limits still apply
 to saved content.
 
-`sessions show` and the JSON form of `sessions new`/`sessions ensure` and `status` include identity fields:
+`sessions show --format json` returns the stored record. Lifecycle summaries from `sessions new`, `sessions ensure`, and `status` use a different field name for the ACP session ID:
 
-| Field            | Meaning                                                           |
-| ---------------- | ----------------------------------------------------------------- |
-| `acpxRecordId`   | Local record id printed in `text` and `quiet` output              |
-| `acpxSessionId`  | acpx-side session id (always present)                             |
-| `agentSessionId` | Provider-native session id, **only when** the adapter exposes one |
+| Field            | Meaning                                                         |
+| ---------------- | --------------------------------------------------------------- |
+| `acpxRecordId`   | Local record ID printed in text and quiet output                |
+| `acpSessionId`   | ACP session ID in the stored record returned by `sessions show` |
+| `acpxSessionId`  | ACP session ID in lifecycle and status summaries                |
+| `agentSessionId` | Provider-native session ID, only when the adapter exposes one   |
+
+See [Output formats](output-formats.md) for the JSON shapes.
 
 Do not pass an `acpx` session id to a native provider CLI unless `agentSessionId` is also present.
 

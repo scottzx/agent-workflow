@@ -21,6 +21,8 @@ import type {
 import type { AcpRuntimeSessionModes } from "../../acp/mode-support.js";
 import type { SessionWatchEvent } from "../../session/journal.js";
 import type {
+  AcpJsonRpcMessage,
+  AcpMessageDirection,
   AcpElicitationHandler,
   AcpElicitationMode,
   AcpPermissionHandler,
@@ -37,6 +39,8 @@ import type { SessionAgentOptions } from "../engine/session-options.js";
 export type { SessionAgentOptions, SystemPromptOption } from "../engine/session-options.js";
 
 export type {
+  AcpJsonRpcMessage,
+  AcpMessageDirection,
   AcpElicitationHandler,
   AcpElicitationMode,
   AcpElicitationContext,
@@ -101,6 +105,14 @@ export type AcpRuntimeEnsureInput = {
   sessionKey: string;
   agent: string;
   mode: AcpRuntimeSessionMode;
+  /**
+   * Resume this exact ACP session. The in-process runtime keeps matching local
+   * history and saved configuration, and later prompt/control reconnects refuse
+   * replacement if this target cannot load. Same-record aliases cannot relax
+   * this constraint. Adding the constraint requires an idle arrangement;
+   * explicit lifecycle reset remains separate. Supply the
+   * target again when attaching through another runtime instance.
+   */
   resumeSessionId?: string;
   cwd?: string;
   /**
@@ -552,6 +564,18 @@ export type AcpRuntimeOptions = {
   cwd: string;
   /** Trusted child-only environment, snapshotted at construction and never persisted. */
   agentProcessEnv?: Record<string, string>;
+  /**
+   * Opt-in allowlist for agent children, command probes and ACP terminals: when set, they
+   * inherit only process essentials, these parent names and `ACPX_AUTH_*` grants.
+   * Snapshotted at construction. Explicit grants and overlays still apply.
+   */
+  agentProcessEnvAllow?: readonly string[];
+  /**
+   * Parent environment names withheld from agent children, command probes and ACP
+   * terminals, applied after `agentProcessEnvAllow` and snapshotted at construction.
+   * Explicit grants and overlays still apply.
+   */
+  agentProcessEnvBlock?: readonly string[];
   sessionStore: AcpSessionStore;
   agentRegistry: AcpAgentRegistry;
   /**
@@ -578,6 +602,13 @@ export type AcpRuntimeOptions = {
   verbose?: boolean;
   /** ACP elicitation modes the embedding host can render for prompt turns. */
   elicitationModes?: readonly AcpElicitationMode[];
+  /**
+   * Best-effort wire observation for owned session clients, including setup and
+   * reconnects. Elicitation payloads and suppressed replay updates are omitted.
+   * Outbound observations precede transport writes; they are not delivery receipts.
+   * Callback failures are ignored. Treat observed messages as read-only.
+   */
+  onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   /** Optional lifecycle observer for ACP agent processes owned by this runtime. */
   processLifecycle?: AcpProcessLifecycle;
   onPermissionRequest?: AcpPermissionHandler;

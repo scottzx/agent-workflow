@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AcpClientOptions } from "../types.js";
+import { inheritParentEnvironment, type InheritedEnvPolicy } from "./inherited-env.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
 // Third-party API gateways (ANTHROPIC_BASE_URL) need the model ids too: user
@@ -126,10 +127,6 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): Set<string> {
   return protectedKeys;
 }
 
-function baseAgentEnvironment(): NodeJS.ProcessEnv {
-  return { ...process.env };
-}
-
 function validateAgentProcessEnv(agentProcessEnv: Record<string, string> | undefined): void {
   for (const [key, value] of Object.entries(agentProcessEnv ?? {})) {
     if (
@@ -150,9 +147,11 @@ function buildAgentEnvironment(
   sessionEnv: Record<string, string> | undefined,
   agentProcessEnv: Record<string, string> | undefined,
   includeClaudeSettings = false,
+  inheritedEnv?: InheritedEnvPolicy,
 ): NodeJS.ProcessEnv {
   validateAgentProcessEnv(agentProcessEnv);
-  const env: NodeJS.ProcessEnv = baseAgentEnvironment();
+  // Allow and block shape inheritance only; explicit grants and overlays below still apply.
+  const env = inheritParentEnvironment(inheritedEnv);
   if (includeClaudeSettings) {
     applyClaudeSettingsEnvironment(env);
   }
@@ -270,7 +269,8 @@ export function buildAgentSpawnOptions(
   authCredentials: Record<string, string> | undefined,
   sessionEnv?: Record<string, string>,
   agentProcessEnvOrClaudeSettings?: Record<string, string> | boolean,
-  includeClaudeSettings = false,
+  includeClaudeSettingsOrInheritedEnv?: boolean | InheritedEnvPolicy,
+  inheritedEnv?: InheritedEnvPolicy,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -278,7 +278,8 @@ export function buildAgentSpawnOptions(
   windowsHide: true;
 } {
   let agentProcessEnv: Record<string, string> | undefined;
-  let claudeSettings = includeClaudeSettings;
+  let claudeSettings = false;
+  let inheritedEnvPolicy = inheritedEnv;
   if (typeof agentProcessEnvOrClaudeSettings === "boolean") {
     claudeSettings = agentProcessEnvOrClaudeSettings;
   } else if (
@@ -287,9 +288,20 @@ export function buildAgentSpawnOptions(
   ) {
     agentProcessEnv = agentProcessEnvOrClaudeSettings;
   }
+  if (typeof includeClaudeSettingsOrInheritedEnv === "boolean") {
+    claudeSettings = includeClaudeSettingsOrInheritedEnv;
+  } else if (includeClaudeSettingsOrInheritedEnv && inheritedEnv === undefined) {
+    inheritedEnvPolicy = includeClaudeSettingsOrInheritedEnv;
+  }
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv, claudeSettings),
+    env: buildAgentEnvironment(
+      authCredentials,
+      sessionEnv,
+      agentProcessEnv,
+      claudeSettings,
+      inheritedEnvPolicy,
+    ),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };

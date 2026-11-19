@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z, ZodError } from "zod";
+import { canonicalAgentCommand } from "../acp/builtin-command-migration.js";
 import { AcpxOperationalError } from "../errors.js";
 import { writePrivateFile } from "../state-files.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
@@ -49,6 +50,7 @@ export type ImportSessionOptions = {
   newCwd?: string;
   expectedAgentName?: string;
   expectedAgentCommand?: string;
+  expectedAgentArgv?: string[];
 };
 
 class SessionImportError extends AcpxOperationalError {
@@ -139,7 +141,10 @@ function resolveImportedName(parsed: ParsedExportedSession, requestedName: strin
 function assertExpectedAgentCommand(
   parsed: ParsedExportedSession,
   sourceRecord: SessionRecord,
-  options: Pick<ImportSessionOptions, "expectedAgentName" | "expectedAgentCommand">,
+  options: Pick<
+    ImportSessionOptions,
+    "expectedAgentName" | "expectedAgentCommand" | "expectedAgentArgv"
+  >,
 ): void {
   const expectedAgentCommand = options.expectedAgentCommand;
   if (!expectedAgentCommand) {
@@ -169,6 +174,12 @@ function assertExpectedAgentCommand(
       expectedAgentCommand,
     })
   ) {
+    if (options.expectedAgentArgv) {
+      sourceRecord.agentArgv = [...options.expectedAgentArgv];
+    } else if (sourceRecord.agentCommand !== expectedAgentCommand) {
+      // Let the destination command resolve its launch rather than retaining stale argv.
+      sourceRecord.agentArgv = undefined;
+    }
     sourceRecord.agentCommand = expectedAgentCommand;
     return;
   }
@@ -211,7 +222,10 @@ function agentCommandMatchesExpected(
   expectedAgentCommand: string,
   expectedAgentName: string | undefined,
 ): boolean {
-  if (archivedCommand === expectedAgentCommand) {
+  if (
+    archivedCommand === expectedAgentCommand ||
+    canonicalAgentCommand(archivedCommand) === expectedAgentCommand
+  ) {
     return true;
   }
   return expectedAgentName
@@ -223,11 +237,11 @@ function commandLooksLikeBuiltInAgent(command: string, agentName: string): boole
   const normalized = command.trim();
   switch (agentName) {
     case "pi":
-      return /(?:^|\s)pi-acp(?:@|\s|$)/.test(normalized);
+      return /(?:^|\s|=)pi-acp(?:@|\s|$)/.test(normalized);
     case "codex":
-      return /(?:^|\s)@agentclientprotocol\/codex-acp(?:@|\s|$)/.test(normalized);
+      return /(?:^|\s|=)@agentclientprotocol\/codex-acp(?:@|\s|$)/.test(normalized);
     case "claude":
-      return /(?:^|\s)@agentclientprotocol\/claude-agent-acp(?:@|\s|$)/.test(normalized);
+      return /(?:^|\s|=)@agentclientprotocol\/claude-agent-acp(?:@|\s|$)/.test(normalized);
     default:
       return false;
   }

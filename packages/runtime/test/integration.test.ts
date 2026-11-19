@@ -10,6 +10,8 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
+import { withTimeout } from "../src/async-control.js";
+import { observeProcessIncarnation, probeProcessIdentity } from "../src/process-identity.js";
 import type { PromptInput } from "../src/prompt-content.js";
 import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
 import {
@@ -31,6 +33,9 @@ const CLI_PATH = fileURLToPath(
   new URL(`../src/cli${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url),
 );
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+const QUEUE_CLEANUP_PATH = fileURLToPath(
+  new URL("./fixtures/retire-integration-queue-owners.js", import.meta.url),
+);
 const FLOW_FIXTURE_PATH = fileURLToPath(new URL("./fixtures/flow-branch.flow.js", import.meta.url));
 const FLOW_SHELL_FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/flow-shell.flow.js", import.meta.url),
@@ -103,6 +108,99 @@ function unwrapTestOutcomes<T>(body: TestOutcome<T>, cleanup: TestOutcome<void>)
     throw cleanup.error;
   }
   return body.value;
+}
+
+for (const stage of ["initialize", "session/new", "session/prompt"] as const) {
+  test(
+    "integration: interrupted exec exits 130 during " + stage,
+    { skip: process.platform === "win32", timeout: 20_000 },
+    async () => {
+      await withTempHome(async (homeDir) => {
+        const requestLog = path.join(homeDir, "requests.jsonl");
+        const setupOption =
+          stage === "initialize" ? " --initialize-action" : " --new-session-action";
+        const command =
+          stage === "session/prompt"
+            ? MOCK_AGENT_COMMAND
+            : MOCK_AGENT_COMMAND + setupOption + ' "sleep 60000"';
+        const child = spawn(
+          process.execPath,
+          [
+            CLI_PATH,
+            "--cwd",
+            homeDir,
+            "--agent",
+            command,
+            "--format",
+            "json",
+            "exec",
+            "stream-sleep 60000 interrupt-ready",
+          ],
+          {
+            env: { ...process.env, HOME: homeDir, ACPX_TEST_REQUEST_LOG: requestLog },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+          (resolve) => {
+            child.once("close", (code, signal) => resolve({ code, signal }));
+          },
+        );
+        const readRequests = async () =>
+          (await fs.readFile(requestLog, "utf8"))
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as { pid: number; method?: string });
+        let peerPid: number | undefined;
+        try {
+          peerPid = await waitFor(async () => {
+            if (child.exitCode !== null || child.signalCode !== null) {
+              throw new Error("exec exited before signal: " + stderr);
+            }
+            const request = (await readRequests()).find((entry) => entry.method === stage);
+            const ready = stage !== "session/prompt" || stdout.includes("interrupt-ready");
+            return request && ready ? request.pid : null;
+          }, 10_000);
+          assert.equal(child.kill("SIGINT"), true);
+          await waitFor(
+            async () => (child.exitCode !== null || child.signalCode !== null ? true : null),
+            5_000,
+          );
+          const result = await exited;
+          assert.equal(result.code, 130, stderr);
+          assert.equal(result.signal, null);
+          const requests = await readRequests();
+          assert.equal(
+            requests.filter((entry) => entry.method === "session/cancel").length,
+            stage === "session/prompt" ? 1 : 0,
+          );
+          if (stage !== "session/prompt") {
+            assert.equal(
+              requests.some((entry) => entry.method === "session/prompt"),
+              false,
+            );
+          }
+          assert.doesNotMatch(stdout, /stream-sleep done/);
+          assert.equal(await waitForPidExit(peerPid, 5_000), true, "owned peer must exit");
+        } finally {
+          await stopChildProcess(child, 5_000, "interrupted exec");
+          if (peerPid !== undefined && isPidAlive(peerPid)) {
+            process.kill(peerPid, "SIGKILL");
+            assert.equal(await waitForPidExit(peerPid, 5_000), true);
+          }
+        }
+      });
+    },
+  );
 }
 
 test("integration: exec echo baseline", async () => {
@@ -1126,6 +1224,53 @@ test("integration: flow run reports waiting checkpoints in json mode", async () 
   });
 });
 
+test("integration: built-in deepseek-harness resolves to dsh --profile acp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-dsh-"));
+
+    try {
+      await writeFakeHarnessAgent(fakeBinDir, "dsh");
+
+      const result = await runCli(
+        [
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "quiet",
+          "deepseek-harness",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+        { env: { PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}` } },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stdout.trim(), "hello");
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: built-in goose agent launches its native ACP server", async () => {
+  await withTempHome(async (homeDir) => {
+    const binDir = path.join(homeDir, "goose bin");
+    await fs.mkdir(binDir);
+    await writeFakeHarnessAgent(binDir, "goose");
+    const result = await runCli(
+      ["--approve-all", "--cwd", homeDir, "--format", "quiet", "goose", "exec", "echo hello"],
+      homeDir,
+      { env: { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` } },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "hello");
+  });
+});
+
 test("integration: built-in droid agent resolves to droid exec --output-format acp", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1263,6 +1408,34 @@ for (const [agent, acpArg] of [
   });
 }
 
+test("integration: built-in ante agent resolves to ante acp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-ante-"));
+    const argLogPath = path.join(homeDir, "ante-args.jsonl");
+
+    try {
+      await writeFakeHarnessAgent(fakeBinDir, "ante", argLogPath);
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "quiet", "ante", "exec", "echo hello"],
+        homeDir,
+        { env: { PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}` } },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /hello/);
+      const launches = (await fs.readFile(argLogPath, "utf8"))
+        .trimEnd()
+        .split(/\r?\n/u)
+        .map((line) => JSON.parse(line) as unknown);
+      assert.deepEqual(launches, [["acp"]]);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: built-in iflow agent resolves to iflow --experimental-acp", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1317,82 +1490,85 @@ test("integration: built-in qoder agent resolves to qodercli --acp", async () =>
   });
 });
 
-test("integration: qoder session reuse preserves persisted startup flags", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-qoder-"));
-    const argLogPath = path.join(fakeBinDir, "qoder-args.log");
-
-    try {
-      await writeFakeHarnessAgent(fakeBinDir, "qodercli", argLogPath);
-      const { createSession } = await import("../src/session/session.js");
-      const { runSessionSetModeDirect } = await import("../src/session/execution/prompt-runner.js");
-      const previousHome = process.env.HOME;
-      const previousUserProfile = process.env.USERPROFILE;
-      const previousPath = process.env.PATH;
-      process.env.HOME = homeDir;
-      if (process.platform === "win32") {
-        process.env.USERPROFILE = homeDir;
-      }
-      process.env.PATH = `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
+for (const command of ["qodercli", "qoder"] as const) {
+  test(`integration: ${command} session reuse preserves persisted startup flags`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+      const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-qoder-"));
+      const argLogPath = path.join(fakeBinDir, "qoder-args.log");
 
       try {
-        const record = await createSession({
-          agentCommand: "qodercli --acp",
-          agentArgv: ["qodercli", "--acp"],
-          cwd,
-          permissionMode: "approve-reads",
-          timeoutMs: 10_000,
-          sessionOptions: {
-            allowedTools: ["Read", "Grep"],
-            maxTurns: 4,
-          },
-        });
-
-        const result = await runSessionSetModeDirect({
-          sessionRecordId: record.acpxRecordId,
-          modeId: "plan",
-          timeoutMs: 10_000,
-        });
-        assert.equal(result.record.acpxRecordId, record.acpxRecordId);
-        await fs.access(
-          path.join(
-            homeDir,
-            ".acpx",
-            "sessions",
-            `${encodeURIComponent(record.acpxRecordId)}.json`,
-          ),
-        );
-      } finally {
-        if (previousHome === undefined) {
-          delete process.env.HOME;
-        } else {
-          process.env.HOME = previousHome;
-        }
+        await writeFakeHarnessAgent(fakeBinDir, command, argLogPath);
+        const { createSession } = await import("../src/session/session.js");
+        const { runSessionSetModeDirect } =
+          await import("../src/session/execution/prompt-runner.js");
+        const previousHome = process.env.HOME;
+        const previousUserProfile = process.env.USERPROFILE;
+        const previousPath = process.env.PATH;
+        process.env.HOME = homeDir;
         if (process.platform === "win32") {
-          if (previousUserProfile === undefined) {
-            delete process.env.USERPROFILE;
-          } else {
-            process.env.USERPROFILE = previousUserProfile;
-          }
+          process.env.USERPROFILE = homeDir;
         }
-        process.env.PATH = previousPath;
-      }
+        process.env.PATH = `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
 
-      const invocations: unknown[] = (await fs.readFile(argLogPath, "utf8"))
-        .trimEnd()
-        .split(/\r?\n/u)
-        .map((line) => JSON.parse(line) as unknown);
-      assert.ok(invocations.length >= 2, "expected initial and reused qoder invocations");
-      const expected = ["--acp", "--max-turns=4", "--allowed-tools=READ,GREP"];
-      assert.deepEqual(invocations[0], expected, "initial qoder startup flags");
-      assert.deepEqual(invocations.at(-1), expected, "reused qoder startup flags");
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+        try {
+          const record = await createSession({
+            agentCommand: `${command} --acp`,
+            agentArgv: [command, "--acp"],
+            cwd,
+            permissionMode: "approve-reads",
+            timeoutMs: 10_000,
+            sessionOptions: {
+              allowedTools: ["Read", "Grep"],
+              maxTurns: 4,
+            },
+          });
+
+          const result = await runSessionSetModeDirect({
+            sessionRecordId: record.acpxRecordId,
+            modeId: "plan",
+            timeoutMs: 10_000,
+          });
+          assert.equal(result.record.acpxRecordId, record.acpxRecordId);
+          await fs.access(
+            path.join(
+              homeDir,
+              ".acpx",
+              "sessions",
+              `${encodeURIComponent(record.acpxRecordId)}.json`,
+            ),
+          );
+        } finally {
+          if (previousHome === undefined) {
+            delete process.env.HOME;
+          } else {
+            process.env.HOME = previousHome;
+          }
+          if (process.platform === "win32") {
+            if (previousUserProfile === undefined) {
+              delete process.env.USERPROFILE;
+            } else {
+              process.env.USERPROFILE = previousUserProfile;
+            }
+          }
+          process.env.PATH = previousPath;
+        }
+
+        const invocations: unknown[] = (await fs.readFile(argLogPath, "utf8"))
+          .trimEnd()
+          .split(/\r?\n/u)
+          .map((line) => JSON.parse(line) as unknown);
+        assert.ok(invocations.length >= 2, "expected initial and reused qoder invocations");
+        const expected = ["--acp", "--max-turns=4", "--allowed-tools=READ,GREP"];
+        assert.deepEqual(invocations[0], expected, "initial qoder startup flags");
+        assert.deepEqual(invocations.at(-1), expected, "reused qoder startup flags");
+      } finally {
+        await fs.rm(fakeBinDir, { recursive: true, force: true });
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
   });
-});
+}
 
 test("integration: exec forwards model, allowed-tools, and max-turns in session/new _meta", async () => {
   await withTempHome(async (homeDir) => {
@@ -3629,6 +3805,38 @@ test("integration: json-strict exec success emits JSON-RPC lines only", async ()
   });
 });
 
+test("integration: non-JSON agent stdout is reported only outside json-strict and quiet", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      // Adapters such as opencode with notification plugins write terminal escapes to stdout.
+      const agentPath = path.join(cwd, "noisy-agent.mjs");
+      await fs.writeFile(
+        agentPath,
+        `process.stdout.write("noisy banner\\n");\nawait import(${JSON.stringify(pathToFileURL(MOCK_AGENT_PATH).href)});\n`,
+      );
+      const agentArgs = ["--agent", `node ${JSON.stringify(agentPath)}`, "--cwd", cwd];
+      for (const [format, reported] of [
+        [["--format", "json", "--json-strict"], false],
+        [["--format", "quiet"], false],
+        [["--format", "text"], true],
+      ] as const) {
+        const result = await runCli([...agentArgs, ...format, "exec", "echo noisy-ok"], homeDir);
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /noisy-ok/);
+        if (reported) {
+          assert.match(result.stderr, /Failed to parse JSON message: noisy banner/);
+        } else {
+          assert.equal(result.stderr, "");
+        }
+      }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: json-strict exec retries without emitting stderr notices", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -4124,6 +4332,119 @@ test("integration: prompt reuses warm queue owner and agent pid across turns", a
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
+});
+
+for (const fails of [false, true]) {
+  test(`integration helper native: HOME cleanup retires warm processes after ${fails ? "failure" : "success"}`, async (t) => {
+    await withTempHome(async (sentinelHome) => {
+      const sentinel = await startWarmFixtureSession(sentinelHome);
+      let fixtureHome: string | undefined;
+      let fixture: Awaited<ReturnType<typeof startWarmFixtureSession>> | undefined;
+      let checkedRemoval = false;
+      const bodyError = new Error("synthetic fixture body failure");
+      const originalRm = fs.rm;
+      const hook = t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+        if (args[0] === fixtureHome && fixture) {
+          // Check at the deletion boundary. On the unchanged fixture this throws
+          // before rm, preserving the exact lease for the proof's rescue cleanup.
+          for (const witness of [fixture.owner, fixture.agent]) {
+            assert.equal(await observeProcessIncarnation(witness.pid, witness.identity), "gone");
+          }
+          checkedRemoval = true;
+        }
+        await originalRm(...args);
+      });
+      const body = await observeTestOutcome(async () => {
+        const result = await observeTestOutcome(() =>
+          withTempHome(async (homeDir) => {
+            fixtureHome = homeDir;
+            fixture = await startWarmFixtureSession(homeDir);
+            const second = await runCli(
+              [...baseAgentArgs(homeDir), "prompt", "echo second"],
+              homeDir,
+            );
+            assert.equal(second.code, 0, second.stderr);
+            assert.equal(
+              (await readQueueOwnerLock(homeDir, fixture.sessionId)).pid,
+              fixture.owner.pid,
+            );
+            const record = JSON.parse(
+              await fs.readFile(
+                path.join(homeDir, ".acpx", "sessions", `${fixture.sessionId}.json`),
+                "utf8",
+              ),
+            ) as { pid: number };
+            assert.equal(record.pid, fixture.agent.pid, "the body must retain the warm agent");
+            if (fails) {
+              throw bodyError;
+            }
+          }),
+        );
+        if (fails) {
+          assert.equal(result.ok, false);
+          if (!result.ok) {
+            assert.equal(result.error, bodyError);
+          }
+        } else if (!result.ok) {
+          throw result.error;
+        }
+        assert.equal(checkedRemoval, true);
+        for (const witness of [sentinel.owner, sentinel.agent]) {
+          assert.equal(await observeProcessIncarnation(witness.pid, witness.identity), "matching");
+        }
+      });
+      hook.mock.restore();
+      const cleanup = await observeTestOutcome(async () => {
+        const fixtureCleanup = await observeTestOutcome(async () => {
+          if (fixtureHome && fsSync.existsSync(fixtureHome)) {
+            const result = await runCliWithEntry(QUEUE_CLEANUP_PATH, [], fixtureHome, {
+              timeoutMs: 30_000,
+            });
+            assert.equal(result.code, 0, result.stderr);
+            await fs.rm(fixtureHome, { recursive: true, force: true });
+          }
+        });
+        // Rescue both homes independently of the helper under test, including
+        // when the fixture rescue fails on the unchanged teardown.
+        const sentinelCleanup = await observeTestOutcome(async () => {
+          const result = await runCliWithEntry(QUEUE_CLEANUP_PATH, [], sentinelHome, {
+            timeoutMs: 30_000,
+          });
+          assert.equal(result.code, 0, result.stderr);
+        });
+        unwrapTestOutcomes(fixtureCleanup, sentinelCleanup);
+      });
+      unwrapTestOutcomes(body, cleanup);
+    });
+  });
+}
+
+test("integration helper native: failed queue retirement retains HOME and body failure", async () => {
+  let fixtureHome: string | undefined;
+  const bodyError = new Error("synthetic fixture body failure");
+  try {
+    await assert.rejects(
+      withTempHome(async (homeDir) => {
+        fixtureHome = homeDir;
+        const { lockPath } = queuePaths(homeDir, "invalid-fixture-owner");
+        await fs.mkdir(path.dirname(lockPath), { recursive: true });
+        await fs.writeFile(lockPath, JSON.stringify({ sessionId: "invalid-fixture-owner" }));
+        throw bodyError;
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.equal(error.errors[0], bodyError);
+        assert.match(String(error.errors[1]), /Queue cleanup failed; retained HOME/);
+        assert.ok(fixtureHome && fsSync.existsSync(fixtureHome));
+        return true;
+      },
+    );
+  } finally {
+    if (fixtureHome) {
+      // This fixture contains an invalid synthetic lease and never starts a process.
+      await fs.rm(fixtureHome, { recursive: true, force: true });
+    }
+  }
 });
 
 test("integration: warm queue owner does not retain per-request permission policy", async () => {
@@ -4699,6 +5020,122 @@ test("integration: cancel yields cancelled stopReason without queue error", asyn
   });
 });
 
+for (const mode of ["queued-pid", "active-group"] as const) {
+  test(
+    `integration: foreground SIGINT targets only its own request (${mode})`,
+    {
+      skip: process.platform === "win32" ? "POSIX signal delivery" : false,
+    },
+    async () => {
+      await withTempHome(async (homeDir) => {
+        const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-foreground-signal-"));
+        const requestLog = path.join(homeDir, "requests.jsonl");
+        const args = ["--agent", LOAD_CAPABLE_MOCK_AGENT_COMMAND, "--cwd", cwd, "--format", "json"];
+        const env = { ...process.env, HOME: homeDir, ACPX_TEST_REQUEST_LOG: requestLog };
+        const children: ReturnType<typeof spawn>[] = [];
+        let sessionId: string | undefined;
+        const requests = async () =>
+          (await fs.readFile(requestLog, "utf8"))
+            .trim()
+            .split("\n")
+            .map(
+              (line) =>
+                JSON.parse(line) as { method?: string; params?: { prompt?: { text?: string }[] } },
+            );
+        const start = (prompt: string) => {
+          const child = spawn(
+            process.execPath,
+            [CLI_PATH, ...args, "prompt", "-s", "signal", prompt],
+            {
+              env,
+              detached: true,
+              stdio: ["ignore", "pipe", "pipe"],
+            },
+          );
+          children.push(child);
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (data: Buffer) => {
+            stdout += data.toString();
+          });
+          child.stderr.on("data", (data: Buffer) => {
+            stderr += data.toString();
+          });
+          const done = new Promise<CliRunResult>((resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+          });
+          void done.catch(() => {});
+          return { child, done, stdout: () => stdout };
+        };
+        try {
+          const created = await runCli([...args, "sessions", "new", "--name", "signal"], homeDir, {
+            env,
+          });
+          assert.equal(created.code, 0, created.stderr);
+          sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
+          const primary = start("stream-sleep 60000 foreground-ready");
+          await waitFor(
+            async () => (primary.stdout().includes("foreground-ready") ? true : null),
+            15_000,
+          );
+          const target = mode === "queued-pid" ? start("echo should-not-run") : primary;
+          if (mode === "queued-pid") {
+            const lockPath = queueOwnerLockPath(homeDir, sessionId);
+            await waitFor(async () => {
+              const lease = JSON.parse(await fs.readFile(lockPath, "utf8")) as {
+                queueDepth: number;
+              };
+              return lease.queueDepth === 1 ? true : null;
+            }, 15_000);
+          }
+          assert.ok(target.child.pid);
+          process.kill(mode === "active-group" ? -target.child.pid : target.child.pid, "SIGINT");
+          const interrupted = await withTimeout(target.done, 10_000);
+          assert.equal(interrupted.code, 130, interrupted.stderr);
+          assert.equal(interrupted.signal, null);
+          const cancels = (await requests()).filter((r) => r.method === "session/cancel");
+          assert.equal(cancels.length, mode === "queued-pid" ? 0 : 1);
+          if (mode === "queued-pid") {
+            assert.equal(primary.child.exitCode, null, "other client's active turn must survive");
+            const cancelled = await runCli([...args, "cancel", "-s", "signal"], homeDir, { env });
+            assert.equal(cancelled.code, 0, cancelled.stderr);
+            assert.equal((await withTimeout(primary.done, 10_000)).code, 0);
+          }
+          const successor = await runCli(
+            [...args, "prompt", "-s", "signal", "echo successor"],
+            homeDir,
+            { env },
+          );
+          assert.equal(successor.code, 0, successor.stderr);
+          assert.match(successor.stdout, /successor/);
+          assert.equal(
+            (await requests()).some(
+              (r) =>
+                r.method === "session/prompt" &&
+                r.params?.prompt?.some((block) => block.text === "echo should-not-run"),
+            ),
+            false,
+          );
+        } finally {
+          for (const child of children) {
+            await stopChildProcess(child, 5_000, "foreground fixture");
+          }
+          if (sessionId) {
+            const lock = await readQueueOwnerLock(homeDir, sessionId).catch(() => undefined);
+            const closed = await runCli([...args, "sessions", "close", "signal"], homeDir, { env });
+            assert.equal(closed.code, 0, closed.stderr);
+            if (lock) {
+              assert.equal(await waitForPidExit(lock.pid, 5_000), true);
+            }
+          }
+          await fs.rm(cwd, { recursive: true, force: true });
+        }
+      });
+    },
+  );
+}
+
 test("integration: prompt exits after done while detached owner stays warm", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -4880,6 +5317,7 @@ test("integration: sessions history shows in-flight prompt after prompt starts",
 test("integration: sessions read shows assistant updates before the prompt finishes", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(homeDir, "cwd-"));
+    const releaseFile = path.join(homeDir, "release-prompt");
 
     const created = await runCli(
       [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
@@ -4895,7 +5333,7 @@ test("integration: sessions read shows assistant updates before the prompt finis
         "--format",
         "quiet",
         "prompt",
-        "stream-sleep 2500 foreground-live-update",
+        `stream-wait-file ${releaseFile}`,
       ],
       {
         env: {
@@ -4907,29 +5345,37 @@ test("integration: sessions read shows assistant updates before the prompt finis
     );
 
     await withObservedChild(promptChild, homeDir, async (waitForClose) => {
-      const history = await waitFor(async () => {
-        const result = await runCli(
-          [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
-          homeDir,
-        );
-        assert.equal(result.code, 0, result.stderr);
-        const payload = JSON.parse(result.stdout.trim()) as {
-          entries?: Array<{ role?: string; textPreview?: string }>;
-        };
-        const assistantEntry = payload.entries?.find(
-          (entry) =>
-            entry.role === "assistant" && entry.textPreview?.includes("foreground-live-update"),
-        );
-        return assistantEntry ? result.stdout : null;
-      }, 5_000);
+      const observation = await observeTestOutcome(async () => {
+        const history = await waitFor(async () => {
+          const result = await runCli(
+            [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
+            homeDir,
+          );
+          assert.equal(result.code, 0, result.stderr);
+          const payload = JSON.parse(result.stdout.trim()) as {
+            entries?: Array<{ role?: string; textPreview?: string }>;
+          };
+          const assistantEntry = payload.entries?.find(
+            (entry) => entry.role === "assistant" && entry.textPreview?.includes("flow-held"),
+          );
+          return assistantEntry ? result.stdout : null;
+        }, 5_000);
 
-      assert.equal(promptChild.exitCode, null, "prompt should still be running");
-      assert.match(history, /foreground-live-update/);
-      assert.doesNotMatch(history, /stream-sleep done/);
-
-      const promptResult = await waitForClose();
-      assert.equal(promptResult.code, 0, promptResult.stderr);
-      assert.match(promptResult.stdout, /stream-sleep done: foreground-live-update/);
+        assert.equal(promptChild.exitCode, null, "prompt should still be running");
+        assert.match(history, /flow-held/);
+        assert.doesNotMatch(history, /stream-wait-file done/);
+      });
+      const completion = await observeTestOutcome(async () => {
+        // Join after failed observation so the detached owner consumes release before HOME removal.
+        await fs.writeFile(releaseFile, "release");
+        const promptResult = await waitForClose();
+        assert.equal(promptResult.code, 0, promptResult.stderr);
+        assert.match(promptResult.stdout, /stream-wait-file done: flow-held/);
+      });
+      if (!completion.ok) {
+        retainedCliHomes.add(homeDir);
+      }
+      unwrapTestOutcomes(observation, completion);
     });
   });
 });
@@ -5185,6 +5631,23 @@ for (const format of ["text", "quiet", "json"]) {
     });
   });
 }
+
+test("integration: status reports a session whose agent crashed mid-turn as dead", async () => {
+  await withTempHome(async (homeDir) => {
+    const base = baseLoadCapableAgentArgs(homeDir);
+    assert.equal((await runCli([...base, "sessions", "new"], homeDir)).code, 0);
+    // The mock writes "partial " and exits 91, so its stdout closes before Node reports the exit.
+    const crashed = await runCli([...base, "--ttl", "1", "disconnect-after-output"], homeDir);
+    assert.equal(crashed.code, 1);
+
+    const status = await waitFor(async () => {
+      const result = await runCli([...base, "--format", "json", "status"], homeDir);
+      const parsed = JSON.parse(result.stdout) as { status?: string; exitCode?: number };
+      return parsed.status === "dead" ? parsed : null;
+    }, 15_000);
+    assert.equal(status.exitCode, 91);
+  });
+});
 
 for (const connection of ["load", "resume"]) {
   for (const scenario of [
@@ -5624,7 +6087,17 @@ async function configuredHarnessInvocation(
 
 async function writeFakeHarnessAgent(
   binDir: string,
-  name: "cursor-agent" | "droid" | "devin" | "uvx" | "iflow" | "qodercli",
+  name:
+    | "ante"
+    | "cursor-agent"
+    | "dsh"
+    | "droid"
+    | "devin"
+    | "uvx"
+    | "iflow"
+    | "qodercli"
+    | "goose"
+    | "qoder",
   argLogPath = "",
 ): Promise<void> {
   const launcher = fileURLToPath(new URL("./fixtures/harness-launcher.js", import.meta.url));
@@ -5752,9 +6225,52 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
         `Retained test HOME because owned CLI or fixture cleanup was not proved: ${tempHome}`,
       );
     }
+    const queueFiles = await fs
+      .readdir(path.join(tempHome, ".acpx", "queues"))
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      });
+    const owners = queueFiles.filter((file) => file.endsWith(".lock")).length;
+    if (owners > 0) {
+      // Foreground close leaves warm owners alive. Keep HOME until canonical
+      // retirement and passive owner/agent birth checks have both completed.
+      const retired = await runCliWithEntry(QUEUE_CLEANUP_PATH, [], tempHome, {
+        // Each owner has a 13.5s TERM/KILL budget plus bounded identity probes.
+        timeoutMs: 5_000 + owners * 25_000,
+      });
+      assert.equal(
+        retired.code,
+        0,
+        `Queue cleanup failed; retained HOME: ${tempHome}\n${retired.stderr}`,
+      );
+    }
     await fs.rm(tempHome, { recursive: true, force: true });
   });
   unwrapTestOutcomes(body, cleanup);
+}
+
+async function startWarmFixtureSession(homeDir: string) {
+  const created = await runCli(
+    [...baseAgentArgs(homeDir), "--format", "json", "sessions", "new"],
+    homeDir,
+  );
+  assert.equal(created.code, 0, created.stderr);
+  const { acpxRecordId: sessionId } = JSON.parse(created.stdout.trim()) as { acpxRecordId: string };
+  const prompt = await runCli([...baseAgentArgs(homeDir), "prompt", "echo first"], homeDir);
+  assert.equal(prompt.code, 0, prompt.stderr);
+  const owner = await readQueueOwnerLock(homeDir, sessionId);
+  const record = JSON.parse(
+    await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${sessionId}.json`), "utf8"),
+  ) as { pid: number };
+  const capture = async (pid: number) => {
+    const probe = await probeProcessIdentity(pid);
+    assert.ok(probe.state === "alive");
+    return { pid, identity: probe.identity };
+  };
+  return { sessionId, owner: await capture(owner.pid), agent: await capture(record.pid) };
 }
 
 // A timer is a failure boundary, never a substitute for joining close.
@@ -7149,5 +7665,186 @@ test("integration helper native: direct child preserves body and kill failures",
       );
     });
     unwrapTestOutcomes(body, cleanup);
+  });
+});
+
+test("integration: flow run applies repeatable run configuration defaults", async () => {
+  await withTempHome(async (homeDir) => {
+    const flowPath = path.join(homeDir, "config-defaults.flow.mjs");
+    await fs.writeFile(
+      flowPath,
+      `import { acp, defineFlow } from "acpx/flows";
+export default defineFlow({ name: "config-defaults", startAt: "ask", nodes: {
+  ask: acp({ session: { isolated: true }, prompt: () => "echo PONG" })
+}, edges: [] });`,
+    );
+    const result = await runCli(
+      [
+        "--agent",
+        `${MOCK_AGENT_COMMAND} --advertise-config-options`,
+        "--cwd",
+        homeDir,
+        "--format",
+        "json",
+        "--model",
+        "fast-model",
+        "flow",
+        "run",
+        flowPath,
+        "--config-option",
+        "reasoning_effort=high",
+        "--config-option",
+        "reasoning_effort=xhigh",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      runDir: string;
+      outputs: { ask: string };
+    };
+    assert.equal(payload.outputs.ask, "PONG");
+    const steps = JSON.parse(
+      await fs.readFile(path.join(payload.runDir, "projections", "steps.json"), "utf8"),
+    ) as {
+      session: {
+        requestedSettings: {
+          model: string;
+          configOptions: Array<{ configId: string; value: string }>;
+        };
+      };
+    }[];
+    assert.deepEqual(steps[0].session.requestedSettings, {
+      model: "fast-model",
+      configOptions: [
+        { configId: "reasoning_effort", value: "high" },
+        { configId: "reasoning_effort", value: "xhigh" },
+      ],
+    });
+  });
+});
+
+test("integration: flow run keeps global model evidence in the bundle for shared handles", async () => {
+  await withTempHome(async (homeDir) => {
+    const flowPath = path.join(homeDir, "global-model.flow.mjs");
+    await fs.writeFile(
+      flowPath,
+      `import { acp, defineFlow } from "acpx/flows";
+export default defineFlow({ name: "global-model", startAt: "first", nodes: {
+  first: acp({ prompt: () => "echo ONE" }),
+  second: acp({ prompt: () => "echo TWO" })
+}, edges: [{ from: "first", to: "second" }] });`,
+    );
+    const result = await runCli(
+      [
+        "--agent",
+        `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options`,
+        "--cwd",
+        homeDir,
+        "--format",
+        "json",
+        "--model",
+        "fast-model",
+        "flow",
+        "run",
+        flowPath,
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      runDir: string;
+      outputs: { first: string; second: string };
+      sessionBindings: Record<string, Record<string, unknown>>;
+    };
+    assert.deepEqual(payload.outputs, { first: "ONE", second: "TWO" });
+    const [stdoutBinding] = Object.values(payload.sessionBindings);
+    assert.equal(Object.keys(payload.sessionBindings).length, 1);
+    assert.equal("requestedSettings" in stdoutBinding, false);
+    assert.equal("acceptedSettings" in stdoutBinding, false);
+
+    const binding = JSON.parse(
+      await fs.readFile(
+        path.join(payload.runDir, "sessions", String(stdoutBinding.bundleId), "binding.json"),
+        "utf8",
+      ),
+    ) as {
+      acpSessionId: string;
+      requestedSettings: unknown;
+      acceptedSettings: { model: unknown };
+    };
+    assert.equal(binding.acpSessionId, stdoutBinding.acpSessionId);
+    assert.deepEqual(binding.requestedSettings, { model: "fast-model", configOptions: [] });
+    assert.deepEqual(binding.acceptedSettings.model, {
+      requested: "fast-model",
+      applied: true,
+      accepted: "fast-model",
+    });
+    const steps = JSON.parse(
+      await fs.readFile(path.join(payload.runDir, "projections", "steps.json"), "utf8"),
+    ) as { session: { acpSessionId: string; requestedSettings: unknown } }[];
+    assert.equal(steps.length, 2);
+    for (const step of steps) {
+      assert.equal(step.session.acpSessionId, binding.acpSessionId);
+      assert.deepEqual(step.session.requestedSettings, binding.requestedSettings);
+    }
+  });
+});
+
+test("integration: flow run json output omits configuration option values", async () => {
+  await withTempHome(async (homeDir) => {
+    const flowPath = path.join(homeDir, "option-output.flow.mjs");
+    await fs.writeFile(
+      flowPath,
+      `import { acp, defineFlow } from "acpx/flows";
+export default defineFlow({ name: "option-output", startAt: "ask", nodes: {
+  ask: acp({
+    configOptions: [{ configId: "reasoning_effort", value: "xhigh" }],
+    prompt: () => "echo PONG"
+  })
+}, edges: [] });`,
+    );
+    const result = await runCli(
+      [
+        "--agent",
+        `${MOCK_AGENT_COMMAND} --advertise-config-options`,
+        "--cwd",
+        homeDir,
+        "--format",
+        "json",
+        "flow",
+        "run",
+        flowPath,
+        "--config-option",
+        "reasoning_effort=high",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.includes("reasoning_effort"), false, result.stdout);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      runDir: string;
+      outputs: { ask: string };
+      sessionBindings: Record<string, { bundleId: string }>;
+    };
+    assert.equal(payload.outputs.ask, "PONG");
+    const [stdoutBinding] = Object.values(payload.sessionBindings);
+    const binding = JSON.parse(
+      await fs.readFile(
+        path.join(payload.runDir, "sessions", stdoutBinding.bundleId, "binding.json"),
+        "utf8",
+      ),
+    ) as {
+      requestedSettings: { configOptions: Array<{ configId: string; value: string }> };
+      acceptedSettings: { configOptions: Array<{ acceptedValue: string }> };
+    };
+    assert.deepEqual(binding.requestedSettings.configOptions, [
+      { configId: "reasoning_effort", value: "high" },
+      { configId: "reasoning_effort", value: "xhigh" },
+    ]);
+    assert.deepEqual(
+      binding.acceptedSettings.configOptions.map((option) => option.acceptedValue),
+      ["high", "xhigh"],
+    );
   });
 });

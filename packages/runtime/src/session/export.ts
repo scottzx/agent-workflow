@@ -1,13 +1,14 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { AcpxOperationalError } from "../errors.js";
 import { isProcessAlive } from "../process-liveness.js";
 import { writePrivateFile } from "../state-files.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { sessionEventLockPath } from "./event-log.js";
 import { listSessionEvents } from "./events.js";
-import { findSession, listSessions, normalizeName } from "./persistence.js";
+import { findSession, listSessions, normalizeName, readSessionRecord } from "./persistence.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 
 export type ExportedSession = {
@@ -30,7 +31,7 @@ export type ExportedSession = {
 
 export type SessionExportLookup = {
   agentName?: string;
-  agentCommand?: string;
+  agentCommand: string;
   cwd?: string;
   name?: string;
 };
@@ -59,29 +60,17 @@ async function loadSessionRecord(
   const cwd = path.resolve(sessionLookup.cwd ?? process.cwd());
   const name = normalizeName(sessionLookup.name);
 
-  if (sessionLookup.agentCommand) {
-    const active = await findSession({
-      agentCommand: sessionLookup.agentCommand,
-      cwd,
-      name,
-    });
-    if (active) {
-      return active;
-    }
-
-    return (await listSessions()).find((session) => {
-      if (session.agentCommand !== sessionLookup.agentCommand || session.cwd !== cwd) {
-        return false;
-      }
-      if (name == null) {
-        return session.name == null;
-      }
-      return session.name === name;
-    });
+  const active = await findSession({
+    agentCommand: sessionLookup.agentCommand,
+    cwd,
+    name,
+  });
+  if (active) {
+    return active;
   }
 
-  const matches = (await listSessions()).filter((session) => {
-    if (session.cwd !== cwd) {
+  return (await listSessions()).find((session) => {
+    if (session.agentCommand !== sessionLookup.agentCommand || session.cwd !== cwd) {
       return false;
     }
     if (name == null) {
@@ -89,12 +78,6 @@ async function loadSessionRecord(
     }
     return session.name === name;
   });
-
-  if (matches.length > 1) {
-    throw sessionLookupError("multiple sessions match export lookup", "ambiguous-session");
-  }
-
-  return matches[0];
 }
 
 type EventLockPayload = {
@@ -133,6 +116,19 @@ async function isSessionActive(record: SessionRecord): Promise<boolean> {
     return false;
   }
   return isProcessAlive(record.pid) || (await hasLiveEventLock(record.acpxRecordId));
+}
+
+async function assertExportCheckpointUnchanged(record: SessionRecord): Promise<void> {
+  // Check ownership before rereading the checkpoint: a turn can finish between
+  // these reads, but it must then leave its changed checkpoint visible.
+  const active = await isSessionActive(record);
+  const current = await readSessionRecord(record.acpxRecordId);
+  if (active || !isDeepStrictEqual(current, record)) {
+    throw sessionLookupError(
+      "session changed while exporting; close it first with `acpx sessions close` and retry",
+      "session-locked",
+    );
+  }
 }
 
 function cwdRelativeToHome(cwd: string, home: string): string {
@@ -198,6 +194,8 @@ export async function exportSession(
     },
     history: await listSessionEvents(record.acpxRecordId, record.eventLog.max_segments),
   };
+
+  await assertExportCheckpointUnchanged(record);
 
   const target = await resolveExportTarget(outputPath);
   await writePrivateFile(target, `${JSON.stringify(exported, null, 2)}\n`, {
