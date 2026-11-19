@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { DirectoryLease } from './a2a/lease.js';
 import { CapacityError, CapacityGovernor, resolveCapacityDirectory,
-  type CapacityLease, type CapacityOptions, type CapacityRequest, type ProcessLeaseOrigin } from './capacity.js';
+  type CapacityKind, type CapacityLease, type CapacityOptions, type CapacityRequest, type CapacitySnapshot,
+  type ProcessLeaseOrigin } from './capacity.js';
 
 export interface CapacityQueueWaitOptions {
   signal?: AbortSignal;
@@ -54,6 +55,11 @@ export class CapacityQueue {
     this.governor = new CapacityGovernor(options);
     this.pollIntervalMs = timing.pollIntervalMs ?? 750;
     if (!isPositiveInteger(this.pollIntervalMs)) throw new Error('ACP capacity queue poll interval must be a positive safe integer');
+  }
+
+  /** Read-only occupancy, so a caller can refuse an interactive open without queueing it. */
+  async snapshot(kind: CapacityKind): Promise<CapacitySnapshot> {
+    return this.governor.snapshot(kind);
   }
 
   async acquire(request: CapacityRequest, { signal, onPending }: CapacityQueueWaitOptions = {}): Promise<CapacityLease> {

@@ -25,6 +25,13 @@ function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): Re
     return { event: event.event ?? 'error', sessionId: event.sessionId, code: 'CAPACITY_PENDING',
       message: 'CAPACITY_PENDING', scope: 'control', terminal: false, data: { position: data.position, waitedMs: data.waitedMs } };
   }
+  // A capacity refusal is composed by this service from its own governor reading; it carries the
+  // occupancy a person needs and never provider text, so it keeps its message instead of a summary.
+  if (typeof event.code === 'string' && event.code.startsWith('ACP_CAPACITY_')) {
+    const data = event.data && typeof event.data === 'object' ? event.data as RecordValue : undefined;
+    return { event: 'error', sessionId: event.sessionId, code: event.code, message: String(event.message ?? ''),
+      scope: 'control', terminal: true, ...(data ? { data } : {}) };
+  }
   if (['tool_call', 'tool_call_update', 'tool_result'].includes(event.event)) {
     if (event.error === undefined && event.errorCode === undefined && event.errorText === undefined) return event;
     const error = toSafeError(event.error ?? (trustedRuntimeErrors ? { code: event.errorCode, message: event.errorText } : undefined), { origin: 'service' });
@@ -138,6 +145,10 @@ export class RuntimePeer {
     if (failureEvent) {
       if (failureEvent.code === 'CAPACITY_PENDING' || failureEvent.message === 'CAPACITY_PENDING') {
         throw new RequestError(-32010, 'CAPACITY_PENDING', failureEvent.data);
+      }
+      // Occupancy messages are built from numeric readings only, so the client keeps the reason.
+      if (typeof failureEvent.code === 'string' && failureEvent.code.startsWith('ACP_CAPACITY_')) {
+        throw new RequestError(-32011, failureEvent.message, failureEvent.data);
       }
       const safe: SafeError = toSafeError(failureEvent.error ?? failureEvent, { origin: 'service', operationId: payload.requestId });
       throw new RequestError(-32000, safe.message, safe);
@@ -543,11 +554,31 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       return {};
     });
   }
+  /**
+   * A dropped transport cannot own a live agent process forever. Sessions this connection
+   * attached are released after a grace window so a reconnecting client keeps its live
+   * session (session/load repoints it) while an abandoned one stops holding a capacity slot
+   * until the daemon restarts.
+   */
+  function releaseOrphanedSessions() {
+    const parsed = Number(process.env.ACP_DISCONNECT_GRACE_MS);
+    const grace = Number.isFinite(parsed) && parsed >= 0 ? parsed : 30_000;
+    for (const [sessionId, session] of [...backend.sessions]) {
+      if (session?.ws !== peer) continue;
+      const timer = setTimeout(() => {
+        // Reattachment repoints the session; another connection owns it now.
+        if (backend.sessions.get(sessionId)?.ws !== peer) return;
+        void peer.command(backend, { action: 'close_session', sessionId }).catch(() => undefined);
+      }, grace);
+      timer.unref?.();
+    }
+  }
   ws.once('close', () => {
     connected = false;
     for (const item of interactive.values()) item.abort.abort();
     for (const pending of prompts.values()) pending.reject(failure(undefined, { origin: 'transport', operationId: pending.requestId, outcomeUnknown: true }));
     prompts.clear();
+    releaseOrphanedSessions();
   });
   const connection = app.connect(webSocketStream(ws));
   client = connection.client;

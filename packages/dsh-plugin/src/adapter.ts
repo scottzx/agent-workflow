@@ -474,6 +474,21 @@ export class AcpAdapter implements LlmAdapter {
     return { processReleased, acp: true };
   }
   /**
+   * Reclaim the agent process of every Session the Host archived. Archiving stops the session's
+   * work in DSH, but the ACP process and its device capacity slot belong to the service daemon,
+   * so the archive has to close them explicitly instead of leaving them to time out.
+   */
+  async releaseArchivedSessions(archived: ReadonlySet<string>): Promise<void> {
+    for (const sessionId of archived) {
+      const pending = this.links.get(sessionId);
+      if (!pending) continue;
+      try { await this.releaseSession(sessionId); continue; }
+      catch { /* Not found (the agent was already gone) or the daemon is unreachable; retry locally. */ }
+      try { (await pending)?.close(); } catch { /* Connection setup already failed. */ }
+      if (this.links.get(sessionId) === pending) this.links.delete(sessionId);
+    }
+  }
+  /**
    * Controlled delete. ACP session/delete closes the process and marks the record deleted.
    * The DSH session and its history stay. A detached session gets a bare link, so no agent process starts.
    */

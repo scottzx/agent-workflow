@@ -49,6 +49,21 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   const processRequests = input.a2a?.workbench ? createWorkbenchProcessClient(input.a2a.workbench) : undefined;
   const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
+  // Archiving a Session in DSH stops its work but never reaches the service daemon, where the
+  // ACP process and its device capacity slot live. Sweep the Host's archive set so an archived
+  // session gives its slot back at once instead of holding it until the daemon restarts.
+  ctx.effect(() => {
+    const interval = Number(process.env.DSH_ACP_ARCHIVE_SWEEP_MS);
+    const every = Number.isFinite(interval) && interval >= 0 ? interval : 2000;
+    if (every === 0) return;
+    const timer = setInterval(() => {
+      const archived = ctx.workspaceRegistry.archivedSessionIds;
+      if (archived.length === 0) return;
+      void adapter.releaseArchivedSessions(new Set(archived.map(String)));
+    }, every);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  });
   // A Cordis listener is released with this plugin's fiber.
   if (processRequests) registerNativeApprovals(ctx, processRequests);
   const nativeSessions = new NativeSessions(ctx, adapter, config);

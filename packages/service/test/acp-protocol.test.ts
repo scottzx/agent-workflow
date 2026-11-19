@@ -478,3 +478,52 @@ test('native model config retains ACP select tags and grouped choices through lo
   const updated = await a.connection.agent.request('session/set_config_option', { sessionId: result.sessionId, configId: 'model', value: 'a' });
   assert.deepEqual(updated.configOptions, native);
 });
+
+test('a dropped transport releases its sessions after the disconnect grace window', async t => {
+  const f = await fixture(t);
+  const previous = process.env.ACP_DISCONNECT_GRACE_MS;
+  process.env.ACP_DISCONNECT_GRACE_MS = '25';
+  t.after(() => { if (previous === undefined) delete process.env.ACP_DISCONNECT_GRACE_MS; else process.env.ACP_DISCONNECT_GRACE_MS = previous; });
+  const a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  assert.equal(f.sessions.size, 1);
+  a.ws.close();
+  await a.connection.closed;
+  // An abandoned transport must not keep the agent process and its capacity slot alive.
+  await new Promise(resolve => setTimeout(resolve, 120));
+  assert.equal(f.sessions.has(sessionId), false);
+});
+
+test('a client that reattaches inside the grace window keeps its live session', async t => {
+  const f = await fixture(t);
+  const previous = process.env.ACP_DISCONNECT_GRACE_MS;
+  process.env.ACP_DISCONNECT_GRACE_MS = '120';
+  t.after(() => { if (previous === undefined) delete process.env.ACP_DISCONNECT_GRACE_MS; else process.env.ACP_DISCONNECT_GRACE_MS = previous; });
+  const a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  a.ws.close();
+  await a.connection.closed;
+  const b = await f.connect();
+  await b.connection.agent.request('session/load', { sessionId, cwd: '/tmp', mcpServers: [] });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  // Reattachment repoints the session, so the pending release must leave it alone.
+  assert.equal(f.sessions.has(sessionId), true);
+});
+
+test('a capacity refusal reaches the client with its reason and occupancy', async t => {
+  const f = await fixture(t);
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'ensure_session') return dispatch(peer, command);
+    peer.send(JSON.stringify({ event: 'error', sessionId: command.sessionId, code: 'ACP_CAPACITY_SOFT_LIMIT',
+      message: 'ACP capacity is full: 8 of 8 process slots are in use. Archive or close an ACP session, then retry.',
+      scope: 'control', terminal: true, data: { used: 8, limit: 8, hardLimit: 12, availableSlots: 0 } }));
+  };
+  const a = await f.connect(undefined, 'codex', async value => value);
+  const error = await a.connection.agent.request('session/new', {
+    cwd: '/tmp', mcpServers: [], _meta: { '1agents': { version: 1, capacityId: 'interactive-refused' } },
+  }).then(() => undefined, (failure: any) => failure);
+  assert.equal(error?.code, -32011);
+  assert.equal(error?.message, 'ACP capacity is full: 8 of 8 process slots are in use. Archive or close an ACP session, then retry.');
+  assert.deepEqual(error?.data, { used: 8, limit: 8, hardLimit: 12, availableSlots: 0 });
+});
