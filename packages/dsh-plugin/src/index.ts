@@ -55,9 +55,11 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   ctx.effect(() => {
     const interval = Number(process.env.DSH_ACP_ARCHIVE_SWEEP_MS);
     const every = Number.isFinite(interval) && interval >= 0 ? interval : 2000;
-    if (every === 0) return;
+    if (every === 0) return () => undefined;
     const timer = setInterval(() => {
-      const archived = ctx.workspaceRegistry.archivedSessionIds;
+      // Read the live archive set rather than a captured copy; the registry mutates it in place.
+      const registry = ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly unknown[] } | undefined;
+      const archived = registry?.archivedSessionIds ?? [];
       if (archived.length === 0) return;
       void adapter.releaseArchivedSessions(new Set(archived.map(String)));
     }, every);
