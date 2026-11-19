@@ -77,6 +77,24 @@ test('bridge cancels pending session launches, including profile keys and late s
     });
   }
 
+  await t.test('an interactive open refuses at once with its reason instead of joining the FIFO', async () => {
+    const occupied = await governor.acquire({ kind: 'process', source: 'automatic', id: 'occupied-interactive' });
+    const ws = peer();
+    try {
+      await deadline(bridge.dispatchCommand(ws, { action: 'ensure_session', sessionId: 'interactive-refused',
+        workspacePath: directory, agentType: 'codex', responsePolicy: 'summary', capacityId: 'interactive-refused' }));
+      const refusal = ws.events.find(event => typeof event.code === 'string' && event.code.startsWith('ACP_CAPACITY_'));
+      assert.ok(refusal, 'a person opening a session must get an explicit capacity reason');
+      assert.equal(refusal.terminal, true);
+      assert.match(String(refusal.message), /ACP capacity is full: 1 of 1 process slots are in use\./);
+      assert.match(String(refusal.message), /Archive or close an ACP session, then retry\./);
+      assert.equal((refusal.data as { used?: number }).used, 1);
+      assert.equal(queueEntries().length, 0, 'an interactive open must not create a queue entry');
+      assert.equal(ws.events.some(event => event.event === 'session_ready'), false);
+      assert.equal(bridge.activeSessions.has('interactive-refused'), false);
+    } finally { await occupied.release(); }
+  });
+
   await t.test('a late ensure result is closed before cancellation returns', async () => {
     const originalEnsure = bridge.runtime.ensureSession;
     const originalClose = bridge.runtime.close;

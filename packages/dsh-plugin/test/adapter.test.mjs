@@ -1094,3 +1094,15 @@ test('release reports the process released only when the service confirms it', {
   assert.deepEqual(await f.adapter.releaseSession('dsh-session'), { processReleased: true, acp: true });
   assert.deepEqual(f.closedSessions, ['remote-1']);
 });
+
+test('an archived session gives its process back without touching unarchived sessions', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await collect(f.adapter, f.options('message-1'));
+  // Nothing archived for this session: the sweep must not close a live one.
+  await f.adapter.releaseArchivedSessions(new Set(['another-session']));
+  assert.deepEqual(f.closedSessions, []);
+  // Archiving the session reclaims its agent process immediately.
+  await f.adapter.releaseArchivedSessions(new Set(['dsh-session']));
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+  assert.deepEqual(await f.adapter.sessionStatus('dsh-session'), { attached: false, activeTurn: false });
+});

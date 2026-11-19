@@ -1715,8 +1715,20 @@ export async function dispatchCommand(ws, payload) {
               console.timeEnd(`ensure_session_${sessionId}`);
               break;
             }
+            const origin = capacityId.startsWith("a2a-") ? "job" : "user-opened";
+            // A person opening a session must be told why it cannot start instead of joining an
+            // unbounded queue behind other work and failing much later with a transport error.
+            // Background jobs (origin "job") keep waiting in FIFO order.
+            if (origin === "user-opened") {
+              const capacity = await processCapacity.snapshot("process");
+              if (capacity.availableAutomatic < 1) {
+                sendCapacityExhausted(ws, sessionId, capacity);
+                console.timeEnd(`ensure_session_${sessionId}`);
+                break;
+              }
+            }
             const admission = await processCapacity.tryAdmit(
-              { kind: "process", source: "automatic", id: capacityId, origin: capacityId.startsWith("a2a-") ? "job" : "user-opened" },
+              { kind: "process", source: "automatic", id: capacityId, origin },
               { signal: initializationSignal },
             );
             if (admission?.pending === true) {
@@ -2900,6 +2912,38 @@ function notifySessionTakenOver(previousWs, nextWs, sessionId) {
   } catch (err) {
     console.warn(`[acpx-server] Failed to notify taken-over ws for ${sessionId}:`, err.message);
   }
+}
+
+/**
+ * A capacity refusal is a control-plane answer, not a turn failure: it is composed here
+ * from the live governor reading so the person sees the reason and the way out immediately.
+ */
+function sendCapacityExhausted(ws, sessionId, snapshot) {
+  const gib = value => `${(value / (1024 ** 3)).toFixed(1)} GB`;
+  const memoryBound = snapshot.memory.availableSlots < 1;
+  const code = memoryBound
+    ? "ACP_CAPACITY_MEMORY_LIMIT"
+    : snapshot.used >= snapshot.limits.hard
+      ? "ACP_CAPACITY_HARD_LIMIT"
+      : "ACP_CAPACITY_SOFT_LIMIT";
+  const message = memoryBound
+    ? `ACP capacity is unavailable: ${gib(snapshot.memory.availableBytes)} of reclaimable memory is below the ${gib(snapshot.memory.reserveBytes)} startup reserve. Close an idle ACP session or free memory, then retry.`
+    : `ACP capacity is full: ${snapshot.used} of ${snapshot.used >= snapshot.limits.hard ? snapshot.limits.hard : snapshot.limits.soft} process slots are in use. Archive or close an ACP session, then retry.`;
+  ws.send(JSON.stringify({
+    event: "error",
+    sessionId,
+    code,
+    message,
+    scope: "control",
+    terminal: true,
+    data: {
+      used: snapshot.used,
+      limit: snapshot.limits.soft,
+      hardLimit: snapshot.limits.hard,
+      availableSlots: snapshot.memory.availableSlots,
+      availableBytes: snapshot.memory.availableBytes,
+    },
+  }));
 }
 
 function sendCapacityPending(ws, sessionId, pending) {
