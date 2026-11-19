@@ -21,15 +21,16 @@ const siteBase = cname ? `https://${cname}` : "";
 const productName = "acpx";
 const productTagline = "Talk to agents from the command line";
 const productDescription =
-  "Headless CLI client for the Agent Client Protocol — persistent multi-turn sessions, queue-aware prompts, structured output, and multi-step flows for Codex, Claude, Pi, OpenClaw, and any ACP-capable agent.";
+  "Headless CLI client for the Agent Client Protocol — persistent multi-turn sessions, queue-aware prompts, structured output, and multi-step flows for Pi, OpenClaw, Codex, Claude, and any ACP-capable agent.";
 const installCommand = "npm install -g acpx";
 
 const sections = [
   ["Start", ["index.md", "install.md", "quickstart.md"]],
-  ["Agents", ["agents.md", "custom-agents.md"]],
-  ["Sessions", ["sessions.md", "prompting.md", "session-control.md"]],
+  ["Agents", ["agents.md", "custom-agents.md", "compare.md"]],
+  ["Sessions", ["sessions.md", "prompting.md", "session-control.md", "session-watch.md"]],
   ["Output & Policy", ["output-formats.md", "permissions.md", "config.md"]],
   ["Flows", ["flows.md"]],
+  ["Embedding", ["shared-sessions.md", "runtime-environment.md", "runtime-process-lifecycle.md"]],
   ["Reference", ["CLI.md", "exit-codes.md", "VISION.md"]],
 ];
 
@@ -81,6 +82,7 @@ const HIGHLIGHT_RULES = {
 // Internal architecture notes and stray dev docs are not part of the user-facing site.
 // They remain in the repo and are reachable from GitHub.
 const buildExcludes = [
+  /^assets\//,
   /^\d{4}-\d{2}-\d{2}-/, // dated architecture notes
   /^proof-/, // internal live verification records and transcripts
   /^ACPX_ERROR_STRATEGY\.md$/,
@@ -135,6 +137,10 @@ for (const page of pages) {
   fs.writeFileSync(pageOut, layout({ page, html, toc, prev, next, sectionName }), "utf8");
 }
 
+const assetsDir = path.join(docsDir, "assets");
+if (fs.existsSync(assetsDir)) {
+  fs.cpSync(assetsDir, path.join(outDir, "assets"), { recursive: true });
+}
 fs.writeFileSync(path.join(outDir, "favicon.svg"), faviconSvg(), "utf8");
 fs.writeFileSync(path.join(outDir, ".nojekyll"), "", "utf8");
 if (cname) {
@@ -441,7 +447,9 @@ function markdownToHtml(markdown, currentRel) {
             `<tr>${r.map((c, idx) => `<td${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ""}>${inline(c, currentRel)}</td>`).join("")}</tr>`,
         )
         .join("");
-      html.push(`<table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);
+      html.push(
+        `<div class="table-scroll" role="region" aria-label="Scrollable table" tabindex="0"><table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`,
+      );
       continue;
     }
     const bullet = line.match(/^\s*-\s+(.+)$/);
@@ -472,7 +480,15 @@ function inline(text, currentRel) {
   const hrefs = [];
   let out = text.replace(/`([^`]+)`/g, (_, code) => {
     stash.push(`<code>${escapeHtml(code)}</code>`);
-    return `@@ACPXCODE${stash.length - 1}@@`;
+    return `@@ACPXHTML${stash.length - 1}@@`;
+  });
+  out = out.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, src) => {
+    const currentOut = pageMap.get(currentRel)?.outRel || outPath(currentRel);
+    const href = /^(https?:|\/)/.test(src)
+      ? src
+      : hrefToOutRel(path.posix.join(path.posix.dirname(currentRel), src), currentOut);
+    stash.push(`<img src="${escapeAttr(href)}" alt="${escapeAttr(alt)}" loading="lazy">`);
+    return `@@ACPXHTML${stash.length - 1}@@`;
   });
   out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
     hrefs.push(href);
@@ -486,12 +502,12 @@ function inline(text, currentRel) {
   out = out.replace(/\\\|/g, "|");
   out = out.replace(/&lt;br&gt;/g, "<br>");
   return out.replace(
-    /\[([^\]]+)\]\(@@ACPXLINK(\d+)@@\)|@@ACPXCODE(\d+)@@/g,
+    /\[([^\]]+)\]\(@@ACPXLINK(\d+)@@\)|@@ACPXHTML(\d+)@@/g,
     (_, label, linkIndex, codeIndex) => {
       if (codeIndex !== undefined) {
         return stash[Number(codeIndex)];
       }
-      const labelHtml = label.replace(/@@ACPXCODE(\d+)@@/g, (_, i) => stash[Number(i)]);
+      const labelHtml = label.replace(/@@ACPXHTML(\d+)@@/g, (_, i) => stash[Number(i)]);
       const href = rewriteHref(hrefs[Number(linkIndex)], currentRel);
       return `<a href="${escapeAttr(href)}">${labelHtml}</a>`;
     },
@@ -576,20 +592,7 @@ function homeHero(page) {
   const quickstartRel = pageMap.get("quickstart.md")?.outRel
     ? hrefToOutRel(pageMap.get("quickstart.md").outRel, page.outRel)
     : "quickstart.html";
-  const agents = [
-    "codex",
-    "claude",
-    "pi",
-    "openclaw",
-    "gemini",
-    "cursor",
-    "copilot",
-    "droid",
-    "qwen",
-    "qoder",
-    "opencode",
-    "kimi",
-  ];
+  const agentExamples = ["pi", "openclaw", "codex", "claude"];
   return `<header class="home-hero">
         <p class="eyebrow"><span class="dot" aria-hidden="true"></span> Agent Client Protocol · Headless CLI</p>
         <h1>Talk to agents <span class="accent">from the command line</span></h1>
@@ -602,8 +605,8 @@ function homeHero(page) {
             <code>${escapeHtml(installCommand)}</code>
           </div>
         </div>
-        <div class="home-services" aria-label="Built-in agents">
-          ${agents.map((s) => `<span>${escapeHtml(s)}</span>`).join("")}
+        <div class="home-services" aria-label="Built-in agent examples">
+          ${agentExamples.map((s) => `<span>${escapeHtml(s)}</span>`).join("")}
         </div>
         <p class="muted"><a href="${installRel}">Install options →</a></p>
       </header>`;
@@ -821,7 +824,7 @@ function validateLinks(outputDir) {
   const placeholderHrefs = /^(url|path|file|dir|name)$/i;
   for (const file of allHtml(outputDir)) {
     const html = fs.readFileSync(file, "utf8");
-    for (const match of html.matchAll(/href="([^"]+)"/g)) {
+    for (const match of html.matchAll(/(?:href|src)="([^"]+)"/g)) {
       const href = match[1];
       if (/^(#|https?:|mailto:|tel:|javascript:)/.test(href)) {
         continue;

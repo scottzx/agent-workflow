@@ -11,7 +11,9 @@ import {
   resolveOutputPolicy,
   resolvePermissionMode,
   type GlobalFlags,
+  type SessionConfigOptionAssignment,
 } from "../cli/flags.js";
+import { readCliInputFile } from "../cli/input-file.js";
 import {
   resolvePermissionPolicyFromFlags,
   sessionOptionsFromGlobalFlags,
@@ -22,11 +24,13 @@ import type { PermissionMode } from "../types.js";
 import { isDefinedFlow } from "./authoring.js";
 import { validateFlowDefinition } from "./graph.js";
 import { installFlowRuntimeResolution } from "./module-resolution.js";
+import type { FlowSessionBinding } from "./types.js";
 
 type FlowRunFlags = {
   inputJson?: string;
   inputFile?: string;
   defaultAgent?: string;
+  configOption?: SessionConfigOptionAssignment[];
 };
 
 export async function handleFlowRun(
@@ -60,6 +64,7 @@ export async function handleFlowRun(
     verbose: globalFlags.verbose,
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
     sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
+    configOptions: flags.configOption,
   });
 
   const result = await runner.run(flow, input, {
@@ -108,24 +113,42 @@ function buildFlowPermissionFailureMessage(
 }
 
 async function readFlowInput(flags: FlowRunFlags): Promise<unknown> {
-  if (flags.inputJson && flags.inputFile) {
+  if (flags.inputJson !== undefined && flags.inputFile !== undefined) {
     throw new InvalidArgumentError("Use only one of --input-json or --input-file");
   }
 
-  if (flags.inputJson) {
+  if (flags.inputJson !== undefined) {
     return parseJsonInput(flags.inputJson, "--input-json");
   }
 
-  if (flags.inputFile) {
+  if (flags.inputFile !== undefined) {
     const inputPath = path.resolve(flags.inputFile);
-    const payload = await fs.readFile(inputPath, "utf8");
+    const payload = await readCliInputFile(inputPath, "Flow input file");
     return parseJsonInput(payload, "--input-file");
   }
 
   return {};
 }
 
+async function assertFlowFile(flowPath: string): Promise<void> {
+  let stats: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    stats = await fs.stat(flowPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new Error(`Flow file not found: ${flowPath}`, { cause: error });
+    }
+    throw error;
+  }
+  if (!stats.isFile()) {
+    throw new Error(`Flow file is not a file: ${flowPath}`);
+  }
+}
+
 async function loadFlowModule(flowPath: string): Promise<FlowDefinition> {
+  // The module loaders report a missing path as an unresolved import with their own require stack.
+  await assertFlowFile(flowPath);
   const extension = path.extname(flowPath).toLowerCase();
   installFlowRuntimeResolution(pathToFileURL(resolveFlowRuntimeImportSpecifier()).href);
   const module = await loadFlowRuntimeModule(pathToFileURL(flowPath).href, extension);
@@ -217,6 +240,21 @@ function parseJsonInput(raw: string, label: string): unknown {
   }
 }
 
+// Settings evidence carries option values; it stays in the run bundle, not stdout.
+function omitSessionSettings(
+  bindings: Record<string, FlowSessionBinding>,
+): Record<string, Omit<FlowSessionBinding, "requestedSettings" | "acceptedSettings">> {
+  const output: Record<
+    string,
+    Omit<FlowSessionBinding, "requestedSettings" | "acceptedSettings">
+  > = {};
+  for (const [key, binding] of Object.entries(bindings)) {
+    const { requestedSettings: _requested, acceptedSettings: _accepted, ...rest } = binding;
+    output[key] = rest;
+  }
+  return output;
+}
+
 function printFlowRunResult(
   result: Awaited<ReturnType<FlowRunner["run"]>>,
   globalFlags: GlobalFlags,
@@ -236,7 +274,7 @@ function printFlowRunResult(
     waitingOn: result.state.waitingOn,
     runDir: result.runDir,
     outputs: result.state.outputs,
-    sessionBindings: result.state.sessionBindings,
+    sessionBindings: omitSessionSettings(result.state.sessionBindings),
   };
 
   if (globalFlags.format === "json") {

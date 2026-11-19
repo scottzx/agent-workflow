@@ -43,7 +43,7 @@ import type {
   AcpRuntimeTurnResult,
 } from "./public/contract.js";
 import { AcpRuntimeError } from "./public/errors.js";
-import { parsePromptEventLine } from "./public/events.js";
+import { runtimeEventFromMessage } from "./public/events.js";
 
 export type SharedAcpRuntimeOptions = {
   cwd: string;
@@ -123,13 +123,23 @@ export class SharedAcpRuntime {
   private readonly controlChains = new Map<string, Promise<void>>();
 
   constructor(options: SharedAcpRuntimeOptions) {
+    if (
+      options.ttlMs !== undefined &&
+      Number.isFinite(options.ttlMs) &&
+      Math.round(options.ttlMs) > 2_147_483_647
+    ) {
+      invalidOption("ttlMs exceeds the maximum supported timer delay");
+    }
     for (const name of [
       "sessionStore",
       "agentProcessEnv",
+      "agentProcessEnvAllow",
+      "agentProcessEnvBlock",
       "mcpServers",
       "sessionPermissions",
       "processLifecycle",
       "onPermissionRequest",
+      "onAcpMessage",
       "elicitationModes",
       "fs",
       "terminal",
@@ -198,6 +208,7 @@ export class SharedAcpRuntime {
         ...session,
         walkBoundary: session.cwd,
         sessionOptions: input.sessionOptions,
+        applyModelOnReuse: false,
         resumeSessionId: input.resumeSessionId,
         handleProcessInterrupts: false,
         signal: this.disconnect.signal,
@@ -220,7 +231,8 @@ export class SharedAcpRuntime {
         "Shared turns support prompt mode and the client's static permission policy; in-process callbacks and steering are unsupported.",
       );
     }
-    if (!input.requestId.trim()) {
+    const requestId = input.requestId;
+    if (!requestId.trim()) {
       invalidOption("A shared turn requires a requestId.");
     }
     const sessionId = sharedRecordId(input.handle);
@@ -239,7 +251,7 @@ export class SharedAcpRuntime {
       }
       cancellation ??= tryCancelOnRunningOwner({
         sessionId,
-        targetRequestId: input.requestId,
+        targetRequestId: requestId,
       }).then(() => {});
       await cancellation;
     };
@@ -265,7 +277,7 @@ export class SharedAcpRuntime {
       const result = await sendSession({
         ...this.options,
         sessionId,
-        requestId: input.requestId,
+        requestId,
         prompt: typeof prompt === "string" ? textPrompt(prompt) : prompt,
         resumePolicy: "same-session-only",
         requireSharedRuntime: true,
@@ -282,7 +294,7 @@ export class SharedAcpRuntime {
         outputFormatter: {
           ...DISCARD_OUTPUT_FORMATTER,
           onAcpMessage: (message) => {
-            const event = parsePromptEventLine(JSON.stringify(message));
+            const event = runtimeEventFromMessage(message);
             if (event) {
               events.push(event);
             }
@@ -316,7 +328,7 @@ export class SharedAcpRuntime {
         }),
     );
     return {
-      requestId: input.requestId,
+      requestId,
       promptStarted: promptStarted.promise,
       events: events.iterate(),
       result,

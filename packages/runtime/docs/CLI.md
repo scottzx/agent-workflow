@@ -25,7 +25,7 @@ acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
 acpx [global_options] compare <agent>... '<prompt_text>'
 acpx [global_options] compare <agent>... --file <path>
-acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
+acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>] [--config-option <key=value>]
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
@@ -69,13 +69,14 @@ Notes:
 - Top-level `flow run <file>` executes a user-authored workflow module and persists run state under `~/.acpx/flows/runs/`.
 - If a prompt argument is omitted, `acpx` reads prompt text from stdin when piped.
 - `--file` works for implicit prompt, `prompt`, and `exec` commands.
+- A `--file` path that does not exist or is a directory fails with `Prompt file not found: <path>` or `Prompt file is not a file: <path>` (exit 1) before any agent starts.
 - After an agent name, `--file` may appear before or after `prompt`/`exec`; an explicit value on the subcommand wins. `--no-wait` works before or after `prompt`, and omission still waits normally.
 - `acpx` with no args in an interactive terminal shows help.
 
 ## `flow run` subcommand
 
 ```bash
-acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
+acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>] [--config-option <key=value>]
 ```
 
 - Runs a user-authored workflow module step by step through the `acpx/flows` runtime.
@@ -85,8 +86,9 @@ acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>
 - `acp` and `action` nodes use the global `--timeout` value as their default step timeout. If `--timeout` is omitted, flows default to 15 minutes per active step.
 - Flows may declare permission requirements. If a flow requires an explicit grant such as `approve-all`, `acpx` fails fast before starting the flow and tells you which permission flag to pass.
 - `--input-json` passes flow input inline as JSON.
-- `--input-file` reads flow input JSON from disk.
+- `--input-file` reads flow input JSON from disk; a path that does not exist or is a directory fails with `Flow input file not found: <path>` or `Flow input file is not a file: <path>`.
 - `--default-agent` supplies the default agent profile for `acp` nodes that do not pin one.
+- Repeatable `--config-option <key=value>` provides ordered ACP configuration defaults before prompting. Node options run after these defaults, and node `modelId` overrides global `--model`. Persistent handles pin their first settings; later omissions inherit and conflicting explicit selections fail. See [flow configuration](flows.md#model-and-session-configuration) for evidence and model-catalog limits.
 - The file is always provided by the caller at runtime. `acpx` does not require any built-in flow registry.
 - The source repo includes example flow files under `examples/flows/`, including a larger PR-triage example under `examples/flows/pr-triage/`.
 
@@ -129,6 +131,13 @@ All global options:
 | `--ttl <seconds>`                        | Queue owner idle TTL before shutdown                | Default `300`. `0` disables TTL.                                                                                                                      |
 | `--model <id>`                           | Set agent model                                     | Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.      |
 | `--verbose`                              | Enable verbose logs                                 | Prints ACP/debug details to stderr.                                                                                                                   |
+| `--auth-policy <policy>`                 | Missing-auth policy                                 | `skip` or `fail` when authentication is required.                                                                                                     |
+| `--allowed-tools <list>`                 | Allowed tool names                                  | Comma-separated names; `""` allows no tools. Adapter support is required.                                                                             |
+| `--max-turns <count>`                    | Session turn limit                                  | Positive integer. Adapter support is required.                                                                                                        |
+| `--system-prompt <text>`                 | Replace the system prompt                           | Claude Code through ACP `_meta.systemPrompt`.                                                                                                         |
+| `--append-system-prompt <text>`          | Append to the system prompt                         | Claude Code through ACP `_meta.systemPrompt.append`.                                                                                                  |
+| `--prompt-retries <count>`               | Retry transient prompt failures                     | Non-negative integer; default `0`.                                                                                                                    |
+| `--mcp-config <path>`                    | MCP server configuration file                       | Overrides project and global `mcpServers`.                                                                                                            |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
 
@@ -170,7 +179,7 @@ acpx [global_options] pi exec [prompt_text...]
 acpx [global_options] pi sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
 ```
 
-Built-in command mapping: `pi -> npx pi-acp`
+Built-in command mapping: `pi -> npx --package=pi-acp -- pi-acp`
 
 ### `openclaw`
 
@@ -183,17 +192,7 @@ acpx [global_options] openclaw sessions [list | new [--name <name>] | ensure [--
 
 Built-in command mapping: `openclaw -> openclaw acp`
 
-For repo-local OpenClaw checkouts, override the built-in command in config:
-
-```json
-{
-  "agents": {
-    "openclaw": {
-      "command": "env OPENCLAW_HIDE_BANNER=1 OPENCLAW_SUPPRESS_NOTES=1 node scripts/run-node.mjs acp --url ws://127.0.0.1:18789 --token-file ~/.openclaw/gateway.token --session agent:main:main"
-    }
-  }
-}
-```
+For source builds, see the [OpenClaw checkout override](custom-agents.md#openclaw-checkout).
 
 ### `codex`
 
@@ -204,7 +203,7 @@ acpx [global_options] codex exec [prompt_text...]
 acpx [global_options] codex sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
 ```
 
-Built-in command mapping: `codex -> npx -y @agentclientprotocol/codex-acp`
+Built-in command mapping: `codex -> npx -y --package=@agentclientprotocol/codex-acp -- codex-acp`
 
 ### `claude`
 
@@ -215,7 +214,7 @@ acpx [global_options] claude exec [prompt_text...]
 acpx [global_options] claude sessions [list | new [--name <name>] | ensure [--name <name>] | close [name]]
 ```
 
-Built-in command mapping: `claude -> npx -y @agentclientprotocol/claude-agent-acp`
+Built-in command mapping: `claude -> npx -y --package=@agentclientprotocol/claude-agent-acp -- claude-agent-acp`
 
 Additional built-in agent docs live in [the Agents page](agents.md).
 
@@ -400,6 +399,7 @@ Behavior:
 - `sessions watch [-s <name>] [--cursor <cursor>]` replays retained events and follows new ones without affecting the active turn; see [Watching sessions](session-watch.md)
 - Watch inherits the agent's `-s`/`--session` selection unless its own `-s`/`--name` is set. Its journal cursor comes only from `watch --cursor`, independently of the list pagination cursor on `sessions`.
 - `sessions export [name] --output <path>` writes a portable JSON archive with session state and event history; `--cwd <dir>` selects a different source cwd relative to global `--cwd`
+- Export refuses active sessions or a session checkpoint that changes during history capture, leaving any existing output file untouched; close the source session and retry
 - `sessions import <archive>` writes a fresh local record from a portable archive, reopens it as idle, keeps the provider session id, and clears source-machine process metadata
 - Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
 - `sessions import --name <name>` and `--cwd <dir>` override the imported destination scope; import fails instead of creating a duplicate when an active session already exists for that `(agent, cwd, name)` scope or when another local record already uses the same provider session id
@@ -534,7 +534,7 @@ For prompt commands:
 Use `sessions new [--name <name>]` when you explicitly want a fresh scoped session.
 Use `sessions ensure [--name <name>]` when you want idempotent "get-or-create" behavior.
 
-If a saved session PID is dead, `acpx` respawns the agent, tries `session/resume` when advertised or `session/load` otherwise, and transparently falls back to `session/new` when reconnecting fails.
+If a saved session PID is dead, `acpx` respawns the agent, tries `session/resume` when advertised or `session/load` otherwise, and applies the [reconnect policy](session-control.md). Explicit resumes stay strict. A failed reconnect does not always start a new conversation.
 
 ### Prompt queueing
 
@@ -545,7 +545,7 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 3. owner drains queued prompts one-by-one after each completed turn
 4. after the queue drains, owner waits for new work up to TTL (`--ttl`, default 300s)
 5. submitter either blocks until completion (default) or exits immediately with `--no-wait`
-6. if interrupted (`Ctrl+C`) during an active turn, `acpx` sends `session/cancel` first, waits briefly for cancelled completion, then force-kills only if needed
+6. foreground `Ctrl+C` cancels only that invocation's request: it removes a pending request or sends `session/cancel` for its active turn, without killing the shared owner (see [Session control](session-control.md))
 
 Slow submitters retain ordered live output in a temporary disk spool instead of
 an unbounded socket buffer. Each observer can retain up to 64 MiB of unread spool
@@ -754,6 +754,7 @@ Related runtime behavior:
 - child processes inherit the current environment by default
 - Windows shell commands keep stdout and stderr available through `terminal/output`. Terminal kill and release requests fail if process cleanup cannot finish after escalation. The terminal remains available for a cleanup retry; restore a working `taskkill` command before retrying.
 - ACP `terminal/create` honors agent `outputByteLimit`; `0` stores nothing and the default when omitted is 64 KiB. Hosts can opt into an additional per-terminal retention ceiling with `ACPX_TERMINAL_MAX_OUTPUT_BYTES` (for example, `16777216` for 16 MiB). Unset, empty, or zero disables only the host ceiling, preserving the agent limit and default. Positive values must be safe integers. The smaller limit applies to combined stdout and stderr, retaining the newest UTF-8 output and reporting `truncated: true` when exceeded. Truncation drops an incomplete leading code point across writes; the retained output can be empty if no complete code point fits. This bounds retained output per terminal, not total process memory. Each ACP client snapshots the setting at construction; restart warm queue owners to change it.
+- An ACP `terminal/create` whose command or `cwd` does not exist fails with the spawn error's `ENOENT` code; when acpx can tell which piece is missing, the error message names it: the working directory, the executable path, or a command that is not on the child `PATH`.
 
 ## Practical examples
 

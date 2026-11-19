@@ -45,7 +45,9 @@ import {
 } from "./queue-owner-process.js";
 import { runQueuedTask } from "./runtime.js";
 
-const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
+// Startup waits on wall time, not attempts: a loaded host can take many seconds
+// just to boot Node and bind the owner socket. A crashed owner still fails fast.
+const QUEUE_OWNER_STARTUP_TIMEOUT_MS = 60_000;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const QUEUE_OWNER_ACTIVE_TURN_CANCEL_GRACE_MS = 750;
 
@@ -577,7 +579,6 @@ async function runQueueOwnerRuntime(
               if (activeControls) {
                 controls.publish(ticket, activeControls);
               }
-              turnController.markPromptActive();
               await applyPendingCancel();
             },
             handleProcessInterrupts: false,
@@ -622,7 +623,8 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
   };
 
   try {
-    for (let attempt = 0; attempt < QUEUE_OWNER_STARTUP_MAX_ATTEMPTS; attempt += 1) {
+    const startupDeadline = Date.now() + QUEUE_OWNER_STARTUP_TIMEOUT_MS;
+    while (Date.now() < startupDeadline) {
       options.signal?.throwIfAborted();
       const queued = await submitToRunningOwner(options, waitForCompletion, { onQueueAccepted });
       if (queued) {

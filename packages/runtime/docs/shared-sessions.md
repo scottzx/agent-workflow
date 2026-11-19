@@ -47,6 +47,8 @@ acpx pi sessions show reviewer
 
 `sessionKey` maps to the CLI's session name. An empty key selects the unnamed default session. Shared lookup uses the exact working directory; it does not walk into parent directories. The scope is the existing `(agentCommand, cwd, name)` tuple. Concurrent `ensureSession()` and CLI `sessions ensure` calls for the same scope select one record.
 
+`ensureSession()` applies `sessionOptions`, including `model`, only when creating a session. Reusing an existing session leaves its model, provider session and history unchanged; it does not open an adapter connection. To change an existing session's model, use `setModel()` while its owner is running, or the equivalent CLI command.
+
 Imports participate in that same exact-scope admission. An ensure waiting behind an import reuses its completed record; an import waiting behind a newly created shared session reports the occupied scope.
 
 `findSession({ sessionKey, agent, cwd? })` looks up an open local session without launching an agent. Handles contain the canonical local record and provider session IDs. Keep shared handles with the shared runtime; the in-process runtime has a different ownership contract.
@@ -86,6 +88,8 @@ On macOS and Linux, the owner disconnects an output observer whose buffered writ
 ## Configuration and compatibility
 
 Shared runtime options are `cwd`, optional `agentRegistry`, required `permissionMode`, and optional `nonInteractivePermissions`, `permissionPolicy`, `authCredentials`, `authPolicy`, `timeoutMs`, and `ttlMs`. The default registry uses built-in agent commands. Applications with custom commands should pass `createAgentRegistry({ overrides: ... })` and use the identical command in CLI configuration or `--agent`.
+
+Finite `ttlMs` values whose rounded millisecond delay exceeds 2,147,483,647 are rejected by `createSharedAcpRuntime()` with `ACP_INVALID_RUNTIME_OPTION`, before a session is created or an adapter starts. Zero retains the keep-alive-forever behavior; omitting `ttlMs` retains the default. This does not change the CLI's seconds-based `--ttl` option.
 
 Each submitting client supplies its static permission policy. Authentication and the child environment belong to the owner started for that session. Joining a session does not replace the existing owner's credentials. This is local, same-user IPC; it is not a network service or an isolation boundary between mutually untrusted clients.
 

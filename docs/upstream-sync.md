@@ -2,7 +2,7 @@
 
 `packages/runtime` is the agent-workflow runtime, derived from [openclaw/acpx](https://github.com/openclaw/acpx). Upstream history is already in this repository. Attribution and the MIT text stay in [NOTICE](../NOTICE) and [packages/runtime/LICENSE](../packages/runtime/LICENSE).
 
-Last synced upstream release: **acpx v0.20.0**. The imported release commit is `afc076b501774c6139c9732f5487dc721d5bd757` (`afc076b`, `chore: release acpx 0.20.0`). The 2026-10-21 import recorded that commit as the merge parent. Upstream has since tagged **v0.21.0** (`c0b9dfdfad12ed4fc000b8ef2efc4b5644f1c3dc`) and **v0.21.1** (`e6c782459a18a5b22d06210fde61d75003883ab0`). Those tags are not merged here.
+Last synced upstream release: **acpx v0.22.0** plus post-release `main` fixes. The 2026-11-19 sync merged `upstream/main` at `48c1615057ae43893f80868f81cd3ee0445eb0ae` (`48c16150`, `docs: help readers understand acpx PRs without reading code`) into `sync/acpx-main-20261119` as a dual-parent merge, covering 84 commits since `afc076b`: releases **v0.21.0** (`c0b9dfdfad12ed4fc000b8ef2efc4b5644f1c3dc`), **v0.21.1** (`e6c782459a18a5b22d06210fde61d75003883ab0`), **v0.22.0** (`1ed28f28`) and post-release fixes up to [`#1006`](https://github.com/openclaw/acpx/pull/1006).
 
 ## Add the upstream remote
 

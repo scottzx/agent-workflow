@@ -59,7 +59,7 @@ import {
   classifyPermissionDecision,
   decisionToResponse,
   inferToolKind,
-  resolvePermissionRequestWithDetails,
+  resolvePermissionRequest,
   withPermissionMetadata,
 } from "../permissions.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
@@ -144,6 +144,7 @@ import {
   type GrokExitPlanModeResponse,
   type GrokExitPlanOutcome,
 } from "./grok-exit-plan.js";
+import { isInheritedEnvName, snapshotEnvNames, type InheritedEnvPolicy } from "./inherited-env.js";
 import {
   assertRequestedModelSupported,
   modelStateFromSessionResponse,
@@ -497,11 +498,6 @@ type StartupFailureWatcher = {
   getError: () => AgentStartupError | undefined;
 };
 
-type SessionUpdateSuppressionState = {
-  suppressSessionUpdates: boolean;
-  suppressReplaySessionUpdateMessages: boolean;
-};
-
 export type AgentExitInfo = {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
@@ -570,7 +566,6 @@ export class AcpClient {
   // lost. Bounded so a handler that is never installed can't grow it forever.
   private bufferedSessionUpdates: SessionNotification[] = [];
   private static readonly MAX_BUFFERED_SESSION_UPDATES = 64;
-  private suppressReplaySessionUpdateMessages = false;
   private activePrompt?: ActivePromptState;
   private readonly pendingPromptOwners: ActivePromptState[] = [];
   private readonly cancellingSessionIds = new Set<string>();
@@ -594,6 +589,8 @@ export class AcpClient {
       ...options,
       cwd: asAbsoluteCwd(options.cwd),
       agentProcessEnv: options.agentProcessEnv ? { ...options.agentProcessEnv } : undefined,
+      agentProcessEnvAllow: snapshotEnvNames("agentProcessEnvAllow", options.agentProcessEnvAllow),
+      agentProcessEnvBlock: snapshotEnvNames("agentProcessEnvBlock", options.agentProcessEnvBlock),
       authPolicy: options.authPolicy ?? "skip",
       permissionPolicy: snapshotPermissionPolicy(options.permissionPolicy),
       elicitationModes: normalizeElicitationModes(options.elicitationModes),
@@ -635,6 +632,7 @@ export class AcpClient {
     });
     this.terminalManager = new TerminalManager({
       cwd: this.options.cwd,
+      inheritedEnv: this.inheritedEnvPolicy(),
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       ...(grokBuildAcp
@@ -905,6 +903,8 @@ export class AcpClient {
           this.rejectPendingConnectionRequests(error);
           connection?.close(error);
         },
+        // Read per line: shared queue clients change this option between turns.
+        () => this.options.suppressSdkConsoleErrors === true,
       ),
     );
 
@@ -967,6 +967,7 @@ export class AcpClient {
       this.options.sessionOptions?.env,
       this.options.agentProcessEnv,
       claudeAcp,
+      this.inheritedEnvPolicy(),
     );
     const commandContext: AgentLaunchPlan["commandContext"] = {
       env: spawnOptions.env,
@@ -1110,7 +1111,11 @@ export class AcpClient {
       });
       await waitForSpawn(spawnedChild);
     } catch (error) {
-      const spawnError = new AgentSpawnError(this.options.agentCommand, error);
+      const spawnError = new AgentSpawnError(this.options.agentCommand, error, {
+        command: launch.command,
+        cwd: launch.cwd,
+        env: plan.spawnOptions.env,
+      });
       this.notifyProcessSpawnFailure(launch, spawnError);
       throw spawnError;
     }
@@ -1173,7 +1178,14 @@ export class AcpClient {
         detached: process.platform !== "win32",
       });
     } catch (error) {
-      this.notifyProcessSpawnFailure(launch, new AgentSpawnError(command, error));
+      this.notifyProcessSpawnFailure(
+        launch,
+        new AgentSpawnError(command, error, {
+          command: launch.command,
+          cwd: launch.cwd,
+          env: options.env,
+        }),
+      );
       return undefined;
     }
     this.commandProbes.add(child);
@@ -1185,7 +1197,14 @@ export class AcpClient {
       try {
         await waitForSpawn(child);
       } catch (error) {
-        this.notifyProcessSpawnFailure(launch, new AgentSpawnError(command, error));
+        this.notifyProcessSpawnFailure(
+          launch,
+          new AgentSpawnError(command, error, {
+            command: launch.command,
+            cwd: launch.cwd,
+            env: options.env,
+          }),
+        );
         return undefined;
       }
       if (child.pid === undefined) {
@@ -1419,7 +1438,7 @@ export class AcpClient {
         this.eventHandlers.onAcpOutputMessage?.(direction, message);
         this.eventHandlers.onAcpMessage?.(direction, message);
       },
-      suppressReplaySessionUpdates: () => this.suppressReplaySessionUpdateMessages,
+      suppressReplaySessionUpdates: () => this.suppressSessionUpdates,
       bindPromptOwner: (owner) => this.bindPromptOwner(owner),
       assertPromptActive: (active) => this.assertPromptActive(active),
       onPromptRequestWritten: (active, owner) => this.onPromptRequestWritten(active, owner),
@@ -1506,9 +1525,8 @@ export class AcpClient {
     const connection = this.getConnection();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
     assertControlAuthority(options.authority);
-    const previousSuppression = this.applySessionUpdateSuppression(
-      Boolean(options.suppressReplayUpdates),
-    );
+    const previousSuppression = this.suppressSessionUpdates;
+    this.suppressSessionUpdates = previousSuppression || Boolean(options.suppressReplayUpdates);
 
     let response: LoadSessionResponse | undefined;
 
@@ -1529,7 +1547,7 @@ export class AcpClient {
         options.replayDrainTimeoutMs ?? REPLAY_DRAIN_TIMEOUT_MS,
       );
     } finally {
-      this.restoreSessionUpdateSuppression(previousSuppression);
+      this.suppressSessionUpdates = previousSuppression;
     }
 
     this.loadedSessionId = sessionId;
@@ -1573,22 +1591,6 @@ export class AcpClient {
     this.updateRememberedSessionModels(sessionId, result);
     await this.captureAgentDescendants(this.agent);
     return result;
-  }
-
-  private applySessionUpdateSuppression(enabled: boolean): SessionUpdateSuppressionState {
-    const previous = {
-      suppressSessionUpdates: this.suppressSessionUpdates,
-      suppressReplaySessionUpdateMessages: this.suppressReplaySessionUpdateMessages,
-    };
-    this.suppressSessionUpdates = previous.suppressSessionUpdates || enabled;
-    this.suppressReplaySessionUpdateMessages =
-      previous.suppressReplaySessionUpdateMessages || enabled;
-    return previous;
-  }
-
-  private restoreSessionUpdateSuppression(previous: SessionUpdateSuppressionState): void {
-    this.suppressSessionUpdates = previous.suppressSessionUpdates;
-    this.suppressReplaySessionUpdateMessages = previous.suppressReplaySessionUpdateMessages;
   }
 
   async prompt(
@@ -2151,7 +2153,6 @@ export class AcpClient {
     this.observedSessionUpdates = 0;
     this.processedSessionUpdates = 0;
     this.suppressSessionUpdates = false;
-    this.suppressReplaySessionUpdateMessages = false;
     this.activePrompt = undefined;
     this.pendingPromptOwners.length = 0;
     this.cancellingSessionIds.clear();
@@ -2515,8 +2516,16 @@ export class AcpClient {
     return undefined;
   }
 
+  private inheritedEnvPolicy(): InheritedEnvPolicy {
+    return { allow: this.options.agentProcessEnvAllow, block: this.options.agentProcessEnvBlock };
+  }
+
   private readAgentSpecificEnvCredential(methodId: string): string | undefined {
-    if (!this.isGrokBuildAcpCommand() || methodId !== "xai.api_key") {
+    if (
+      !this.isGrokBuildAcpCommand() ||
+      methodId !== "xai.api_key" ||
+      !isInheritedEnvName(this.inheritedEnvPolicy(), "XAI_API_KEY")
+    ) {
       return undefined;
     }
     return nonEmptyEnvironmentValue(process.env.XAI_API_KEY);
@@ -3010,7 +3019,7 @@ export class AcpClient {
   ): Promise<RequestPermissionResponse> {
     try {
       assertControlAuthority(owner);
-      const result = await resolvePermissionRequestWithDetails(
+      const result = await resolvePermissionRequest(
         preferCodexPermissionRefusal(params, this.initResult?.agentInfo?.name),
         this.options.permissionMode,
         this.options.nonInteractivePermissions ?? "deny",
@@ -3187,7 +3196,21 @@ export class AcpClient {
     exitCode: number | null,
     signal: NodeJS.Signals | null,
   ): void {
-    if (this.agent !== child || this.lastAgentExit) {
+    if (this.agent !== child) {
+      return;
+    }
+    const recorded = this.lastAgentExit;
+    if (recorded) {
+      // A crash usually closes the pipe before Node reports the exit status.
+      // Keep the first reason and add that status, but never a signal acpx
+      // sent while retiring the agent itself.
+      if (
+        recorded.unexpectedDuringPrompt &&
+        recorded.exitCode === null &&
+        recorded.signal === null
+      ) {
+        this.lastAgentExit = { ...recorded, exitCode, signal };
+      }
       return;
     }
 

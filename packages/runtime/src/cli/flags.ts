@@ -1,6 +1,7 @@
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import type { Command } from "commander";
+import { splitCommandLine } from "../acp/client-process.js";
 import {
   DEFAULT_AGENT_NAME,
   normalizeAgentName,
@@ -458,10 +459,13 @@ export function addPromptInputOption(command: Command): Command {
   return command.option("-f, --file <path>", "Read prompt text from file path (use - for stdin)");
 }
 
-export function addExecConfigOption(command: Command): Command {
+export function addExecConfigOption(
+  command: Command,
+  description = "Set an ACP session config option before the one-shot prompt (repeatable)",
+): Command {
   return command.option(
     "--config-option <key=value>",
-    "Set an ACP session config option before the one-shot prompt (repeatable)",
+    description,
     collectSessionConfigOptionAssignment,
   );
 }
@@ -565,7 +569,17 @@ function resolveModelOption(value: unknown): string | undefined {
 }
 
 function resolveAgentOverride(value: string | undefined): string | undefined {
-  return value === undefined ? undefined : parseNonEmptyValue("Agent command", value);
+  if (value === undefined) {
+    return undefined;
+  }
+  const command = parseNonEmptyValue("Agent command", value);
+  // Parse now so a malformed command fails as a usage error instead of at spawn time.
+  try {
+    splitCommandLine(command);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
+  return command;
 }
 
 export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): OutputPolicy {

@@ -26,7 +26,6 @@ import {
   recordClientOperation,
   recordPromptSubmission,
   recordSessionUpdate,
-  trimConversationForRuntime,
 } from "../../session/conversation-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
@@ -45,7 +44,7 @@ import type {
   AcpRuntimeTurnResult,
 } from "../public/contract.js";
 import { AcpRuntimeError } from "../public/errors.js";
-import { parsePromptEventLine } from "../public/events.js";
+import { runtimeEventFromMessage } from "../public/events.js";
 import { probeRuntime, type RuntimeHealthReport } from "../public/probe.js";
 import { withConnectedSession } from "./connected-session.js";
 import { resolveSupportedConfigOptionId } from "./controls.js";
@@ -312,14 +311,38 @@ type PreparedRuntimeTurnState = {
   promptMessageId: string | undefined;
 };
 
+async function withSessionSetupTimeout<T>(
+  method: string,
+  request: Promise<T>,
+  timeoutMs: number | undefined,
+): Promise<T> {
+  try {
+    return await withTimeout(request, timeoutMs);
+  } catch (error) {
+    if (!(error instanceof TimeoutError)) {
+      throw error;
+    }
+    throw new AcpRuntimeError(
+      "ACP_SESSION_INIT_FAILED",
+      `ACP ${method} did not complete within ${timeoutMs}ms. Retry session setup and check that the configured ACP agent is responding.`,
+      { cause: error },
+    );
+  }
+}
+
 async function createOrLoadRuntimeSession(
   client: AcpClient,
   resumeSessionId: string | undefined,
   cwd: string,
+  timeoutMs: number | undefined,
 ): Promise<CreatedRuntimeSession> {
   if (resumeSessionId) {
     if (client.supportsResumeSession()) {
-      const resumed = await client.resumeSession(resumeSessionId, cwd);
+      const resumed = await withSessionSetupTimeout(
+        "session/resume",
+        client.resumeSession(resumeSessionId, cwd),
+        timeoutMs,
+      );
       return {
         sessionId: resumeSessionId,
         agentSessionId: resumed.agentSessionId,
@@ -331,7 +354,11 @@ async function createOrLoadRuntimeSession(
         `Agent does not support session/resume or session/load; cannot resume session ${resumeSessionId}`,
       );
     }
-    const loaded = await client.loadSession(resumeSessionId, cwd);
+    const loaded = await withSessionSetupTimeout(
+      "session/load",
+      client.loadSession(resumeSessionId, cwd),
+      timeoutMs,
+    );
     return {
       sessionId: resumeSessionId,
       agentSessionId: loaded.agentSessionId,
@@ -339,7 +366,11 @@ async function createOrLoadRuntimeSession(
     };
   }
 
-  const created = await client.createSession(cwd);
+  const created = await withSessionSetupTimeout(
+    "session/new",
+    client.createSession(cwd),
+    timeoutMs,
+  );
   return {
     sessionId: created.sessionId,
     agentSessionId: created.agentSessionId,
@@ -348,6 +379,7 @@ async function createOrLoadRuntimeSession(
 }
 
 export class AcpRuntimeManager {
+  private readonly exactSessionRecordIds = new Set<string>();
   private readonly activeControllers = new Map<string, ActiveSessionController>();
   private readonly controlSessionRecords = new Map<string, RuntimeControlSession>();
   private readonly retainedSessionOwners = new Map<string, RuntimeSessionOwner>();
@@ -363,6 +395,16 @@ export class AcpRuntimeManager {
   private readonly pendingTasks = new Set<Promise<unknown>>();
   private shuttingDown = false;
   private shutdownTask?: Promise<void>;
+  private readonly observeAcpMessage: NonNullable<AcpRuntimeOptions["onAcpMessage"]> = (
+    direction,
+    message,
+  ) => {
+    try {
+      void Promise.resolve(this.options.onAcpMessage?.(direction, message)).catch(() => {});
+    } catch {
+      // Observations must not interrupt protocol processing or transport writes.
+    }
+  };
 
   constructor(
     private readonly options: AcpRuntimeOptions,
@@ -381,7 +423,11 @@ export class AcpRuntimeManager {
     this.assertOpen();
     const clientOptions: ConstructorParameters<typeof AcpClient>[0] = {
       ...options,
+      onAcpMessage:
+        options.processLaunchScope?.kind === "runtime-session" ? this.observeAcpMessage : undefined,
       agentProcessEnv: this.options.agentProcessEnv,
+      agentProcessEnvAllow: this.options.agentProcessEnvAllow,
+      agentProcessEnvBlock: this.options.agentProcessEnvBlock,
       processLifecycle: {
         ...options.processLifecycle,
         onBeforeSpawn: async (launch) => {
@@ -536,6 +582,7 @@ export class AcpRuntimeManager {
 
   private installActiveOwnerEventHandlers(owner: RuntimeSessionOwner): void {
     owner.client.setEventHandlers({
+      onAcpMessage: this.observeAcpMessage,
       onSessionUpdate: (notification) => this.routeOwnedSessionUpdate(owner, notification),
       onClientOperation: (operation) => this.routeOwnedClientOperation(owner, operation),
     });
@@ -592,7 +639,6 @@ export class AcpRuntimeManager {
         // notification cannot overwrite a later acknowledgement after replay.
         turn.record.acpx = recordSessionUpdate(turn.conversation, turn.record.acpx, notification);
       }
-      trimConversationForRuntime(turn.conversation);
       this.emitRuntimeTurnEvent(task, {
         jsonrpc: "2.0",
         method: "session/update",
@@ -616,7 +662,6 @@ export class AcpRuntimeManager {
       projection.record.acpx,
       notification,
     );
-    trimConversationForRuntime(projection.conversation);
     const updateTag = notification.update.sessionUpdate;
     // Debounced persist; once it lands, notify hosts that history is current.
     owner.pendingOutOfTurnNotice = () => {
@@ -641,7 +686,6 @@ export class AcpRuntimeManager {
     } else {
       turn.record.acpx = recordClientOperation(turn.conversation, turn.record.acpx, operation);
     }
-    trimConversationForRuntime(turn.conversation);
     this.emitRuntimeTurnEvent(task, {
       type: "client_operation",
       ...operation,
@@ -914,6 +958,7 @@ export class AcpRuntimeManager {
           verbose: this.options.verbose,
           timeoutMs: this.options.timeoutMs,
           resumePolicy: resumePolicyForSessionMode(sessionMode),
+          strictResume: this.exactSessionRecordIds.has(record.acpxRecordId),
           replacingMode: replayOptions?.replacingMode,
           replacingConfigOption: replayOptions?.replacingConfigOption,
           authority,
@@ -950,9 +995,16 @@ export class AcpRuntimeManager {
   }
 
   async ensureSession(input: RuntimeEnsureInput): Promise<SessionRecord> {
-    return await this.withEnsureSessionLock(input, async () =>
-      this.ensureSessionWithOwnership(input),
-    );
+    return await this.withEnsureSessionLock(input, async () => {
+      const record = await this.ensureSessionWithOwnership(input);
+      if (input.resumeSessionId && !this.exactSessionRecordIds.has(record.acpxRecordId)) {
+        // Compatible ensures bypass operation locks; an earlier alias may
+        // already have committed to fresh fallback while awaiting its reply.
+        this.assertRuntimeSessionIdle(record.acpxRecordId);
+        this.exactSessionRecordIds.add(record.acpxRecordId);
+      }
+      return record;
+    });
   }
 
   private async withEnsureSessionLock<T>(
@@ -1185,7 +1237,12 @@ export class AcpRuntimeManager {
     try {
       await startRuntimeClient(client, agent, this.options.timeoutMs);
       this.assertOpen();
-      const session = await createOrLoadRuntimeSession(client, input.resumeSessionId, cwd);
+      const session = await createOrLoadRuntimeSession(
+        client,
+        input.resumeSessionId,
+        cwd,
+        this.options.timeoutMs,
+      );
       const record = await this.prepareInitialRuntimeRecord({
         input,
         client,
@@ -1197,6 +1254,9 @@ export class AcpRuntimeManager {
       });
       this.setTransientCredentials(record.acpxRecordId, input.authCredentials);
       await this.retainInitializedSessionOwner(owner, record);
+      if (!input.resumeSessionId) {
+        this.exactSessionRecordIds.delete(record.acpxRecordId);
+      }
       return record;
     } catch (error) {
       await settleAttempt(async () => this.abandonInitializingSessionOwner(owner));
@@ -1534,7 +1594,6 @@ export class AcpRuntimeManager {
         promptStartedAt,
         task.input.requestId,
       );
-      trimConversationForRuntime(conversation);
       const nextAcpxState = cloneSessionAcpxState(acpxState) ?? {};
       nextAcpxState.turn_results = {
         ...nextAcpxState.turn_results,
@@ -1726,11 +1785,11 @@ export class AcpRuntimeManager {
     task: RuntimeTurnTask,
     turn: RunningRuntimeTurn,
   ): Promise<boolean> {
-    if (turn.client.hasActivePrompt()) {
-      return await turn.client.requestCancelActivePrompt();
-    }
     if (!task.state.turnActive) {
       return false;
+    }
+    if (turn.client.hasActivePrompt()) {
+      return await turn.client.requestCancelActivePrompt();
     }
     task.state.pendingCancel = true;
     return true;
@@ -1782,7 +1841,7 @@ export class AcpRuntimeManager {
   }
 
   private emitRuntimeTurnEvent(task: RuntimeTurnTask, payload: Record<string, unknown>): void {
-    const parsed = parsePromptEventLine(JSON.stringify(payload));
+    const parsed = runtimeEventFromMessage(payload);
     if (!parsed) {
       return;
     }
@@ -1794,7 +1853,12 @@ export class AcpRuntimeManager {
     turn: RunningRuntimeTurn,
   ): Promise<ConnectAndLoadSessionResult> {
     if (turn.connected) {
-      return { sessionId: turn.record.acpSessionId, resumed: false, loadError: undefined };
+      return {
+        sessionId: turn.record.acpSessionId,
+        resumed: false,
+        loadError: undefined,
+        reusingLoadedSession: true,
+      };
     }
     const loaded = await this.connectRuntimeTurnClient(task, turn);
     turn.acpxState = cloneSessionAcpxState(turn.record.acpx);
@@ -1810,6 +1874,7 @@ export class AcpRuntimeManager {
       client: turn.client,
       record: turn.record,
       resumePolicy: resumePolicyForSessionMode(task.input.sessionMode),
+      strictResume: this.exactSessionRecordIds.has(turn.record.acpxRecordId),
       timeoutMs: this.options.timeoutMs,
       promptRecorded: true,
       activeController: task.state.activeController!,

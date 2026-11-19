@@ -30,7 +30,7 @@ acpx --timeout 1800 flow run ./my-flow.ts
 
 What happens:
 
-- The runtime loads the flow module from disk.
+- The runtime loads the flow module from disk. A path that does not exist or is not a file fails with `Flow file not found: <path>` or `Flow file is not a file: <path>` before a run directory is created.
 - A run id is generated and a run directory is created at `~/.acpx/flows/runs/<runId>/`.
 - Steps execute in topological order. ACP steps reuse one implicit main session by default.
 - Run state (graph, ACP transcripts, artifacts, errors) is persisted as the run progresses.
@@ -42,7 +42,7 @@ Existing custom output-root directories keep their permissions. Snapshot writes
 publish complete files atomically and clean up failed staging writes. Event logs
 remain append-only and retain their existing ordering and size behavior.
 
-`--input-json` and `--input-file` are mutually exclusive ways to provide flow input. `--default-agent` supplies the default agent profile for `acp` nodes that do not pin one.
+`--input-json` and `--input-file` are mutually exclusive ways to provide flow input. Omitting both passes `{}`; an empty argument is rejected. `--default-agent` supplies the default agent profile for `acp` nodes that do not pin one.
 
 The CLI resolves `acpx/flows` in the entry module and its imported helpers without rewriting source text or creating files beside the flow. Flows can run from read-only directories. Global `--system-prompt` and `--append-system-prompt` flags are forwarded to every ACP node, including isolated sessions.
 
@@ -60,7 +60,9 @@ helper throws the usual `Could not parse JSON` error. Prefer direct or fenced
 JSON when recovery must not depend on surrounding prose; those parsing paths
 are unaffected by the compatibility recovery budget. Use
 `parseStrictJsonObject(text)` to require direct JSON, or `mode: "fenced"` to
-accept direct JSON and fenced blocks without embedded recovery.
+accept direct JSON and fenced blocks without embedded recovery. Literal triple
+backticks inside JSON strings do not close the surrounding fence, including
+when those strings contain escaped quotes or backslashes.
 
 ## Node types
 
@@ -150,6 +152,26 @@ This fragment assumes an earlier `prepare_workspace` node returns `{ workdir: st
 
 Persistent ACP steps reuse a session when their resolved command, explicit argument vector (when supplied), working directory, and session handle match. Different profile names may share a session when those values match. Argument boundaries and empty arguments are significant. Each step snapshots its resolved arguments, so a custom resolver reusing an array cannot change earlier step metadata.
 
+## Model and session configuration
+
+ACP nodes can select a model and ordered adapter configuration options before their first prompt:
+
+```ts
+acp({
+  modelId: "selected-model",
+  configOptions: [{ configId: "adapter_option", value: "selected-value" }],
+  prompt: () => "Summarize the findings",
+});
+```
+
+Global `--model` and repeatable `flow run --config-option <key=value>` provide run defaults. Library callers use `FlowRunnerOptions.sessionOptions.model` and `FlowRunnerOptions.configOptions`. A node's `modelId` overrides the default; other global session options still apply. The legacy passthrough `model` field remains inert extension metadata and never selects a model. Run config options execute first, then node options in array order, including repeated IDs. Option IDs and values in flow definitions are opaque strings and are not normalized. A model-related config option executes after model selection and may change the final model.
+
+For persistent sessions, the first binding pins the effective settings. Later omitted fields inherit that binding; explicit fields must match its requested model or final option values. Use a distinct `session.handle` for different settings. Reconnecting loads the same ACP session, reapplies the pinned selections, and fails before prompting if they cannot be restored. This also applies when the initial connection ends after configuration but before the first prompt. Isolated sessions apply their own settings independently. Selection rejection or timeout prevents the prompt.
+
+When a model or config option was requested, bindings in the run bundle include `requestedSettings` and `acceptedSettings`; step session snapshots carry the same evidence. The `flow run --format json` result prints session bindings without these fields; read them from the run bundle. Model evidence distinguishes the requested ID, whether ACP model selection was applied, and the accepted final ID. Without an advertised model catalog, adapters with supported startup-model behavior retain that behavior and report `applied: false`; other adapters reject the model request. Option evidence records each acknowledged `acceptedValue` and a `reported` boolean: `true` means the value came from the adapter reply catalog; `false` means the reply acknowledged the request without reporting a value, so `acceptedValue` echoes the resolved request. These acknowledgements are configuration evidence; inspect adapter prompt-response metadata for provider usage attestation.
+
+Persistent creation-time controls (`session/new` and initial model/config selections) are not captured in `sessions/*/events.ndjson`. Their evidence lives in `sessions/*/binding.json` and step session snapshots. Later reconnect controls are captured in the event stream; isolated sessions also capture creation controls.
+
 ## Permissions
 
 Flows can declare an explicit permission requirement. If a flow needs `approve-all` and you forget the flag, `acpx` fails fast before the first step runs and prints the flag to add:
@@ -209,6 +231,8 @@ action({
 Arbitrary callback JavaScript cannot be forcibly stopped. Check `context.signal` before starting your own side effects and after awaits, or use `runShell` for owned native commands. The runner does not wait forever for an uncooperative callback and does not roll back completed external effects. The PR-triage example uses these boundaries for its commands and file writes.
 
 A shell action's `timeoutMs: 0` disables its own deadline; an enclosing node deadline still applies. Node and command deadlines must be finite and no greater than 2,147,483,647 milliseconds. Invalid command deadlines or non-string `stdin` values are rejected before spawning. On expiry or interruption, acpx cancels active shell commands and waits for termination and output-stream cleanup before reporting cancellation. Cleanup failures are reported instead of silently claiming cleanup succeeded. An executor that resolves after its node has timed out or been interrupted cannot launch a new shell process.
+
+A shell action whose command, `shell`, or `cwd` does not exist fails with the spawn error's `ENOENT` code; when acpx can tell which piece is missing, the message names it: the working directory, the executable path, or a command that is not on the child `PATH`.
 
 A shell node drains its wrapper's final stdout and stderr after exit, waiting for pipe closure for up to 100 milliseconds. Inherited pipes from a surviving descendant do not keep a completed flow's host alive beyond that drain window. While other work keeps the host running, these pipes continue draining without extending the completed result.
 

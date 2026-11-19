@@ -1,6 +1,7 @@
 import type { AcpClient } from "../acp/client.js";
 import { InterruptedError, withInterrupt } from "../async-control.js";
 import { promptToDisplayText } from "../prompt-content.js";
+import type { SessionConfiguration } from "../session/configuration.js";
 import {
   cloneSessionAcpxState,
   createSessionConversation,
@@ -55,6 +56,10 @@ import {
   summarizePrompt,
   updateStatusDetail,
 } from "./runtime-support.js";
+import {
+  assertCompatibleSessionSettings,
+  assertReplayedSessionSettings,
+} from "./session-settings.js";
 import { FlowRunStore } from "./store.js";
 import type {
   AcpNodeDefinition,
@@ -174,6 +179,7 @@ export class FlowRunner {
   private readonly defaultNodeTimeoutMs;
   private readonly suppressSdkConsoleErrors?;
   private readonly sessionOptions?;
+  private readonly configOptions;
   private readonly services;
   private readonly store;
   private readonly pendingPersistentSessionClients = new Map<string, Map<string, AcpClient>>();
@@ -199,6 +205,7 @@ export class FlowRunner {
       options.defaultNodeTimeoutMs ?? options.timeoutMs ?? DEFAULT_FLOW_STEP_TIMEOUT_MS;
     this.suppressSdkConsoleErrors = options.suppressSdkConsoleErrors;
     this.sessionOptions = options.sessionOptions;
+    this.configOptions = options.configOptions ?? [];
     this.services = options.services ?? {};
     this.store = new FlowRunStore(options.outputRoot);
   }
@@ -271,7 +278,9 @@ export class FlowRunner {
         cancellation ??= this.cancelShellOwners(runDir, signal);
         void cancellation.catch(() => {});
         this.attempts.get(runDir)?.cancel(reason, signal);
-        await execution?.catch(() => {});
+        // The interrupt callback owns the final outcome while execution retires.
+        // Preserve admitted-work and cleanup failures instead of discarding them.
+        await execution;
       },
     ).then(
       (value) => ({ ok: true as const, value }),
@@ -772,25 +781,39 @@ export class FlowRunner {
   ): Promise<FlowNodeExecutionResult> {
     const attempt = context.attempt;
     const prepared = await this.prepareAcpPrompt(runDir, state, node, context);
-    if (node.session?.isolated) {
-      return await this.executeIsolatedAcpPrompt(runDir, state, flow, node, context, prepared);
+    const isolated = node.session?.isolated;
+    const binding = isolated
+      ? createIsolatedSessionBinding(
+          flow.name,
+          state.runId,
+          attempt.attemptId,
+          node.profile,
+          prepared.agentInfo,
+        )
+      : await this.ensureSessionBinding(runDir, state, flow, node, prepared.agentInfo, attempt);
+    if (isolated) {
+      const requestedSettings = this.resolveSessionSettings(node);
+      if (requestedSettings.model !== undefined || requestedSettings.configOptions.length > 0) {
+        binding.requestedSettings = requestedSettings;
+      }
     }
-    const boundSession = await this.ensureSessionBinding(
-      runDir,
-      state,
-      flow,
-      node,
-      prepared.agentInfo,
-      attempt,
+    prepared.result.sessionInfo = binding;
+    if (isolated) {
+      await attempt.own(() =>
+        this.initializeIsolatedSessionBundle(runDir, state, binding, attempt),
+      );
+    }
+    await attempt.own(() =>
+      this.appendAcpPromptPreparedTrace(runDir, state, binding, prepared.promptArtifact, attempt),
     );
-    return await this.executePersistentAcpPrompt(
-      runDir,
-      state,
-      node,
-      context,
-      prepared,
-      boundSession,
+    const prompt = await attempt.own(() =>
+      isolated
+        ? this.runIsolatedPrompt(runDir, state, binding, prepared)
+        : this.runPersistentPrompt(runDir, state, binding, prepared),
     );
+    await attempt.own(() => this.appendAcpResponseParsedTrace(runDir, state, prompt, attempt));
+    const output = await this.parseAcpOutput(node, context, prompt.rawText);
+    return { ...prepared.result, output };
   }
 
   private async prepareAcpPrompt(
@@ -854,40 +877,6 @@ export class FlowRunner {
     });
   }
 
-  private async executeIsolatedAcpPrompt(
-    runDir: string,
-    state: FlowRunState,
-    flow: FlowDefinition,
-    node: AcpNodeDefinition,
-    context: FlowAttemptContext,
-    prepared: PreparedAcpPrompt,
-  ): Promise<FlowNodeExecutionResult> {
-    const binding = createIsolatedSessionBinding(
-      flow.name,
-      state.runId,
-      prepared.attempt.attemptId,
-      node.profile,
-      prepared.agentInfo,
-    );
-    prepared.result.sessionInfo = binding;
-    await prepared.attempt.own(() =>
-      this.initializeIsolatedSessionBundle(runDir, state, binding, prepared.attempt),
-    );
-    await prepared.attempt.own(() =>
-      this.appendAcpPromptPreparedTrace(
-        runDir,
-        state,
-        binding,
-        prepared.promptArtifact,
-        prepared.attempt,
-      ),
-    );
-    const prompt = await prepared.attempt.own(() =>
-      this.runIsolatedPrompt(runDir, state, binding, prepared),
-    );
-    return await this.finishAcpPrompt(runDir, state, node, context, prepared, prompt);
-  }
-
   private async initializeIsolatedSessionBundle(
     runDir: string,
     state: FlowRunState,
@@ -904,30 +893,6 @@ export class FlowRunner {
       lastSeq: 0,
     });
     await this.store.ensureSessionBundle(runDir, state, binding, initialRecord);
-  }
-
-  private async executePersistentAcpPrompt(
-    runDir: string,
-    state: FlowRunState,
-    node: AcpNodeDefinition,
-    context: FlowAttemptContext,
-    prepared: PreparedAcpPrompt,
-    binding: FlowSessionBinding,
-  ): Promise<FlowNodeExecutionResult> {
-    prepared.result.sessionInfo = binding;
-    await prepared.attempt.own(() =>
-      this.appendAcpPromptPreparedTrace(
-        runDir,
-        state,
-        binding,
-        prepared.promptArtifact,
-        prepared.attempt,
-      ),
-    );
-    const prompt = await prepared.attempt.own(() =>
-      this.runPersistentPrompt(runDir, state, binding, prepared),
-    );
-    return await this.finishAcpPrompt(runDir, state, node, context, prepared, prompt);
   }
 
   private async appendAcpPromptPreparedTrace(
@@ -948,21 +913,6 @@ export class FlowRunner {
         promptArtifact,
       },
     });
-  }
-
-  private async finishAcpPrompt(
-    runDir: string,
-    state: FlowRunState,
-    node: AcpNodeDefinition,
-    context: FlowAttemptContext,
-    prepared: PreparedAcpPrompt,
-    prompt: TracedPromptResult,
-  ): Promise<FlowNodeExecutionResult> {
-    await prepared.attempt.own(() =>
-      this.appendAcpResponseParsedTrace(runDir, state, prompt, prepared.attempt),
-    );
-    const output = await this.parseAcpOutput(node, context, prompt.rawText);
-    return { ...prepared.result, output };
   }
 
   private async publishAcpCapture(
@@ -1078,6 +1028,15 @@ export class FlowRunner {
     return () => clearInterval(timer);
   }
 
+  private resolveSessionSettings(node: AcpNodeDefinition) {
+    return {
+      model: node.modelId ?? this.sessionOptions?.model,
+      configOptions: [...this.configOptions, ...(node.configOptions ?? [])].map(
+        ({ configId, value }) => ({ configId, value }),
+      ),
+    };
+  }
+
   private async ensureSessionBinding(
     runDir: string,
     state: FlowRunState,
@@ -1090,10 +1049,13 @@ export class FlowRunner {
     const key = createSessionBindingKey(agent.agentCommand, agent.cwd, handle, agent.agentArgv);
     const existing = state.sessionBindings[key];
     if (existing) {
+      assertCompatibleSessionSettings(node, existing);
       await attempt.own(() => this.store.ensureSessionBundle(runDir, state, existing));
       return existing;
     }
 
+    const requestedSettings = this.resolveSessionSettings(node);
+    let acceptedSettings: SessionConfiguration | undefined;
     const name = createSessionName(flow.name, handle, agent.cwd, state.runId);
     const created = await attempt.own(async () => {
       const acquired = await createSessionWithClient({
@@ -1104,7 +1066,11 @@ export class FlowRunner {
         ...this.connectionOptions,
         signal: attempt.signal,
         handleProcessInterrupts: false,
-        sessionOptions: this.sessionOptions,
+        sessionOptions: { ...this.sessionOptions, model: requestedSettings.model },
+        configOptions: requestedSettings.configOptions,
+        onSessionConfigured: (configuration) => {
+          acceptedSettings = configuration;
+        },
       });
       this.pendingClientReleases.set(
         acquired.client,
@@ -1121,6 +1087,9 @@ export class FlowRunner {
     attempt.assertActive();
 
     const binding: FlowSessionBinding = {
+      ...(requestedSettings.model !== undefined || requestedSettings.configOptions.length > 0
+        ? { requestedSettings, acceptedSettings }
+        : {}),
       key,
       handle,
       bundleId: createSessionBundleId(handle, key),
@@ -1247,6 +1216,18 @@ export class FlowRunner {
             onAcpMessage: events.onAcpMessage,
             suppressSdkConsoleErrors: this.suppressSdkConsoleErrors,
             client: initialClient,
+            skipConfigurationForLoadedSession: initialClient !== undefined,
+            sessionOptions: {
+              ...this.sessionOptions,
+              model: binding.requestedSettings?.model,
+            },
+            configOptions: binding.requestedSettings?.configOptions,
+            onSessionConfigured: (configuration: SessionConfiguration) => {
+              assertReplayedSessionSettings(binding, configuration);
+              if (binding.requestedSettings) {
+                binding.acceptedSettings = configuration;
+              }
+            },
           },
           { signal: attempt.signal, handleProcessInterrupts: false },
         ),
@@ -1321,7 +1302,13 @@ export class FlowRunner {
               acpxState = recordConversationClientOperation(conversation, acpxState, operation);
             },
             suppressSdkConsoleErrors: this.suppressSdkConsoleErrors,
-            sessionOptions: this.sessionOptions,
+            sessionOptions: { ...this.sessionOptions, model: binding.requestedSettings?.model },
+            configOptions: binding.requestedSettings?.configOptions,
+            onSessionConfigured: (configuration) => {
+              if (binding.requestedSettings) {
+                binding.acceptedSettings = configuration;
+              }
+            },
           },
           { signal: attempt.signal, handleProcessInterrupts: false },
         ),

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { InterruptedError, TimeoutError } from "../../async-control.js";
+import { describeSpawnEnoent } from "../../errors.js";
 import type { ShellActionExecution, ShellActionResult } from "../runtime.js";
 import { resolveFlowTimeoutMs } from "../timeout.js";
 import type { FlowShellExecution, FlowShellResult } from "../types.js";
@@ -65,21 +66,6 @@ export type RunShellActionOptions = {
   terminationSignal?: NodeJS.Signals;
   registerOwner?: (owner: ShellProcessOwner) => () => void;
 };
-
-export async function withShellAbort<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
-  signal.throwIfAborted();
-  let rejectAbort: (reason: unknown) => void = () => {};
-  const aborted = new Promise<never>((_resolve, reject) => {
-    rejectAbort = reject;
-  });
-  const onAbort = () => rejectAbort(signal.reason);
-  signal.addEventListener("abort", onAbort, { once: true });
-  try {
-    return await Promise.race([run(), aborted]);
-  } finally {
-    signal.removeEventListener("abort", onAbort);
-  }
-}
 
 function rejectIfShellFailed(
   spec: ShellActionExecution,
@@ -314,12 +300,13 @@ async function runShellProcess(
   if (spec.stdin !== undefined && typeof spec.stdin !== "string") {
     throw new TypeError("stdin must be a string");
   }
+  const env = {
+    ...process.env,
+    ...spec.env,
+  };
   const child = spawn(spec.command, args, {
     cwd,
-    env: {
-      ...process.env,
-      ...spec.env,
-    },
+    env,
     shell: spec.shell,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -335,7 +322,11 @@ async function runShellProcess(
     return result;
   } catch (error) {
     await termination.cancel("SIGTERM");
-    throw error;
+    throw describeSpawnEnoent(
+      error,
+      `Shell action failed (${renderShellCommand(spec.command, args)}): `,
+      { command: spec.command, cwd, env },
+    );
   } finally {
     await termination.dispose();
   }

@@ -15,6 +15,18 @@ import test from "node:test";
 
 const examples = [
   {
+    markdown: '![Agent & "logo"](../assets/logo.svg)',
+    html: '<img src="../assets/logo.svg" alt="Agent &amp; &quot;logo&quot;" loading="lazy">',
+  },
+  {
+    markdown: "[![Agent](../assets/logo.svg)](plain.md#target)",
+    html: '<a href="plain.html#target"><img src="../assets/logo.svg" alt="Agent" loading="lazy"></a>',
+  },
+  {
+    markdown: "`![Literal](../assets/logo.svg)`",
+    html: "<code>![Literal](../assets/logo.svg)</code>",
+  },
+  {
     markdown: "[Query](https://example.invalid/search?first=1&second=2)",
     html: '<a href="https://example.invalid/search?first=1&amp;second=2">Query</a>',
   },
@@ -70,12 +82,15 @@ const examples = [
   },
 ];
 
-test("docs site preserves link destinations, inline formatting, and page rewrites", (t) => {
+test("docs site orders agent examples and preserves links, formatting, and page rewrites", (t) => {
   const repositoryRoot = process.cwd();
   const directory = mkdtempSync(path.join(os.tmpdir(), "acpx-docs-links-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const docsDirectory = path.join(directory, "docs");
   cpSync(path.join(repositoryRoot, "docs"), docsDirectory, { recursive: true });
+  mkdirSync(path.join(docsDirectory, "assets"), { recursive: true });
+  const logo = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"></svg>';
+  writeFileSync(path.join(docsDirectory, "assets", "logo.svg"), logo);
   writeFileSync(path.join(docsDirectory, "CNAME"), "docs.example.invalid\n");
   writeFileSync(
     path.join(docsDirectory, "link-fixture-parent.md"),
@@ -102,6 +117,20 @@ test("docs site preserves link destinations, inline formatting, and page rewrite
   );
   assert.equal(result.error, undefined, "documentation builder must finish before the timeout");
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(
+    readFileSync(path.join(directory, "dist", "docs-site", "assets", "logo.svg"), "utf8"),
+    logo,
+  );
+
+  const home = readFileSync(path.join(directory, "dist", "docs-site", "index.html"), "utf8");
+  const agentExamples = home.match(
+    /<div class="home-services" aria-label="Built-in agent examples">([\s\S]*?)<\/div>/,
+  );
+  assert.ok(agentExamples, "home page must label the agent badges as examples");
+  assert.deepEqual(
+    [...agentExamples[1].matchAll(/<span>([^<]+)<\/span>/g)].map(([, agent]) => agent),
+    ["pi", "openclaw", "codex", "claude"],
+  );
 
   const output = readFileSync(
     path.join(directory, "dist", "docs-site", "link-fixtures", "source.html"),

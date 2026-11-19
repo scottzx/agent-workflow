@@ -23,7 +23,7 @@ for (const entry of ['dist', 'skills', 'LICENSE', 'README.md']) {
 }
 // Preserve the runtime's package boundary, version, CLI-relative resources and
 // flow self-imports. Route the runtime's SDK through an alias so it keeps SDK
-// 1.5 alongside the service's SDK 1.4, and add the service flow entrypoint.
+// 1.9 alongside the service's SDK 1.4, and add the service flow entrypoint.
 function rewriteRuntimeModules(directory) {
   let flowHooks = 0;
   for (const entry of readdirSync(directory, { withFileTypes: true })) {

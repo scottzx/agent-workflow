@@ -8,6 +8,104 @@ Repo: https://github.com/scottzx/agent-workflow
 
 - Repository: the product brand is agent-workflow, part of 一芥天地 (DreamMate World) by 一芥智能. GitHub is now https://github.com/scottzx/agent-workflow. The npm package remains `@scottzx/1acp`, and the `1acp` / `acpx` commands are unchanged. Historical release notes below are unchanged.
 
+### Fixes
+
+- Sessions: keep tool result text that agents report through ACP `content` blocks when they send no `rawOutput`, so saved sessions and the embedded runtime no longer record those results as empty. Thanks @saariuslystoned.
+
+- Runtime/embedding: keep cancellation of an already-settled turn from cancelling a later turn on the same reused session client. Thanks @saariuslystoned.
+
+- Sessions: keep the exit code or signal of an agent that crashes mid-turn when its stdout closes before the process exit is reported, so `status` reports the session as dead and `sessions show` lists the exit code. Thanks @saariuslystoned.
+
+- CLI: `Ctrl+C` on a foreground session prompt now cancels that prompt (dequeues it or sends `session/cancel`) instead of leaving it running in the queue owner. Thanks @saariuslystoned.
+
+- Sessions: wait up to 60 seconds for a newly started queue owner instead of about six, so the first prompt on a slow or heavily loaded host no longer fails with "Session queue owner failed to start". Thanks @saariuslystoned.
+
+- CLI: report invalid option values once in text output, and as a single `[acpx] error: USAGE` line in quiet output instead of the full help plus the raw error. Thanks @saariuslystoned.
+
+- Sessions/prune: fail with the filesystem error when a selected file cannot be deleted instead of reporting success and freed bytes. Thanks @saariuslystoned.
+
+- CLI: preserve the interrupted exit status while cancellation and connection cleanup settle an in-flight one-shot command. Thanks @saariuslystoned.
+
+- Output: keep agent stdout parse diagnostics off stderr in `--format json --json-strict` and `--format quiet`, so strict JSON pipelines and quiet scripts no longer get a stack trace when an adapter prints a non-JSON line. Thanks @saariuslystoned.
+
+- Flows: `flow run` now rejects an empty `--input-json` or `--input-file` argument (for example an unset shell variable) instead of silently running the flow with `{}`. Thanks @saariuslystoned.
+
+- ACP/terminals: identify missing executable paths and working directories in `terminal/create` startup errors while preserving the original `ENOENT` details. Thanks @KrasimirKralev.
+
+- Sessions/import: launch an imported session with the destination's configured agent command and arguments instead of the source machine's saved launch arguments when the two commands differ. Thanks @saariuslystoned.
+
+- Shared runtime: `ensureSession()` no longer applies a creation-time `sessionOptions.model` to an existing persistent session, so reuse keeps its model and provider session instead of reconnecting. Thanks @saariuslystoned.
+
+- Dependencies: update the guarded filesystem runtime, Commander, and development tools while retaining the ACP SDK 1.x line and existing security overrides.
+
+- Sessions/export: reject archives when session ownership or the saved checkpoint changes during capture, preserving existing output files. Thanks @saariuslystoned.
+- Flows: reapply and verify pinned model and configuration choices when the initial connection dies before the first prompt. Thanks @saariuslystoned.
+- Output: skip malformed embedded resource metadata without losing later text or completion events. Thanks @saariuslystoned.
+- Flows/JSON: preserve literal backticks inside fenced JSON strings and keys. Thanks @saariuslystoned.
+- Runtime: reject overflowing in-process timeouts and shared-session idle TTLs before admitting session work. Thanks @saariuslystoned.
+- Shared sessions: retain each turn's request identity when callers reuse the input object, so cancellation targets the original turn. Thanks @saariuslystoned.
+- Sessions/watch: keep read contents suppressed when opposite-direction requests reuse an RPC ID. Thanks @saariuslystoned.
+- Sessions/list: preserve accepted opaque pagination cursors without trimming them. Thanks @saariuslystoned.
+- CLI: identify missing or non-file prompt, flow, and flow-input paths while preserving exit codes and JSON error envelopes. Thanks @KrasimirKralev.
+
+## 0.22.0 - 2026-11-06
+
+**Highlights:** Patch security advisories in glob, minimatch, qs, and re2js; add Goose, DeepSeek Harness, and experimental Ante support; expose ACP message observation, configure models per flow node, and improve session reliability and shell diagnostics.
+
+### Changes
+
+- Agents: add Goose as a built-in native ACP agent through `goose acp`.
+- Agents: add the native `deepseek-harness` profile using `dsh --profile acp`.
+- Agents: add experimental `ante` support through `ante acp`; requires Ante and the separate `ante-acp` adapter, with no session reopening after disconnect.
+- Runtime/embedding: expose an optional best-effort ACP message observer for owned session clients, including setup, reconnects, cold controls, and session discard, while retaining elicitation and replay filtering.
+- Flows: select per-node models and ordered ACP configuration options before the first prompt, with run defaults, persistent-handle conflict checks, same-session replay, and requested/accepted settings in run bundles. Thanks @superbiche.
+
+- Docs/Grok Build: distinguish the local ACP profile from Grok Bot cloud routines and explain webhook acceptance versus results.
+
+- Docs: add a complete supported-agent catalog with logos and setup links, render local images on the docs site, and clarify prerequisites, session identity, and reconnect behavior.
+
+### Fixes
+
+- Dependencies: patch the `glob` AbortSignal bypass and the `minimatch`, `qs`, and `re2js` denial-of-service advisories in the pinned development toolchain overrides; update the guarded filesystem runtime and development tooling. Thanks @hxy91819.
+
+- Flows/shell: identify missing executable paths and working directories in shell-action startup errors while preserving the original `ENOENT` details. Thanks @KrasimirKralev.
+
+- Docs/prompting: list `-s, --session` and `--no-wait` as options of `prompt` and the bare form only; `exec` rejects them with `unknown option`. Thanks @KrasimirKralev.
+- CLI: unknown options and other usage errors on subcommands (`acpx codex exec --bogus`, `acpx sessions list --bogus`) now exit with code 2 as documented, and `--format json` reports them as a JSON-RPC error instead of plain text only; they used to exit 1. Thanks @KrasimirKralev.
+- Agents/launch: start npm-backed built-in adapters (pi, codex, claude, kilocode, mux, opencode) when acpx itself runs under `npx` and the Node-relative npm bridge is unavailable, instead of exiting with code 127 before initialize. Thanks @kanzaki-chiya.
+- Docs/Qwen Code: clarify text filesystem delegation, native file discovery, and that `--no-fs` does not sandbox native file access; distinguish the CLI from QwenWork.
+- Agents/launch: add best-effort executable and working-directory hints to missing-path errors using the actual child launch context, while retaining the ambiguous-case checklist. Thanks @odrobnik.
+- Docs/site: label the homepage badges as curated examples and use the primary Pi, OpenClaw, Codex, and Claude order.
+
+- Qoder: preserve native startup options, shutdown grace, and cleanup-message filtering when a custom command uses `qoder --acp` instead of `qodercli --acp`.
+- Sessions/controls: `set model`, `set-mode` and other session-control failures now show the adapter's `data.message` reason in text output (`pro-model requires a Pro plan` instead of `Internal error (ACP -32603)`), preferring `data.details` as before. Thanks @KrasimirKralev.
+
+- Runtime/embedding: apply independent setup deadlines to session creation, load and resume requests, cleaning up stalled clients without replacing explicitly resumed sessions.
+
+- Runtime/embedding: keep explicit `resumeSessionId` attachments strict across matching local-record reuse and later prompt/control reconnects without resetting history or saved configuration. Same-record aliases retain the constraint; adding it to unfinished untargeted work refuses until that work settles.
+
+## 0.21.1 - 2026-10-26
+
+**Highlights:** Patch four URI security vulnerabilities in development dependencies, update the guarded filesystem runtime, and clarify missing-prompt errors.
+
+### Fixes
+
+- Dependencies: update the guarded filesystem runtime and development tools; patch four URI normalization and scheme/host confusion vulnerabilities in the development dependency `fast-uri`.
+- Docs/prompting: describe what a prompt command does with no prompt text: it exits with code 2 and `Prompt is required` (or `Prompt from stdin is empty`) instead of printing help. Thanks @KrasimirKralev.
+
+## 0.21.0 - 2026-10-23
+
+**Highlights:** Add opt-in environment controls for embedded agents, clarify malformed agent command errors, and patch denial-of-service vulnerabilities in documentation dependencies.
+
+### Changes
+
+- Runtime/embedding: add opt-in `agentProcessEnvBlock` and `agentProcessEnvAllow` so embedders can keep their own credentials out of the environment inherited by agents, command probes and ACP terminals. Both are off by default; explicit grants and overlays still apply. Thanks @VACInc.
+
+### Fixes
+
+- CLI: report a malformed `--agent` command (an unterminated quote or a quoted empty command) as a usage error with exit code 2 and `acpxCode: "USAGE"` instead of a runtime error. Thanks @KrasimirKralev.
+- Dependencies: update the guarded filesystem runtime and development tools, and patch denial-of-service vulnerabilities in the docs Markdown renderer.
+
 ## 0.20.0 - 2026-10-20
 
 **Highlights:** Add Octomind support, select exact permission options, and recover cleanly from failed session launches and discards.

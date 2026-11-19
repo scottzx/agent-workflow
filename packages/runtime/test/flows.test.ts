@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { AcpClient } from "../src/acp/client.js";
 import { TimeoutError } from "../src/async-control.js";
 import { decision, decisionEdge } from "../src/flows/decision.js";
 import { validateFlowDefinition } from "../src/flows/graph.js";
@@ -190,6 +191,66 @@ test("parseJsonObject parses fenced JSON without regex backtracking", () => {
     ok: true,
   });
   assert.throws(() => parseJsonObject("```json\n", { mode: "fenced" }), /Could not parse JSON/);
+});
+
+for (const value of [
+  { message: "literal ``` and ```` fences", ok: true },
+  { "key```": 'escaped " before ``` and " after' },
+  { message: "backslash \\ before ```", tail: "\\" },
+  { message: 'backslash quote \\" before ```' },
+  ["```", { nested: "```" }],
+  "```",
+]) {
+  test(`parseJsonObject preserves fenced JSON string content ${JSON.stringify(value)}`, () => {
+    const json = JSON.stringify(value);
+    for (const opener of ["```json\n", "```JSON\r\n", "```\n"]) {
+      const fenced = opener + json + "\n```";
+      assert.deepEqual(parseJsonObject(fenced, { mode: "fenced" }), value);
+      assert.deepEqual(parseJsonObject(fenced), value);
+      assert.deepEqual(parseJsonObject(json, { mode: "strict" }), value);
+      assert.throws(() => parseJsonObject(fenced, { mode: "strict" }), /Could not parse JSON/);
+    }
+  });
+}
+
+test("parseJsonObject requires a closing fence outside a complete JSON string", () => {
+  for (const text of [
+    '```json\n{"message":"```"}',
+    '```json\n{"message":"unterminated ```\n```',
+    '```json\n{"message":"```",}\n```',
+    '```json\n{"ok":true} trailing "quote"\n```',
+  ]) {
+    assert.throws(() => parseJsonObject(text, { mode: "fenced" }), /Could not parse JSON/);
+  }
+  assert.deepEqual(
+    parseJsonObject('```json\n{"first":true}\n```\n{"second":true}', { mode: "fenced" }),
+    { first: true },
+  );
+});
+
+test("fenced JSON scanning stays bounded with repeated literal fences", () => {
+  const parserUrl = new URL("../src/flows/json.js", import.meta.url).href;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+    import assert from 'node:assert/strict';
+    import { parseJsonObject } from ${JSON.stringify(parserUrl)};
+    const fence = String.fromCharCode(96).repeat(3);
+    const value = { text: (fence + String.fromCharCode(34, 92)).repeat(100_000) };
+    const text = fence + 'json' + String.fromCharCode(10) + JSON.stringify(value);
+    assert.deepEqual(parseJsonObject(text + String.fromCharCode(10) + fence, { mode: 'fenced' }), value);
+    assert.throws(() => parseJsonObject(text, { mode: 'fenced' }), /Could not parse JSON/);
+    process.stdout.write('bounded');
+  `,
+    ],
+    { encoding: "utf8", timeout: 5_000 },
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "bounded");
 });
 
 test("createRunId slugifies flow names without regex backtracking", () => {
@@ -2549,3 +2610,820 @@ test("flow keys: an own direct edge cannot recover through an inherited result s
     assert.equal(successorCalled, false);
   });
 });
+
+type LoggedFlowRequest = {
+  pid: number;
+  method?: string;
+  params?: { configId?: string; value?: string; sessionId?: string };
+};
+
+async function readFlowRequests(log: string): Promise<LoggedFlowRequest[]> {
+  return (await fs.readFile(log, "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as LoggedFlowRequest);
+}
+
+for (const isolated of [false, true]) {
+  for (const selection of ["none", "run", "node"] as const) {
+    test(`flow settings: legacy model metadata stays inert (${isolated ? "isolated" : "persistent"}, ${selection})`, async () => {
+      await withTempHome(async (home) => {
+        const log = path.join(home, "requests.ndjson");
+        const runner = new FlowRunner({
+          resolveAgent: () => ({
+            agentName: "mock",
+            agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session`,
+            cwd: home,
+          }),
+          permissionMode: "deny-all",
+          outputRoot: path.join(home, "runs"),
+          sessionOptions: {
+            ...(selection === "none" ? {} : { model: "smart-model" }),
+            env: { ACPX_TEST_REQUEST_LOG: log },
+          },
+        });
+        const metadata = [42, "legacy-routing-note", { label: "legacy" }];
+        const nodes = Object.fromEntries(
+          metadata.map((model, index) => {
+            const definition = {
+              model,
+              ...(selection === "node" && (isolated || index === 0)
+                ? { modelId: "fast-model" }
+                : {}),
+              session: { isolated },
+              prompt: () => `echo step-${index}`,
+            };
+            const node = acp(definition);
+            assert.deepEqual((node as typeof node & { model: unknown }).model, model);
+            return [`step-${index}`, node];
+          }),
+        );
+        const result = await runner.run(
+          defineFlow({
+            name: "legacy-model-metadata",
+            startAt: "step-0",
+            nodes,
+            edges: [
+              { from: "step-0", to: "step-1" },
+              { from: "step-1", to: "step-2" },
+            ],
+          }),
+          {},
+        );
+        assert.equal(result.state.status, "completed");
+        const requests = await readFlowRequests(log);
+        assert.equal(requests.filter((entry) => entry.method === "session/prompt").length, 3);
+        const modelSelections = requests.filter(
+          (entry) =>
+            entry.method === "session/set_config_option" && entry.params?.configId === "model",
+        );
+        if (selection === "none") {
+          assert.deepEqual(modelSelections, []);
+          assert.ok(
+            result.state.steps.every((step) => step.session?.requestedSettings === undefined),
+          );
+        } else {
+          const expectedModel = selection === "node" ? "fast-model" : "smart-model";
+          assert.ok(modelSelections.length >= 3);
+          assert.ok(modelSelections.every((entry) => entry.params?.value === expectedModel));
+          assert.ok(
+            result.state.steps.every(
+              (step) => step.session?.requestedSettings?.model === expectedModel,
+            ),
+          );
+        }
+        const snapshot = JSON.parse(
+          await fs.readFile(path.join(result.runDir, "flow.json"), "utf8"),
+        ) as { nodes: Record<string, { modelId?: string }> };
+        for (const [id, node] of Object.entries(snapshot.nodes)) {
+          assert.equal(Object.hasOwn(node, "model"), false);
+          assert.equal(node.modelId, nodes[id].modelId);
+        }
+        if (!isolated) {
+          assert.equal(
+            new Set(result.state.steps.map((step) => step.session?.acpSessionId)).size,
+            1,
+          );
+        }
+      });
+    });
+  }
+}
+
+for (const isolated of [false, true]) {
+  test(`flow settings: ${isolated ? "isolated" : "persistent"} first-turn ordering and bundle evidence`, async () => {
+    await withTempHome(async (home) => {
+      const log = path.join(home, "requests.ndjson");
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session --load-session-fails-on-empty`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+        sessionOptions: {
+          model: "smart-model",
+          systemPrompt: { append: "keep this" },
+          env: { ACPX_TEST_REQUEST_LOG: log },
+        },
+        configOptions: [{ configId: "reasoning_effort", value: "low" }],
+      });
+      const selections = [
+        { configId: "reasoning_effort", value: "high" },
+        { configId: "reasoning_effort", value: "xhigh" },
+      ];
+      const flow = defineFlow({
+        name: "settings",
+        startAt: "ask",
+        nodes: {
+          ask: acp({
+            modelId: "fast-model",
+            configOptions: selections,
+            session: { isolated },
+            prompt: () => "echo PONG",
+          }),
+        },
+        edges: [],
+      });
+      const result = await runner.run(flow, {});
+      const requests = await readFlowRequests(log);
+      const controls = requests.filter((entry) =>
+        ["session/set_config_option", "session/prompt"].includes(entry.method ?? ""),
+      );
+      assert.deepEqual(
+        controls.map((entry) =>
+          entry.method === "session/prompt"
+            ? "prompt"
+            : `${entry.params?.configId}=${entry.params?.value}`,
+        ),
+        [
+          "model=fast-model",
+          "reasoning_effort=low",
+          "reasoning_effort=high",
+          "reasoning_effort=xhigh",
+          "prompt",
+        ],
+      );
+      assert.equal(
+        new Set(controls.map((entry) => entry.pid)).size,
+        1,
+        "first prompt must use creating client",
+      );
+      assert.equal(
+        requests.some((entry) => entry.method === "session/load"),
+        false,
+      );
+      const binding = result.state.steps[0].session;
+      assert.ok(binding);
+      assert.deepEqual(binding.requestedSettings, {
+        model: "fast-model",
+        configOptions: [{ configId: "reasoning_effort", value: "low" }, ...selections],
+      });
+      assert.deepEqual(binding.acceptedSettings?.model, {
+        requested: "fast-model",
+        applied: true,
+        accepted: "fast-model",
+      });
+      assert.equal(binding.acceptedSettings?.configOptions.at(-1)?.acceptedValue, "xhigh");
+      assert.equal(binding.acceptedSettings?.configOptions.at(-1)?.reported, true);
+      const saved = JSON.parse(
+        await fs.readFile(
+          path.join(result.runDir, "sessions", binding.bundleId, "binding.json"),
+          "utf8",
+        ),
+      ) as typeof binding;
+      assert.deepEqual(saved.acceptedSettings, binding.acceptedSettings);
+      const snapshot = JSON.parse(
+        await fs.readFile(path.join(result.runDir, "flow.json"), "utf8"),
+      ) as { nodes: { ask: { modelId: string; configOptions: typeof selections } } };
+      assert.equal(snapshot.nodes.ask.modelId, "fast-model");
+      assert.deepEqual(snapshot.nodes.ask.configOptions, selections);
+    });
+  });
+
+  test(`flow settings: ${isolated ? "isolated" : "persistent"} rejection sends no prompt`, async () => {
+    await withTempHome(async (home) => {
+      const log = path.join(home, "requests.ndjson");
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --set-session-config-invalid-params`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+        sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+      });
+      await assert.rejects(
+        runner.run(
+          defineFlow({
+            name: "reject-settings",
+            startAt: "ask",
+            nodes: {
+              ask: acp({
+                configOptions: [{ configId: "reasoning_effort", value: "high" }],
+                session: { isolated },
+                prompt: () => "echo never",
+              }),
+            },
+            edges: [],
+          }),
+          {},
+        ),
+        /Invalid params/,
+      );
+      assert.equal(
+        (await readFlowRequests(log)).some((entry) => entry.method === "session/prompt"),
+        false,
+      );
+    });
+  });
+
+  test(`flow settings: ${isolated ? "isolated" : "persistent"} missing catalog and opaque option ids`, async () => {
+    await withTempHome(async (home) => {
+      const log = path.join(home, "requests.ndjson");
+      const startupAgent = await writeFlowStartupModelAgent(home);
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${JSON.stringify(startupAgent)} --omit-set-config-options`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+        suppressSdkConsoleErrors: true,
+        sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+      });
+      const configId = " Adapter.Option/Id ";
+      const result = await runner.run(
+        defineFlow({
+          name: "opaque-settings",
+          startAt: "ask",
+          nodes: {
+            ask: acp({
+              modelId: "unadvertised",
+              configOptions: [{ configId, value: " raw=value " }],
+              session: { isolated },
+              prompt: () => "echo PONG",
+            }),
+          },
+          edges: [],
+        }),
+        {},
+      );
+      assert.deepEqual(result.state.steps[0].session?.acceptedSettings, {
+        model: { requested: "unadvertised", applied: false },
+        configOptions: [
+          { configId, value: " raw=value ", acceptedValue: " raw=value ", reported: false },
+        ],
+      });
+      assert.ok(
+        (await readFlowRequests(log)).some(
+          (entry) => entry.params?.configId === configId && entry.params.value === " raw=value ",
+        ),
+      );
+    });
+  });
+}
+
+test("flow settings: shared handles inherit, compare final repeated selections, and reconnect before prompting", async () => {
+  await withTempHome(async (home) => {
+    const log = path.join(home, "requests.ndjson");
+    const runner = new FlowRunner({
+      resolveAgent: () => ({
+        agentName: "mock",
+        agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session`,
+        cwd: home,
+      }),
+      permissionMode: "deny-all",
+      outputRoot: path.join(home, "runs"),
+      sessionOptions: { model: "smart-model", env: { ACPX_TEST_REQUEST_LOG: log } },
+      configOptions: [{ configId: "reasoning_effort", value: "low" }],
+    });
+    const settings = {
+      modelId: "fast-model",
+      configOptions: [
+        { configId: "reasoning_effort", value: "high" },
+        { configId: "reasoning_effort", value: "xhigh" },
+      ],
+    };
+    const result = await runner.run(
+      defineFlow({
+        name: "reuse-settings",
+        startAt: "first",
+        nodes: {
+          first: acp({ ...settings, prompt: () => "echo one" }),
+          second: acp({ prompt: () => "echo two" }),
+          third: acp({
+            modelId: "fast-model",
+            configOptions: [{ configId: "reasoning_effort", value: "xhigh" }],
+            prompt: () => "echo three",
+          }),
+          fourth: acp({
+            modelId: "smart-model",
+            configOptions: [{ configId: "reasoning_effort", value: "low" }],
+            session: { handle: "other" },
+            prompt: () => "echo four",
+          }),
+        },
+        edges: [
+          { from: "first", to: "second" },
+          { from: "second", to: "third" },
+          { from: "third", to: "fourth" },
+        ],
+      }),
+      {},
+    );
+    assert.equal(result.state.status, "completed");
+    assert.equal(Object.keys(result.state.sessionBindings).length, 2);
+    assert.equal(
+      result.state.steps[0].session?.acpSessionId,
+      result.state.steps[2].session?.acpSessionId,
+    );
+    assert.deepEqual(
+      result.state.steps[1].session?.requestedSettings,
+      result.state.steps[0].session?.requestedSettings,
+    );
+    const requests = await readFlowRequests(log);
+    const loads = requests.flatMap((entry, index) =>
+      entry.method === "session/load" ? [index] : [],
+    );
+    assert.equal(loads.length, 2);
+    for (const load of loads) {
+      const prompt = requests.findIndex(
+        (entry, index) => index > load && entry.method === "session/prompt",
+      );
+      const controls = requests
+        .slice(load + 1, prompt)
+        .filter((entry) => entry.method === "session/set_config_option");
+      assert.equal(controls[0].params?.configId, "model");
+      assert.equal(controls.at(-1)?.params?.value, "xhigh");
+      assert.equal(requests[load].params?.sessionId, requests[prompt].params?.sessionId);
+    }
+  });
+});
+
+for (const conflict of [
+  { modelId: "smart-model" },
+  { configOptions: [{ configId: "reasoning_effort", value: "low" }] },
+]) {
+  test(`flow settings: conflicting shared handle fails before another prompt (${JSON.stringify(conflict)})`, async () => {
+    await withTempHome(async (home) => {
+      const log = path.join(home, "requests.ndjson");
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+        sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+      });
+      await assert.rejects(
+        runner.run(
+          defineFlow({
+            name: "conflict-settings",
+            startAt: "first",
+            nodes: {
+              first: acp({
+                modelId: "fast-model",
+                configOptions: [{ configId: "reasoning_effort", value: "high" }],
+                prompt: () => "echo one",
+              }),
+              second: acp({ ...conflict, prompt: () => "echo never" }),
+            },
+            edges: [{ from: "first", to: "second" }],
+          }),
+          {},
+        ),
+        /Conflicting/,
+      );
+      assert.equal(
+        (await readFlowRequests(log)).filter((entry) => entry.method === "session/prompt").length,
+        1,
+      );
+    });
+  });
+}
+
+test("flow settings schema rejects empty or malformed selections", () => {
+  for (const settings of [
+    { modelId: " " },
+    { modelId: 42 },
+    { configOptions: [{ configId: "", value: "high" }] },
+    { configOptions: [{ configId: "effort", value: " " }] },
+    { configOptions: {} },
+  ]) {
+    assert.throws(
+      () => acp({ ...settings, prompt: () => "x" } as Parameters<typeof acp>[0]),
+      /Invalid acp node definition/,
+    );
+  }
+});
+
+async function writeFlowStartupModelAgent(home: string): Promise<string> {
+  const bin = path.join(
+    home,
+    process.platform === "win32" ? "claude-agent-acp.cmd" : "claude-agent-acp",
+  );
+  const content =
+    process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "${MOCK_AGENT_PATH}" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"\n`;
+  await fs.writeFile(bin, content, { mode: 0o755 });
+  return bin;
+}
+
+for (const isolated of [false, true]) {
+  test(`flow settings: ${isolated ? "isolated" : "persistent"} timed-out selection sends no prompt`, async (t) => {
+    await withTempHome(async (home) => {
+      const log = path.join(home, "requests.ndjson");
+      const original = AcpClient.prototype.setSessionConfigOption;
+      t.mock.method(
+        AcpClient.prototype,
+        "setSessionConfigOption",
+        async function (this: AcpClient, ...args: Parameters<AcpClient["setSessionConfigOption"]>) {
+          await original.apply(this, args);
+          return await new Promise<Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>>(
+            (_resolve, reject) => {
+              const signal = args[4]?.signal;
+              assert.ok(signal);
+              signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            },
+          );
+        },
+      );
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+        sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+      });
+      await assert.rejects(
+        runner.run(
+          defineFlow({
+            name: "timeout-settings",
+            startAt: "ask",
+            nodes: {
+              ask: acp({
+                timeoutMs: 2000,
+                configOptions: [{ configId: "reasoning_effort", value: "high" }],
+                session: { isolated },
+                prompt: () => "echo never",
+              }),
+            },
+            edges: [],
+          }),
+          {},
+        ),
+        TimeoutError,
+      );
+      const requests = await readFlowRequests(log);
+      assert.ok(requests.some((entry) => entry.method === "session/set_config_option"));
+      assert.equal(
+        requests.some((entry) => entry.method === "session/prompt"),
+        false,
+      );
+    });
+  });
+}
+
+for (const drift of ["none", "model", "option"] as const) {
+  test(
+    "flow settings: first-prompt reconnect preserves pinned settings (" + drift + ")",
+    async (t) => {
+      await withTempHome(async (home) => {
+        const log = path.join(home, "requests.ndjson");
+        let reconnecting = false;
+        const originalLoad = AcpClient.prototype.loadSessionWithOptions;
+        t.mock.method(
+          AcpClient.prototype,
+          "loadSessionWithOptions",
+          async function (
+            this: AcpClient,
+            ...args: Parameters<AcpClient["loadSessionWithOptions"]>
+          ) {
+            reconnecting = true;
+            return await originalLoad.apply(this, args);
+          },
+        );
+        const originalSet = AcpClient.prototype.setSessionConfigOption;
+        t.mock.method(
+          AcpClient.prototype,
+          "setSessionConfigOption",
+          async function (
+            this: AcpClient,
+            ...args: Parameters<AcpClient["setSessionConfigOption"]>
+          ) {
+            const response = await originalSet.apply(this, args);
+            if (!reconnecting) {
+              if (args[1] === "reasoning_effort") {
+                // Lose the configured initial connection before its first prompt.
+                await this.close();
+              }
+              return response;
+            }
+            return {
+              ...response,
+              configOptions: response.configOptions?.map((option) =>
+                drift !== "none" && option.id === (drift === "model" ? "model" : "reasoning_effort")
+                  ? Object.assign({}, option, {
+                      currentValue: drift === "model" ? "smart-model" : "low",
+                    })
+                  : option,
+              ),
+            };
+          },
+        );
+        const runner = new FlowRunner({
+          resolveAgent: () => ({
+            agentName: "mock",
+            agentCommand:
+              MOCK_AGENT_COMMAND + " --advertise-config-options --supports-load-session",
+            cwd: home,
+          }),
+          permissionMode: "deny-all",
+          outputRoot: path.join(home, "runs"),
+          sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+        });
+        const run = runner.run(
+          defineFlow({
+            name: "first-prompt-reconnect",
+            startAt: "ask",
+            nodes: {
+              ask: acp({
+                modelId: "fast-model",
+                configOptions: [{ configId: "reasoning_effort", value: "high" }],
+                prompt: () => "echo first",
+              }),
+            },
+            edges: [],
+          }),
+          {},
+        );
+        if (drift === "none") {
+          assert.equal((await run).state.status, "completed");
+        } else {
+          await assert.rejects(run, /Cannot replay pinned/);
+        }
+        const requests = await readFlowRequests(log);
+        assert.equal(requests.filter((entry) => entry.method === "session/new").length, 1);
+        assert.equal(requests.filter((entry) => entry.method === "session/load").length, 1);
+        assert.equal(
+          requests.filter((entry) => entry.method === "session/prompt").length,
+          drift === "none" ? 1 : 0,
+        );
+      });
+    },
+  );
+}
+
+test("flow settings: reconnect cannot silently drop the pinned model", async (t) => {
+  await withTempHome(async (home) => {
+    const log = path.join(home, "requests.ndjson");
+    const original = AcpClient.prototype.loadSessionWithOptions;
+    t.mock.method(
+      AcpClient.prototype,
+      "loadSessionWithOptions",
+      async function (this: AcpClient, ...args: Parameters<AcpClient["loadSessionWithOptions"]>) {
+        const loaded = await original.apply(this, args);
+        return {
+          ...loaded,
+          models: undefined,
+          configOptions: loaded.configOptions?.filter((option) => option.category !== "model"),
+        };
+      },
+    );
+    const runner = new FlowRunner({
+      resolveAgent: () => ({
+        agentName: "mock",
+        agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session`,
+        cwd: home,
+      }),
+      permissionMode: "deny-all",
+      outputRoot: path.join(home, "runs"),
+      sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+    });
+    await assert.rejects(
+      runner.run(
+        defineFlow({
+          name: "replay-fails",
+          startAt: "first",
+          nodes: {
+            first: acp({
+              modelId: "fast-model",
+              configOptions: [{ configId: "reasoning_effort", value: "high" }],
+              prompt: () => "echo one",
+            }),
+            second: acp({ prompt: () => "echo never" }),
+          },
+          edges: [{ from: "first", to: "second" }],
+        }),
+        {},
+      ),
+      /did not advertise|Cannot replay/,
+    );
+    const requests = await readFlowRequests(log);
+    assert.equal(requests.filter((entry) => entry.method === "session/prompt").length, 1);
+    assert.equal(requests.filter((entry) => entry.method === "session/new").length, 1);
+    assert.equal(requests.filter((entry) => entry.method === "session/load").length, 1);
+  });
+});
+
+for (const drift of ["option", "model"] as const) {
+  test(`flow settings: reconnect rejects a different accepted ${drift} before prompting`, async (t) => {
+    await withTempHome(async (home) => {
+      const log = path.join(home, "requests.ndjson");
+      let reconnecting = false;
+      const originalLoad = AcpClient.prototype.loadSessionWithOptions;
+      t.mock.method(
+        AcpClient.prototype,
+        "loadSessionWithOptions",
+        async function (this: AcpClient, ...args: Parameters<AcpClient["loadSessionWithOptions"]>) {
+          const loaded = await originalLoad.apply(this, args);
+          reconnecting = true;
+          return loaded;
+        },
+      );
+      const originalSet = AcpClient.prototype.setSessionConfigOption;
+      t.mock.method(
+        AcpClient.prototype,
+        "setSessionConfigOption",
+        async function (this: AcpClient, ...args: Parameters<AcpClient["setSessionConfigOption"]>) {
+          const response = await originalSet.apply(this, args);
+          if (!reconnecting) {
+            return response;
+          }
+          return {
+            ...response,
+            configOptions: response.configOptions?.map((option) =>
+              option.id === (drift === "model" ? "model" : "reasoning_effort")
+                ? Object.assign({}, option, {
+                    currentValue: drift === "model" ? "smart-model" : "low",
+                  })
+                : option,
+            ),
+          };
+        },
+      );
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+        sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+      });
+      await assert.rejects(
+        runner.run(
+          defineFlow({
+            name: "replay-acceptance-drift",
+            startAt: "first",
+            nodes: {
+              first: acp({
+                modelId: "fast-model",
+                configOptions: [{ configId: "reasoning_effort", value: "high" }],
+                prompt: () => "echo one",
+              }),
+              second: acp({ prompt: () => "echo never" }),
+            },
+            edges: [{ from: "first", to: "second" }],
+          }),
+          {},
+        ),
+        drift === "model"
+          ? /Cannot replay pinned model for persistent session handle "main"/
+          : /Cannot replay pinned config option "reasoning_effort" for persistent session handle "main"/,
+      );
+      const requests = await readFlowRequests(log);
+      assert.equal(requests.filter((entry) => entry.method === "session/prompt").length, 1);
+      assert.equal(requests.filter((entry) => entry.method === "session/new").length, 1);
+      assert.equal(requests.filter((entry) => entry.method === "session/load").length, 1);
+    });
+  });
+}
+
+test("flow settings: unconfigured persistent and isolated bundles omit settings evidence", async () => {
+  await withTempHome(async (home) => {
+    const log = path.join(home, "requests.ndjson");
+    const runner = new FlowRunner({
+      resolveAgent: () => ({
+        agentName: "mock",
+        agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options --supports-load-session`,
+        cwd: home,
+      }),
+      permissionMode: "deny-all",
+      outputRoot: path.join(home, "runs"),
+      sessionOptions: { env: { ACPX_TEST_REQUEST_LOG: log } },
+    });
+    const result = await runner.run(
+      defineFlow({
+        name: "no-settings",
+        startAt: "first",
+        nodes: {
+          first: acp({ prompt: () => "echo one" }),
+          second: acp({ prompt: () => "echo two" }),
+          isolated: acp({ session: { isolated: true }, prompt: () => "echo three" }),
+        },
+        edges: [
+          { from: "first", to: "second" },
+          { from: "second", to: "isolated" },
+        ],
+      }),
+      {},
+    );
+    for (const step of result.state.steps) {
+      const binding = step.session;
+      assert.ok(binding);
+      assert.equal(Object.hasOwn(binding, "requestedSettings"), false);
+      assert.equal(Object.hasOwn(binding, "acceptedSettings"), false);
+      const saved = JSON.parse(
+        await fs.readFile(
+          path.join(result.runDir, "sessions", binding.bundleId, "binding.json"),
+          "utf8",
+        ),
+      ) as typeof binding;
+      assert.equal(Object.hasOwn(saved, "requestedSettings"), false);
+      assert.equal(Object.hasOwn(saved, "acceptedSettings"), false);
+    }
+    const savedSteps = JSON.parse(
+      await fs.readFile(path.join(result.runDir, "projections", "steps.json"), "utf8"),
+    ) as typeof result.state.steps;
+    for (const step of savedSteps) {
+      assert.ok(step.session);
+      assert.equal(Object.hasOwn(step.session, "requestedSettings"), false);
+      assert.equal(Object.hasOwn(step.session, "acceptedSettings"), false);
+    }
+    const requests = await readFlowRequests(log);
+    assert.equal(requests.filter((entry) => entry.method === "session/prompt").length, 3);
+    assert.equal(
+      requests.some((entry) => entry.method === "session/set_config_option"),
+      false,
+    );
+    assert.equal(requests.filter((entry) => entry.method === "session/load").length, 1);
+  });
+});
+
+for (const omitted of ["catalog", "option", "non-list catalog"] as const) {
+  test(`flow settings: accepted option is unreported when reply omits ${omitted}`, async (t) => {
+    await withTempHome(async (home) => {
+      const original = AcpClient.prototype.setSessionConfigOption;
+      t.mock.method(
+        AcpClient.prototype,
+        "setSessionConfigOption",
+        async function (this: AcpClient, ...args: Parameters<AcpClient["setSessionConfigOption"]>) {
+          const response = await original.apply(this, args);
+          return {
+            ...response,
+            configOptions:
+              omitted === "catalog"
+                ? undefined
+                : omitted === "non-list catalog"
+                  ? ({} as unknown as typeof response.configOptions)
+                  : response.configOptions?.filter((option) => option.id !== "reasoning_effort"),
+          };
+        },
+      );
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --advertise-config-options`,
+          cwd: home,
+        }),
+        permissionMode: "deny-all",
+        outputRoot: path.join(home, "runs"),
+      });
+      const result = await runner.run(
+        defineFlow({
+          name: "unreported-option",
+          startAt: "ask",
+          nodes: {
+            ask: acp({
+              configOptions: [{ configId: "reasoning_effort", value: "high" }],
+              prompt: () => "echo one",
+            }),
+          },
+          edges: [],
+        }),
+        {},
+      );
+      assert.deepEqual(result.state.steps[0].session?.acceptedSettings?.configOptions, [
+        {
+          configId: "reasoning_effort",
+          value: "high",
+          acceptedValue: "high",
+          reported: false,
+        },
+      ]);
+    });
+  });
+}

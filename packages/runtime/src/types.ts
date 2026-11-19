@@ -124,8 +124,6 @@ export type PermissionEscalationEvent = {
 export const SESSION_RESUME_POLICIES = ["allow-new", "same-session-only"] as const;
 export type SessionResumePolicy = (typeof SESSION_RESUME_POLICIES)[number];
 
-export const OUTPUT_STREAMS = ["prompt", "control"] as const;
-export type OutputStream = (typeof OUTPUT_STREAMS)[number];
 export type AcpJsonRpcMessage = AnyMessage;
 export type AcpMessageDirection = "outbound" | "inbound";
 
@@ -325,6 +323,13 @@ export type AcpClientOptions = {
   agentArgv?: string[];
   /** Trusted child-only environment overlay; never persisted as session options. */
   agentProcessEnv?: Record<string, string>;
+  /**
+   * Opt-in allowlist: agent children, probes and terminals inherit only process essentials,
+   * these parent names and `ACPX_AUTH_*` grants.
+   */
+  agentProcessEnvAllow?: readonly string[];
+  /** Parent environment names that agent children, probes and terminals do not inherit. */
+  agentProcessEnvBlock?: readonly string[];
   cwd: string;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
