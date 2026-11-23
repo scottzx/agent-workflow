@@ -128,12 +128,23 @@ function localLaunch(id: string, options: DiscoveryOptions): string[] | undefine
   // A package runner alone does not demonstrate an installed harness.
   if (argv[0] === 'uvx') return undefined;
   const binary = findAgentBinary(argv[0], options);
-  return binary ? [binary, ...argv.slice(1)] : undefined;
+  if (binary) return [binary, ...argv.slice(1)];
+  if (id === 'antigravity') {
+    const fallbackArgv = antigravityFallbackArgv(options.platform ?? process.platform);
+    const fallbackBinary = findAgentBinary(fallbackArgv[0], options);
+    if (fallbackBinary) return [fallbackBinary, ...fallbackArgv.slice(1)];
+  }
+  return undefined;
 }
 
-/** Antigravity's ACP runtime is a separate download from the `agy` CLI. */
-function discoveryBinary(id: string, descriptor: { binary: string } | undefined, argv: string[] | string | undefined, platform: NodeJS.Platform): string {
-  if (id === 'antigravity') return platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par';
+/** Legacy standalone Antigravity ACP runtime, used only when `agy` is absent. */
+function antigravityFallbackArgv(platform: NodeJS.Platform): string[] {
+  return platform === 'win32'
+    ? ['agy_acp_server.exe']
+    : ['agy_acp_server.par', ...(platform === 'linux' ? ['--uid='] : [])];
+}
+
+function discoveryBinary(id: string, descriptor: { binary: string } | undefined, argv: string[] | string | undefined): string {
   return descriptor?.binary ?? (Array.isArray(argv) && !['npx', 'uvx'].includes(argv[0]) ? argv[0] : id);
 }
 
@@ -145,8 +156,16 @@ export function discoverAgents(options: DiscoveryOptions = {}): AgentStatus[] {
   return [...new Set([...supportedAgents, ...descriptors.keys()])].map(id => {
     const descriptor = descriptors.get(id);
     const argv = registry.resolve(id);
-    const binary = discoveryBinary(id, descriptor, argv, platform);
-    const path = findAgentBinary(binary, options);
+    let binary = discoveryBinary(id, descriptor, argv);
+    let path = findAgentBinary(binary, options);
+    if (!path && id === 'antigravity') {
+      const fallbackBinary = antigravityFallbackArgv(platform)[0];
+      const fallbackPath = findAgentBinary(fallbackBinary, options);
+      if (fallbackPath) {
+        binary = fallbackBinary;
+        path = fallbackPath;
+      }
+    }
     const supported = supportedAgents.has(id);
     return {
       id, type: descriptor?.type ?? id, label: descriptor?.label ?? id, binary,

@@ -48,6 +48,7 @@ export const LEGACY_AGENT_COMMANDS: Readonly<Record<string, readonly string[]>> 
     "npm exec @agentclientprotocol/claude-agent-acp@^0.76.0",
     "npm exec @agentclientprotocol/claude-agent-acp@^0.81.2",
   ],
+  antigravity: ["agy_acp_server.par", "agy_acp_server.par --uid=", "agy_acp_server.exe"],
   gemini: ["gemini", "gemini --experimental-acp"],
   kilocode: ["npx -y @kilocode/cli acp"],
   kiro: ["kiro-cli acp"],

@@ -2794,8 +2794,9 @@ export class AcpClient {
   private resolveAntigravityInteractionResponse(
     params: RequestPermissionRequest,
   ): RequestPermissionResponse | undefined {
+    const agentName = this.initResult?.agentInfo?.name;
     const isAntigravityInteraction =
-      this.initResult?.agentInfo?.name === "antigravity-acp" &&
+      (agentName === "antigravity-acp" || agentName === "Antigravity ACP Server") &&
       params.toolCall.toolCallId.startsWith("interaction_");
     if (!isAntigravityInteraction) {
       return undefined;

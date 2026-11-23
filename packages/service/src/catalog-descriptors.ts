@@ -123,12 +123,12 @@ export const catalogDescriptors = [
   {
     "type": "antigravity",
     "label": "Antigravity",
-    "binary": "agy_acp_server.par",
+    "binary": "agy",
     "acp_capable": true,
     "cli_capable": true,
     "cc_transport": "acp",
     "integrated": true,
-    "install_command": "Install agy_acp_server and localharness_external from the same antigravity-acp release (https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json) onto PATH, and point ANTIGRAVITY_HARNESS_PATH at that helper"
+    "install_command": "Install Google Antigravity CLI (agy >= 1.5 with agy acp) onto PATH, or install agy_acp_server and localharness_external from an antigravity-acp release"
   },
   {
     "type": "openhands",

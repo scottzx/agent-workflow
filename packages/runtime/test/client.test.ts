@@ -511,7 +511,7 @@ test("AcpClient authenticateIfRequired throws when auth policy is fail and crede
   );
 });
 
-for (const agentName of ["antigravity-acp", "custom-agent"]) {
+for (const agentName of ["antigravity-acp", "Antigravity ACP Server", "custom-agent"]) {
   for (const toolCallId of ["interaction_question", "ordinary-tool"]) {
     test(`AcpClient handles ${agentName} ${toolCallId} without inventing user answers`, async (t) => {
       let hostCalls = 0;
@@ -544,7 +544,9 @@ for (const agentName of ["antigravity-acp", "custom-agent"]) {
       const message = await fixture.message(1);
       assert("result" in message);
       const response = message.result as RequestPermissionResponse;
-      const isQuestion = agentName === "antigravity-acp" && toolCallId.startsWith("interaction_");
+      const isQuestion =
+        (agentName === "antigravity-acp" || agentName === "Antigravity ACP Server") &&
+        toolCallId.startsWith("interaction_");
       assert.deepEqual(
         response.outcome,
         isQuestion ? { outcome: "cancelled" } : { outcome: "selected", optionId: "production" },
