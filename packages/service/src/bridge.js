@@ -124,6 +124,52 @@ function interactionTimeoutMs() {
 function interactionTimeoutText() {
   return `${Math.round(interactionTimeoutMs() / 60_000)}min`;
 }
+// Idle process reclamation (Phase 1: tiered TTL + pressure-driven eviction + bg-task protection).
+// Inactive sessions (no running turn, no queued prompt, no pending interactive prompt,
+// no running background task) release their child process and capacity lease while
+// keeping their durable session record on disk for fast session/load (~0.5-1.5s).
+// Defaults: interactive (user-opened) 5min, background A2A job 60s, pressure eviction grace 15s.
+// Set ACP_IDLE_SESSION_TTL_MS=0 to disable periodic idle reaping.
+// Set ACP_PRESSURE_EVICT_ENABLED=0 to disable on-demand capacity eviction.
+const DEFAULT_IDLE_SESSION_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_IDLE_JOB_TTL_MS = 60 * 1000;
+const DEFAULT_PRESSURE_EVICT_GRACE_MS = 15 * 1000;
+const RUNNING_BACKGROUND_TASK_STATUSES = new Set(["running", "in_progress", "pending"]);
+
+function idleSessionTtlMs() {
+  const raw = process.env.ACP_IDLE_SESSION_TTL_MS;
+  if (raw === undefined || raw === "") return DEFAULT_IDLE_SESSION_TTL_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return DEFAULT_IDLE_SESSION_TTL_MS;
+  return value <= 0 ? 0 : value;
+}
+
+function idleJobTtlMs(baseTtlMs = idleSessionTtlMs()) {
+  const raw = process.env.ACP_IDLE_JOB_TTL_MS;
+  if (raw !== undefined && raw !== "") {
+    const value = Number(raw);
+    if (Number.isFinite(value)) return value <= 0 ? 0 : value;
+  }
+  if (baseTtlMs <= 0) return 0;
+  return Math.min(baseTtlMs, DEFAULT_IDLE_JOB_TTL_MS);
+}
+
+function sessionIdleTtlMs(session) {
+  const base = idleSessionTtlMs();
+  return session?.origin === "job" ? idleJobTtlMs(base) : base;
+}
+
+function pressureEvictEnabled() {
+  return process.env.ACP_PRESSURE_EVICT_ENABLED !== "0";
+}
+
+function pressureEvictGraceMs() {
+  const raw = process.env.ACP_PRESSURE_EVICT_GRACE_MS;
+  if (raw === undefined || raw === "") return DEFAULT_PRESSURE_EVICT_GRACE_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return DEFAULT_PRESSURE_EVICT_GRACE_MS;
+  return value < 0 ? 0 : value;
+}
 function clearHandshake(launchId) {
   const timer = handshakeTimers.get(launchId);
   if (timer) clearTimeout(timer);
@@ -168,6 +214,13 @@ const runtime = createAcpRuntime({
         ? "prewarm"
         : typeof sessionKey === "string" && sessionKey ? "user-opened" : undefined;
       if (origin) launchOrigins.set(launch.launchId, origin);
+      if (!preparedByLaunch.has(launch.launchId) && pressureEvictEnabled()) {
+        const snapshot = await processCapacity.snapshot("process");
+        if (snapshot.availableAutomatic < 1) {
+          await evictIdleSessionsForCapacity({ excludeSessionId: sessionKey, signal });
+          signal.throwIfAborted();
+        }
+      }
       await capacityLifecycle.onBeforeSpawn(launch);
       signal.throwIfAborted();
       // The 60s budget starts only after the process slot is held.
@@ -218,6 +271,9 @@ const runtime = createAcpRuntime({
       return;
     }
     if (updateTag === "background_task" && Array.isArray(update?.tasks)) {
+      sessionBackgroundTasks.set(sessionKey, update.tasks);
+      touchSessionActivity(session);
+      scheduleIdleReap();
       // Background-task snapshots can arrive between turns (a task finishing
       // long after the turn that started it). Forward the full snapshot so
       // the client's task panel stays live.
@@ -240,9 +296,9 @@ const runtime = createAcpRuntime({
       // to the history push below so the chat transcript updates too.
       const task = parseBackgroundTaskReminder(update);
       if (task) {
-        const tasks = sessionBackgroundTasks.get(sessionKey) ?? [];
-        tasks.push(task);
-        sessionBackgroundTasks.set(sessionKey, tasks);
+        const tasks = upsertBackgroundTask(sessionKey, task);
+        touchSessionActivity(session);
+        scheduleIdleReap();
         const ws = session.ws;
         if (ws && ws.readyState === 1 /* OPEN */) {
           ws.send(
@@ -259,6 +315,7 @@ const runtime = createAcpRuntime({
       void sendSessionMeta(session.ws, sessionKey, session.handle);
     }
     if (HISTORY_UPDATE_TAGS.has(updateTag)) {
+      touchSessionActivity(session);
       scheduleSessionHistoryPush(sessionKey);
     }
   },
@@ -266,8 +323,211 @@ const runtime = createAcpRuntime({
 const turnJournal = createTurnJournal({ stateDir: DEFAULT_STATE_DIR });
 
 // Map of active session handles and turn contexts
-// sessionId -> { handle, activeTurn }
+// sessionId -> { handle, activeTurn, lastActivityAt }
 const activeSessions = new Map();
+
+let idleReapTimer = null;
+let idleReapInFlight = null;
+let pressureEvictChain = Promise.resolve();
+
+function touchSessionActivity(session) {
+  if (session) session.lastActivityAt = Date.now();
+}
+
+function upsertBackgroundTask(sessionId, task) {
+  const existing = sessionBackgroundTasks.get(sessionId) ?? [];
+  const next = [...existing];
+  const idx = task?.id ? next.findIndex((item) => item?.id === task.id) : -1;
+  if (idx >= 0) next[idx] = { ...next[idx], ...task };
+  else next.push(task);
+  sessionBackgroundTasks.set(sessionId, next);
+  return next;
+}
+
+function hasRunningBackgroundTask(sessionId) {
+  const tasks = sessionBackgroundTasks.get(sessionId);
+  if (!Array.isArray(tasks) || tasks.length === 0) return false;
+  return tasks.some((task) => RUNNING_BACKGROUND_TASK_STATUSES.has(task?.status));
+}
+
+function hasPendingInteraction(sessionId) {
+  for (const pending of pendingPermissions.values()) {
+    if (pending.sessionId === sessionId) return true;
+  }
+  for (const pending of pendingAskUserQuestions.values()) {
+    if (pending.sessionId === sessionId) return true;
+  }
+  for (const pending of pendingExitPlanModes.values()) {
+    if (pending.sessionId === sessionId) return true;
+  }
+  return false;
+}
+
+function isSessionBusy(sessionId, session) {
+  return Boolean(
+    session.activeTurn ||
+      (Array.isArray(session.promptQueue) && session.promptQueue.length > 0) ||
+      initializingSessions.has(sessionId) ||
+      hasPendingInteraction(sessionId) ||
+      hasRunningBackgroundTask(sessionId),
+  );
+}
+
+function isSessionIdleEligible(sessionId, session, minIdleMs, now = Date.now()) {
+  if (!session || isSessionBusy(sessionId, session)) return false;
+  if (minIdleMs < 0) return false;
+  const last = typeof session.lastActivityAt === "number" ? session.lastActivityAt : now;
+  return now - last >= minIdleMs;
+}
+
+function evictionPriorityTier(session) {
+  // Tier 0: disconnected/orphaned WS; Tier 1: background A2A job; Tier 2: interactive user session
+  if (!session?.ws || session.ws.readyState !== 1) return 0;
+  if (session.origin === "job") return 1;
+  return 2;
+}
+
+function stopIdleReaper() {
+  if (idleReapTimer) {
+    clearTimeout(idleReapTimer);
+    idleReapTimer = null;
+  }
+}
+
+function scheduleIdleReap() {
+  stopIdleReaper();
+  if (activeSessions.size === 0) return;
+  const now = Date.now();
+  let earliestDue = Infinity;
+  let hasScheduledTarget = false;
+  for (const [sessionId, session] of activeSessions.entries()) {
+    const ttlMs = sessionIdleTtlMs(session);
+    if (ttlMs <= 0) continue;
+    hasScheduledTarget = true;
+    if (isSessionBusy(sessionId, session)) {
+      if (ttlMs < earliestDue) earliestDue = ttlMs;
+      continue;
+    }
+    const last = typeof session.lastActivityAt === "number" ? session.lastActivityAt : now;
+    const remaining = ttlMs - (now - last);
+    if (remaining < earliestDue) earliestDue = remaining;
+  }
+  if (!hasScheduledTarget || !Number.isFinite(earliestDue)) return;
+  const overrideInterval = Number(process.env.ACP_IDLE_REAP_INTERVAL_MS);
+  const delayMs =
+    Number.isFinite(overrideInterval) && overrideInterval > 0
+      ? overrideInterval
+      : Math.min(60_000, Math.max(25, earliestDue));
+  idleReapTimer = setTimeout(() => {
+    idleReapTimer = null;
+    void reapIdleSessions().finally(() => scheduleIdleReap());
+  }, delayMs);
+  idleReapTimer.unref?.();
+}
+
+async function reclaimIdleSession(sessionId, { minIdleMs, reason, closeLabel }) {
+  let reaped = false;
+  await withTurnDispatchLock(sessionId, async () => {
+    const now = Date.now();
+    const session = activeSessions.get(sessionId);
+    if (!isSessionIdleEligible(sessionId, session, minIdleMs, now)) return;
+    activeSessions.delete(sessionId);
+    sessionBackgroundTasks.delete(sessionId);
+    unregisterAgentSessionMapping(session.handle);
+    clearSessionHistoryPush(sessionId);
+    const owner = session.ws;
+    const idleSec = Math.round((now - (session.lastActivityAt ?? now)) / 1000);
+    console.log(
+      `[acpx-server] Reclaiming idle session process: ${sessionId} (origin=${session.origin ?? "user-opened"}, reason=${reason}, idle ${idleSec}s)`,
+    );
+    try {
+      await runtime.close({ handle: session.handle, reason: closeLabel });
+    } catch (err) {
+      console.warn(`[acpx-server] Error closing idle session ${sessionId}:`, err);
+    }
+    sessionMcpServers.delete(session.handle?.sessionKey);
+    reaped = true;
+    if (owner && owner.readyState === 1) {
+      try {
+        owner.send(JSON.stringify({ event: "session_closed", sessionId, reason }));
+      } catch {
+        // ignore send errors on closed peer
+      }
+    }
+  });
+  return reaped;
+}
+
+async function reapIdleSessions() {
+  if (idleReapInFlight) return idleReapInFlight;
+  if (activeSessions.size === 0) return [];
+  idleReapInFlight = (async () => {
+    const now = Date.now();
+    const candidates = [];
+    for (const [sessionId, session] of activeSessions.entries()) {
+      const ttlMs = sessionIdleTtlMs(session);
+      if (ttlMs > 0 && isSessionIdleEligible(sessionId, session, ttlMs, now)) {
+        candidates.push({ sessionId, ttlMs });
+      }
+    }
+    const reaped = [];
+    for (const { sessionId, ttlMs } of candidates) {
+      if (
+        await reclaimIdleSession(sessionId, {
+          minIdleMs: ttlMs,
+          reason: "idle_timeout",
+          closeLabel: "Idle session timeout",
+        })
+      ) {
+        reaped.push(sessionId);
+      }
+    }
+    return reaped;
+  })();
+  try {
+    return await idleReapInFlight;
+  } finally {
+    idleReapInFlight = null;
+  }
+}
+
+async function evictIdleSessionsForCapacity({ excludeSessionId, signal } = {}) {
+  if (!pressureEvictEnabled() || activeSessions.size === 0) return [];
+  const run = async () => {
+    signal?.throwIfAborted();
+    const graceMs = pressureEvictGraceMs();
+    const now = Date.now();
+    const candidates = [];
+    for (const [sessionId, session] of activeSessions.entries()) {
+      if (sessionId === excludeSessionId) continue;
+      if (!isSessionIdleEligible(sessionId, session, graceMs, now)) continue;
+      candidates.push({
+        sessionId,
+        tier: evictionPriorityTier(session),
+        lastActivityAt: typeof session.lastActivityAt === "number" ? session.lastActivityAt : now,
+      });
+    }
+    if (candidates.length === 0) return [];
+    candidates.sort((a, b) => a.tier - b.tier || a.lastActivityAt - b.lastActivityAt);
+    const evicted = [];
+    for (const candidate of candidates) {
+      signal?.throwIfAborted();
+      const snapshot = await processCapacity.snapshot("process");
+      if (snapshot.availableAutomatic >= 1) break;
+      const reaped = await reclaimIdleSession(candidate.sessionId, {
+        minIdleMs: graceMs,
+        reason: "capacity_evicted",
+        closeLabel: "Evicted idle session for capacity",
+      });
+      if (reaped) evicted.push(candidate.sessionId);
+    }
+    if (evicted.length > 0) scheduleIdleReap();
+    return evicted;
+  };
+  const next = pressureEvictChain.then(run, run);
+  pressureEvictChain = next.then(() => undefined, () => undefined);
+  return next;
+}
 
 // Phase 2 Pre-warm pool for grok-build (scoped to the most recent CWD)
 // Disabled: nothing schedules prewarmGrokSession. A spare starts without the
@@ -1328,7 +1588,7 @@ export function attachBridgeServer(serverOrOptions = {}) {
   });
 
   wss.on("connection", (ws, req) => attachAcpConnection(ws, req));
-  wss.on("close", () => { wss = null; });
+  wss.on("close", () => { stopIdleReaper(); wss = null; });
 
   return {
     wss,
@@ -1347,6 +1607,16 @@ export async function dispatchCommand(ws, payload) {
     }
 
     console.log(`[acpx-server] Received action: ${action} for session: ${sessionId}`);
+    if (
+      sessionId &&
+      action !== "list_sessions" &&
+      action !== "get_history" &&
+      action !== "close_session" &&
+      action !== "delete_session" &&
+      action !== "close_all_sessions"
+    ) {
+      touchSessionActivity(activeSessions.get(sessionId));
+    }
 
     try {
       switch (action) {
@@ -1563,6 +1833,8 @@ export async function dispatchCommand(ws, payload) {
             if (ws._acpxReqHost) {
               existingSession.reqHost = ws._acpxReqHost;
             }
+            touchSessionActivity(existingSession);
+            scheduleIdleReap();
             // Re-deliver any interactive prompts that were in-flight when the
             // previous WebSocket dropped. The ACP runtime is still blocked
             // waiting for the response; re-sending the event lets the newly
@@ -1674,11 +1946,17 @@ export async function dispatchCommand(ws, payload) {
                 promptQueue: [],
                 ws,
                 agentType,
+                origin:
+                  typeof payload.capacityId === "string" && payload.capacityId.trim().startsWith("a2a-")
+                    ? "job"
+                    : "user-opened",
                 sessionMode: await resolveGrokPermissionMode(handle, agentType),
                 permissionMode: seededMode ?? "approve-reads",
                 responsePolicy: normalizedResponsePolicy,
                 reqHost: ws._acpxReqHost,
+                lastActivityAt: Date.now(),
               });
+              scheduleIdleReap();
               registerAgentSessionMapping(sessionId, handle);
               if (normalizedResponsePolicy !== "summary") {
                 await sendAuthoritativeTurnSync(ws, sessionId, activeSessions.get(sessionId), true);
@@ -1708,6 +1986,10 @@ export async function dispatchCommand(ws, payload) {
             }
           }
 
+          const sessionOrigin =
+            typeof payload.capacityId === "string" && payload.capacityId.trim().startsWith("a2a-")
+              ? "job"
+              : "user-opened";
           if (typeof payload.capacityId === "string" && payload.capacityId.trim()) {
             const capacityId = payload.capacityId.trim();
             if (capacityId.length > 4096) {
@@ -1715,22 +1997,44 @@ export async function dispatchCommand(ws, payload) {
               console.timeEnd(`ensure_session_${sessionId}`);
               break;
             }
-            const origin = capacityId.startsWith("a2a-") ? "job" : "user-opened";
+            const origin = sessionOrigin;
             // A person opening a session must be told why it cannot start instead of joining an
             // unbounded queue behind other work and failing much later with a transport error.
             // Background jobs (origin "job") keep waiting in FIFO order.
+            // Before rejecting or queueing, evict eligible idle sessions to free capacity on demand.
             if (origin === "user-opened") {
-              const capacity = await processCapacity.snapshot("process");
+              let capacity = await processCapacity.snapshot("process");
+              if (capacity.availableAutomatic < 1) {
+                const evicted = await evictIdleSessionsForCapacity({
+                  excludeSessionId: sessionId,
+                  signal: initializationSignal,
+                });
+                if (evicted.length > 0) {
+                  capacity = await processCapacity.snapshot("process");
+                }
+              }
               if (capacity.availableAutomatic < 1) {
                 sendCapacityExhausted(ws, sessionId, capacity);
                 console.timeEnd(`ensure_session_${sessionId}`);
                 break;
               }
             }
-            const admission = await processCapacity.tryAdmit(
+            let admission = await processCapacity.tryAdmit(
               { kind: "process", source: "automatic", id: capacityId, origin },
               { signal: initializationSignal },
             );
+            if (admission?.pending === true) {
+              const evicted = await evictIdleSessionsForCapacity({
+                excludeSessionId: sessionId,
+                signal: initializationSignal,
+              });
+              if (evicted.length > 0) {
+                admission = await processCapacity.tryAdmit(
+                  { kind: "process", source: "automatic", id: capacityId, origin },
+                  { signal: initializationSignal },
+                );
+              }
+            }
             if (admission?.pending === true) {
               sendCapacityPending(ws, sessionId, admission);
               console.timeEnd(`ensure_session_${sessionId}`);
@@ -1801,6 +2105,7 @@ export async function dispatchCommand(ws, payload) {
               promptQueue: [],
               ws,
               agentType,
+              origin: sessionOrigin,
               sessionMode,
               // permissionMode is per-session and overrides the runtime
               // default in handlePermissionRequestCallback. The Composer's
@@ -1813,7 +2118,9 @@ export async function dispatchCommand(ws, payload) {
               profileRevision,
               responsePolicy: normalizedResponsePolicy,
               reqHost: ws._acpxReqHost,
+              lastActivityAt: Date.now(),
             });
+            scheduleIdleReap();
             registerAgentSessionMapping(sessionId, handle);
 
             if (normalizedResponsePolicy !== "summary") {
@@ -1909,6 +2216,11 @@ export async function dispatchCommand(ws, payload) {
               return;
             }
             await withTurnDispatchLock(sessionId, async () => {
+              if (activeSessions.get(sessionId) !== session) {
+                sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+                return;
+              }
+              touchSessionActivity(session);
               const snapshot = await turnJournal.snapshot(sessionId);
               const requestFingerprint = hostPromptFingerprint(text, attachments);
               const existing = snapshot.turns.find(
@@ -1974,37 +2286,44 @@ export async function dispatchCommand(ws, payload) {
             break;
           }
 
-          if (session.activeTurn || session.promptQueue.length > 0) {
-            // Another prompt is already executing or waiting. Append to the
-            // per-session queue and ack the sender — the active turn's
-            // finally block will drain this when it finishes.
-            const queuedRequestId = `queued_${Date.now()}_${session.promptQueue.length}`;
-            session.promptQueue.push({
+          await withTurnDispatchLock(sessionId, async () => {
+            if (activeSessions.get(sessionId) !== session) {
+              sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+              return;
+            }
+            touchSessionActivity(session);
+            if (session.activeTurn || session.promptQueue.length > 0) {
+              // Another prompt is already executing or waiting. Append to the
+              // per-session queue and ack the sender — the active turn's
+              // finally block will drain this when it finishes.
+              const queuedRequestId = `queued_${Date.now()}_${session.promptQueue.length}`;
+              session.promptQueue.push({
+                text,
+                attachments,
+                queuedRequestId,
+                ws,
+                responsePolicy: parsedPromptPolicy,
+              });
+              ws.send(
+                JSON.stringify({
+                  event: "prompt_queued",
+                  sessionId,
+                  requestId: queuedRequestId,
+                  queuePosition: session.promptQueue.length,
+                  text,
+                }),
+              );
+              console.log(
+                `[acpx-server] Prompt queued for session ${sessionId} (queue depth=${session.promptQueue.length})`,
+              );
+              return;
+            }
+
+            await runPromptTurn(session, sessionId, {
               text,
               attachments,
-              queuedRequestId,
-              ws,
               responsePolicy: parsedPromptPolicy,
             });
-            ws.send(
-              JSON.stringify({
-                event: "prompt_queued",
-                sessionId,
-                requestId: queuedRequestId,
-                queuePosition: session.promptQueue.length,
-                text,
-              }),
-            );
-            console.log(
-              `[acpx-server] Prompt queued for session ${sessionId} (queue depth=${session.promptQueue.length})`,
-            );
-            return;
-          }
-
-          await runPromptTurn(session, sessionId, {
-            text,
-            attachments,
-            responsePolicy: parsedPromptPolicy,
           });
           break;
         }
@@ -3134,6 +3453,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
   turn.eventSequence = 0;
 
   session.activeTurn = turn;
+  touchSessionActivity(session);
   let terminalSent = false;
   let accumulatedAnswer = "";
   let hasMessagePhase = false;
@@ -3142,6 +3462,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
   void (async () => {
     try {
       for await (const event of turn.events) {
+        touchSessionActivity(activeSessions.get(sessionId) ?? session);
         if (event.type === "text_delta") {
           const streamType = event.stream || "output";
           if (streamType === "output") {
@@ -3283,6 +3604,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             payload: { entries: event.planEntries },
           });
         } else if (event.type === "background_task" && Array.isArray(event.tasks)) {
+          sessionBackgroundTasks.set(sessionId, event.tasks);
           sendRuntimeTurnEvent(targetWs, sessionId, turn, {
             event: "background_task",
             payload: { tasks: event.tasks },
@@ -3483,9 +3805,12 @@ async function runPromptTurn(session, sessionId, promptItem) {
         const currentSession = activeSessions.get(sessionId);
         if (currentSession?.activeTurn === turn) {
           currentSession.activeTurn = null;
+          touchSessionActivity(currentSession);
           if (currentSession.promptQueue.length > 0) {
             const next = currentSession.promptQueue.shift();
             await runPromptTurn(currentSession, sessionId, next);
+          } else {
+            scheduleIdleReap();
           }
         }
       });
@@ -3833,6 +4158,7 @@ async function handlePermissionRequestCallback(req, ctx) {
 // Subprocess Cleanup / Orphan Prevention
 // ----------------------------------------------------
 async function killAllManagedAgents() {
+  stopIdleReaper();
   console.log("[acpx-server] Cleaning up all active sessions and child processes...");
   const pendingLaunches = capacityLaunchAbort;
   capacityLaunchAbort = new AbortController();
@@ -3907,6 +4233,9 @@ export {
   killAllManagedAgents,
   gracefulExit,
   prewarmGrokSession,
+  reapIdleSessions,
+  scheduleIdleReap,
+  evictIdleSessionsForCapacity,
 };
 
 

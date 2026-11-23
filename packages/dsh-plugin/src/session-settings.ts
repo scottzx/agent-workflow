@@ -18,6 +18,19 @@ export interface PinnedAcpSettings {
 
 const fileName = 'agent-session-settings.json';
 
+/**
+ * Antigravity's `agy acp` renamed its thinking control from `thinking_level`
+ * to `thought_level`. Pins recorded by the old standalone runtime still carry
+ * the old id, so translate them on load; values and the `model` flag are kept.
+ */
+const AGENT_OPTION_ID_RENAMES: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  antigravity: { thinking_level: 'thought_level' },
+};
+
+function migrateOptionId(agent: string, id: string): string {
+  return AGENT_OPTION_ID_RENAMES[agent]?.[id] ?? id;
+}
+
 /** Remembers values an Agent has already accepted. It does not store the advertised catalog. */
 export class AgentSessionSettings {
   constructor(private readonly directory: string) {}
@@ -94,12 +107,18 @@ function decodeEntry(value: unknown): PinnedAcpSettings {
   if (typeof entry.cwd !== 'string' || !isAbsolute(entry.cwd) || typeof entry.agent !== 'string' || !entry.agent) throw new Error('Invalid ACP session settings');
   if (entry.modeId !== undefined && (typeof entry.modeId !== 'string' || !entry.modeId)) throw new Error('Invalid ACP session settings');
   if (!Array.isArray(entry.options)) throw new Error('Invalid ACP session settings');
-  const options = entry.options.map(option => {
+  const options: PinnedAcpOption[] = [];
+  for (const option of entry.options) {
     if (!option || typeof option !== 'object' || Array.isArray(option)) throw new Error('Invalid ACP session settings');
     const item = option as Record<string, unknown>;
     if (typeof item.id !== 'string' || !item.id || typeof item.value !== 'string' || !item.value) throw new Error('Invalid ACP session settings');
     if (item.model !== undefined && item.model !== true) throw new Error('Invalid ACP session settings');
-    return { id: item.id, value: item.value, ...(item.model ? { model: true as const } : {}) };
-  });
+    const migrated: PinnedAcpOption = { id: migrateOptionId(entry.agent, item.id), value: item.value, ...(item.model ? { model: true as const } : {}) };
+    // A renamed pin can collide with a pin already recorded under the new id.
+    // The explicit new-id pin reflects the user's latest choice and wins.
+    const index = options.findIndex(existing => existing.id === migrated.id);
+    if (index < 0) options.push(migrated);
+    else options[index] = migrated;
+  }
   return { cwd: entry.cwd, agent: entry.agent, ...(typeof entry.modeId === 'string' ? { modeId: entry.modeId } : {}), options };
 }

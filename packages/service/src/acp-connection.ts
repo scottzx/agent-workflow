@@ -291,6 +291,13 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       const { event: name, type, ...params } = event;
       notify(`${EXT}events/${name || type}`, { ...params, ...(name ? { type } : { _meta: { [NS]: { viewType: true } } }) });
     }
+    if (event.event === 'session_closed' && (event.reason === 'idle_timeout' || event.reason === 'capacity_evicted') && connected && attached.size === 0 && prompts.size === 0 && held.size === 0) {
+      void output.then(() => {
+        if (connected && attached.size === 0 && prompts.size === 0 && held.size === 0) {
+          ws.close(1000, event.reason === 'capacity_evicted' ? 'Idle session evicted for capacity' : 'Idle session released');
+        }
+      });
+    }
     const terminal = (event.event === 'turn_state' && ['completed', 'failed', 'cancelled'].includes(event.status)) || event.event === 'done' || event.event === 'turn_terminal' || (event.event === 'error' && event.terminal !== false && event.scope === 'turn');
     if (terminal) {
       if (summary && event.event !== 'turn_state') {

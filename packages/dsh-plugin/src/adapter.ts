@@ -358,6 +358,7 @@ export class AcpAdapter implements LlmAdapter {
       const capabilities: Capabilities = { agent: name, commands: [], configOptions: [] };
       this.capabilities.set(agent.id, capabilities);
       const interactionSignal = (signal: AbortSignal) => AbortSignal.any([signal, this.lifetime.signal, ...(this.controllers.has(agent.id) ? [this.controllers.get(agent.id)!.signal] : [])]);
+      let linkRef: Link | undefined;
       const link = await connect(endpoint.href, {
         update: update => {
           if (this.capabilities.get(agent.id) !== capabilities) return;
@@ -371,7 +372,14 @@ export class AcpAdapter implements LlmAdapter {
         permission: (p, s) => this.permission(agent, p, interactionSignal(s)),
         question: (p, s) => this.question(agent, p, interactionSignal(s)),
         plan: (p, s) => this.plan(agent, p, interactionSignal(s)),
+        closed: closedSessionId => {
+          const currentBinding = this.state.get(agent.id);
+          if (currentBinding?.sessionId && currentBinding.sessionId !== closedSessionId) return;
+          if (this.links.get(agent.id) === operation) this.links.delete(agent.id);
+          linkRef?.close();
+        },
       }, this.lifetime.signal);
+      linkRef = link;
       let createdBinding: Binding | undefined;
       try {
         const policy = this.config.sessionPolicies?.find(p => p.cwd === resolve(cwd) && p.agent === name);
@@ -790,6 +798,18 @@ export class AcpAdapter implements LlmAdapter {
         } catch (error) {
           if (error instanceof LlmError) throw error;
           if (isCancellationRejection(error, signal)) { endBlock(); throw cancelled(requestSent); }
+          // An idle-reaped session can detach right before session/prompt arrives.
+          // requireSession rejects with -32001 before touching the agent, so re-attach once via session/load.
+          const detachedSession = error instanceof RequestError && error.code === -32001
+            && /not attached/i.test(error.message) && !nativeConfirmed && Boolean(binding?.sessionId);
+          if (detachedSession && attempt < Math.max(1, this.config.reconnectAttempts)) {
+            const stale = active;
+            const current = this.links.get(agent.id);
+            if (current && (await current.catch(() => undefined)) === stale) this.links.delete(agent.id);
+            stale?.close();
+            requestSent = false;
+            continue;
+          }
           // Only transport loss is retried. The managed request ID makes an
           // uncertain delivery idempotent; provider errors remain errors.
           if (error instanceof RequestError || (active && active.ws.readyState === 1) || attempt >= this.config.reconnectAttempts) {

@@ -35,6 +35,7 @@ export interface Handlers {
   permission(params: RequestPermissionRequest, signal: AbortSignal): Promise<RequestPermissionResponse>;
   question(params: JsonObject, signal: AbortSignal): Promise<JsonObject>;
   plan(params: JsonObject, signal: AbortSignal): Promise<JsonObject>;
+  closed?(sessionId: string): void;
 }
 export async function connect(endpoint: string, handlers: Handlers, signal: AbortSignal) {
   signal.throwIfAborted();
@@ -47,6 +48,9 @@ export async function connect(endpoint: string, handlers: Handlers, signal: Abor
       ws.once('close', () => reject(new Error('ACP connection closed')));
     });
     const connection = client().onNotification('session/update', ({ params }) => handlers.update(params.update))
+      .onNotification('_1agents/events/session_closed', object, ({ params }) => {
+        if (typeof params.sessionId === 'string') handlers.closed?.(params.sessionId);
+      })
       .onRequest('session/request_permission', ({ params, signal }) => handlers.permission(params, signal))
       .onRequest('_x.ai/ask_user_question', object, ({ params, signal }) => handlers.question(params, signal))
       .onRequest('_x.ai/exit_plan_mode', object, ({ params, signal }) => handlers.plan(params, signal))

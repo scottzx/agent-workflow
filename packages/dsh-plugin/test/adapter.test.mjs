@@ -1106,3 +1106,75 @@ test('an archived session gives its process back without touching unarchived ses
   assert.deepEqual(f.closedSessions, ['remote-1']);
   assert.deepEqual(await f.adapter.sessionStatus('dsh-session'), { attached: false, activeTurn: false });
 });
+
+test('adapter drops cached link on idle session_closed notification and races -32001 by re-attaching via session/load', { timeout: 5000 }, async t => {
+  // Part A: race where session/prompt hits -32001 "Session is not attached to this connection" before close frame arrives.
+  let detachedOnce = false;
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-idle-race-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(r => wss.once('listening', r));
+  t.after(() => new Promise(r => { for (const c of wss.clients) c.terminate(); wss.close(() => r()); }));
+  const attaches = [];
+  const serverConnections = [];
+  wss.on('connection', ws => {
+    let conn;
+    const app = acpAgent()
+      .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true, _meta: { '1agents': { version: 1 } } } }))
+      .onRequest('session/new', () => { attaches.push('session/new'); return { sessionId: 'remote-idle-1', configOptions: [] }; })
+      .onRequest('session/load', ({ params }) => { attaches.push(`session/load:${params.sessionId}`); return { configOptions: [] }; })
+      .onRequest('session/prompt', async ({ params }) => {
+        if (!detachedOnce && attaches.length === 1 && serverConnections.length === 1 && params.prompt[0]?.text === 'turn-2-race') {
+          detachedOnce = true;
+          throw new RequestError(-32001, 'Session is not attached to this connection');
+        }
+        const turnId = params._meta['1agents'].turnId;
+        await conn.client.notify('session/update', {
+          sessionId: params.sessionId,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `reply:${params.prompt[0]?.text}` }, _meta: { '1agents': { turnId, sequence: 1 } } },
+        });
+        return { stopReason: 'end_turn' };
+      });
+    conn = app.connect(stream(ws));
+    serverConnections.push({ ws, conn });
+  });
+  const local = { id: 'idle-session', session: { header: { cwd: directory, agentPreset: 'oneagents-acp-codex' }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: { inject: async () => ({ dispose: async () => {} }) } };
+  const ctx = {
+    sessionProjections: { stateOf: (session, key) => key === 'turnBoundary' ? session.boundary : session.header.agentPreset },
+    agents: { get: id => id === local.id ? local : undefined },
+    approval: { request: async () => 'allowed-once' },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+  };
+  const adapter = new AcpAdapter(ctx, {
+    serviceUrl: `http://127.0.0.1:${wss.address().port}`,
+    agents: ['codex'],
+    stateDirectory: join(directory, 'state'),
+    reconnectAttempts: 1,
+    reconnectDelayMs: 10,
+  });
+  t.after(() => adapter.dispose());
+  const runTurn = async (id, text) => {
+    const chunks = [];
+    for await (const chunk of adapter.stream({ sessionId: local.id, model: 'codex', messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }] })) chunks.push(chunk);
+    return chunks.filter(c => c.type === 'text-delta').map(c => c.text).join('');
+  };
+
+  assert.equal(await runTurn('m1', 'turn-1'), 'reply:turn-1');
+  assert.deepEqual(await adapter.sessionStatus(local.id), { attached: true, activeTurn: false });
+
+  // Simulate -32001 race on turn 2: adapter transparently drops stale link, calls session/load, and completes turn 2.
+  assert.equal(await runTurn('m2', 'turn-2-race'), 'reply:turn-2-race');
+  assert.deepEqual(attaches, ['session/new', 'session/load:remote-idle-1']);
+
+  // Simulate server pushing _1agents/events/session_closed (idle_timeout) without dropping TCP first.
+  await serverConnections.at(-1).conn.client.notify('_1agents/events/session_closed', { sessionId: 'remote-idle-1', reason: 'idle_timeout' });
+  for (let i = 0; i < 40; i++) {
+    if (!(await adapter.sessionStatus(local.id)).attached) break;
+    await new Promise(r => setTimeout(r, 15));
+  }
+  assert.deepEqual(await adapter.sessionStatus(local.id), { attached: false, activeTurn: false });
+
+  // Turn 3 transparently re-attaches via session/load.
+  assert.equal(await runTurn('m3', 'turn-3-after-notify'), 'reply:turn-3-after-notify');
+  assert.deepEqual(attaches, ['session/new', 'session/load:remote-idle-1', 'session/load:remote-idle-1']);
+});
