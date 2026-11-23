@@ -774,6 +774,21 @@ const standard = { ...spawn, agentPreset: 'standard' };
 const getTask = (gateway: RemoteAgentGateway, taskId: string) => gateway.invoke('remote_agent_get', { remote: 'wsl', originSessionId: 'parent-a', taskId }) as Promise<any>;
 const settled = (gateway: RemoteAgentGateway, taskId: string) => until(() => getTask(gateway, taskId), value => value.state === 'TASK_STATE_COMPLETED' || value.state === 'TASK_STATE_FAILED');
 
+test('model catalog is read from the execution host without creating a session', async t => {
+  class CatalogBackend extends Backend {
+    reads = 0;
+    async modelCatalog() {
+      this.reads++;
+      return { default: { provider: 'magpie', model: 'group/daily-choice' }, groups: [{ id: 'magpie', name: 'Magpie', models: [{ id: 'group/daily-choice', name: '平价', routingGroup: true as const }] }], failures: [] };
+    }
+  }
+  const backend = new CatalogBackend(), f = await fixture(t, backend), gateway = f.gateway();
+  const catalog = await gateway.invoke('remote_agent_model_catalog', { remote: 'wsl', originSessionId: 'parent-a' }) as { default: { provider: string; model: string } };
+  assert.deepEqual(catalog.default, { provider: 'magpie', model: 'group/daily-choice' });
+  assert.equal(backend.reads, 1);
+  assert.equal(backend.runs.length, 0);
+});
+
 test('standard spawn selects the requested model before its prompt and reports it', async t => {
   const f = await fixture(t, new ModelBackend()), gateway = f.gateway();
   const task = await gateway.invoke('remote_agent_spawn', { ...standard, provider: 'deepseek', model: 'deepseek-v4' }) as any;
@@ -792,6 +807,7 @@ test('a model missing from the host catalog fails the task without a prompt', as
   const final = await settled(gateway, task.taskId);
   assert.equal(final.state, 'TASK_STATE_FAILED');
   assert.equal(final.resultMetadata.validation.code, 'MODEL_UNAVAILABLE');
+  assert.equal(final.result, 'The requested model is not in the DSH model catalog.');
   assert.equal(final.provider, undefined);
   assert.deepEqual(f.backend.runs, []);
 });

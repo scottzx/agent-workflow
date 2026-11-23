@@ -11,6 +11,8 @@ export type { A2AExecutionRef } from './execution-binding.js';
 export { a2aRoleSkillsSchema } from './types.js';
 export type { A2AExecutionOptions } from './executor.js';
 export { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema, A2APreflightError, runA2APreflight } from './preflight.js';
+export { a2aModelCatalogSchema } from './model-catalog.js';
+export type { A2AModelCatalog } from './model-catalog.js';
 export { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetadata, saveA2AResultMetadata } from './result-metadata.js';
 export type { A2AResultContract, A2AVerifiedArtifact, A2AResultMetadata } from './result-metadata.js';
 export { RemoteAgentGateway, serveA2AGateway, REMOTE_AGENT_METHODS } from './gateway.js';

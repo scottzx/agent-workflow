@@ -265,8 +265,9 @@ test('standard prepare selects the requested model after create and before the f
 test('a model missing from the DSH catalog fails before a session is created and never falls back', async t => {
   const f = await fixture(t), host = modelHost(f);
   await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'deepseek', model: 'unknown-model' }),
-    error => error.code === 'MODEL_UNAVAILABLE' && /not in the DSH model catalog/.test(error.message));
-  await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'other', model: 'deepseek-v4' }), error => error.code === 'MODEL_UNAVAILABLE');
+    error => error.code === 'UNKNOWN_MODEL_OR_GROUP' && error.message === 'Unknown model or routing group: deepseek/unknown-model. Available: deepseek/deepseek-v4');
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard', provider: 'other', model: 'deepseek-v4' }),
+    error => error.code === 'UNKNOWN_MODEL_OR_GROUP' && /Available: deepseek\/deepseek-v4/.test(error.message));
   assert.deepEqual(host.calls, ['catalog', 'catalog']);
   assert.equal(f.createCount, 0);
   f.controller.selectModel = async () => { throw new Error('session/model-unavailable'); };

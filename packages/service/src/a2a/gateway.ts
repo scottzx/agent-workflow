@@ -15,6 +15,7 @@ import { A2AAutomation, automationConfigSchema, createAutomationServer } from '.
 import { sessionHostSchema } from './session-hosts.js';
 import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
+import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
 import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
@@ -115,6 +116,7 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   provider: string.optional(), model: string.optional(), initiatedBy: actorSchema.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
+const modelCatalogQuerySchema = z.object({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
 const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
 const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
@@ -168,6 +170,7 @@ const EXECUTION_METHODS = {
 export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
+  remote_agent_model_catalog: { description: '读取执行宿主 standard 预设当前可选的 provider 与 model，含默认路由和 routing group。不创建会话、不调用模型。填 remote_agent_spawn 或 remote_agent_message 时，provider 用 groups[].id，model 用其中的 models[].id。', parameters: z.toJSONSchema(modelCatalogQuerySchema) },
   remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
@@ -1062,6 +1065,20 @@ export class RemoteAgentGateway {
       return a2aPreflightReportSchema.parse(await response.json());
     } finally { this.controllers.delete(controller); }
   }
+  /** Standard routes on the execution host. Does not create a session or send a prompt. */
+  private async modelCatalog(remote: string) {
+    const config = this.config.remotes[remote];
+    if (!config) throw new Error(`Unknown remote: ${remote}`);
+    const url = await this.hostRoute(remote, config.url, '/model-catalog');
+    const controller = new AbortController(); this.controllers.add(controller);
+    try {
+      const response = await fetch(url, { method: 'POST', redirect: 'error',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
+        body: '{}', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`Remote model catalog failed (HTTP ${response.status})`); }
+      return a2aModelCatalogSchema.parse(await response.json());
+    } finally { this.controllers.delete(controller); }
+  }
   /** Host extensions sit beside the JSONRPC endpoint the remote advertises, and only on its configured origin. */
   private async hostRoute(remote: string, base: string, suffix: string): Promise<URL> {
     const client = await this.client(remote, base), card = await client.getAgentCard(this.auth(remote));
@@ -1482,6 +1499,10 @@ export class RemoteAgentGateway {
     if (method === 'remote_agent_preflight') {
       const { remote, originSessionId: _origin, ...input } = preflightSchema.parse(params);
       return this.preflight(remote, input);
+    }
+    if (method === 'remote_agent_model_catalog') {
+      const { remote } = modelCatalogQuerySchema.parse(params);
+      return this.modelCatalog(remote);
     }
     if (method === 'session_bind') return this.sessions.bind(sessionBindSchema.parse(params));
     if (method === 'session_send') {

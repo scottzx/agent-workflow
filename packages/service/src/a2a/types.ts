@@ -1,5 +1,6 @@
 /** Execution interfaces shared by DSH and future standalone A2A hosts. */
 import type { SafeError } from '@1agents/acp-service/runtime';
+import type { A2AModelCatalog } from './model-catalog.js';
 import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 import type { A2AExecutionRef } from './execution-binding.js';
@@ -102,6 +103,8 @@ export interface A2ARunResult {
 export interface A2ABackend {
   /** Does not allocate a session or submit a model prompt. */
   preflight?(input: A2APreflightInput): Promise<A2APreflightReport>;
+  /** Standard preset routes on this host. Does not allocate a session or submit a prompt. */
+  modelCatalog?(): Promise<A2AModelCatalog>;
   /** Optional read-only reconciliation; never resumes or repeats execution. */
   recover?(target: A2ATarget, options: { requestId: string }): Promise<SafeError | undefined>;
   /** Cancel pending admission and drain owned initialization before rejecting an aborted preparation. */

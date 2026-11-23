@@ -1,6 +1,6 @@
 {
   "name": "@1agents/acp-service",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "agent-workflow ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness ACP/A2A plugins in one package. Part of 一芥天地 (DreamMate World).",
   "keywords": [
     "dreammate",
@@ -92,6 +92,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p workbench-ui/tsconfig.json",
     "test": "npm run build && npm run test:only",
     "prepack": "node ../../scripts/verify-package-build.mjs",
+    "postinstall": "node -e \"try{require('node:fs').accessSync('vendor/dsh/sync-global.js')}catch{process.exit(0)}require('node:child_process').execFileSync(process.execPath,['vendor/dsh/sync-global.js'],{stdio:'inherit'})\"",
     "start": "tsx bin/acp-service.ts",
     "test:only": "node --import tsx --test test/*.test.ts"
   },

@@ -20,12 +20,18 @@ import type { ExecutorTicketArgs } from '@1agents/acp-service/a2a';
 import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
 import { createTicketGateway, runTicketTool, ticketTools } from './ticket-tools.js';
 import { HANDOFF_PATH } from './handoff-spec.js';
+import { syncGlobalAcpService } from './sync-global.js';
 import { handoffTools } from './handoff-tools.js';
 import { runHandoffTool } from './handoff-executor.js';
 import { TICKET_PATH } from './ticket-spec.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
+  // One plugin install updates the global acp-service CLI. A failure must not stop DSH.
+  try {
+    const synced = await syncGlobalAcpService();
+    if (synced.updated) console.log(`acp-service global CLI updated ${synced.from ?? '(none)'} -> ${synced.version}`);
+  } catch (error) { console.warn(`acp-service global CLI was not updated: ${error instanceof Error ? error.message : String(error)}`); }
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
   const service = resolveServiceOptions(input);

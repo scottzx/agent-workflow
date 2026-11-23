@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DshA2ABackend, inspectSession } from '../dist/a2a-executor.js';
+import { DshA2ABackend, inspectSession, projectModelCatalog } from '../dist/a2a-executor.js';
 
 /** A context shaped like DSH 0.2.2: no sessionController.inspect, headers through sessionQuery, models on the agent. */
 function currentDsh(cwd) {
@@ -28,6 +28,23 @@ function currentDsh(cwd) {
   };
   return { ctx, disposed, selected, controllerSelections, defaults };
 }
+
+test('model catalog keeps routing groups and drops provider failure text', () => {
+  const catalog = projectModelCatalog({
+    default: { provider: 'magpie', model: 'group/daily-choice' },
+    groups: [{ id: 'magpie', name: 'Magpie', models: [
+      { id: 'group/daily-choice', name: '平价 · routing group', reasoning: { efforts: [{ id: 'high', name: 'high' }], defaultEffort: 'high' } },
+      { id: 'minimax-cn/MiniMax-M3.1-Flash', name: 'MiniMax' },
+    ] }],
+    failures: [{ id: 'broken', name: 'Broken', message: 'secret upstream detail' }],
+  });
+  assert.equal(catalog.default.model, 'group/daily-choice');
+  assert.equal(catalog.groups[0].models[0].routingGroup, true);
+  assert.deepEqual(catalog.groups[0].models[0].reasoning, { efforts: [{ id: 'high', name: 'high' }], defaultEffort: 'high' });
+  assert.equal(catalog.groups[0].models[1].routingGroup, undefined);
+  assert.deepEqual(catalog.failures, [{ id: 'broken', name: 'Broken' }]);
+  assert.equal(JSON.stringify(catalog).includes('secret upstream'), false);
+});
 
 test('inspectSession reads a stored header without sessionController.inspect and releases the observation', async t => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-current-')));
@@ -56,4 +73,36 @@ test('continuing a stored session prepares it and selects its model without savi
   await assert.rejects(backend.prepare({ sessionId: 'missing' }), /not found/);
   assert.deepEqual(await backend.status({ sessionId: 'stored', agentPreset: 'standard' }), { attached: true, activeTurn: false });
   assert.deepEqual(await backend.status({ sessionId: 'missing', agentPreset: 'standard' }), { attached: false, activeTurn: false });
+});
+
+test('a routing group is recorded even when exact model resolution rejects it', async t => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-current-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const f = currentDsh(cwd);
+  f.ctx.sessionController.modelCatalog = async () => ({
+    default: { provider: 'magpie', model: 'group/daily-choice' },
+    groups: [{ id: 'magpie', models: [{ id: 'group/daily-choice', name: '平价 · routing group' }, { id: 'group/work', name: '主力 · routing group' }] }],
+  });
+  f.ctx.llm.resolveCallConfig = async () => { throw Object.assign(new Error('pi-ai provider "magpie" has no configured model "group/daily-choice"'), { code: 'UNKNOWN_MODEL' }); };
+  const backend = new DshA2ABackend(f.ctx);
+  const target = await backend.prepare({ sessionId: 'stored', cwd, agentPreset: 'standard', provider: 'magpie', model: 'group/daily-choice' });
+  assert.equal(target.provider, 'magpie');
+  assert.equal(target.model, 'group/daily-choice');
+  assert.deepEqual(f.selected, [{ provider: 'magpie', model: 'group/daily-choice' }]);
+  assert.deepEqual(f.controllerSelections, [], 'the session route is recorded locally and is not saved as the host default');
+});
+
+test('the host default route is accepted when the catalog cannot enumerate it', async t => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-current-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const f = currentDsh(cwd);
+  f.ctx.sessionController.modelCatalog = async () => { throw new Error('catalog.groups is not iterable'); };
+  f.ctx.agentDefaultModel = { currentSelection: () => ({ provider: 'magpie', model: 'group/daily-choice' }) };
+  f.ctx.llm.resolveCallConfig = async () => { throw new Error('exact model lookup failed'); };
+  const backend = new DshA2ABackend(f.ctx);
+  const target = await backend.prepare({ sessionId: 'stored', cwd, provider: 'magpie', model: 'group/daily-choice' });
+  assert.deepEqual(f.selected, [{ provider: 'magpie', model: 'group/daily-choice' }]);
+  assert.equal(`${target.provider}/${target.model}`, 'magpie/group/daily-choice');
+  await assert.rejects(backend.prepare({ sessionId: 'stored', cwd, provider: 'magpie', model: 'missing-model' }),
+    error => error.code === 'UNKNOWN_MODEL_OR_GROUP' && error.message === 'Unknown model or routing group: magpie/missing-model');
 });

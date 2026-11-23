@@ -18,6 +18,8 @@ dsh plugin --profile web add @1agents/acp-service@^0.7.0
 
 If pnpm pauses or fails with an ignored transitive `esbuild` build script, follow its prompt or configure that individual package's approval in the profile's `pnpm-workspace.yaml`, then repeat the install. Approve or deny it according to your policy. A successful isolated package smoke used `--ignore-scripts`; the interactive pnpm 11 profile check approved only `esbuild`. A partial install can leave the bundle disabled, so check the Plugins page afterward.
 
+Installing or loading this plugin in a DSH profile also compares the global `acp-service` CLI with this package. A different version is replaced by `npm install -g` of this same directory, so one plugin update upgrades the global command. A checkout or an install that sets `ACP_SERVICE_SYNC_GLOBAL=0` does not. Failure to update the global CLI is logged and does not stop the plugin.
+
 Restart DSH after updating packages, confirm **`@1agents/acp-service`** is enabled on its Plugins page, and choose a discovered **ACP · Agent** preset for a new session. Select an existing workspace, then send a text prompt. Replace `web` with your profile name, such as `desktop`; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
 
 For a pinned fallback, install the identical npm artifact from [GitHub Release 0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0).

@@ -90,7 +90,7 @@ async function fixture(t: TestContext, options: Partial<Omit<A2AServerOptions, '
   let host: Awaited<ReturnType<typeof createA2AServer>> | undefined;
   const server = createServer((req, res) => {
     if (!host) { res.writeHead(503); res.end(); return; }
-    const handler = req.url === '/.well-known/agent-card.json' ? host.cardHandler : (req.url === host.path || req.url === `${host.path}/preflight`) ? host.handler : undefined;
+    const handler = req.url === '/.well-known/agent-card.json' ? host.cardHandler : (req.url === host.path || req.url === `${host.path}/preflight` || req.url === `${host.path}/model-catalog`) ? host.handler : undefined;
     if (!handler) { res.writeHead(404); res.end(); return; }
     void handler(req, res).catch(error => { res.destroy(error); });
   });
@@ -321,6 +321,27 @@ test('authenticated host preflight checks requirements without allocating a task
   assert.equal(backend.runs.length, 0);
   const tasks = await f.client.listTasks(ListTasksRequest.fromJSON({}), authenticated);
   assert.equal(tasks.tasks.length, 0);
+});
+
+test('authenticated model catalog lists standard routes without allocating a task or session', async t => {
+  const catalog = { default: { provider: 'magpie', model: 'group/daily-choice' }, groups: [{ id: 'magpie', name: 'Magpie', models: [{ id: 'group/daily-choice', name: '平价 · routing group', routingGroup: true }] }], failures: [] };
+  class CatalogBackend extends DeferredBackend {
+    reads = 0;
+    async modelCatalog() { this.reads++; return catalog; }
+  }
+  const backend = new CatalogBackend(), f = await fixture(t, {}, backend);
+  const request = (body = '{}', authorized = true) => fetch(`${f.origin}/a2a/model-catalog`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...(authorized ? { Authorization: `Bearer ${token}` } : {}) }, body,
+  });
+  assert.equal((await request('{}', false)).status, 401);
+  assert.equal(backend.reads, 0);
+  assert.equal((await request('{"provider":"magpie"}')).status, 400);
+  const listed = await request();
+  assert.equal(listed.status, 200);
+  assert.deepEqual(await listed.json(), catalog);
+  assert.equal(backend.preparations.length, 0);
+  assert.equal(backend.runs.length, 0);
+  assert.equal((await f.client.listTasks(ListTasksRequest.fromJSON({}), authenticated)).tasks.length, 0);
 });
 
 test('a disconnected SendStreamingMessage continues execution and saves its final result', { timeout: 10000 }, async t => {

@@ -10,6 +10,7 @@ import { toSafeError } from '@1agents/acp-service/runtime';
 import { a2aRequestId } from './request-id.js';
 import { FileA2AStore } from './store.js';
 import type { A2ABackend } from './types.js';
+import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema } from './preflight.js';
 import { ArtifactContentError, readVerifiedArtifact } from './artifact-content.js';
 import type { A2AVerifiedArtifact } from './result-metadata.js';
@@ -262,6 +263,31 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(report));
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Invalid preflight request' }));
+      }
+      return;
+    }
+    // Same credential boundary as preflight. The standard catalog is host state, not a session.
+    if (req.url === `${path}/model-catalog`) {
+      if (!options.backend.modelCatalog) {
+        res.writeHead(501, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Host model catalog is not supported' })); return;
+      }
+      try {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of req) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > 4096) throw new Error('Model catalog body exceeds 4 KiB');
+          chunks.push(buffer);
+        }
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        if (text && text !== '{}') throw new Error('Model catalog takes no parameters');
+        const catalog = a2aModelCatalogSchema.parse(await options.backend.modelCatalog());
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(catalog));
+      } catch (error) {
+        const invalid = error instanceof Error && /body exceeds|takes no parameters/.test(error.message);
+        res.writeHead(invalid ? 400 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: invalid ? 'Invalid model catalog request' : 'Model catalog unavailable' }));
       }
       return;
     }

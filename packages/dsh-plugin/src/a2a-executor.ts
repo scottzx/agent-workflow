@@ -19,10 +19,98 @@ export interface SessionControl {
   status(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }>;
 }
 
-function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT' | 'MODEL_UNAVAILABLE' | 'MODEL_SELECTION_UNSUPPORTED', message: string): Error {
+function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT' | 'MODEL_UNAVAILABLE' | 'MODEL_SELECTION_UNSUPPORTED' | 'UNKNOWN_MODEL_OR_GROUP', message: string): Error {
   const error = new Error(message) as Error & { code: string };
   error.code = code;
   return error;
+}
+
+/** One provider/model pair the host can record. Routing groups use the same shape as concrete models. */
+interface ModelRoute { provider: string; model: string }
+
+/** Catalog rows are advisory. A missing or oddly shaped catalog must not throw before the default route is considered. */
+function modelGroups(catalog: unknown): { id: string; models: { id: string; name?: string }[] }[] {
+  const record = catalog && typeof catalog === 'object' ? catalog as { groups?: unknown; value?: { groups?: unknown } } : undefined;
+  const groups = Array.isArray(record?.groups) ? record.groups : Array.isArray(record?.value?.groups) ? record.value.groups : [];
+  return groups.flatMap(group => {
+    if (!group || typeof group !== 'object') return [];
+    const row = group as { id?: unknown; models?: unknown };
+    if (typeof row.id !== 'string' || !row.id) return [];
+    const models = Array.isArray(row.models) ? row.models : [];
+    return [{ id: row.id, models: models.flatMap(model => {
+      if (!model || typeof model !== 'object') return [];
+      const item = model as { id?: unknown; name?: unknown };
+      return typeof item.id === 'string' && item.id ? [{ id: item.id, ...(typeof item.name === 'string' ? { name: item.name } : {}) }] : [];
+    }) }];
+  });
+}
+
+/** The route a brand-new session would run when the caller omits provider and model. */
+function hostDefault(ctx: Context, catalog: unknown): ModelRoute | undefined {
+  const record = catalog && typeof catalog === 'object' ? catalog as { default?: ModelRoute; value?: { default?: ModelRoute } } : undefined;
+  const listed = record?.default ?? record?.value?.default;
+  if (typeof listed?.provider === 'string' && listed.provider && typeof listed?.model === 'string' && listed.model) return { provider: listed.provider, model: listed.model };
+  const service = (ctx as { agentDefaultModel?: { currentSelection?: () => ModelRoute } }).agentDefaultModel
+    ?? ctx.get?.('agentDefaultModel') as { currentSelection?: () => ModelRoute } | undefined;
+  try {
+    const current = service?.currentSelection?.();
+    if (typeof current?.provider === 'string' && current.provider && typeof current?.model === 'string' && current.model) return { provider: current.provider, model: current.model };
+  } catch { /* A default service that cannot be read is not itself a route. */ }
+  return undefined;
+}
+
+function sameRoute(left: ModelRoute | undefined, right: ModelRoute): boolean {
+  return left?.provider === right.provider && left?.model === right.model;
+}
+
+/** Host-authored catalog ids only. Provider error text never enters this sentence. */
+function routingGroup(id: string, name: string): boolean {
+  return id.startsWith('group/') || /routing group/i.test(name);
+}
+
+/** Caller-facing catalog. Provider failure text stays on the host. */
+export function projectModelCatalog(catalog: unknown): { default: ModelRoute; groups: { id: string; name: string; models: { id: string; name: string; routingGroup?: true; reasoning?: { efforts: { id: string; name: string }[]; defaultEffort?: string } }[] }[]; failures: { id: string; name: string }[] } {
+  const record = catalog && typeof catalog === 'object' ? catalog as { default?: ModelRoute; value?: { default?: ModelRoute; groups?: unknown; failures?: unknown }; groups?: unknown; failures?: unknown } : {};
+  const source = record.value && typeof record.value === 'object' ? record.value : record;
+  const fallback = source.default;
+  if (typeof fallback?.provider !== 'string' || !fallback.provider || typeof fallback.model !== 'string' || !fallback.model) throw new Error('DSH model catalog has no default route');
+  const groups = Array.isArray(source.groups) ? source.groups : [];
+  const failures = Array.isArray(source.failures) ? source.failures : [];
+  return {
+    default: { provider: fallback.provider, model: fallback.model },
+    groups: groups.flatMap(group => {
+      if (!group || typeof group !== 'object') return [];
+      const row = group as { id?: unknown; name?: unknown; models?: unknown };
+      if (typeof row.id !== 'string' || !row.id) return [];
+      const name = typeof row.name === 'string' && row.name ? row.name : row.id;
+      const models = Array.isArray(row.models) ? row.models.flatMap(model => {
+        if (!model || typeof model !== 'object') return [];
+        const item = model as { id?: unknown; name?: unknown; reasoning?: { efforts?: unknown; defaultEffort?: unknown } };
+        if (typeof item.id !== 'string' || !item.id) return [];
+        const modelName = typeof item.name === 'string' && item.name ? item.name : item.id;
+        const efforts = Array.isArray(item.reasoning?.efforts) ? item.reasoning.efforts.flatMap(effort => {
+          if (!effort || typeof effort !== 'object') return [];
+          const option = effort as { id?: unknown; name?: unknown };
+          return typeof option.id === 'string' && option.id && typeof option.name === 'string' && option.name ? [{ id: option.id, name: option.name }] : [];
+        }) : [];
+        const defaultEffort = typeof item.reasoning?.defaultEffort === 'string' && efforts.some(effort => effort.id === item.reasoning?.defaultEffort) ? item.reasoning.defaultEffort : undefined;
+        return [{ id: item.id, name: modelName, ...(routingGroup(item.id, modelName) ? { routingGroup: true as const } : {}), ...(efforts.length ? { reasoning: { efforts, ...(defaultEffort ? { defaultEffort } : {}) } } : {}) }];
+      }) : [];
+      return [{ id: row.id, name, models }];
+    }),
+    failures: failures.flatMap(failure => {
+      if (!failure || typeof failure !== 'object') return [];
+      const row = failure as { id?: unknown; name?: unknown };
+      if (typeof row.id !== 'string' || !row.id) return [];
+      return [{ id: row.id, name: typeof row.name === 'string' && row.name ? row.name : row.id }];
+    }),
+  };
+}
+
+function unknownRoute(provider: string, model: string, candidates: readonly string[]): Error {
+  const shown = candidates.filter(id => /^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/.test(id)).slice(0, 12);
+  const available = shown.length ? `. Available: ${shown.join(', ')}` : '';
+  return sessionError('UNKNOWN_MODEL_OR_GROUP', `Unknown model or routing group: ${provider}/${model}${available}`);
 }
 
 /** Host inspect either returns null or throws its own not-found error. Other failures stay unchanged. */
@@ -146,6 +234,11 @@ export class DshA2ABackend implements A2ABackend {
     return runA2APreflight(input);
   }
 
+  /** Standard routes currently advertised by this host. Does not create a session. */
+  async modelCatalog() {
+    return projectModelCatalog(await this.ctx.sessionController.modelCatalog());
+  }
+
   /** Create a new session or restore an explicitly addressed session without changing its workspace or preset.
    * @param input Remote host directory, preset, and optional existing DSH session identity.
    * @returns The resolved DSH session and its durable workspace and preset.
@@ -186,12 +279,12 @@ export class DshA2ABackend implements A2ABackend {
       if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw sessionError('SESSION_CONFLICT', 'Existing session cwd conflicts');
       signal?.throwIfAborted();
       if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw sessionError('SESSION_CONFLICT', 'Existing session preset conflicts');
-      if (input.provider !== undefined) await this.requireModel(input, agentPreset, signal);
-      const selected = await this.selectModel(input, input.sessionId as SessionId, signal);
+      const allowUnresolved = input.provider === undefined ? false : await this.requireModel(input, agentPreset, signal);
+      const selected = await this.selectModel(input, input.sessionId as SessionId, signal, allowUnresolved);
       return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight, ...selected };
     }
     // Reject an unknown model before a blank session is created for it.
-    if (input.provider !== undefined) await this.requireModel(input, agentPreset, signal);
+    const allowUnresolved = input.provider === undefined ? false : await this.requireModel(input, agentPreset, signal);
     const created = await this.ctx.sessionController.create({
       cwd,
       ...(agentPreset === undefined ? {} : { agentPreset }),
@@ -201,7 +294,7 @@ export class DshA2ABackend implements A2ABackend {
     signal?.throwIfAborted();
     const agent = await this.agent(created.sessionId);
     signal?.throwIfAborted();
-    const selected = await this.selectModel(input, created.sessionId, signal);
+    const selected = await this.selectModel(input, created.sessionId, signal, allowUnresolved);
     return {
       sessionId: created.sessionId,
       cwd: agent.session.header.cwd ?? cwd,
@@ -211,18 +304,33 @@ export class DshA2ABackend implements A2ABackend {
     };
   }
 
-  /** Standard presets only. The catalog must list the exact model; a miss never falls back to the host default. */
-  private async requireModel(input: A2APrepareInput, agentPreset: string | undefined, signal?: AbortSignal): Promise<void> {
+  /**
+   * Standard presets only. A catalog hit or the host's current default route is accepted.
+   * Routing groups and slash model ids may fail exact-model resolution and are still recorded,
+   * which is how a new session keeps magpie/group/daily-choice when the caller omits both fields.
+   * @returns Whether exact resolveCallConfig may fail without rejecting the route.
+   */
+  private async requireModel(input: A2APrepareInput, agentPreset: string | undefined, signal?: AbortSignal): Promise<boolean> {
     if (agentPreset?.startsWith('oneagents-acp-')) throw sessionError('MODEL_SELECTION_UNSUPPORTED', 'provider and model apply only to standard presets');
-    const catalog = await this.ctx.sessionController.modelCatalog();
+    const requested: ModelRoute = { provider: input.provider!, model: input.model! };
+    let catalog: unknown;
+    try { catalog = await this.ctx.sessionController.modelCatalog(); }
+    catch { catalog = undefined; }
     signal?.throwIfAborted();
-    if (!catalog.groups.some(group => group.id === input.provider && group.models.some(model => model.id === input.model))) {
-      throw sessionError('MODEL_UNAVAILABLE', `Model ${input.provider}/${input.model} is not in the DSH model catalog`);
+    const groups = modelGroups(catalog);
+    const match = groups.find(group => group.id === requested.provider)?.models.find(model => model.id === requested.model);
+    const fallback = hostDefault(this.ctx, catalog);
+    if (!match && !sameRoute(fallback, requested)) {
+      throw unknownRoute(requested.provider, requested.model, groups.flatMap(group => group.models.map(model => `${group.id}/${model.id}`)));
     }
+    const namedGroup = typeof match?.name === 'string' && /routing group/i.test(match.name);
+    // Slash ids are opaque routes. Exact adapter lookup treats some of them as missing models
+    // even though the session default runs them unchanged.
+    return namedGroup || requested.model.startsWith('group/') || requested.model.includes('/') || (!match && sameRoute(fallback, requested));
   }
 
   /** Install the requested model before the first prompt and return what DSH resolved. Omitted fields leave the session unchanged. */
-  private async selectModel(input: A2APrepareInput, sessionId: SessionId, signal?: AbortSignal): Promise<{ provider?: string; model?: string }> {
+  private async selectModel(input: A2APrepareInput, sessionId: SessionId, signal?: AbortSignal, allowUnresolved = false): Promise<{ provider?: string; model?: string }> {
     if (input.provider === undefined || input.model === undefined) return {};
     let selected: { provider: string; model: string } = { provider: input.provider, model: input.model };
     try {
@@ -231,7 +339,10 @@ export class DshA2ABackend implements A2ABackend {
       // A task only chooses for its own session, so current DSH selects on the agent directly.
       const model = modelSelectionOf(agent);
       if (model) {
-        await this.ctx.llm.resolveCallConfig?.(selected);
+        if (this.ctx.llm.resolveCallConfig) {
+          try { await this.ctx.llm.resolveCallConfig(selected); }
+          catch (error) { if (!allowUnresolved) throw error; }
+        }
         model.select(selected);
       } else ({ selected } = await this.ctx.sessionController.selectModel({ sessionId, ...selected }));
     }

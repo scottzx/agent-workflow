@@ -56,7 +56,19 @@ class RoleSkillLoadingError extends Error {
   constructor(cause: unknown) { super('Role skills could not be loaded or verified; the model was not started', { cause }); }
 }
 
-const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS', 'MODEL_UNAVAILABLE', 'MODEL_SELECTION_UNSUPPORTED']);
+const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS', 'MODEL_UNAVAILABLE', 'MODEL_SELECTION_UNSUPPORTED', 'UNKNOWN_MODEL_OR_GROUP']);
+/** Host-authored model ids only. A mismatch keeps the static sentence and drops whatever else the error carried. */
+const MODEL_FAILURE_MESSAGE = /^(?:Unknown model or routing group: [A-Za-z0-9][A-Za-z0-9._:/@+-]*(?:\. Available: [A-Za-z0-9][A-Za-z0-9._:/@+-]*(?:, [A-Za-z0-9][A-Za-z0-9._:/@+-]*)*)?|The requested model is not in the DSH model catalog\.|DSH did not select [A-Za-z0-9][A-Za-z0-9._:/@+-]*)$/;
+
+function modelFailureMessage(error: unknown, code: string | undefined): string | undefined {
+  if (code !== 'UNKNOWN_MODEL_OR_GROUP' && code !== 'MODEL_UNAVAILABLE' && code !== 'MODEL_SELECTION_UNSUPPORTED') return undefined;
+  const message = error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string'
+    ? (error as { message: string }).message : '';
+  if (MODEL_FAILURE_MESSAGE.test(message)) return message;
+  if (code === 'UNKNOWN_MODEL_OR_GROUP') return 'Unknown model or routing group.';
+  if (code === 'MODEL_SELECTION_UNSUPPORTED') return 'provider and model apply only to standard presets';
+  return 'The requested model is not in the DSH model catalog.';
+}
 
 function sessionFailureCode(error: unknown): string | undefined {
   const seen = new Set<unknown>();
@@ -373,7 +385,8 @@ export class A2ASessionExecutor implements AgentExecutor {
         ...(error instanceof A2APreflightError ? { preflight: error.report } : {}) });
       try { await saveA2AResultMetadata(resultMetadata, target); }
       catch { resultMetadata.validation = { status: 'failed', code: 'result-record-write-failed' }; delete resultMetadata.recordPath; }
-      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, capacityFailure?.message ?? returnedFailureMessage ?? safe.message, safe);
+      const modelCode = sessionFailureCode(error);
+      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, capacityFailure?.message ?? modelFailureMessage(error, modelCode) ?? returnedFailureMessage ?? safe.message, safe);
     } finally {
       // Release failures retain the durable reservation and cannot strand close().
       try { await capacityLease?.release(); }
