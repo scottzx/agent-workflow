@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
-function mount(preset, writable = true, assistantChildren, customFetch, reactHooks = {}) {
+function mount(preset, writable = true, assistantChildren, customFetch, reactHooks = {}, overrides = {}) {
   let client, command;
   const remoteHandlers = new Map();
   const localHandlers = new Map();
@@ -33,10 +33,10 @@ function mount(preset, writable = true, assistantChildren, customFetch, reactHoo
       const key = options.key ?? options.name; slots.set(key, { options, component });
       return () => slots.delete(key);
     } },
-    sessions: { binding: id => ({ session: { projections: { faceOf: () => ({ getSnapshot: () => presets.get(id) ?? preset }) } } }), subagentAddress: () => undefined },
+    sessions: { binding: id => ({ session: { projections: { faceOf: name => ({ subscribe: () => () => {}, getSnapshot: () => name === "modelSelection" ? overrides.modelSelection?.(id) : (presets.get(id) ?? preset) }) } } }), subagentAddress: id => overrides.subagentAddress?.(id) },
     remote: { $on: (name, handler) => remoteHandlers.set(name, handler), session: {
-      modelCatalog: async () => ({ ok: true, value: { groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'dsh-model', name: 'DSH model' }] }] } }),
-      selectModel: async value => { calls.push(value); return { ok: true }; },
+      modelCatalog: async () => overrides.modelCatalog ? overrides.modelCatalog() : ({ ok: true, value: { groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'dsh-model', name: 'DSH model' }] }] } }),
+      selectModel: async value => { calls.push(value); return overrides.selectModel ? overrides.selectModel(value) : { ok: true }; },
     } },
     commandUi: { register: value => { command = value; } },
   };
@@ -81,89 +81,12 @@ test('native writer contention disables only its composer, then clears after res
   assert.equal(f.blocks.get(context.sessionId), undefined);
 });
 
-test('ordered ACP groups reuse native renderers, disclose independent peer calls, and unload cleanly', () => {
-  const f = mount('oneagents-acp-codex');
-  const entry = f.slots.get('assistant-step');
-  assert.ok(entry.options.priority < f.nativeAssistant.options.priority);
-  assert.equal(entry.options.inject, f.nativeAssistant.inject);
-  assert.equal(entry.options.locale, 'conversation');
-  let open = false;
-  const roots = [{ callId: 'a', name: 'Bash', phase: 'start', subCalls: [] }, { callId: 'b', name: 'Bash', phase: 'start', subCalls: [] }];
-  const owner = { sessionId: 'acp', useChat: selector => selector({ nodes: { values: () => [] } }),
-    useDisclosure: () => ({ expanded: open, toggle: () => { open = !open; } }),
-    node: { data: { turn: 1, step: 1, acpTranscript: { groups: [
-      { kind: 'text', key: 'intro', text: 'Before' }, { kind: 'tools', key: 'a', roots },
-      { kind: 'reasoning', key: 'think', text: 'Thinking' }, { kind: 'tools', key: 'c', roots: [roots[0]] },
-      { kind: 'text', key: 'answer', text: 'After' },
-    ] } } } };
-  const rendered = entry.component(owner).children[0];
-  assert.equal(rendered[0].type, f.nativeAssistant.component);
-  assert.equal(rendered[2].type, f.nativeAssistant.component);
-  assert.equal(rendered[4].type, f.nativeAssistant.component);
-  assert.equal(rendered[2].props.node.data.blocks[0].kind, 'reasoning');
-  const group = rendered[1];
-  const closed = group.type(group.props);
-  assert.equal(closed.children[0].props['aria-expanded'], false);
-  assert.equal(closed.children[1], null);
-  assert.equal(closed.children[0].children[0], '⌄ 已调用 2 个工具');
-  closed.children[0].props.onClick();
-  const peers = group.type(group.props).children[1].children[0];
-  assert.equal(peers.length, 2);
-  for (const peer of peers) assert.equal(peer.type, f.nativeBash.component);
-  assert.equal(peers[0].props.block, roots[0]);
-  assert.equal(peers[1].props.block, roots[1]);
-  f.dispose();
-  assert.equal(f.slots.has('assistant-step'), false);
-});
-
-test('standard messages delegate to DSH; an ACP original is hidden only when an ordered projection exists', () => {
+test('the client leaves the chat transcript to DSH and does not replace assistant-step', () => {
   for (const preset of ['standard', 'oneagents-acp-codex']) {
     const f = mount(preset);
-    const node = { data: { turn: 1, step: 2 } };
-    const owner = { node, sessionId: 's', useChat: selector => selector({ nodes: { values: () => [{ data: {
-      turn: 1, step: 2, acpTranscript: {},
-    } }] } }) };
-    const rendered = f.slots.get('assistant-step').component(owner);
-    assert.equal(rendered.type, preset === 'standard' ? f.nativeAssistant.component : 'span');
-    const unmatched = f.slots.get('assistant-step').component({ ...owner,
-      useChat: selector => selector({ nodes: { values: () => [] } }) });
-    assert.equal(unmatched.type, f.nativeAssistant.component);
+    assert.equal(f.slots.has('assistant-step'), false);
+    f.dispose();
   }
-});
-
-test('native assistant child slots use the host content factories without redeclaring owned slots', async () => {
-  const children = {
-    'conversation.chat.reasoning.body': { kind: 'single', scope: 'session' },
-    'conversation.chat.message.images': { kind: 'single', scope: 'session' },
-  };
-  const f = mount('oneagents-acp-codex', true, children);
-  const entry = f.slots.get('assistant-step');
-  assert.equal(entry.options.children, undefined);
-  assert.equal(f.nativeAssistant.children, children);
-  assert.equal(entry.options.inject, f.nativeAssistant.inject);
-  assert.equal(entry.options.locale, f.nativeAssistant.locale);
-  const calls = [];
-  const renderFactorySlot = (name, owner) => { calls.push({ name, owner }); return name; };
-  const owner = { sessionId: 's', renderFactorySlot, node: { data: { turn: 1, step: 1 } },
-    useChat: selector => selector({ nodes: { values: () => [] } }) };
-  const standard = entry.component(owner);
-  assert.equal(standard.type, f.nativeAssistant.component);
-  const reasoning = { text: 'Thinking', running: true };
-  const images = { images: [{ attachment: 'image' }], loadImage: () => {}, align: 'start' };
-  assert.equal(standard.props.renderSlot('conversation.chat.reasoning.body', reasoning), 'conversation.chat.reasoning.content');
-  assert.equal(standard.props.renderSlot('conversation.chat.message.images', images), 'conversation.images.content');
-  assert.equal(calls[0].owner, reasoning);
-  assert.equal(calls[1].owner, images);
-  const transcript = entry.component({ ...owner, node: { data: { acpTranscript: { groups: [
-    { kind: 'reasoning', key: 'think', text: 'Thinking' },
-  ] } } } }).children[0][0];
-  assert.equal(transcript.type, f.nativeAssistant.component);
-  transcript.props.renderSlot('conversation.chat.reasoning.body', reasoning);
-  assert.equal(calls[2].name, 'conversation.chat.reasoning.content');
-  assert.equal((await f.command.ui.options({ sessionId: 's' }))[0].label, 'Native B');
-  f.dispose();
-  assert.equal(f.slots.has('assistant-step'), false);
-  assert.equal(f.nativeAssistant.children, children);
 });
 
 test('standard selection clears ACP loading before the projection catches up', async () => {
@@ -335,5 +258,184 @@ test('a previous mode configuration cannot clear a newer configuration busy stat
   controls = render();
   assert.equal(controls[0].props.disabled, false);
   assert.equal(controls.some(control => control.props?.role === 'alert'), false);
+  f.dispose();
+});
+
+function findNodes(node, predicate, out = []) {
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const item of node) findNodes(item, predicate, out);
+    return out;
+  }
+  if (predicate(node)) out.push(node);
+  if (node.children) findNodes(node.children, predicate, out);
+  return out;
+}
+
+function textOf(node) {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (typeof node === "object" && node.children) return textOf(node.children);
+  return "";
+}
+
+test("conversation.input.model declares official label and options child slots", () => {
+  const f = mount("standard");
+  const entry = f.slots.get("conversation.input.model");
+  assert.deepEqual(JSON.parse(JSON.stringify(entry.options.children)), {
+    "conversation.input.model.label": { kind: "single", scope: "session", inline: true },
+    "conversation.input.model.options": { kind: "list", scope: "session" },
+  });
+  assert.equal(entry.options.inject("s1").available, true);
+  f.dispose();
+
+  const sub = mount("standard", true, undefined, undefined, {}, { subagentAddress: () => ({ id: "sub" }) });
+  assert.equal(sub.slots.get("conversation.input.model").options.inject("s2").available, false);
+  sub.dispose();
+});
+
+test("standard DSH session renders official capsule trigger, two-level popover, badges, and model.options slot", async () => {
+  const outer = hookRenderer();
+  const inner = hookRenderer();
+  let activeHooks = outer.hooks;
+  const catalogValue = {
+    default: { provider: "deepseek-account", model: "routing-group" },
+    groups: [
+      { id: "third-party", name: "Third Party", models: [{ id: "tp-1", name: "TP Model" }] },
+      {
+        id: "deepseek-account",
+        name: "Account",
+        models: [
+          {
+            id: "routing-group",
+            name: "routing group",
+            badge: { tone: "neutral", text: { zh: "平价", en: "Economy" } },
+            reasoning: { efforts: [{ id: "low", name: "Low" }, { id: "high", name: "High" }] },
+          },
+        ],
+      },
+    ],
+  };
+  let selectResult = { ok: true };
+  const labelSlots = [];
+  let optionsOwner = null;
+  const reactHooks = {
+    Fragment: Symbol.for("react.fragment"),
+    useState: init => activeHooks.useState(init),
+    useRef: init => activeHooks.useRef(init),
+    useSyncExternalStore: (sub, snap) => activeHooks.useSyncExternalStore(sub, snap),
+    useEffect: (fn, deps) => activeHooks.useEffect(fn, deps),
+    useLayoutEffect: (fn, deps) => activeHooks.useEffect(fn, deps),
+    useId: () => ":r1:",
+    useMemo: fn => fn(),
+  };
+  const f = mount("standard", true, undefined, undefined, reactHooks, {
+    modelCatalog: async () => ({ ok: true, value: catalogValue }),
+    modelSelection: () => ({ next: undefined }),
+    selectModel: async () => selectResult,
+  });
+  const entry = f.slots.get("conversation.input.model");
+  const injected = entry.options.inject("dsh-1");
+  const renderSlot = (name, owner, opts) => {
+    if (name === "conversation.input.model.label") {
+      labelSlots.push(owner);
+      return opts.fallback;
+    }
+    if (name === "conversation.input.model.options") {
+      optionsOwner = owner;
+      return { type: "team-toggle", props: { locked: owner.locked }, children: ["启用智能体团队协作"] };
+    }
+    return null;
+  };
+  const outerTree = entry.component({ ...injected, locked: false, renderSlot });
+  const StandardSelect = outerTree.type;
+  assert.equal(typeof StandardSelect, "function");
+
+  // Render StandardModelSelect with its own hook state; trigger initial catalog load.
+  const renderStandard = (extraProps = {}) => {
+    const prev = activeHooks;
+    activeHooks = inner.hooks;
+    try {
+      let tree;
+      const proxy = props => {
+        tree = StandardSelect(props);
+        return { children: [tree] };
+      };
+      return inner.render(proxy, { ...outerTree.props, ...extraProps });
+    } finally {
+      activeHooks = prev;
+    }
+  };
+
+  renderStandard();
+  await new Promise(resolve => setImmediate(resolve));
+
+  // Trigger shows badge ("平价"), model name ("routing group"), and effort ("effortDefault").
+  let tree = renderStandard();
+  const trigger = findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0];
+  assert.ok(trigger, "capsule trigger button should render");
+  assert.equal(trigger.props["aria-expanded"], false);
+  const triggerText = textOf(trigger);
+  assert.ok(triggerText.includes("平价"), "trigger should include localized model badge");
+  assert.ok(triggerText.includes("routing group"), "trigger should include model name");
+  assert.ok(triggerText.includes("effortDefault"), "trigger should include effort label");
+  assert.equal(labelSlots[labelSlots.length - 1].placement, "trigger");
+
+  // Open root popover menu.
+  trigger.props.onClick();
+  tree = renderStandard();
+  const menu = findNodes(tree, n => n.props?.className === "oacp-ms-menu")[0];
+  assert.ok(menu, "popover menu should render when open");
+  assert.equal(menu.props.role, "menu");
+  const cells = findNodes(menu, n => n.type === "button" && n.props?.className === "oacp-ms-cell");
+  assert.equal(cells.length, 2, "root pane should have Model and Reasoning Effort rows");
+  assert.ok(textOf(menu).includes("启用智能体团队协作"), "conversation.input.model.options child slot should mount inside root pane");
+  assert.equal(optionsOwner.locked, false);
+
+  // Drill into effort pane and choose High.
+  cells[1].props.onClick();
+  tree = renderStandard();
+  const effortButtons = findNodes(tree, n => n.type === "button" && n.props?.role === "menuitemradio");
+  assert.deepEqual(effortButtons.map(b => textOf(b)), ["effortDefault", "Low", "High"]);
+  effortButtons[2].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(JSON.stringify(f.calls)), [
+    { sessionId: "dsh-1", provider: "deepseek-account", model: "routing-group", reasoningEffort: "high" },
+  ]);
+
+  // Reopen root pane, drill into model pane, verify provider ordering (deepseek-account first) and select third-party model.
+  tree = renderStandard();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0].props.onClick();
+  tree = renderStandard();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-cell")[0].props.onClick();
+  tree = renderStandard();
+  const modelButtons = findNodes(tree, n => n.type === "button" && n.props?.role === "menuitemradio");
+  assert.equal(modelButtons.length, 2);
+  assert.ok(textOf(modelButtons[0]).includes("routing group"), "deepseek-account should be ordered first");
+  assert.ok(textOf(modelButtons[1]).includes("TP Model"));
+
+  // Failed selection surfaces writer-held toast.
+  selectResult = { ok: false, error: { code: "session/writer-held", message: "busy" } };
+  modelButtons[1].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  tree = renderStandard();
+  const toasts = findNodes(tree, n => typeof n.props?.text === "string" && typeof n.props?.onDone === "function");
+  assert.ok(toasts.some(a => a.props.text.includes("errorSessionInUse")));
+
+  // Options slot reportFailure and dismiss work as expected.
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0].props.onClick();
+  tree = renderStandard();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0].props.onClick();
+  tree = renderStandard();
+  assert.ok(optionsOwner);
+  optionsOwner.reportFailure("team error");
+  optionsOwner.dismiss();
+  tree = renderStandard();
+  assert.equal(findNodes(tree, n => n.props?.className === "oacp-ms-menu").length, 0);
+  assert.ok(findNodes(tree, n => typeof n.props?.text === "string" && typeof n.props?.onDone === "function").some(a => a.props.text.includes("team error")));
+
+  // Subagent session renders null.
+  assert.equal(entry.component({ ...injected, available: false, locked: false, renderSlot }), null);
   f.dispose();
 });
