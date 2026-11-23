@@ -812,3 +812,57 @@ test('a host-default ACP preset rejects provider and model before preparing a se
   assert.equal(f.backend.preparations.length, 0);
   assert.equal(f.backend.runs.length, 0);
 });
+
+test('oneagents-acp presets do not emit a false FIFO capacity wait message when capacity is available', { timeout: 10000 }, async t => {
+  const f = await fixture(t, { defaultAgentPreset: 'oneagents-acp-grok-build' });
+  const task = await submit(f.client, message('work', { metadata: { agentPreset: 'oneagents-acp-grok-build' } }));
+  const submittedText = task.status?.message?.parts?.map(part => part.content?.$case === 'text' ? part.content.value : '').join('') ?? '';
+  assert.doesNotMatch(submittedText, /waiting in FIFO order/);
+  const historyTexts = (task.history ?? []).flatMap(item => item.parts.map(part => part.content?.$case === 'text' ? part.content.value : ''));
+  assert.ok(!historyTexts.some(line => line.includes('waiting in FIFO order')));
+  while (!f.backend.runs.length) await new Promise(resolve => setTimeout(resolve, 10));
+  f.backend.runs[0].result.resolve({ text: 'ok', outcome: 'completed' });
+  const done = await waitForTask(f.client, task.id, TaskState.TASK_STATE_COMPLETED);
+  const allHistory = (done.history ?? []).flatMap(item => item.parts.map(part => part.content?.$case === 'text' ? part.content.value : ''));
+  assert.ok(!allHistory.some(line => line.includes('waiting in FIFO order')));
+});
+
+test('PRESET_UNSUPPORTED and headless MODEL_SELECTION_UNSUPPORTED surface host-authored messages and scrub untrusted text', { timeout: 10000 }, async t => {
+  class RejectingBackend extends DeferredBackend {
+    mode: 'preset' | 'preset-untrusted' | 'model' = 'preset';
+    override async prepare(): Promise<A2ATarget> {
+      if (this.mode === 'preset') {
+        throw Object.assign(new Error('Only the configured DSH headless composition is supported'), { code: 'PRESET_UNSUPPORTED' });
+      }
+      if (this.mode === 'preset-untrusted') {
+        throw Object.assign(new Error('leaked secret token=abc'), { code: 'PRESET_UNSUPPORTED' });
+      }
+      throw Object.assign(new Error('Configure the model on the DSH headless profile'), { code: 'MODEL_SELECTION_UNSUPPORTED' });
+    }
+  }
+  const backend = new RejectingBackend();
+  const f = await fixture(t, { defaultAgentPreset: 'standard' }, backend);
+
+  const presetTask = await submit(f.client, message('run acp', { metadata: { agentPreset: 'oneagents-acp-grok-build' } }));
+  const presetFailed = await waitForTask(f.client, presetTask.id, TaskState.TASK_STATE_FAILED);
+  assert.equal((presetFailed.metadata?.['1agents'] as { result: { validation: { code: string } } }).result.validation.code, 'PRESET_UNSUPPORTED');
+  const presetMsg = presetFailed.status?.message?.parts?.[0]?.content?.$case === 'text' ? presetFailed.status.message.parts[0].content.value : '';
+  assert.equal(presetMsg, 'Only the configured DSH headless composition is supported');
+  const presetHistory = (presetFailed.history ?? []).flatMap(item => item.parts.map(part => part.content?.$case === 'text' ? part.content.value : ''));
+  assert.ok(!presetHistory.some(line => line.includes('waiting in FIFO order')));
+
+  backend.mode = 'preset-untrusted';
+  const scrubbedTask = await submit(f.client, message('run untrusted', { metadata: { agentPreset: 'oneagents-acp-codex' } }));
+  const scrubbedFailed = await waitForTask(f.client, scrubbedTask.id, TaskState.TASK_STATE_FAILED);
+  assert.equal((scrubbedFailed.metadata?.['1agents'] as { result: { validation: { code: string } } }).result.validation.code, 'PRESET_UNSUPPORTED');
+  const scrubbedMsg = scrubbedFailed.status?.message?.parts?.[0]?.content?.$case === 'text' ? scrubbedFailed.status.message.parts[0].content.value : '';
+  assert.equal(scrubbedMsg, 'The requested agent preset is not supported by this host.');
+  assert.ok(!scrubbedMsg.includes('secret'));
+
+  backend.mode = 'model';
+  const modelTask = await submit(f.client, message('pick model', { metadata: { agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' } }));
+  const modelFailed = await waitForTask(f.client, modelTask.id, TaskState.TASK_STATE_FAILED);
+  assert.equal((modelFailed.metadata?.['1agents'] as { result: { validation: { code: string } } }).result.validation.code, 'MODEL_SELECTION_UNSUPPORTED');
+  const modelMsg = modelFailed.status?.message?.parts?.[0]?.content?.$case === 'text' ? modelFailed.status.message.parts[0].content.value : '';
+  assert.equal(modelMsg, 'Configure the model on the DSH headless profile');
+});

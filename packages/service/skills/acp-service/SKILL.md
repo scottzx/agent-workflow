@@ -85,15 +85,19 @@ acp-service --skill install acp-service --agent codex --scope repo
 }
 ```
 
-工作目录与预设必须存在于远端部署。需要普通 DSH Agent 时显式传 `standard`；需要外部 Codex 时传 `oneagents-acp-codex`（前提是该预设可用）。省略 `agentPreset` 会用 **A2A 服务端配置的默认预设**，它可能与 DSH 界面默认值不同。
+工作目录与预设必须存在于远端部署，且先区分远端 A2A 宿主类型：
+- **完整 DSH + ACP 插件宿主（`@1agents/acp-service` / `DshA2ABackend`）**：支持 `standard`（可传 `provider`/`model` 选目录内模型）及该宿主实际启用的 `oneagents-acp-*` 外部 ACP 预设（如 `oneagents-acp-codex`、`oneagents-acp-grok-build`）。
+- **独立纯 DSH 宿主（`@1agents/dsh-a2a` / `oneagents-dsh-a2a` / `HeadlessDshBackend`）**：不经 ACP 服务，**仅支持 `standard`（或省略 `agentPreset`）与宿主 profile 自身配置的模型**；向这类宿主传 `oneagents-acp-*` 或其它非 `standard` 预设会直接失败（`PRESET_UNSUPPORTED`），传请求级 `provider`/`model` 也会失败（`MODEL_SELECTION_UNSUPPORTED`）。不走 ACP 是为了避免维护两套消息通知体系、简化系统以保障长期稳健性；早期同时支持 DSH 与 ACP 属于过渡策略，现已明确收紧入口，先确保 `standard` 稳定跑通，后续再视情况评估是否放开 ACP。
+
+需要外部 ACP Agent（如 `oneagents-acp-codex`、`oneagents-acp-grok-build`）时，必须派发到挂载 `@1agents/acp-service` DSH 插件的目标；向 `@1agents/dsh-a2a` 目标派单时仅传 `standard` 或省略 `agentPreset`，且不传 `provider`/`model`。省略 `agentPreset` 会用 **A2A 服务端配置的默认预设**，它可能与 DSH 界面默认值不同。
 
 ## 会话、模式与模型
 
 | 概念 | 当前行为 |
 | --- | --- |
 | `cwd` | gateway 的 spawn 必填；是远端现有绝对路径，不能传本机路径代替 |
-| `agentPreset` | 选择 DSH Agent 的组成；gateway 可省略并使用远端 A2A 默认值 |
-| 标准 DSH 模型 | `standard` 使用该 DSH 部署的默认 provider/model，不固定为某一厂商 |
+| `agentPreset` | 选择 DSH Agent 的组成；gateway 可省略并使用远端 A2A 默认值。`oneagents-acp-*` 仅适用于 `@1agents/acp-service` DSH 插件宿主；`@1agents/dsh-a2a`（headless/SDK）宿主仅接受 `standard` 或省略，传其它值报 `PRESET_UNSUPPORTED` |
+| 标准 DSH 模型 | `standard` 使用该 DSH 部署的默认 provider/model，不固定为某一厂商；完整 DSH 插件宿主支持请求级 `provider`/`model`，`@1agents/dsh-a2a` 宿主仅使用 profile 预配置模型（请求级覆盖报 `MODEL_SELECTION_UNSUPPORTED`） |
 | ACP Agent 模型/模式 | 由原生 Agent 提供，通过其公布的配置选项或模式切换 |
 | A2A `modelId` / `modeId` | spawn 和 `metadata.1agents` 没有这些参数。模型名称写进 prompt 不会改 ACP 配置。试跑时在 DSH 的 ACP 设置里被该 Agent 接受的值，按工作区和 Agent 记在插件里，之后该 Agent 的新建会话会自动回放 |
 

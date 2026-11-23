@@ -56,17 +56,18 @@ class RoleSkillLoadingError extends Error {
   constructor(cause: unknown) { super('Role skills could not be loaded or verified; the model was not started', { cause }); }
 }
 
-const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS', 'MODEL_UNAVAILABLE', 'MODEL_SELECTION_UNSUPPORTED', 'UNKNOWN_MODEL_OR_GROUP']);
-/** Host-authored model ids only. A mismatch keeps the static sentence and drops whatever else the error carried. */
-const MODEL_FAILURE_MESSAGE = /^(?:Unknown model or routing group: [A-Za-z0-9][A-Za-z0-9._:/@+-]*(?:\. Available: [A-Za-z0-9][A-Za-z0-9._:/@+-]*(?:, [A-Za-z0-9][A-Za-z0-9._:/@+-]*)*)?|The requested model is not in the DSH model catalog\.|DSH did not select [A-Za-z0-9][A-Za-z0-9._:/@+-]*)$/;
+const sessionFailureCodes = new Set(['SESSION_NOT_FOUND', 'SESSION_DELETED', 'SESSION_CLOSED', 'SESSION_CONFLICT', 'SESSION_ATTACH_IN_PROGRESS', 'MODEL_UNAVAILABLE', 'MODEL_SELECTION_UNSUPPORTED', 'PRESET_UNSUPPORTED', 'UNKNOWN_MODEL_OR_GROUP']);
+/** Host-authored model/preset failure text only. A mismatch keeps the static sentence and drops whatever else the error carried. */
+const MODEL_FAILURE_MESSAGE = /^(?:Unknown model or routing group: [A-Za-z0-9][A-Za-z0-9._:/@+-]*(?:\. Available: [A-Za-z0-9][A-Za-z0-9._:/@+-]*(?:, [A-Za-z0-9][A-Za-z0-9._:/@+-]*)*)?|The requested model is not in the DSH model catalog\.|DSH did not select [A-Za-z0-9][A-Za-z0-9._:/@+-]*|Configure the model on the DSH headless profile|provider and model apply only to standard presets|Only the configured DSH headless composition is supported)$/;
 
 function modelFailureMessage(error: unknown, code: string | undefined): string | undefined {
-  if (code !== 'UNKNOWN_MODEL_OR_GROUP' && code !== 'MODEL_UNAVAILABLE' && code !== 'MODEL_SELECTION_UNSUPPORTED') return undefined;
+  if (code !== 'UNKNOWN_MODEL_OR_GROUP' && code !== 'MODEL_UNAVAILABLE' && code !== 'MODEL_SELECTION_UNSUPPORTED' && code !== 'PRESET_UNSUPPORTED') return undefined;
   const message = error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string'
     ? (error as { message: string }).message : '';
   if (MODEL_FAILURE_MESSAGE.test(message)) return message;
   if (code === 'UNKNOWN_MODEL_OR_GROUP') return 'Unknown model or routing group.';
   if (code === 'MODEL_SELECTION_UNSUPPORTED') return 'provider and model apply only to standard presets';
+  if (code === 'PRESET_UNSUPPORTED') return 'The requested agent preset is not supported by this host.';
   return 'The requested model is not in the DSH model catalog.';
 }
 
@@ -296,8 +297,9 @@ export class A2ASessionExecutor implements AgentExecutor {
         const agentPreset = input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset;
         // ACP Agents publish their own model options through session/set_config_option.
         if (input.provider && agentPreset?.startsWith('oneagents-acp-')) throw Object.assign(new Error('provider and model apply only to standard presets'), { code: 'MODEL_SELECTION_UNSUPPORTED' });
-        // ACP session preparation can itself wait in the process FIFO.
-        if (agentPreset?.startsWith('oneagents-acp-')) pendingCapacity();
+        // ACP session preparation can wait in backend admission; publish early submission so
+        // returnImmediately callers do not block on prepare(), without falsely claiming a queue wait.
+        if (agentPreset?.startsWith('oneagents-acp-')) submitted();
         // Acquire only after context/role waits, immediately before session creation.
         capacityLease = await acquireCapacity();
         controller.signal.throwIfAborted();

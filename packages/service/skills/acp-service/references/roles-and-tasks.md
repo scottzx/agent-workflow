@@ -95,7 +95,7 @@
 }
 ```
 
-preset 必须在执行宿主真实可用；要用普通 DSH 时显式选 `standard`。临时任务无需新建角色或复制技能。若需复用宿主已配置的网络角色，可显式传 `input.roleId`，仍不能自定义 profile、网络地址或缓存根。兼容旧客户端可使用 `remote_agent_spawn`，见 [A2A](a2a.md#远端任务工具)。
+preset 必须在执行宿主真实可用，且与目标宿主类型匹配：`oneagents-acp-*`（外部 ACP Agent）仅适用于挂载 `@1agents/acp-service` DSH 插件的宿主（`DshA2ABackend`）；独立 `@1agents/dsh-a2a`（`HeadlessDshBackend`）宿主仅支持 `standard`（或省略 `agentPreset`）与宿主 profile 预配置模型，传 `oneagents-acp-*` 会报 `PRESET_UNSUPPORTED`，传请求级 `provider`/`model` 会报 `MODEL_SELECTION_UNSUPPORTED`（独立纯 DSH 宿主不走 ACP 是为了避免维护两套消息通知体系、简化系统保障长期稳健性；早期同时支持 DSH 与 ACP 为过渡策略，现明确收紧先确保 `standard` 跑通，后续再视情况评估是否放开 ACP）。要用普通 DSH 时显式选 `standard`。临时任务无需新建角色或复制技能。若需复用宿主已配置的网络角色，可显式传 `input.roleId`，仍不能自定义 profile、网络地址或缓存根。兼容旧客户端可使用 `remote_agent_spawn`，见 [A2A](a2a.md#远端任务工具)。
 
 ## 账本、通知与处理
 

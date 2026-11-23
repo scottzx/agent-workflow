@@ -50,8 +50,12 @@ export class HeadlessDshBackend {
   }
   async prepare(input, { signal } = {}) {
     signal?.throwIfAborted();
-    if (input.agentPreset && input.agentPreset !== 'standard') throw new Error('Only the configured DSH headless composition is supported');
-    if (input.provider || input.model) throw new Error('Configure the model on the DSH headless profile');
+    if (input.agentPreset && input.agentPreset !== 'standard') {
+      throw Object.assign(new Error('Only the configured DSH headless composition is supported'), { code: 'PRESET_UNSUPPORTED' });
+    }
+    if (input.provider || input.model) {
+      throw Object.assign(new Error('Configure the model on the DSH headless profile'), { code: 'MODEL_SELECTION_UNSUPPORTED' });
+    }
     const previous = input.sessionId ? await this.load(input.sessionId) : undefined;
     const cwd = resolve(input.cwd ?? previous?.cwd ?? process.cwd());
     if (previous && previous.cwd !== cwd) throw new Error('Existing session cwd conflicts');

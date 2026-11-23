@@ -12,7 +12,20 @@
 → 独立执行 → GetTask / SSE / webhook → gateway 持久收件箱 → 主会话处理并 ack
 ```
 
-当前为 **A2A 1.0 JSON-RPC**，SDK `@a2a-js/sdk@1.3.0`。执行端挂载于 DSH web server；`acp-service serve` 提供 ACP，不会自动开放 DSH A2A。`a2a gateway` 是调用端工具和收件箱，不是另一个 DSH 执行器。
+当前为 **A2A 1.0 JSON-RPC**，SDK `@a2a-js/sdk@1.3.0`。`acp-service serve` 提供 ACP，不会自动开放 DSH A2A。`a2a gateway` 是调用端工具和收件箱，不是另一个 DSH 执行器。
+
+### 两类 DSH A2A 执行宿主的能力边界
+
+派单前必须确认远端目标属于哪一类 DSH A2A 宿主，不要混用预设与模型参数：
+
+| 执行宿主实现 | 典型部署 | 允许的 `agentPreset` | 请求级 `provider`/`model` | 不支持时的错误码与说明 |
+| --- | --- | --- | --- | --- |
+| `@1agents/acp-service` 内嵌 DSH 插件（`DshA2ABackend`） | DSH web server 启用 `oneagents-acp` 插件的 `a2a` 配置 | `standard` 及该宿主已启用的 `oneagents-acp-*`（如 `oneagents-acp-codex`、`oneagents-acp-grok-build`） | 仅 `standard` 支持（先查 `remote_agent_model_catalog`）；`oneagents-acp-*` 拒绝 | `oneagents-acp-*` 传 `provider`/`model` → `MODEL_SELECTION_UNSUPPORTED` |
+| `@1agents/dsh-a2a` 独立纯 DSH 入口（`oneagents-dsh-a2a` / `HeadlessDshBackend`） | 独立运行 `dsh-a2a`（headless CLI 或 SDK 模式），不依赖 ACP 服务 | **仅 `standard`（或省略）** | **不支持**（模型由宿主 headless/SDK profile 配置） | 传 `oneagents-acp-*` 或非 `standard` → `PRESET_UNSUPPORTED`（`Only the configured DSH headless composition is supported`）；传 `provider`/`model` → `MODEL_SELECTION_UNSUPPORTED`（`Configure the model on the DSH headless profile`） |
+
+需要调用 `oneagents-acp-*`（Codex、Grok Build、Claude 等外部 ACP Agent）时，必须选择 `DshA2ABackend` 宿主；如果目标运行的是 `@1agents/dsh-a2a`（`HeadlessDshBackend`），应改派到已接入 `acp-service` 的 DSH 插件宿主，或仅使用 `standard`（省略 `agentPreset` 与 `provider`/`model`）。
+
+**补充说明（为什么独立纯 DSH 宿主不走 ACP）**：主要是为了不维护两套消息通知体系、简化系统架构，保障长期的系统稳健性。最初同时支持 DSH 与 ACP 是一种过渡策略；现在明确收紧这个口子，先确保 `standard` 稳定跑通，后续再根据实际情况评估是否放开 ACP。
 
 ## 远端 DSH 启用 A2A
 
@@ -127,7 +140,7 @@ JSON
 
 每次 spawn 都创建新会话，即使 cwd 相同。这次新会话会回放该工作区、该 Agent 在 ACP 设置里已经接受的模式和配置；Grok Build 与 Codex 的记录各自保存。message 复用原 context/cwd/preset 和原会话上的设置，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。未传 `lifecycle` 时 message 沿用原会话策略。`remote_agent_*` 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。
 
-**standard 选模型。** 先 `remote_agent_model_catalog` 读这份宿主的目录，再把 `provider` 和 `model` 一起传给 `standard` 等 DSH 原生预设。`provider` 用 `groups[].id`，`model` 用该组的 `models[].id`（routing group 也是这个 id，例如 `group/daily-choice`）。`default` 就是省略这两个字段时会走的路由。DSH 新建会话后、第一条 prompt 前，按 `modelCatalog()` 核对，再调用 `selectModel`。目录里没有、且也不是宿主当前默认路由时任务失败，`resultMetadata.validation.code` 为 `UNKNOWN_MODEL_OR_GROUP`，结果文字写明未知的 `provider/model` 和最多 12 个可选 id，不再只显示 “ACP execution failed.”。`group/daily-choice` 这类 routing group 与省略时的默认路由一样只记录选择，不要求先解析成具体模型。宿主已接受该路由但没能写上时，code 仍是 `MODEL_UNAVAILABLE`。省略时用 DSH 当时的默认模型，get 不带这两个字段。message 不传时沿用该会话已选的模型，传了就在本轮前切换。`oneagents-acp-*` 预设传这两个字段会被拒绝（宿主侧为 `MODEL_SELECTION_UNSUPPORTED`），它们的模型由 Agent 自己公布，经 `session/set_config_option` 切换。get 与 `resultMetadata` 写出实际使用的 `provider`、`model`。不要把模型名写进 prompt，那不会改会话模型。注意：DSH 的 `selectModel` 同时把这次选择存成 DSH 的默认模型，之后不指定模型的新会话（包括 DSH 界面里新开的）会用它。投递到已存在的主会话使用下面新增的 `session_*` 工具，两类 API 的任务 ID 和会话 ID 不可混用。
+**standard 选模型。** 先 `remote_agent_model_catalog` 读这份宿主的目录，再把 `provider` 和 `model` 一起传给 `standard` 等 DSH 原生预设。`provider` 用 `groups[].id`，`model` 用该组的 `models[].id`（routing group 也是这个 id，例如 `group/daily-choice`）。`default` 就是省略这两个字段时会走的路由。DSH 新建会话后、第一条 prompt 前，按 `modelCatalog()` 核对，再调用 `selectModel`。目录里没有、且也不是宿主当前默认路由时任务失败，`resultMetadata.validation.code` 为 `UNKNOWN_MODEL_OR_GROUP`，结果文字写明未知的 `provider/model` 和最多 12 个可选 id，不再只显示 “ACP execution failed.”。`group/daily-choice` 这类 routing group 与省略时的默认路由一样只记录选择，不要求先解析成具体模型。宿主已接受该路由但没能写上时，code 仍是 `MODEL_UNAVAILABLE`。省略时用 DSH 当时的默认模型，get 不带这两个字段。message 不传时沿用该会话已选的模型，传了就在本轮前切换。`oneagents-acp-*` 预设传这两个字段会被拒绝（宿主侧为 `MODEL_SELECTION_UNSUPPORTED`），它们的模型由 Agent 自己公布，经 `session/set_config_option` 切换；独立 `@1agents/dsh-a2a`（`HeadlessDshBackend`）宿主也不接受请求级 `provider`/`model`（返回 `MODEL_SELECTION_UNSUPPORTED`：`Configure the model on the DSH headless profile`），也不接受 `oneagents-acp-*` 等非 `standard` 预设（返回 `PRESET_UNSUPPORTED`：`Only the configured DSH headless composition is supported`）。get 与 `resultMetadata` 写出实际使用的 `provider`、`model`。不要把模型名写进 prompt，那不会改会话模型。注意：DSH 的 `selectModel` 同时把这次选择存成 DSH 的默认模型，之后不指定模型的新会话（包括 DSH 界面里新开的）会用它。投递到已存在的主会话使用下面新增的 `session_*` 工具，两类 API 的任务 ID 和会话 ID 不可混用。
 
 `lifecycle` 省略或 `mode: "one-shot"` 时，任务完成、失败或取消后由网关普通关闭进程，之后 message 经 `session/load` 接回；2026-10-31 之前保存、没有 lifecycle 的旧任务仍按 persistent。`closeAfter: "ack"` 要等这条通知被 ack。`INPUT_REQUIRED` 不关闭。one-shot 在 runtime 里仍调用 `ensureSession({ mode: "persistent" })`，关闭只 release，不 delete，也不改 runtime 模式。`remote_agent_get` 在进程名额排队时仍是 submitted，并带 `capacity.position` 与 `capacity.waitedMs`；60 秒握手时限从出队之后才开始计。本技能不保证模型在进程关闭后仍记得上文。
 

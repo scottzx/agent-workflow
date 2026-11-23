@@ -22,7 +22,8 @@ test('DSH-only runtime creates and resumes persisted sessions across backend res
   const restarted = new HeadlessDshBackend(config);
   assert.equal((await restarted.run(target, 'continue', options)).text, 'continue');
   assert.equal((await restarted.status(target)).activeTurn, false);
-  await assert.rejects(restarted.prepare({ cwd: f.dir, agentPreset: 'oneagents-acp-codex' }), /composition/);
+  await assert.rejects(restarted.prepare({ cwd: f.dir, agentPreset: 'oneagents-acp-codex' }), error => error.code === 'PRESET_UNSUPPORTED' && /composition/.test(error.message));
+  await assert.rejects(restarted.prepare({ cwd: f.dir, provider: 'deepseek', model: 'deepseek-v4' }), error => error.code === 'MODEL_SELECTION_UNSUPPORTED' && /headless profile/.test(error.message));
 });
 test('missing final is failed and cannot silently replay an uncertain run', async t => {
   const f = await fixture(t, 'missing'), backend = new HeadlessDshBackend({ directory: f.dir, ...f.runtime });
@@ -77,4 +78,53 @@ test('a listen error other than a taken port still fails before the store is acq
     port: 0, publicUrl: 'http://127.0.0.1:3080', token: 'test', stateDirectory: directory, runtime: f.runtime,
   });
   await recovered.close();
+});
+
+test('standalone A2A rejects oneagents-acp-* preset and provider/model with clear error codes and no false queuing message', async t => {
+  const f = await fixture(t);
+  const service = await startA2AService({
+    port: 0, host: '127.0.0.1', publicUrl: 'http://127.0.0.1:3080', token: 'test',
+    stateDirectory: join(f.dir, 'state-reject'), runtime: f.runtime,
+  });
+  t.after(() => service.close());
+  const origin = `http://127.0.0.1:${service.server.address().port}`;
+  const rpc = async (method, params) => {
+    const res = await fetch(`${origin}/a2a`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test', 'A2A-Version': '1.0', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: '1', method, params }),
+    });
+    assert.equal(res.status, 200);
+    return res.json();
+  };
+  const send = await rpc('SendMessage', {
+    message: { messageId: 'm-preset', role: 'ROLE_USER', parts: [{ text: 'hello', mediaType: 'text/plain' }] },
+    configuration: { returnImmediately: true },
+    metadata: { '1agents': { cwd: f.dir, agentPreset: 'oneagents-acp-grok-build' } },
+  });
+  const taskId = send.result.task.id;
+  const submittedText = send.result.task.status?.message?.parts?.[0]?.text ?? '';
+  assert.doesNotMatch(submittedText, /waiting in FIFO order/);
+  let task;
+  for (let i = 0; i < 40; i++) {
+    const got = await rpc('GetTask', { id: taskId });
+    task = got.result;
+    if (task.status?.state === 'TASK_STATE_FAILED') break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.equal(task.status?.state, 'TASK_STATE_FAILED');
+  assert.equal(task.metadata?.['1agents']?.result?.validation?.code, 'PRESET_UNSUPPORTED');
+  assert.equal(task.status?.message?.parts?.[0]?.text, 'Only the configured DSH headless composition is supported');
+  const historyTexts = (task.history ?? []).flatMap(item => (item.parts ?? []).map(p => p.text ?? ''));
+  assert.ok(!historyTexts.some(line => line.includes('waiting in FIFO order')));
+
+  const modelSend = await rpc('SendMessage', {
+    message: { messageId: 'm-model', role: 'ROLE_USER', parts: [{ text: 'hello', mediaType: 'text/plain' }] },
+    configuration: { returnImmediately: false },
+    metadata: { '1agents': { cwd: f.dir, agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' } },
+  });
+  const modelTask = modelSend.result.task;
+  assert.equal(modelTask.status?.state, 'TASK_STATE_FAILED');
+  assert.equal(modelTask.metadata?.['1agents']?.result?.validation?.code, 'MODEL_SELECTION_UNSUPPORTED');
+  assert.equal(modelTask.status?.message?.parts?.[0]?.text, 'Configure the model on the DSH headless profile');
 });

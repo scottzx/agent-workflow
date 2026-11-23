@@ -88,6 +88,8 @@ curl http://127.0.0.1:36812/manifest
 
 后续请求使用 `session/new` 返回的 **服务 session ID**。`_meta.1agents.agentSessionId` 可能是原生 ID，不能混用。传输断开后的恢复应使用已有身份；不明确的已受理 prompt 不应自动重发。
 
+**非活跃会话进程分级回收与压力驱逐**：`acp-service` 会自动回收空闲且无保护状态（无进行中回合、无排队 prompt、无待答复交互请求、无运行中后台任务）的 ACP 子进程，释放进程名额租约，同时保留磁盘上的持久会话记录与历史。默认按会话意图分级保活：交互会话（`user-opened`）默认 5 分钟（`ACP_IDLE_SESSION_TTL_MS`，设为 `0` 关闭定期回收），后台 A2A 任务（`job`）默认 60 秒（`ACP_IDLE_JOB_TTL_MS`）。当新会话申请进程槽位遇到名额满或内存水位不足时，还会触发按需压力驱逐（默认开启，可用 `ACP_PRESSURE_EVICT_ENABLED=0` 关闭；最低空闲宽限 `ACP_PRESSURE_EVICT_GRACE_MS` 默认 15 秒），按「已断连 WS → 后台 `job` → 交互 `user-opened`（同级 LRU）」顺序逐个驱逐直到释放出可用名额。回收后会向所属连接发出 `_1agents/events/session_closed`（`reason: "idle_timeout"` 或 `"capacity_evicted"`）并在连接无其它附着会话时正常关闭空闲 WebSocket；客户端（含 DSH 插件）在下次发言时通过 `session/load` 无缝恢复原会话，不丢失会话身份与记录。注意：`runtime.close()` 会连同 ACP 子进程的后代进程一并终止，因此含运行中 `background_task` 的会话受保护不会被回收。
+
 ## 编程入口与流程
 
 ```ts
