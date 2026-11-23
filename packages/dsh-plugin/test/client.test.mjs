@@ -200,7 +200,7 @@ function hookRenderer() {
       pending = [];
       const tree = component(props);
       for (const effect of pending) effect();
-      return tree.children[0];
+      return tree;
     },
   };
 }
@@ -215,16 +215,16 @@ test('configuration busy clears after a same-mode reconnect without showing the 
   const component = f.slots.get('conversation.input.model').component;
   const render = () => renderer.render(component, context);
   await f.command.ui.options(context);
-  const updating = render()[0].props.onSelect('b');
-  assert.equal(render()[0].props.disabled, true);
+  const updating = render().props.onConfigure('native-model', 'b');
+  assert.equal(render().props.busy, true);
   f.emitLocal('connection/reset');
   render();
   rejectPost(new Error('old configuration failed'));
   await updating;
   await f.command.ui.options(context);
-  const controls = render();
-  assert.equal(controls[0].props.disabled, false);
-  assert.equal(controls.some(control => control.props?.role === 'alert'), false);
+  const tree = render();
+  assert.equal(tree.props.busy, false);
+  assert.equal(tree.props.error, '');
   f.dispose();
 });
 
@@ -239,7 +239,7 @@ test('a previous mode configuration cannot clear a newer configuration busy stat
   const component = f.slots.get('conversation.input.model').component;
   const render = () => renderer.render(component, context);
   await f.command.ui.options(context);
-  const first = render()[0].props.onSelect('b');
+  const first = render().props.onConfigure('native-model', 'b');
   f.emitRemote('agent-preset/selected', context.sessionId, 'standard');
   f.setPreset(context.sessionId, 'standard');
   render();
@@ -247,17 +247,17 @@ test('a previous mode configuration cannot clear a newer configuration busy stat
   f.setPreset(context.sessionId, 'oneagents-acp-codex');
   render();
   await f.command.ui.options(context);
-  const second = render()[0].props.onSelect('b');
+  const second = render().props.onConfigure('native-model', 'b');
   posts[0]({ ok: true, json: async () => f.native });
   await first;
-  let controls = render();
-  assert.equal(controls[0].props.disabled, true);
-  assert.equal(controls.some(control => control.props?.role === 'alert'), false);
+  let tree = render();
+  assert.equal(tree.props.busy, true);
+  assert.equal(tree.props.error, '');
   posts[1]({ ok: true, json: async () => f.native });
   await second;
-  controls = render();
-  assert.equal(controls[0].props.disabled, false);
-  assert.equal(controls.some(control => control.props?.role === 'alert'), false);
+  tree = render();
+  assert.equal(tree.props.busy, false);
+  assert.equal(tree.props.error, '');
   f.dispose();
 });
 
@@ -437,5 +437,153 @@ test("standard DSH session renders official capsule trigger, two-level popover, 
 
   // Subagent session renders null.
   assert.equal(entry.component({ ...injected, available: false, locked: false, renderSlot }), null);
+  f.dispose();
+});
+
+test("ACP external Agent session renders official capsule trigger and two-level popover for model, thought_level, and mode", async () => {
+  const outer = hookRenderer();
+  const inner = hookRenderer();
+  let activeHooks = outer.hooks;
+  const antigravityCaps = {
+    agent: "antigravity",
+    writable: true,
+    configOptions: [
+      {
+        id: "model",
+        category: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "gemini-4-neon",
+        options: [
+          { group: "gemini", name: "Gemini", options: [
+            { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+            { value: "gemini-pro", name: "Gemini Pro" },
+          ] },
+          { group: "claude", name: "Claude", options: [
+            { value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+            { value: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
+            { value: "gpt-oss-120b", name: "GPT OSS 120B" },
+          ] },
+        ],
+      },
+      {
+        id: "thought_level",
+        category: "thought_level",
+        name: "Thought Level",
+        type: "select",
+        currentValue: "medium",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ],
+      },
+    ],
+    modes: {
+      currentModeId: "agent",
+      availableModes: [
+        { id: "agent", name: "Agent" },
+        { id: "plan", name: "Plan" },
+      ],
+    },
+  };
+  const reactHooks = {
+    Fragment: Symbol.for("react.fragment"),
+    useState: init => activeHooks.useState(init),
+    useRef: init => activeHooks.useRef(init),
+    useSyncExternalStore: (sub, snap) => activeHooks.useSyncExternalStore(sub, snap),
+    useEffect: (fn, deps) => activeHooks.useEffect(fn, deps),
+    useLayoutEffect: (fn, deps) => activeHooks.useEffect(fn, deps),
+    useId: () => ":acp1:",
+    useMemo: fn => fn(),
+  };
+  const f = mount("oneagents-acp-antigravity", true, undefined, async (_url, options) => {
+    if (options?.method === "POST") {
+      const body = JSON.parse(options.body);
+      if (body.configId === "thought_level") antigravityCaps.configOptions[1].currentValue = body.value;
+      if (body.configId === "$mode") antigravityCaps.modes.currentModeId = body.value;
+      if (body.configId === "model") antigravityCaps.configOptions[0].currentValue = body.value;
+    }
+    return { ok: true, json: async () => structuredClone(antigravityCaps) };
+  }, reactHooks);
+
+  const entry = f.slots.get("conversation.input.model");
+  const injected = entry.options.inject("acp-1");
+  await f.command.ui.options({ sessionId: "acp-1" });
+
+  const renderAcp = () => {
+    const outerTree = outer.render(entry.component, { ...injected, locked: false });
+    const AcpSelect = outerTree.type;
+    const prev = activeHooks;
+    activeHooks = inner.hooks;
+    try {
+      return inner.render(AcpSelect, outerTree.props);
+    } finally {
+      activeHooks = prev;
+    }
+  };
+
+  // Trigger capsule displays current model and thought level.
+  let tree = renderAcp();
+  assert.equal(tree.props["data-oneagents-acp-controls"], "acp");
+  const trigger = findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0];
+  assert.ok(trigger, "ACP capsule trigger button should render");
+  assert.equal(trigger.props["aria-expanded"], false);
+  assert.ok(textOf(trigger).includes("Gemini 4 Neon"), "trigger should show current ACP model");
+  assert.ok(textOf(trigger).includes("Medium"), "trigger should show current thought level");
+
+  // Open root popover: Model, Thought Level, Mode cells.
+  trigger.props.onClick();
+  tree = renderAcp();
+  const menu = findNodes(tree, n => n.props?.className === "oacp-ms-menu")[0];
+  assert.ok(menu, "ACP popover menu should open");
+  const cells = findNodes(menu, n => n.type === "button" && n.props?.className === "oacp-ms-cell");
+  assert.equal(cells.length, 3, "root pane should list Model, Thought Level, and Mode");
+  assert.ok(textOf(cells[0]).includes("Gemini 4 Neon"));
+  assert.ok(textOf(cells[1]).includes("Medium"));
+  assert.ok(textOf(cells[2]).includes("Agent"));
+
+  // Drill into Model pane (> 4 options shows search box) and select Claude Opus 5.5.
+  cells[0].props.onClick();
+  tree = renderAcp();
+  assert.equal(findNodes(tree, n => n.props?.role === "searchbox").length, 1, "model list with >4 items should show search box");
+  const modelOptions = findNodes(tree, n => n.type === "button" && n.props?.role === "menuitemradio");
+  assert.equal(modelOptions.length, 5);
+  modelOptions[2].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  const lastPost = f.calls.filter(([, opts]) => opts?.method === "POST").at(-1);
+  assert.deepEqual(JSON.parse(lastPost[1].body), { configId: "model", value: "claude-opus-5-5" });
+
+  // Reopen root pane, drill into Thought Level, select High.
+  tree = renderAcp();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0].props.onClick();
+  tree = renderAcp();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-cell")[1].props.onClick();
+  tree = renderAcp();
+  const effortOptions = findNodes(tree, n => n.type === "button" && n.props?.role === "menuitemradio");
+  assert.deepEqual(effortOptions.map(b => textOf(b)), ["Low", "Medium", "High"]);
+  effortOptions[2].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  const effortPost = f.calls.filter(([, opts]) => opts?.method === "POST").at(-1);
+  assert.deepEqual(JSON.parse(effortPost[1].body), { configId: "thought_level", value: "high" });
+
+  // Reopen root pane, drill into Mode, select Plan.
+  tree = renderAcp();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0].props.onClick();
+  tree = renderAcp();
+  findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-cell")[2].props.onClick();
+  tree = renderAcp();
+  const modeOptions = findNodes(tree, n => n.type === "button" && n.props?.role === "menuitemradio");
+  assert.deepEqual(modeOptions.map(b => textOf(b)), ["Agent", "Plan"]);
+  modeOptions[1].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  const modePost = f.calls.filter(([, opts]) => opts?.method === "POST").at(-1);
+  assert.deepEqual(JSON.parse(modePost[1].body), { configId: "$mode", value: "plan" });
+
+  // Trigger reflects updated model and thought level.
+  tree = renderAcp();
+  const updatedTrigger = findNodes(tree, n => n.type === "button" && n.props?.className === "oacp-ms-trigger")[0];
+  assert.ok(textOf(updatedTrigger).includes("Claude Opus 5.5"));
+  assert.ok(textOf(updatedTrigger).includes("High"));
   f.dispose();
 });

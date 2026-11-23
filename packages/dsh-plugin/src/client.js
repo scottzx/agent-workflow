@@ -1,6 +1,7 @@
 /** Browser controls for native ACP configuration and ordinary DSH models. */
 import { createElement as h, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
+  AcpModelSelect,
   StandardModelSelect,
   createModelCatalogStore,
   formatCopy,
@@ -103,16 +104,6 @@ async function acpRequest(sessionId, change, signal) {
   const value = await response.json();
   if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
   return value;
-}
-
-const selectStyle = { maxWidth: 210, minHeight: 30, borderRadius: 7, border: '1px solid var(--dsw-alias-border-l1, #8885)', color: 'inherit', background: 'var(--dsw-alias-bg-base, transparent)', padding: '3px 7px', fontSize: 12 };
-
-function Select({ title, value, rows, disabled, onSelect, placeholder }) {
-  return h('label', { style: { display: 'inline-flex', gap: 5, alignItems: 'center', fontSize: 12 } },
-    h('span', null, title),
-    h('select', { 'aria-label': title, style: selectStyle, value: value ?? '', disabled, onChange: e => onSelect(e.target.value) },
-      h('option', { value: '', disabled: true }, placeholder || title),
-      rows.map(row => h('option', { key: row.value, value: row.value, title: row.description }, `${row.group ? `${row.group} · ` : ''}${row.name}`))));
 }
 
 export function apply(ctx) {
@@ -233,7 +224,6 @@ export function apply(ctx) {
     const [error, setError] = useState('');
     const [loadError, setLoadError] = useState('');
     const [busy, setBusy] = useState(false);
-    const [expanded, setExpanded] = useState(false);
     const changeSequence = useRef(0);
     const refresh = async () => {
       const revision = revisionOf(sessionId);
@@ -277,8 +267,8 @@ export function apply(ctx) {
       const current = () => !disposed && operation === changeSequence.current && revision === revisionOf(sessionId) && presetOf(sessionId) === presetId;
       setBusy(true);
       setError('');
-      try { await action(); }
-      catch (error) { if (current()) setError(String(error.message ?? error)); }
+      try { await action(); return true; }
+      catch (error) { if (current()) setError(String(error.message ?? error)); return false; }
       finally { if (operation === changeSequence.current) setBusy(false); }
     };
 
@@ -301,22 +291,19 @@ export function apply(ctx) {
       });
     }
 
-    const disabled = locked || busy || capabilities?.writable === false;
-    const controls = [];
-    if (capabilities) {
-      const configs = capabilities.configOptions.filter(option => option.type === 'select');
-      const model = configs.find(option => option.category === 'model' || option.id === 'model');
-      if (model) controls.push(h(Select, { key: model.id, title: model.name || t('model'), value: model.currentValue, rows: choices(model), disabled, onSelect: value => change(() => configure(sessionId, model.id, value)) }));
-      else controls.push(h('span', { key: 'unsupported', title: t('unsupported'), style: { fontSize: 12 } }, `ACP · ${capabilities.agent}`));
-      const additional = configs.filter(option => option !== model && !(capabilities.modes && (option.category === 'mode' || option.id === 'mode')));
-      if (additional.length || capabilities.modes) controls.push(h('button', { key: 'settings', type: 'button', style: selectStyle, onClick: () => setExpanded(!expanded), 'aria-expanded': expanded }, t('native')));
-      if (expanded) {
-        for (const option of additional) controls.push(h(Select, { key: option.id, title: option.name, value: option.currentValue, rows: choices(option), disabled, onSelect: value => change(() => configure(sessionId, option.id, value)) }));
-        if (capabilities.modes) controls.push(h(Select, { key: 'mode', title: t('mode'), value: capabilities.modes.currentModeId, rows: capabilities.modes.availableModes.map(m => ({ value: m.id, name: m.name, description: m.description })), disabled, onSelect: value => change(() => configure(sessionId, '$mode', value)) }));
-      }
-    } else if (!error && !loadError) controls.push(h('span', { key: 'loading', style: { fontSize: 12 } }, t('loading')));
-    if (error || loadError) controls.push(h('span', { key: 'error', role: 'alert', style: { color: '#c64b45', fontSize: 12, maxWidth: 360 } }, error || loadError, ' ', h('button', { type: 'button', onClick: () => { setError(''); void refresh(); } }, t('retry'))));
-    return h('div', { 'data-oneagents-acp-controls': 'acp', style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 } }, controls);
+    return h(AcpModelSelect, {
+      sessionId,
+      presetId,
+      capabilities,
+      locked,
+      busy,
+      error,
+      loadError,
+      onConfigure: (configId, value) => change(() => configure(sessionId, configId, value)),
+      onRefresh: refresh,
+      onClearError: () => setError(''),
+      t,
+    });
   }
 
   ctx.slots.inject('conversation.input.model', () => ctx.slots.register({

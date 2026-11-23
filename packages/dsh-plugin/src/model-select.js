@@ -1165,3 +1165,509 @@ export function StandardModelSelect({
     onDone: () => { setToast(null); },
   }));
 }
+
+function acpChoices(option) {
+  return (option?.options ?? []).flatMap(item => ('group' in item
+    ? item.options.map(value => ({ ...value, group: item.name ?? item.group }))
+    : [item]));
+}
+
+function isAcpEffortOption(option) {
+  return option.category === 'thought_level'
+    || option.category === 'reasoning_effort'
+    || /^(thought_level|thinking_level|reasoning_effort|effort)$/i.test(option.id);
+}
+
+/** Official-parity composer model & native config capsule + two-level popover for ACP sessions. */
+export function AcpModelSelect({
+  sessionId,
+  presetId,
+  capabilities,
+  locked,
+  busy,
+  error,
+  loadError,
+  onConfigure,
+  onRefresh,
+  onClearError,
+  t,
+}) {
+  const [open, setOpen] = useState(false);
+  const [pane, setPane] = useState('root');
+  const [query, setQuery] = useState('');
+  const [highlightedIndex, setHighlightedIndex] = useState(null);
+  const [selectionFocus, setSelectionFocus] = useState(false);
+  const [pendingChoice, setPendingChoice] = useState(null);
+  const [toast, setToast] = useState(null);
+  const toastSeq = useRef(0);
+  const mountedRef = useRef(true);
+  const rootRef = useRef(null);
+  const triggerRef = useRef(null);
+  const searchRef = useRef(null);
+  const menuRef = useRef(null);
+  const groupsRef = useRef(null);
+  const itemRefs = useRef([]);
+  const paneFocus = useRef(null);
+  const rawId = typeof useId === 'function' ? useId() : 'oacp-acp-ms';
+  const anchorStyle = { '--dsh-model-anchor': `--dsh-acp-model-${rawId.replaceAll(':', '')}` };
+
+  const compute = (factory, deps) => (typeof useMemo === 'function' ? useMemo(factory, deps) : factory());
+
+  const { modelSection, effortSection, sections } = compute(() => {
+    if (!capabilities) return { modelSection: undefined, effortSection: undefined, sections: [] };
+    const configs = (capabilities.configOptions ?? []).filter(option => option.type === 'select');
+    const model = configs.find(option => option.category === 'model' || option.id === 'model');
+    const additional = configs.filter(option => option !== model && !(capabilities.modes && (option.category === 'mode' || option.id === 'mode')));
+    const effort = additional.find(isAcpEffortOption);
+    const others = additional.filter(option => option !== effort);
+    const toSection = (option, fallbackLabel) => {
+      const rows = acpChoices(option);
+      const currentRow = rows.find(row => row.value === option.currentValue);
+      return {
+        id: option.id,
+        label: option.name || fallbackLabel,
+        currentValue: option.currentValue,
+        currentLabel: currentRow?.name ?? option.currentValue ?? t('choose'),
+        rows,
+      };
+    };
+    const nextSections = [];
+    const builtModel = model ? toSection(model, t('model')) : undefined;
+    if (builtModel) nextSections.push(builtModel);
+    const builtEffort = effort ? toSection(effort, t('effort')) : undefined;
+    if (builtEffort) nextSections.push(builtEffort);
+    for (const opt of others) nextSections.push(toSection(opt, opt.id));
+    if (capabilities.modes?.availableModes?.length) {
+      const rows = capabilities.modes.availableModes.map(mode => ({
+        value: mode.id,
+        name: mode.name,
+        description: mode.description,
+      }));
+      const currentRow = rows.find(row => row.value === capabilities.modes.currentModeId);
+      nextSections.push({
+        id: '$mode',
+        label: t('mode'),
+        currentValue: capabilities.modes.currentModeId,
+        currentLabel: currentRow?.name ?? capabilities.modes.currentModeId ?? '',
+        rows,
+      });
+    }
+    return { modelSection: builtModel, effortSection: builtEffort, sections: nextSections };
+  }, [capabilities, t]);
+
+  const activeSection = pane === 'root' ? undefined : sections.find(section => section.id === pane);
+  const showSearch = (activeSection?.rows.length ?? 0) > 4;
+
+  const groupedRows = compute(() => {
+    if (!activeSection) return [];
+    const filtered = rankByName(activeSection.rows, showSearch ? query.trim() : '');
+    const hasGroups = filtered.some(row => row.group);
+    if (!hasGroups) return filtered.length ? [{ id: '__flat__', label: null, rows: filtered }] : [];
+    const map = new Map();
+    for (const row of filtered) {
+      const key = row.group ?? '';
+      let bucket = map.get(key);
+      if (!bucket) map.set(key, bucket = { id: key || '__ungrouped__', label: row.group ?? null, rows: [] });
+      bucket.rows.push(row);
+    }
+    return Array.from(map.values());
+  }, [activeSection, query, showSearch]);
+
+  const visibleRows = compute(() => groupedRows.flatMap(group => group.rows), [groupedRows]);
+  const currentVisibleIndex = activeSection
+    ? visibleRows.findIndex(row => row.value === activeSection.currentValue)
+    : -1;
+  const activeRowIndex = Math.min(highlightedIndex ?? Math.max(0, currentVisibleIndex), visibleRows.length - 1);
+
+  const disabled = Boolean(locked) || Boolean(busy) || capabilities?.writable === false;
+  const triggerDisabled = Boolean(locked) || capabilities?.writable === false;
+  const singleSection = sections.length === 1;
+  const canOpenMenu = sections.length > 0 || Boolean(error || loadError);
+
+  useEffect(() => {
+    setOpen(false);
+    setPane('root');
+    setQuery('');
+    setHighlightedIndex(null);
+    setPendingChoice(null);
+  }, [sessionId, presetId]);
+
+  useEffect(() => {
+    if (!busy) setPendingChoice(null);
+  }, [busy]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (error) {
+      toastSeq.current += 1;
+      setToast({ seq: toastSeq.current, text: formatCopy(t, 'errorAction', { message: error }) });
+    }
+  }, [error]);
+
+  useEffect(() => {
+    if (!open || typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined;
+    const closeOutside = event => {
+      if (rootRef.current?.contains?.(event.target) === true) return;
+      if (menuRef.current?.contains?.(event.target) === true) return;
+      setOpen(false);
+    };
+    document.addEventListener('mousedown', closeOutside);
+    return () => { document.removeEventListener('mousedown', closeOutside); };
+  }, [open]);
+
+  useSafeLayoutEffect(() => {
+    if (!showSearch) {
+      setQuery('');
+      setHighlightedIndex(null);
+    }
+  }, [showSearch]);
+
+  useEffect(() => {
+    const intent = paneFocus.current;
+    paneFocus.current = null;
+    if (!open || intent === null) return;
+    if (intent === 'drill') {
+      if (showSearch && !isMobileDevice()) {
+        searchRef.current?.focus?.();
+        return;
+      }
+      const checked = menuRef.current?.querySelector?.('[role="menuitemradio"][aria-checked="true"]:not([disabled])');
+      const target = checked ?? itemRefs.current.find(item => item != null && !item.disabled);
+      (target ?? triggerRef.current)?.focus?.();
+      return;
+    }
+    const index = sections.findIndex(section => section.id === intent);
+    const cell = itemRefs.current[index >= 0 ? index : 0];
+    (cell != null && !cell.disabled ? cell : triggerRef.current)?.focus?.();
+  }, [open, pane, showSearch]);
+
+  useEffect(() => {
+    const viewport = groupsRef.current;
+    if (!viewport) return undefined;
+    return observeStickyMenuGroups(viewport);
+  }, [open, pane, groupedRows]);
+
+  useSafeLayoutEffect(() => {
+    if (open && pane !== 'root' && activeRowIndex >= 0) {
+      itemRefs.current[activeRowIndex]?.scrollIntoView?.({ block: 'nearest' });
+    }
+  }, [open, pane, activeRowIndex, visibleRows]);
+
+  const show = () => {
+    if (!canOpenMenu) return;
+    setSelectionFocus(false);
+    triggerRef.current?.focus?.();
+    setQuery('');
+    setHighlightedIndex(null);
+    const initialPane = singleSection ? sections[0].id : 'root';
+    paneFocus.current = singleSection ? 'drill' : sections[0]?.id ?? null;
+    setPane(initialPane);
+    setOpen(true);
+  };
+
+  const close = (restoreFocus = false) => {
+    setOpen(false);
+    setPane('root');
+    if (restoreFocus) {
+      const focus = () => { triggerRef.current?.focus?.(); };
+      if (typeof queueMicrotask === 'function') queueMicrotask(focus);
+      else void Promise.resolve().then(focus);
+    }
+  };
+
+  const closeAfterSelection = () => {
+    setSelectionFocus(true);
+    close(true);
+  };
+
+  const drill = nextPane => {
+    setQuery('');
+    setHighlightedIndex(null);
+    paneFocus.current = 'drill';
+    setPane(nextPane);
+  };
+
+  const back = fromPane => {
+    paneFocus.current = fromPane;
+    setPane('root');
+  };
+
+  const changeQuery = next => {
+    setQuery(next);
+    setHighlightedIndex(0);
+  };
+
+  const moveFocus = offset => {
+    const items = Array.from(menuRef.current?.querySelectorAll?.(
+      'button[role="menuitem"]:not([disabled]), button[role="menuitemradio"]:not([disabled])',
+    ) ?? []);
+    if (items.length === 0) return;
+    const active = items.findIndex(item => item === document.activeElement);
+    const next = active === -1
+      ? (offset > 0 ? 0 : items.length - 1)
+      : (active + offset + items.length) % items.length;
+    items[next]?.focus?.();
+  };
+
+  const choose = (configId, value) => {
+    if (disabled) return;
+    const section = sections.find(item => item.id === configId);
+    if (section && section.currentValue === value) {
+      closeAfterSelection();
+      return;
+    }
+    setSelectionFocus(true);
+    setPendingChoice({ configId, value });
+    return Promise.resolve(onConfigure(configId, value)).then(ok => {
+      if (mountedRef.current) {
+        setPendingChoice(null);
+        if (ok !== false) closeAfterSelection();
+      }
+    });
+  };
+
+  const onRootKeyDown = event => {
+    if (event.nativeEvent?.isComposing) return;
+    if (event.key === 'Escape' && open) {
+      event.preventDefault();
+      if (pane !== 'root' && !singleSection) back(pane);
+      else close(true);
+      return;
+    }
+    if (!open) return;
+    if (pane !== 'root' && showSearch && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+      event.preventDefault();
+      if (!disabled && visibleRows.length > 0) {
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        setHighlightedIndex((activeRowIndex + direction + visibleRows.length) % visibleRows.length);
+        searchRef.current?.focus?.();
+      }
+      return;
+    }
+    if (pane !== 'root' && showSearch && typeof HTMLInputElement !== 'undefined' && event.target instanceof HTMLInputElement
+      && (event.key === 'Enter' || (event.key === 'Tab' && !event.shiftKey))) {
+      if (event.key === 'Tab' && visibleRows.length === 0) return;
+      event.preventDefault();
+      const highlighted = visibleRows[activeRowIndex];
+      if (!disabled && highlighted !== undefined && activeSection) void choose(activeSection.id, highlighted.value);
+      return;
+    }
+    if (event.key === 'Tab') {
+      if (event.shiftKey) {
+        event.preventDefault();
+        if (pane !== 'root' && !singleSection) back(pane);
+        else close(true);
+        return;
+      }
+      const focused = typeof document !== 'undefined' ? document.activeElement : null;
+      const rows = Array.from(menuRef.current?.querySelectorAll?.(
+        'button[role="menuitem"]:not([disabled]), button[role="menuitemradio"]:not([disabled])',
+      ) ?? []);
+      if (typeof HTMLButtonElement !== 'undefined' && focused instanceof HTMLButtonElement && rows.includes(focused)) {
+        event.preventDefault();
+        focused.click();
+        return;
+      }
+      if (focused !== triggerRef.current) return;
+      event.preventDefault();
+      if (pane !== 'root' && showSearch) {
+        setHighlightedIndex(null);
+        searchRef.current?.focus?.();
+        return;
+      }
+      const checked = menuRef.current?.querySelector?.('[role="menuitemradio"][aria-checked="true"]:not([disabled])');
+      (checked ?? rows.find(item => !item.disabled))?.focus?.();
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveFocus(event.key === 'ArrowDown' ? 1 : -1);
+    }
+  };
+
+  const onBlur = event => {
+    const related = event.relatedTarget;
+    if (related && (rootRef.current?.contains?.(related) === true || menuRef.current?.contains?.(related) === true)) return;
+    close();
+  };
+
+  const loading = !capabilities && !error && !loadError;
+  const primaryLabel = loading
+    ? t('loading')
+    : !capabilities
+      ? t('error')
+      : modelSection
+        ? modelSection.currentLabel
+        : `ACP · ${capabilities.agent}`;
+  const secondaryLabel = effortSection ? effortSection.currentLabel : undefined;
+  const triggerTitle = secondaryLabel ? `${primaryLabel} · ${secondaryLabel}` : primaryLabel;
+  const triggerAria = loading
+    ? t('loading')
+    : !capabilities
+      ? t('error')
+      : secondaryLabel
+        ? formatCopy(t, 'triggerAriaEffort', { model: primaryLabel, effort: secondaryLabel })
+        : formatCopy(t, 'triggerAria', { model: primaryLabel });
+
+  const errorBannerText = error || loadError;
+
+  let itemIndex = 0;
+  let rowIndex = 0;
+  const itemRef = () => {
+    const at = itemIndex++;
+    return node => { itemRefs.current[at] = node; };
+  };
+
+  const renderRowButton = row => {
+    const index = rowIndex++;
+    const selected = row.value === activeSection.currentValue;
+    const isPending = pendingChoice?.configId === activeSection.id && pendingChoice.value === row.value;
+    return h('button', {
+      ref: itemRef(),
+      type: 'button',
+      role: 'menuitemradio',
+      'aria-checked': selected,
+      id: `${rawId}-opt-${index}`,
+      tabIndex: showSearch ? -1 : 0,
+      onFocus: () => { setHighlightedIndex(index); },
+      'data-highlighted': index === activeRowIndex ? '' : undefined,
+      className: cx('oacp-ms-option', 'oacp-ms-modelOption', selected && 'oacp-ms-selected', index === activeRowIndex && 'oacp-ms-optionActive'),
+      onMouseMove: disabled || index === activeRowIndex ? undefined : () => {
+        if (showSearch) setHighlightedIndex(index);
+        else itemRefs.current[index]?.focus?.();
+      },
+      key: row.value,
+      title: row.description || row.name,
+      disabled,
+      onClick: () => { void choose(activeSection.id, row.value); },
+    },
+    h('span', { className: 'oacp-ms-optionCopy' },
+      h('span', { className: 'oacp-ms-modelName' }, row.name)),
+    h('span', { className: 'oacp-ms-check' },
+      isPending
+        ? h(StateDotComp, { state: 'ongoing' })
+        : selected ? h(IconCheckComp, null) : null));
+  };
+
+  const menu = open ? renderPortal(
+    h(MenuSurfaceComp, {
+      ref: menuRef,
+      id: `${rawId}-menu`,
+      className: 'oacp-ms-menu',
+      style: anchorStyle,
+      role: pane === 'root' ? 'menu' : 'group',
+      'aria-label': t('native'),
+      'aria-busy': Boolean(busy),
+    },
+    errorBannerText && h('div', { className: 'oacp-ms-error', role: 'alert' },
+      h('span', null, errorBannerText),
+      h('button', {
+        type: 'button',
+        className: 'oacp-ms-retry',
+        onClick: () => { onClearError?.(); void onRefresh?.(); },
+      }, t('retry'))),
+    pane === 'root' && sections.map(section => h('button', {
+      key: section.id,
+      ref: itemRef(),
+      type: 'button',
+      role: 'menuitem',
+      className: 'oacp-ms-cell',
+      disabled,
+      onClick: () => { drill(section.id); },
+    },
+    h('span', { className: 'oacp-ms-cellLabel' }, section.label),
+    h('span', { className: 'oacp-ms-cellValue' }, section.currentLabel),
+    h(IconChevronRightComp, { className: 'oacp-ms-cellChevron' }))),
+    pane !== 'root' && activeSection && h(Fragment, null,
+      showSearch && h('div', { className: 'oacp-ms-searchRow' },
+        h(InputComp, {
+          ref: searchRef,
+          className: cx('oacp-ms-search', query !== '' && 'oacp-ms-searchWithQuery'),
+          type: 'text',
+          role: 'searchbox',
+          'aria-label': t('searchPlaceholder'),
+          'aria-controls': `${rawId}-options`,
+          'aria-activedescendant': activeRowIndex < 0 ? undefined : `${rawId}-opt-${activeRowIndex}`,
+          placeholder: t('searchPlaceholder'),
+          value: query,
+          readOnly: disabled,
+          onChange: event => { changeQuery(event.target.value); },
+        }),
+        query !== '' && h('button', {
+          type: 'button',
+          className: 'oacp-ms-searchClear',
+          'aria-label': t('searchClear'),
+          disabled,
+          onClick: () => {
+            changeQuery('');
+            searchRef.current?.focus?.();
+          },
+        }, h(IconCloseComp, null))),
+      h('div', {
+        ref: groupsRef,
+        id: `${rawId}-options`,
+        className: 'oacp-ms-groups scrollable',
+        role: 'menu',
+        'aria-label': activeSection.label,
+        hidden: groupedRows.length === 0,
+      },
+      groupedRows.map(group => (group.label
+        ? h(MenuGroupComp, { key: group.id, label: group.label }, group.rows.map(renderRowButton))
+        : h(Fragment, { key: group.id }, group.rows.map(renderRowButton))))),
+      groupedRows.length === 0 && h('div', { className: 'oacp-ms-empty', role: 'status' },
+        t(activeSection.rows.length === 0 ? 'emptyModels' : 'searchEmpty')))),
+  ) : null;
+
+  return h('div', {
+    ref: rootRef,
+    className: 'oacp-ms-root',
+    'data-oneagents-acp-controls': 'acp',
+    onKeyDown: onRootKeyDown,
+    onBlur,
+    onMouseDown: event => {
+      if (typeof Element !== 'undefined' && event.target instanceof Element && event.target.closest('button') !== null) {
+        event.preventDefault();
+      }
+    },
+  },
+  h('button', {
+    ref: triggerRef,
+    type: 'button',
+    className: 'oacp-ms-trigger',
+    style: anchorStyle,
+    'aria-label': triggerAria,
+    'aria-haspopup': canOpenMenu ? 'menu' : undefined,
+    'aria-expanded': canOpenMenu ? open : undefined,
+    'aria-controls': open ? `${rawId}-menu` : undefined,
+    title: capabilities && !modelSection ? t('unsupported') : triggerTitle,
+    'aria-busy': Boolean(busy) || loading,
+    'data-selection-focus': selectionFocus ? '' : undefined,
+    onBlur: () => { setSelectionFocus(false); },
+    disabled: triggerDisabled || (!canOpenMenu && !loading),
+    onClick: () => { if (open) close(true); else show(); },
+  },
+  loading
+    ? h(StateDotComp, { state: 'ongoing' })
+    : (!capabilities && errorBannerText)
+      ? h(IconWarningComp, null)
+      : h(IconDataComp, { className: 'oacp-ms-triggerIcon', size: 16 }),
+  h('span', { className: 'oacp-ms-triggerLabel' }, primaryLabel),
+  secondaryLabel !== undefined && h('span', { className: 'oacp-ms-triggerEffort' }, secondaryLabel),
+  busy
+    ? h(StateDotComp, { state: 'ongoing' })
+    : canOpenMenu
+      ? h(IconChevronDownComp, { className: cx('oacp-ms-chevron', open && 'oacp-ms-chevronOpen') })
+      : null),
+  menu,
+  toast !== null && h(ToastComp, {
+    key: toast.seq,
+    text: toast.text,
+    icon: h(IconWarningComp, null),
+    anchor: rootRef.current?.closest?.('[data-composer-card]') ?? null,
+    onDone: () => { setToast(null); },
+  }));
+}
