@@ -25,3 +25,5 @@ packages/service/vendor/
 # Copies of runtime assets that land in the working directory, not project sources.
 dsh-image-gen/
 /skills/
+.tmp/
+packages/*/.tmp/
