@@ -20,13 +20,13 @@ import {
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
-test("sendSessionDirect closes a shared client after reconnect preference failure", async () => {
+test("sendSessionDirect keeps a shared client when the saved model left the catalog", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
     const record = makeSessionRecord({
-      acpxRecordId: "failed-shared-reconnect",
-      acpSessionId: "failed-shared-reconnect-backend",
+      acpxRecordId: "retired-shared-reconnect",
+      acpSessionId: "retired-shared-reconnect-backend",
       agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session --advertise-models`,
       cwd,
       acpx: { session_options: { model: "unavailable-saved-model" } },
@@ -38,18 +38,16 @@ test("sendSessionDirect closes a shared client after reconnect preference failur
       permissionMode: "approve-all",
     });
     try {
-      await assert.rejects(
-        sendSessionDirect({
-          sessionId: record.acpxRecordId,
-          prompt: [{ type: "text", text: "hello" }],
-          permissionMode: "approve-all",
-          outputFormatter: createOutputFormatter("quiet"),
-          client,
-          timeoutMs: 5_000,
-        }),
-        /Failed to replay saved session model unavailable-saved-model/,
-      );
-      assert.equal(client.hasReusableSession(record.acpSessionId), false);
+      const result = await sendSessionDirect({
+        sessionId: record.acpxRecordId,
+        prompt: [{ type: "text", text: "hello" }],
+        permissionMode: "approve-all",
+        outputFormatter: createOutputFormatter("quiet"),
+        client,
+        timeoutMs: 5_000,
+      });
+      assert.equal(result.record.acpSessionId, record.acpSessionId);
+      assert.equal(client.hasReusableSession(record.acpSessionId), true);
       const saved = await resolveSessionRecord(record.acpxRecordId);
       assert.equal(saved.acpx?.session_options?.model, "unavailable-saved-model");
     } finally {
