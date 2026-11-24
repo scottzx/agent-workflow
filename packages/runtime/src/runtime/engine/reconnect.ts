@@ -310,7 +310,7 @@ function retiredAdvertisedModel(error: unknown): boolean {
 function failOrSkipModelReplay(
   error: unknown,
   params: {
-    desiredModelId: string;
+    desiredModelId: string | undefined;
     sessionId: string;
     suppressWarnings?: boolean;
   },

@@ -914,6 +914,35 @@ test('native commands, models and modes are discovered before prompting and stay
   assert.deepEqual(f.changes.map(c => c.sessionId), ['remote-1', 'remote-1']);
 });
 
+test('a saved model that left the catalog no longer blocks a forked ACP session', async t => {
+  const retired = { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'gemini-pro-orchestrator-g1-pro', options: [{ value: 'gemini-pro-orchestrator-g1-pro', name: 'Orchestrator (Argon)' }] };
+  const current = { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'gemini-4-neon-high', options: [{ value: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] };
+  let modelRetired = false;
+  const catalog = () => [structuredClone(modelRetired ? current : retired)];
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    onNew: ({ sessionId }) => ({ sessionId, configOptions: catalog() }),
+    onConfig: ({ params }) => ({ configOptions: catalog().map(option => option.id === params.configId ? { ...option, currentValue: params.value } : option) }),
+  });
+  f.config.agents = [...f.config.agents, 'antigravity'];
+  const agents = new Map([[f.local.id, f.local]]);
+  f.ctx.agents.get = id => agents.get(id);
+  const spawn = id => {
+    const agent = { id, session: { header: { cwd: f.local.session.header.cwd, agentPreset: 'oneagents-acp-antigravity' }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: f.local.ctx, followup: f.local.followup };
+    agents.set(id, agent);
+    return agent;
+  };
+  const first = spawn('dsh-antigravity-first');
+  await f.adapter.describe(first);
+  await f.adapter.configure(first, 'model', 'gemini-pro-orchestrator-g1-pro');
+  modelRetired = true;
+  f.changes.length = 0;
+  const forked = spawn('dsh-antigravity-fork');
+  const capabilities = await f.adapter.describe(forked);
+  assert.deepEqual(f.changes, []);
+  assert.equal(capabilities.configOptions[0].currentValue, 'gemini-4-neon-high');
+  assert.equal(f.prompts.length, 0);
+});
+
 test('pinned settings stay with their own agent and a changed catalog fails before prompting', async t => {
   const grokModes = { currentModeId: 'acceptEdits', availableModes: [{ id: 'acceptEdits', name: 'Accept Edits' }, { id: 'bypassPermissions', name: 'Always Approve' }] };
   const codexModes = { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] };

@@ -277,7 +277,14 @@ export class AcpAdapter implements LlmAdapter {
     let advertised = capabilities.configOptions;
     for (const option of replayPinnedOptions(pinned?.options ?? [])) {
       const mismatch = pinnedOptionError(name, option, advertised);
-      if (mismatch) throw new Error(mismatch);
+      if (mismatch) {
+        // A saved model can drop out of an Agent's catalog after an upgrade
+        // (e.g. Antigravity's agy acp model list). Keep the model the Agent
+        // just advertised and retry this pin if the id returns; a stale model
+        // must never block a forked session. Other stale pins still fail.
+        if (option.model) continue;
+        throw new Error(mismatch);
+      }
       const next = await link.rpc.request('session/set_config_option', { sessionId, configId: option.id, value: option.value }, { cancellationSignal });
       advertised = next.configOptions ?? [];
       capabilities.configOptions = advertised;
