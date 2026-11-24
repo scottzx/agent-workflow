@@ -1341,6 +1341,74 @@ test("connectAndLoadSession fails clearly when saved model cannot be replayed ge
   });
 });
 
+test("connectAndLoadSession keeps a resumed session when the saved model left the catalog", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "retired-model-resume",
+      acpSessionId: "kept-session",
+      agentSessionId: "kept-runtime",
+      agentCommand: "agy acp",
+      cwd,
+      acpx: {
+        session_options: {
+          model: "gemini-pro-orchestrator-g1-pro",
+        },
+        current_model_id: "gemini-pro-orchestrator-g1-pro",
+      },
+    });
+    const advertised: SessionModelState = {
+      configId: "model",
+      currentModelId: "gemini-4-neon-high",
+      availableModels: [
+        { modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+        { modelId: "gemini-4-argon", name: "Gemini 4 Argon" },
+      ],
+    };
+    let setModelCalls = 0;
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async () => ({
+        agentSessionId: "kept-runtime",
+        models: advertised,
+        configOptionsPresent: true,
+      }),
+      loadSessionWithOptions: async () => {
+        throw new Error("load should not run when resume is supported");
+      },
+      createSession: async () => {
+        throw new Error("create should not replace a resumed session");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {
+        setModelCalls += 1;
+      },
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(result.resumed, true);
+    assert.equal(result.sessionId, "kept-session");
+    assert.equal(setModelCalls, 0);
+    assert.equal(record.acpSessionId, "kept-session");
+    assert.equal(record.agentSessionId, "kept-runtime");
+    assert.equal(record.acpx?.session_options?.model, "gemini-pro-orchestrator-g1-pro");
+    assert.equal(record.acpx?.current_model_id, "gemini-4-neon-high");
+  });
+});
+
 test("connectAndLoadSession restores the original session when desired model replay fails", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

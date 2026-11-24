@@ -7,6 +7,7 @@ import {
 } from "../../acp/error-normalization.js";
 import {
   assertRequestedModelSupported,
+  RequestedModelUnsupportedError,
   resolveRequestedModelId,
   resolveRequestedConfigOption,
   type SessionModelState,
@@ -294,6 +295,19 @@ async function replayDesiredModel(params: {
     };
   } catch (error) {
     rethrowAuthorityFailure(params.replay, error);
+    if (
+      error instanceof RequestedModelUnsupportedError &&
+      error.reason === "unadvertised-model" &&
+      error.ambiguous !== true
+    ) {
+      // A catalog change must not tear down a resumed session. The agent keeps
+      // the default it just advertised; the saved id is retried on a later resume.
+      emitModelSupportWarning(
+        `saved model "${params.desiredModelId}" is no longer advertised; keeping the agent default`,
+        params.suppressWarnings,
+      );
+      return { replayed: false };
+    }
     throw new SessionModelReplayError(
       `Failed to replay saved session model ${params.desiredModelId} on ACP session ${params.sessionId}: ${formatErrorMessage(error)}`,
       {

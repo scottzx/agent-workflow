@@ -45,7 +45,7 @@ Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, 
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-The current npm release is `1.0.0`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+The current npm release is `1.0.1`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
 dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
