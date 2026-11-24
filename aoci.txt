@@ -1,7 +1,7 @@
 #AOCI-ROOT-MANIFEST: 1
 #Format-Version: cognition-volumes/v1
 #Locale: zh-CN
-#Project: 1acp
-#Global-Invariants: -
+#Project: agent-workflow 是多智能体协作的 ACP 任务流引擎与 A2A 网关：以 DSH 插件和独立 CLI 接入 Codex、Claude、Grok、Antigravity 等 Agent，提供会话与任务编排、固定角色与技能派发、A2A 消息/通知/回执、工作区看板与 RSI 大纲质检，并配套发布与本地部署脚本。
+#Global-Invariants: npm 包名、命令名、环境变量名与 .1agents/ 目录名保持不变；AOCI 语义只按当前机器 Plan 与实时 Guide 由 Host 模型基于证据创作，不得由路径/AST/模板生成；@deepseek-ai/* 由 DSH 宿主提供，不从 npm 安装同名 rc 包；宿主凭据与本机运行数据不入库。
 #Volume: id=meta kind=meta path=aoci.meta.txt format=meta-v1 depends=- state=enabled
 #Volume: id=code kind=code path=aoci.code.txt format=object-fras-v2 depends=meta state=enabled

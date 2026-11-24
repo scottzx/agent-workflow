@@ -38,14 +38,14 @@ pnpm build && pnpm test
 Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.10.4
+dsh plugin --profile web add @1agents/acp-service@^1.0.0
 ```
 
 Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, then create a session with an **ACP · Agent** preset and an existing workspace. The plugin starts or reuses its local ACP service automatically. Replace `web` with your profile name; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
 
 If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
 
-The current npm release is `0.10.4`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
+The current npm release is `1.0.0`. For a pinned GitHub Release artifact, install the tarball attached to the latest release on this repository, [acp-service-v0.6.0](https://github.com/scottzx/agent-workflow/releases/tag/acp-service-v0.6.0):
 
 ```sh
 dsh plugin --profile web add https://github.com/scottzx/agent-workflow/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
@@ -70,7 +70,7 @@ The plugin currently accepts text prompts. Available controls depend on the sele
 ## Standalone CLI
 
 ```sh
-npm install -g @1agents/acp-service@^0.10.4
+npm install -g @1agents/acp-service@^1.0.0
 acp-service --help
 acp-service serve --host 127.0.0.1 --port 36812 --no-report
 ```
@@ -147,10 +147,10 @@ Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasonin
 
 ```sh
 # Ordinary CLI installation:
-npm install -g @1agents/acp-service@^0.10.4
+npm install -g @1agents/acp-service@^1.0.0
 acp-service --help
 # DSH installation (run from its checkout):
-pnpm dsh plugin --profile web add @1agents/acp-service@^0.10.4
+pnpm dsh plugin --profile web add @1agents/acp-service@^1.0.0
 ```
 
 The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.

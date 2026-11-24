@@ -11,6 +11,7 @@ test('A2A source and manifest have no dependency on the ACP plugin or SDK', asyn
   assert.equal(dependencies['@1agents/dsh-acp'], undefined);
   assert.equal(manifest.dependencies['@1agents/acp-service'], undefined);
   assert.equal(dependencies['@agentclientprotocol/sdk'], undefined);
+  assert.equal(dependencies['@1agents/acp-runtime-sdk'], undefined);
   for (const name of await readdir(new URL('src/', root))) {
     if (!name.endsWith('.js')) continue;
     const source = await readFile(new URL(`src/${name}`, root), 'utf8');

@@ -135,6 +135,13 @@ jobs:
         run: tar -xzf service-build.tgz -C packages/service
       - run: pnpm --filter @1agents/dsh-acp build
       - run: pnpm --filter @1agents/dsh-acp test:only
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-tests
+      - name: Restore runtime dist for embed verification
+        run: |
+          tar -xzf runtime-tests.tgz -C packages/runtime
+          test -f packages/runtime/dist/cli.js
       - run: node scripts/embed-dsh.mjs
       - run: node scripts/release-artifacts.mjs
       - run: node scripts/smoke-service-package.mjs release/*.tgz "$GITHUB_WORKSPACE/.dsh-checkout"
