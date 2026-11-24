@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-23T06:27:37Z",
-  "updated_at": "2026-11-24T01:14:32Z",
+  "updated_at": "2026-11-24T01:31:06Z",
   "files": {
     ".1agents/README.md": {
       "role": "index",
@@ -1927,9 +1927,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "cf70db34a7c76fadebcb9b874bb0ac90243f50750179e82024485835cab29e8c",
-      "size": 400570,
-      "normalized_sha256": "cf70db34a7c76fadebcb9b874bb0ac90243f50750179e82024485835cab29e8c"
+      "sha256": "f977933633751271e938fca4517a1d3ab5ae6018cb3859dfe556ee07c8ee661c",
+      "size": 400572,
+      "normalized_sha256": "f977933633751271e938fca4517a1d3ab5ae6018cb3859dfe556ee07c8ee661c"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -2071,9 +2071,9 @@
     },
     "changelog/2026-11-24.md": {
       "role": "index",
-      "sha256": "73e05baccb69f5de047c07d9a09d2744e65e356f49144c9be65b5b2002a73cd6",
-      "size": 2409,
-      "normalized_sha256": "73e05baccb69f5de047c07d9a09d2744e65e356f49144c9be65b5b2002a73cd6"
+      "sha256": "1120c12215669e2925cc8748046b9d2931e26672d69c0a837350e799e363b1fb",
+      "size": 2540,
+      "normalized_sha256": "1120c12215669e2925cc8748046b9d2931e26672d69c0a837350e799e363b1fb"
     },
     "docs/a2a-gap-closure-plan-20261027.md": {
       "role": "index",

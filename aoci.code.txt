@@ -78,7 +78,7 @@ publish-npm.yml[FO5M]: F:用 npm OIDC 可信发布同一提交的 service 包 | 
 2026-11-20.md[SG3T]: F:记录 ACP 工具在 DSH 只显示种类名的原因（桥用 kind 盖掉 title、插件拼成摘要）及以后改法，本次不改代码 | R:- | A:- | S:-
 2026-11-22.md[SG5T]: F:重构普通 DSH 会话模型选择前端控件与官方 dsh-client-ui-model-selection 一致（胶囊按钮+两级 Popover），保留 ACP 能力与 conversation.input.model 槽位，embed client.js 并部署桌面端 | R:- | A:StandardModelSelect；conversation.input.model.options；bundle-client.mjs | S:-
 2026-11-23.md[SG6T]: F:记录 2026-11-23 的 antigravity 切换、聊天区、模型控件、全局 CLI、模型目录、回收与选模修复，以及 0.11.2/0.11.3 发布 | R:- | A:AcpModelSelect；remote_agent_model_catalog；ACP_IDLE_SESSION_TTL_MS；UNKNOWN_MODEL_OR_GROUP | S:0.11.3 的桌面 profile 已升级并重启核验；本机 acp-service 与 A2A 网关目录不随插件安装热更新
-2026-11-24.md[SG6T]: F:记录 @1agents/acp-service 1.0.0：嵌入内容校验、dsh-a2a 不再声明 ACP SDK、只保留 OIDC 发布 | R:code:packages/service/package.json,code:.github/workflows/publish-npm.yml | A:- | S:^0.11.4 不会自动升到 1.0.0；本机不直接 npm publish，registry 结果以 publish-npm.yml 为准
+2026-11-24.md[SG6T]: F:记录 @1agents/acp-service 1.0.0 已用 OIDC 发出，并记下嵌入内容校验与只留两处 ACP SDK 钉死 | R:code:packages/service/package.json,code:.github/workflows/publish-npm.yml | A:- | S:^0.11.4 不会自动升到 1.0.0；latest 已是 1.0.0，正在运行的本机服务没有随发布重启
 
 ===/<repository>/docs/===
 a2a-gap-closure-plan-20261027.md[SG6L]: F:A2A 缺口收口方案：列出 G1–G9 缺口，锁定会话关闭/接回/lifecycle/两本账/空闲回收的决定与接口，P0–P3 实施顺序与进度，调用约定 | R:- | A:remote_agent_close；/sessions/close、status；lifecycle；CAPACITY_PENDING；idle-ttl；G9 | S:不传 lifecycle 自 2026-10-31 起是 one-shot，旧无 lifecycle 任务仍按 persistent；one-shot 仍用 runtime persistent 而非 oneshot，才能关进程后接回原 ACP 会话
