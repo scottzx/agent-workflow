@@ -13,6 +13,8 @@ import { appendFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import path from 'node:path';
 import { z } from 'zod';
 import { checkResultSchema, pendingItems, qualityReviewSchema, type QualityReview, type CheckResult, type Ticket, unsettledMust } from '../execution/ticket.js';
+import { loadChecklist, renderExecutorChecklistPrompt, renderQaChecklistPrompt, toTicketSelfChecks } from './checklist.js';
+import { firstRoundSubmitGate, loadWorkflow, runRoundDag } from './engine.js';
 
 const caseSchema = z.object({
   schemaVersion: z.literal(1), id: z.string().min(1), kind: z.enum(['original', 'variant']), locked: z.boolean(),
@@ -79,6 +81,8 @@ export interface OutlineRunOptions {
   log?: (line: string) => void; now?: () => Date;
   /** A run directory: goes on with the run recorded there instead of starting one. */
   resume?: string;
+  /** Trial records observe-only failures; formal (the default for a test run) can promote them to block. */
+  mode?: 'trial' | 'formal';
 }
 
 /** Runs that stopped because something did not finish; the others stopped by the training's rules. */
@@ -197,7 +201,7 @@ async function check(work: string, python: string, jobId: string): Promise<{ res
 
 export async function runOutlineCase(options: OutlineRunOptions): Promise<OutlineRunReport> {
   const log = options.log ?? (() => {}), now = options.now ?? (() => new Date());
-  const pollMs = options.pollMs ?? 10_000, timeoutMs = options.timeoutMs ?? 60 * 60_000, maxBounces = options.maxBounces ?? 1;
+  const pollMs = options.pollMs ?? 10_000, timeoutMs = options.timeoutMs ?? 60 * 60_000;
   const prior = options.resume ? JSON.parse(await readFile(path.join(options.resume, 'run.json'), 'utf8')) as OutlineRunReport : undefined;
   const python = await checkInterpreter(options.python ?? 'python3'), startedAt = prior?.startedAt ?? now().toISOString();
   const roleDirectory = path.resolve(options.roleDirectory);
@@ -213,6 +217,13 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const phase = options.phase ?? 'dev', role = await roleVersion(roleDirectory);
   if (phase === 'test' && role.dirty) throw new Error('A test run needs the role directory committed with no local changes');
   if (phase === 'test' && !options.qa) throw new Error('A test run needs the QA review');
+  const checklist = await loadChecklist(roleDirectory);
+  const workflow = await loadWorkflow(roleDirectory);
+  const mode = options.mode ?? (phase === 'test' ? 'formal' : 'trial');
+  const policy = workflow.policies[mode];
+  const maxBounces = options.maxBounces ?? policy.maxProgramBounces;
+  const produce = workflow.nodes.find(node => node.id === workflow.entry) ?? workflow.nodes.find(node => node.type === 'executor_turn');
+  const requireTicketSubmit = produce?.requireTicketSubmit === true;
 
   const stamp = startedAt.replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
   const work = options.resume ? path.resolve(options.resume) : path.join(path.resolve(options.workspace), roleId, `${kase.id}-${stamp}`);
@@ -225,6 +236,9 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     await mkdir(work, { recursive: true });
     await exportProject(path.resolve(options.projectPath), kase.input.commit, path.join(work, 'project'), kase.input.exclude);
     await cp(path.join(roleDirectory, 'checklist.json'), path.join(work, 'checklist.json'));
+    await cp(path.join(roleDirectory, 'workflow.json'), path.join(work, 'workflow.json')).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    });
     await cp(path.join(roleDirectory, 'checks'), path.join(work, 'checks'), { recursive: true });
     await cp(path.join(caseDirectory, kase.features), path.join(work, 'features.json'));
   }
@@ -264,8 +278,16 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     }
   };
 
-  const roleText = await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8');
-  const qaRole = options.qa ? await readFile(path.join(roleDirectory, 'QA.md'), 'utf8') : '';
+  const selfChecks = requireTicketSubmit ? toTicketSelfChecks(checklist, mode, policy.enforceObserveAsBlock) : [];
+  // Self-checks are projected into the executor prompt only when this run actually mounts them.
+  // Otherwise an item that is merely declared would tell the executor to punch a card the ticket does not have.
+  const executorChecklist = selfChecks.length ? checklist : {
+    ...checklist,
+    items: checklist.items.map(item => item.kind === 'self' || item.kind === 'self_and_qa' || item.selfCheck
+      ? { ...item, modePolicy: { ...item.modePolicy, [mode]: 'skip' as const } } : item),
+  };
+  const roleText = `${await readFile(path.join(roleDirectory, 'ROLE.md'), 'utf8')}\n\n${renderExecutorChecklistPrompt(executorChecklist, mode, policy.enforceObserveAsBlock)}`;
+  const qaRole = options.qa ? `${await readFile(path.join(roleDirectory, 'QA.md'), 'utf8')}\n\n${renderQaChecklistPrompt(checklist, mode, policy.enforceObserveAsBlock)}` : '';
   const outlinePath = path.join(work, 'outline.json'), ticketPath = path.join(work, 'ticket.json');
   /**
    * One QA session per task: the first review opens it and each re-review continues it. The QA agent reads a
@@ -313,7 +335,8 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     if (method !== 'ticket_get') await options.invoke(method, { ...scope, ...params });
     return await options.invoke('ticket_get', scope) as Ticket;
   };
-  let ticket = prior ? await ticketCall('ticket_get') : await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath });
+  let ticket = prior ? await ticketCall('ticket_get') : await ticketCall('ticket_open', { roleId, caseId: kase.id, exportPath: ticketPath,
+    ...(checklist.artifacts.length ? { artifacts: checklist.artifacts } : {}), ...(selfChecks.length ? { selfChecks } : {}) });
   const steps = ticketSteps(jobId, options.cli);
   const rounds: OutlineRound[] = prior ? [...prior.rounds] : [];
   // Where a resumed run picks up: the round its host never finished waiting on, or the review QA did not finish.
@@ -367,13 +390,47 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
         continue;
       }
     }
+    if (!reviewOnly && round === 1 && executionStatus === 'completed') {
+      ticket = await ticketCall('ticket_get');
+      const gate = firstRoundSubmitGate({ requireTicketSubmit, round, ticket });
+      if (gate.bounce) {
+        rounds.push({ round, jobId, executionStatus, passed: false, results: [], ticketErrors: gate.problems });
+        log(`第 ${round} 轮：任务单没有按规定处理（${gate.problems.join('；')}）`);
+        if (round !== excusedRound) {
+          if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
+          bounces++;
+        }
+        await sendBack(round, current => ticketBouncePrompt(steps, current, gate.problems), '执行者没有完成交付前自检');
+        continue;
+      }
+    }
     const checked = executionStatus === 'completed' ? await check(work, python, jobId) : { results: [] };
     const results = checked.results, programPassed = executionStatus === 'completed' && results.every(result => result.pass);
+    if (executionStatus === 'completed') {
+      // produce already finished above. The check layer is the micro-DAG: schema, then rules ∥ digest, then L1.
+      const dag = await runRoundDag({
+        workflow, round, workDirectory: work, mode, checklist,
+        nodes: workflow.nodes.filter(node => node.type === 'program_check' || node.type === 'artifact_digest_check' || node.type === 'ticket_apply_checks'),
+        precompleted: [{ round, nodeId: produce?.id ?? 'produce', inputDigest: 'produce', status: 'completed',
+          startedAt: now().toISOString(), finishedAt: now().toISOString(), output: { executionStatus: 'completed' } }],
+        handlersByType: {
+          program_check: async ctx => ({ results: results.filter(result => ctx.checkIds.includes(result.itemId) || (ctx.node.id === 'check_schema' && result.itemId === 'P0')) }),
+          artifact_digest_check: async () => ({ results: results.filter(result => result.itemId === 'D1') }),
+          ticket_apply_checks: async () => {
+            if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
+            return { status: 'completed' as const, output: { programPassed } };
+          },
+        },
+      });
+      const applied = dag.records.find(record => record.nodeId === 'l1_crosscheck');
+      if (!applied || applied.status !== 'completed') {
+        if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
+      }
+    }
     const record: OutlineRound = { round, jobId, executionStatus, passed: programPassed, results, ...(checked.outlineSha256 ? { outlineSha256: checked.outlineSha256 } : {}) };
     rounds.push(record);
     log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
     if (executionStatus !== 'completed') { stopReason = 'not_completed'; break; }
-    if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
     let feedback: (ticket: Ticket) => string, note: string;
     if (!programPassed) {
       if (bounces >= maxBounces) { stopReason = 'max_bounces'; break; }
@@ -389,7 +446,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       if (verdict === 'pass') break;
       reviews.push(accepted);
       if (stalled(reviews)) { stopReason = 'stalled'; log('质检意见连续两轮没有改到位，或分数连续两轮没有提高，停止修改'); break; }
-      if (revisions >= (options.qa.maxRevisions ?? 3)) { stopReason = 'max_revisions'; break; }
+      if (revisions >= (options.qa.maxRevisions ?? policy.maxQaRevisions)) { stopReason = 'max_revisions'; break; }
       revisions++; feedback = current => revisePrompt(steps, current, accepted, round); note = '质检要求修改';
     } else break;
     await sendBack(round, feedback, note);
