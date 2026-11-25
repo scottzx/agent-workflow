@@ -14,7 +14,7 @@ import { FileA2AStore } from './store.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
 import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
-import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
+import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, type RemoteAgentNotice } from './notices.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
@@ -74,7 +74,9 @@ const configSchema = z.object({
     /** How long a question, plan or tool approval waits for a person. The ACP bridge's ACP_INTERACTION_TIMEOUT_MS must be at least as long. */
     requestTimeoutMinutes: z.number().int().min(1).max(24 * 60).default(5),
     /** Show a macOS notification when a request starts waiting. */
-    desktopNotifications: z.boolean().default(false) }).strict().optional(),
+    desktopNotifications: z.boolean().default(false),
+    /** Push a steer wakeup to the bound origin session when a child task opens a process request. */
+    notifyOriginOnProcessRequest: z.boolean().default(true) }).strict().optional(),
   /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
   capacityDirectory: z.string().min(1).optional(),
   /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
@@ -143,8 +145,14 @@ const executionUnwatchSchema = executionJobSchema.extend({ reason: string }).str
 const caseGetSchema = z.object({ originSessionId: string, caseId: string }).strict();
 /** The coach answers an executor's process request: the same answer as the workbench page, naming who decided and why. */
 const processAnswerSchema = executionJobSchema.extend({ requestId: string, clientRequestId: string,
-  outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']), note: string.optional(), stopTask: z.literal(true).optional(),
+  outcome: z.enum(['accepted', 'cancelled', 'approved', 'rejected', 'abandoned']), answers: processRequestAnswerSchema.shape.answers, note: string.optional(), stopTask: z.literal(true).optional(),
   decidedBy: actorSchema.optional() }).strict();
+const executionPendingApprovalsSchema = z.object({
+  originSessionId: string.optional(),
+  jobId: string.optional(),
+  includeResolved: z.boolean().optional(),
+  limit: z.number().int().min(1).max(200).default(50),
+}).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
@@ -159,6 +167,7 @@ const EXECUTION_METHODS = {
   execution_unwatch: { description: '发起方不再等待任务当前这一轮（等待超时，或自己出错），reason 写原因。执行轮次本身不变；工作台把它列为异常，可以之后重新查询执行宿主。', parameters: z.toJSONSchema(executionUnwatchSchema) },
   execution_process_requests: { description: '读取任务上的过程请求（执行者的工具审批、提问、计划），含已回答的和谁回答的。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_process_answer: { description: '回答任务上的一条过程请求，和工作台页面同一记录；decidedBy 写明是人还是教练（教练写明所在的智能体会话），note 写理由。', parameters: z.toJSONSchema(processAnswerSchema) },
+  execution_pending_approvals: { description: '跨任务汇总当前待审批的 A2A 过程请求（工具权限/计划/提问）、待裁决的任务单改进提议与活跃任务单；支持按 originSessionId 或 jobId 过滤。', parameters: z.toJSONSchema(executionPendingApprovalsSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
   case_open: { description: '开一件事：写下目标，登记进账本。之后 handoff_space、handoff_offer 和带 caseId 的提交都只能引用已存在的一件事，不会隐式创建。', parameters: z.toJSONSchema(caseOpenSchema) },
@@ -1309,14 +1318,32 @@ export class RemoteAgentGateway {
         const notice = record.notice;
         // Keep already-persisted queue text immutable across notification format upgrades.
         if (this.sessions.hasDelivery(notice.originSessionId, record.sessionDeliveryId)) continue;
-        this.sessions.enqueue({ originSessionId: notice.originSessionId, messageId: record.sessionDeliveryId,
-          text: formatNotice(notice) });
+        this.sessions.enqueue({
+          originSessionId: notice.originSessionId,
+          messageId: record.sessionDeliveryId,
+          notice: { form: 'notice', summary: formatNoticeSummary(notice) },
+          text: formatNotice(notice),
+        });
+      }
+      if (this.sessions.healthy) {
+        const nowMs = this.now();
+        for (const req of this.state.processRequests ?? []) {
+          if (req.status !== 'pending' || Date.parse(req.deadlineAt) > nowMs) continue;
+          const origin = this.ledger.originOf(req.jobId);
+          if (origin) this.sessions.acknowledgeProcessRequest(origin, req.requestId);
+        }
       }
       if (this.sessions.healthy) await this.sessions.reconcile();
       if (this.sessions.healthy) {
         for (const notice of this.state.executionNotices ?? []) {
           if (!notice.processedAt && this.sessions.hasBinding(notice.originSessionId) && !this.sessions.hasDelivery(notice.originSessionId, notice.messageId)) {
-            this.sessions.enqueue({ originSessionId: notice.originSessionId, messageId: notice.messageId, text: notice.text });
+            const summary = `A2A交付通知 · ${notice.executionStatus}（${notice.jobId}）`.slice(0, 120);
+            this.sessions.enqueue({
+              originSessionId: notice.originSessionId,
+              messageId: notice.messageId,
+              notice: { form: 'notice', summary },
+              text: notice.text,
+            });
           }
         }
         await this.sessions.reconcile();
@@ -1484,6 +1511,9 @@ export class RemoteAgentGateway {
       this.ledger.get(originSessionId, jobId);
       return (await this.answerProcessRequest(jobId, requestId, answer)).processRequests.find(request => request.requestId === requestId);
     }
+    if (method === 'execution_pending_approvals') {
+      return this.pendingApprovals(executionPendingApprovalsSchema.parse(params ?? {}));
+    }
     if (method === 'execution_inbox') {
       const { originSessionId } = inboxSchema.parse(params);
       return { notices: this.state.executionNotices!.filter(item => item.originSessionId === originSessionId && !item.processedAt)
@@ -1507,7 +1537,9 @@ export class RemoteAgentGateway {
     if (method === 'session_bind') return this.sessions.bind(sessionBindSchema.parse(params));
     if (method === 'session_send') {
       const input = sessionSendSchema.parse(params);
-      if (input.messageId.startsWith('a2a-notice:') || input.messageId.startsWith('execution-notice:')) throw new Error('The a2a-notice: and execution-notice: message ID namespaces are reserved for task notifications');
+      if (input.messageId.startsWith('a2a-notice:') || input.messageId.startsWith('execution-notice:') || input.messageId.startsWith('process-request:')) {
+        throw new Error('The a2a-notice:, execution-notice:, and process-request: message ID namespaces are reserved for task notifications');
+      }
       const result = this.sessions.enqueue(input);
       void this.reconcile().catch(() => {});
       return result;
@@ -1624,6 +1656,76 @@ export class RemoteAgentGateway {
     this.save();
   }
   workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
+  /** Cross-task summary of pending process requests, open ticket proposals and active tickets. */
+  pendingApprovals(input: { originSessionId?: string; jobId?: string; includeResolved?: boolean; limit?: number } = {}) {
+    const now = Date.now();
+    const limit = Math.min(200, Math.max(1, Math.trunc(input.limit ?? 50)));
+    const includeResolved = Boolean(input.includeResolved);
+    const terminal = new Set(['completed', 'failed', 'canceled', 'rejected']);
+    const snapshot = this.ledger.snapshot();
+    const matchesJob = (jobId: string, originSessionId?: string) => {
+      if (input.jobId && jobId !== input.jobId) return false;
+      if (input.originSessionId && originSessionId !== input.originSessionId) return false;
+      return true;
+    };
+    const processRequests = (this.state.processRequests ?? [])
+      .map(request => {
+        const projected = projectProcessRequest(request, now);
+        const owner = snapshot.jobs[request.jobId];
+        return {
+          ...projected,
+          originSessionId: owner?.originSessionId ?? '',
+          ...(owner?.title ? { title: owner.title } : {}),
+          ...(owner?.executionStatus ? { executionStatus: owner.executionStatus } : {}),
+          canAnswer: projected.status === 'pending' && Boolean(owner) && owner!.currentAttemptId === request.attemptId && !terminal.has(owner!.executionStatus),
+        };
+      })
+      .filter(item => matchesJob(item.jobId, item.originSessionId) && (includeResolved || item.canAnswer))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    const ticketEntries = Object.entries(snapshot.tickets ?? {})
+      .map(([jobId, ticket]) => ({ jobId, ticket, owner: snapshot.jobs[jobId] }))
+      .filter(entry => matchesJob(entry.jobId, entry.owner?.originSessionId));
+
+    const ticketProposals = ticketEntries.flatMap(({ jobId, ticket, owner }) =>
+      ticket.proposals
+        .filter(proposal => includeResolved || proposal.state === 'open')
+        .map(proposal => ({
+          jobId,
+          originSessionId: owner?.originSessionId ?? '',
+          ...(owner?.title ? { title: owner.title } : {}),
+          roleId: ticket.roleId,
+          caseId: ticket.caseId,
+          ticketStatus: ticket.status,
+          round: ticket.round,
+          ...structuredClone(proposal),
+        })));
+
+    const openTickets = ticketEntries
+      .filter(({ ticket }) => includeResolved || ticket.status !== 'closed')
+      .map(({ jobId, ticket, owner }) => ({
+        jobId,
+        originSessionId: owner?.originSessionId ?? '',
+        ...(owner?.title ? { title: owner.title } : {}),
+        roleId: ticket.roleId,
+        caseId: ticket.caseId,
+        status: ticket.status,
+        round: ticket.round,
+        pendingItemCount: ticket.items.filter(item => item.state === 'open' || item.state === 'reopened').length,
+        openProposalCount: ticket.proposals.filter(proposal => proposal.state === 'open').length,
+      }));
+
+    return {
+      counts: {
+        pendingProcessRequests: processRequests.filter(item => item.canAnswer).length,
+        openTicketProposals: ticketProposals.filter(item => item.state === 'open').length,
+        activeTickets: openTickets.filter(item => item.status !== 'closed').length,
+      },
+      processRequests: processRequests.slice(0, limit),
+      ticketProposals: ticketProposals.slice(0, limit),
+      openTickets: openTickets.slice(0, limit),
+    };
+  }
   /** Who may decide each gate. A gate with nobody named belongs to the reviewer. */
   private gateReviewer(gate: 'handoff' | 'publish' | 'acceptance'): string {
     const config = this.config.workbench!;
@@ -1865,6 +1967,31 @@ export class RemoteAgentGateway {
         const what = created.kind === 'permission' ? `工具「${created.toolTitle}」等待批准` : created.kind === 'plan' ? '计划等待批准' : '问题等待回答';
         notifyDesktop(`任务工作台 · ${scope.title}`.slice(0, 120), `${what}，${config.requestTimeoutMinutes} 分钟内处理`.slice(0, 240), config.publicBaseUrl);
       }
+      if (config?.notifyOriginOnProcessRequest !== false && this.sessions.healthy && this.sessions.hasBinding(scope.originSessionId)) {
+        try {
+          const noticePayload = {
+            originSessionId: scope.originSessionId,
+            jobId: created.jobId,
+            attemptId: created.attemptId,
+            requestId: created.requestId,
+            title: scope.title,
+            kind: created.kind,
+            ...(created.toolTitle ? { toolTitle: created.toolTitle } : {}),
+            ...(created.toolDetail ? { toolDetail: created.toolDetail } : {}),
+            ...(created.planContent ? { planContent: created.planContent } : {}),
+            ...(created.questions ? { questions: created.questions } : {}),
+            deadlineAt: created.deadlineAt,
+          };
+          this.sessions.enqueue({
+            originSessionId: scope.originSessionId,
+            messageId: `process-request:${created.requestId}`,
+            mode: 'steer',
+            notice: { form: 'notice', summary: formatProcessRequestSummary(noticePayload) },
+            text: formatProcessRequestNotice(noticePayload),
+          });
+          void this.sessions.reconcile().catch(() => {});
+        } catch { /* Best-effort origin wakeup must not hide the durable workbench request. */ }
+      }
       return created;
     });
   }
@@ -1878,21 +2005,28 @@ export class RemoteAgentGateway {
     let stop: { origin: string; reason: string } | undefined;
     const task = await this.workbench(async () => {
       if (this.closed) throw new Error('Gateway is closed');
-      this.workbenchTask(jobId);
+      const scope = this.workbenchTask(jobId);
       const stored = this.state.processRequests?.find(item => item.requestId === requestId && item.jobId === jobId);
       if (!stored) throw new ProcessRequestError('not_found', 'Process request not found in authorized task');
       const parsed = processRequestAnswerSchema.parse(input);
       if (stored.status === 'pending' && Date.parse(stored.deadlineAt) <= Date.now() && stored.answer?.clientRequestId !== parsed.clientRequestId) {
         this.writeProcessRequest(expireProcessRequest(stored));
+        if (this.sessions.healthy) try { this.sessions.acknowledgeProcessRequest(scope.originSessionId, requestId); } catch {}
         throw new ProcessRequestError('expired', 'This process request has expired');
       }
       let result;
       try { result = answerProcessRequest(stored, parsed); }
       catch (error) {
-        if (error instanceof ProcessRequestError && error.code === 'expired' && stored.status === 'pending') this.writeProcessRequest(expireProcessRequest(stored));
+        if (error instanceof ProcessRequestError && error.code === 'expired' && stored.status === 'pending') {
+          this.writeProcessRequest(expireProcessRequest(stored));
+          if (this.sessions.healthy) try { this.sessions.acknowledgeProcessRequest(scope.originSessionId, requestId); } catch {}
+        }
         throw error;
       }
-      if (!result.idempotent) this.writeProcessRequest(result.request);
+      if (!result.idempotent) {
+        this.writeProcessRequest(result.request);
+        if (this.sessions.healthy) try { this.sessions.acknowledgeProcessRequest(scope.originSessionId, requestId); } catch {}
+      }
       const view = this.workbenchTask(jobId);
       if (parsed.stopTask && !result.idempotent) stop = { origin: view.originSessionId,
         reason: `人工拒绝工具调用并停止任务${stored.toolTitle ? `（${stored.toolTitle.slice(0, 200)}）` : ''}${parsed.note ? `：${parsed.note}` : ''}` };

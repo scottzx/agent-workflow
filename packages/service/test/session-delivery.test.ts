@@ -93,3 +93,47 @@ test('a failed durable write cannot be reported as accepted by repeating the sam
     await sessions.reconcile();
   }
 });
+
+test('steer mode persists, detects idempotency conflicts, repumps concurrent enqueue, and suppresses acknowledged process requests', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'session-steer-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const delivered: Array<{ rpcId: string; mode: string; text: string }> = [];
+  let releaseFirst: (() => void) | undefined;
+  const firstArrived = new Promise<void>(resolve => {
+    const server = createServer(async (req, res) => {
+      let raw = ''; for await (const chunk of req) raw += chunk;
+      const request = JSON.parse(raw);
+      const item = request.payload.args.request;
+      delivered.push({ rpcId: request.rpcId, mode: item.mode, text: item.content[0].text });
+      if (delivered.length === 1) {
+        resolve();
+        await new Promise<void>(done => { releaseFirst = done; });
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ type: 'server-response', rpcId: request.rpcId, result: { ok: true, value: { accepted: true } } }));
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address(); assert.ok(address && typeof address !== 'string');
+      t.after(() => new Promise<void>(done => server.close(() => done())));
+      const hosts = { dsh: sessionHostSchema.parse({ kind: 'dsh', url: `http://127.0.0.1:${address.port}` }) };
+      const sessions = new SessionDelivery(root, hosts);
+      t.after(() => sessions.close());
+      sessions.bind({ originSessionId: 'parent-a', host: 'dsh', sessionId: 'sess-a' });
+      sessions.bind({ originSessionId: 'parent-b', host: 'dsh', sessionId: 'sess-b' });
+      sessions.enqueue({ originSessionId: 'parent-a', messageId: 'msg-1', text: 'first' });
+      sessions.enqueue({ originSessionId: 'parent-b', messageId: 'process-request:prc-suppressed', mode: 'steer', text: 'already answered' });
+      sessions.acknowledgeProcessRequest('parent-b', 'prc-suppressed');
+      assert.throws(() => sessions.enqueue({ originSessionId: 'parent-a', messageId: 'msg-1', mode: 'steer', text: 'first' }), /different content/);
+      const pump = sessions.reconcile();
+      void firstArrived.then(async () => {
+        sessions.enqueue({ originSessionId: 'parent-b', messageId: 'process-request:prc-live', mode: 'steer', text: 'approve bash' });
+        const secondPump = sessions.reconcile();
+        releaseFirst?.();
+        await Promise.all([pump, secondPump]);
+      });
+    });
+  });
+  await firstArrived;
+  for (let i = 0; i < 40 && delivered.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(delivered.map(item => [item.mode, item.text]), [['queue', 'first'], ['steer', 'approve bash']]);
+});

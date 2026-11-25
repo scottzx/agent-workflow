@@ -673,7 +673,8 @@ export class AcpAdapter implements LlmAdapter {
     while (start >= 0 && options.messages[start].role !== 'assistant') start--;
     if (this.agentName(agent) !== options.model) throw new Error('ACP is available only in its matching Agent preset; start a new ACP session');
     const importedIds = new Set(this.state.get(agent.id)?.imported?.messageIds ?? []);
-    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && m.source?.kind === 'user' && (m.id === undefined || !importedIds.has(m.id)));
+    const isForwardableSource = (kind: unknown): boolean => kind === 'user' || kind === '1agents-acp';
+    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && isForwardableSource(m.source?.kind) && (m.id === undefined || !importedIds.has(m.id)));
     const blocks = input.flatMap(m => m.content);
     if (!blocks.length || blocks.some(b => b.type !== 'text')) throw new Error('This ACP plugin currently accepts text prompts only');
     const text = blocks.map(b => (b as { text: string }).text).join('\n\n');
@@ -757,7 +758,7 @@ export class AcpAdapter implements LlmAdapter {
         diagnosticId = await this.diagnostics!.begin({ sessionId: agent.id, turn,
           turnStartSeq, stepStartSeq: boundary?.lastStepStartSeq ?? 0, nativeRequestId: requestId,
           messageIds: [...new Set(admitted.flatMap(m => m.id === undefined ? [] : [m.id]))],
-          requestIds: [...new Set(admitted.flatMap(m => m.role === 'user' && m.source?.kind === 'user' && 'rpcId' in m.source
+          requestIds: [...new Set(admitted.flatMap(m => m.role === 'user' && isForwardableSource(m.source?.kind) && 'rpcId' in m.source
             && typeof m.source.rpcId === 'string' ? [m.source.rpcId] : []))],
         });
       });

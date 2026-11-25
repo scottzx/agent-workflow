@@ -50,8 +50,20 @@ export class SessionDeliveryError extends Error {
   }
 }
 
-type Message = { sessionId: string; messageId: string; text: string };
-const messageSchema = z.object({ sessionId: value, messageId: value, text: z.string().min(1).refine(text => !text.includes('\0')) });
+export type SessionDeliveryMode = 'queue' | 'steer';
+export const sessionNoticeSchema = z.discriminatedUnion('form', [
+  z.object({ form: z.literal('notice'), summary: z.string().trim().min(1).max(240).refine(text => !text.includes('\0'), 'NUL is not allowed') }).strict(),
+  z.object({ form: z.literal('relay') }).strict(),
+]);
+export type SessionNoticeMeta = z.output<typeof sessionNoticeSchema>;
+type Message = { sessionId: string; messageId: string; text: string; mode?: SessionDeliveryMode; notice?: SessionNoticeMeta };
+const messageSchema = z.object({
+  sessionId: value,
+  messageId: value,
+  text: z.string().min(1).refine(text => !text.includes('\0')),
+  mode: z.enum(['queue', 'steer']).optional(),
+  notice: sessionNoticeSchema.optional(),
+});
 const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
 const uuidPattern = new RegExp(`^${uuid}$`, 'i');
 const queuedPattern = new RegExp(`^Queued message (${uuid}) for thread (${uuid})\\.?$`, 'i');
@@ -147,27 +159,32 @@ const dshReplySchema = z.object({
   ]),
 });
 
-async function deliverDsh(
-  host: Extract<SessionHost, { kind: 'dsh' }>, input: Message, signal?: AbortSignal,
-): Promise<{ hostReceiptId: string }> {
+async function deliverDshRpc(
+  host: Extract<SessionHost, { kind: 'dsh' }>,
+  endpoint: string,
+  body: Record<string, unknown>,
+  messageId: string,
+  signal: AbortSignal | undefined,
+  allowNotFoundFallback = false,
+): Promise<{ hostReceiptId: string } | 'not_found'> {
   const deadline = AbortSignal.timeout(host.timeoutMs);
   try {
     const headers = new Headers(host.headers);
     headers.set('Content-Type', 'application/json');
-    const response = await fetch(new URL('/api/session/prompt', host.url), {
+    const response = await fetch(new URL(endpoint, host.url), {
       method: 'POST', headers, redirect: 'manual',
       signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
-      body: JSON.stringify({
-        type: 'client-request', rpcId: input.messageId, method: 'session/prompt',
-        payload: { args: { request: {
-          requestId: input.messageId, sessionId: input.sessionId, mode: 'queue',
-          content: [{ type: 'text', text: input.text }],
-        } } },
-      }),
+      body: JSON.stringify(body),
     });
+    if (allowNotFoundFallback && response.status === 404) {
+      const raw = await readDshReply(response);
+      // Only fall back when the route itself is absent (not an RPC-level "session not found").
+      if (!dshReplySchema.safeParse(raw).success) return 'not_found';
+      throw new SessionDeliveryError('DSH rejected the session message.', { retryable: false, outcomeUnknown: false });
+    }
     const raw = await readDshReply(response);
     const parsed = dshReplySchema.safeParse(raw);
-    if (!parsed.success || parsed.data.rpcId !== input.messageId) {
+    if (!parsed.success || parsed.data.rpcId !== messageId) {
       throw new SessionDeliveryError('DSH returned an invalid delivery receipt.', { retryable: false, outcomeUnknown: true });
     }
     if (!parsed.data.result.ok) {
@@ -183,6 +200,49 @@ async function deliverDsh(
     // Request IDs help deduplicate ordinary retries, but do not prove admission after a lost response or host restart.
     throw new SessionDeliveryError('DSH delivery could not be confirmed.', { retryable: false, outcomeUnknown: true });
   }
+}
+
+async function deliverDsh(
+  host: Extract<SessionHost, { kind: 'dsh' }>, input: Message, signal?: AbortSignal,
+): Promise<{ hostReceiptId: string }> {
+  if (input.notice) {
+    const structured = await deliverDshRpc(
+      host,
+      '/api/1agents-acp/session/deliver',
+      {
+        type: 'client-request',
+        rpcId: input.messageId,
+        method: '1agents-acp/session/deliver',
+        payload: { args: { request: {
+          requestId: input.messageId,
+          sessionId: input.sessionId,
+          mode: input.mode ?? 'queue',
+          text: input.text,
+          form: input.notice.form,
+          ...(input.notice.form === 'notice' ? { summary: input.notice.summary } : {}),
+        } } },
+      },
+      input.messageId,
+      signal,
+      true,
+    );
+    if (structured !== 'not_found') return structured;
+  }
+  const result = await deliverDshRpc(
+    host,
+    '/api/session/prompt',
+    {
+      type: 'client-request', rpcId: input.messageId, method: 'session/prompt',
+      payload: { args: { request: {
+        requestId: input.messageId, sessionId: input.sessionId, mode: input.mode ?? 'queue',
+        content: [{ type: 'text', text: input.text }],
+      } } },
+    },
+    input.messageId,
+    signal,
+    false,
+  );
+  return result as { hostReceiptId: string };
 }
 
 async function readDshReply(response: Response): Promise<unknown> {

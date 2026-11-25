@@ -140,6 +140,17 @@ ack 会标记通知已处理、记录对应 delivery 的 `processedAt`，并阻�
 
 未绑定时的旧 webhook 行为不变：非 2xx/超时会重试，HTTP 2xx 后停止 webhook 重投，但 notice 继续留在 inbox。自建 receiver 必须先持久化再回 2xx，并自行负责后续注入与恢复。
 
+## 过程审批请求实时提醒（DSH `steer`）
+
+子任务在执行期间提交工具权限（`permission`）、计划审批（`plan`）或提问（`question`）等过程请求时，若发起方 `originSessionId` 已通过 `session_bind` 绑定，且网关未关闭 `workbench.notifyOriginOnProcessRequest`（默认 `true`），网关在持久化 `ProcessRequest` 后立即写入一条幂等投递并触发即时派发：
+
+- 幂等键使用保留命名空间 `process-request:<requestId>`（`session_send` 拒绝手动使用该前缀）。
+- 投递模式为 `mode: "steer"`，并携带 `notice: { form: "notice", summary }`：
+  - 对安装了新版 `@1agents/acp-service` 插件的 DSH 宿主，优先调用 `POST /api/1agents-acp/session/deliver`，以原生 `ContextFormed`（`source: { kind: "1agents-acp", form: "notice", summary }`）写入 `agent.steer()`，在 DSH 对话流中渲染为可展开的单行系统通知条（不冒充人类聊天气泡），同时在 ACP 适配器中放行 `1agents-acp` 来源以兼容外部 ACP 主会话；
+  - 若旧版 DSH 宿主尚未暴露该路由（返回非 RPC 的 HTTP 404），自动降级到 `/api/session/prompt`（`mode: "steer"`）；对 Codex 宿主仍走 `codex queue`。
+- 正文采用 `<system-reminder>` 结构，包含工具名/参数节选、截止时间、授权边界提示、`mcp-a2a-approval.a2a_process_answer` 直调模板（已知精确契约，可跳过 `search → inspect` 直接 `dreammate_invoke`）及定位 JSON；发起方可通过 `mcp-a2a-approval.a2a_process_answer` 或 `a2a-gateway` 的 `execution_process_answer`（`decidedBy: { kind: "coach", ... }`）审批或答复，与任务工作台人工操作先到先得。
+- 请求一旦被回答、取消或到期，网关自动标记对应 `process-request:<requestId>` 为已确认，避免尚未发出的过期提醒继续投递。
+
 ## 验证边界
 
 先检查实际版本、方法契约、受保护配置和真实会话 ID，再由用户授权的测试消息验证宿主排队。测试应分别确认：receipt 接受、宿主入队、原模型执行、业务处理和最终 ack。不要只凭 accepted 宣称闭环完成。

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Task } from '@a2a-js/sdk';
-import { artifactLinks, formatNotice, type RemoteAgentNotice } from '../src/a2a/notices.js';
+import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, type RemoteAgentNotice } from '../src/a2a/notices.js';
 
 const notice: RemoteAgentNotice = {
   noticeId: 'synthetic-notice', originSessionId: 'synthetic-origin', remote: 'synthetic-remote',
@@ -57,4 +57,50 @@ test('large multibyte answers and many attachments are bounded with explicit ful
   assert.match(text, /正文较长.*节选/);
   assert.match(text, /更多产物链接/);
   assert.equal(JSON.parse(text.split('\n').at(-1)!).taskId, notice.taskId);
+});
+
+test('process request wakeup wraps tool permission, plan and question in a bounded system-reminder with locator JSON', () => {
+  const deadlineAt = '2026-11-25T02:40:00.000Z';
+  const perm = formatProcessRequestNotice({
+    originSessionId: 'origin-1', jobId: 'job-1', attemptId: 'att-1', requestId: 'prc-1',
+    title: '实现 MCP 服务', kind: 'permission', toolTitle: 'run_command', toolDetail: '{"cmd":"pnpm test"}', deadlineAt,
+  });
+  assert.ok(perm.startsWith('<system-reminder>\n[A2A过程审批] 子任务等待工具权限批准\n'));
+  assert.ok(perm.endsWith('\n</system-reminder>'));
+  assert.match(perm, /工具：run_command/);
+  assert.match(perm, /mcp-a2a-approval\.a2a_process_answer/);
+  assert.match(perm, /跳过 dreammate_search_tools \/ dreammate_inspect/);
+  assert.match(perm, /execution_process_answer/);
+  const lines = perm.split('\n');
+  assert.deepEqual(JSON.parse(lines.at(-2)!), {
+    kind: 'permission', originSessionId: 'origin-1', jobId: 'job-1', attemptId: 'att-1', requestId: 'prc-1', deadlineAt,
+  });
+
+  const oversized = formatProcessRequestNotice({
+    originSessionId: 'origin-1', jobId: 'job-1', attemptId: 'att-1', requestId: 'prc-2',
+    kind: 'plan', planContent: '计划内容🙂'.repeat(4000), deadlineAt,
+  });
+  assert.ok(Buffer.byteLength(oversized) < 16 * 1024);
+  assert.ok(!oversized.includes('\uFFFD'));
+  assert.match(oversized, /内容较长.*节选/);
+
+  const question = formatProcessRequestNotice({
+    originSessionId: 'origin-1', jobId: 'job-1', attemptId: 'att-1', requestId: 'prc-3',
+    kind: 'question', questions: [{ id: '0', question: '目标环境？', options: [{ label: 'local' }, { label: 'network' }] }], deadlineAt,
+  });
+  assert.match(question, /子任务等待问题答复/);
+  assert.match(question, /1\. 目标环境？（选项：local \/ network）/);
+  assert.match(question, /outcome="accepted"/);
+
+  assert.equal(
+    formatProcessRequestSummary({ originSessionId: 'o', jobId: 'j', attemptId: 'a', requestId: 'r', title: '实现 MCP', kind: 'permission', toolTitle: 'bash', deadlineAt }),
+    'A2A过程审批 · 工具「bash」等待批准（实现 MCP）',
+  );
+  const capped = formatProcessRequestSummary({
+    originSessionId: 'o', jobId: 'j', attemptId: 'a', requestId: 'r', title: '很长的标题'.repeat(40), kind: 'plan', deadlineAt,
+  });
+  assert.equal(capped.length, 120);
+  assert.ok(capped.endsWith('…'));
+  assert.equal(formatNoticeSummary({ ...notice, title: '方案B实测' }), 'A2A任务通知 · 任务已完成（方案B实测）');
+  assert.equal(formatNoticeSummary({ ...notice, state: 'TASK_STATE_CANCELED', title: '方案B实测' }), 'A2A任务通知 · 任务已取消（方案B实测）');
 });

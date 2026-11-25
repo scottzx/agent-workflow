@@ -689,3 +689,74 @@ test('a path can register on a DSH-native preset with a fixed model', async t =>
   assert.equal(remodel.developing.length, 2);
   assert.equal(remodel.developing.find((item: any) => item.agentId === row.agentId).model, 'deepseek-chat');
 });
+
+test('opening a process request immediately steers a bound DSH origin session, acknowledges on answer, and respects opt-out', async t => {
+  const received: Array<{ url: string; sessionId: string; mode: string; text: string; requestId: string; form?: string; summary?: string }> = [];
+  const dshServer = createServer(async (req, res) => {
+    let raw = ''; for await (const chunk of req) raw += chunk;
+    const rpc = JSON.parse(raw);
+    const payload = rpc.payload.args.request;
+    const text = typeof payload.text === 'string' ? payload.text : payload.content[0].text;
+    received.push({ url: req.url!, sessionId: payload.sessionId, mode: payload.mode, text, requestId: payload.requestId, form: payload.form, summary: payload.summary });
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ type: 'server-response', rpcId: rpc.rpcId, result: { ok: true, value: { accepted: true } } }));
+  });
+  await new Promise<void>(resolve => dshServer.listen(0, '127.0.0.1', resolve));
+  const dshAddr = dshServer.address() as AddressInfo;
+  t.after(() => new Promise<void>(resolve => dshServer.close(() => resolve())));
+
+  const f = await fixture(t);
+  f.config.sessionHosts = { localDsh: { kind: 'dsh', url: `http://127.0.0.1:${dshAddr.port}` } };
+  await f.restart();
+  await f.gateway.invoke('session_bind', { originSessionId: 'allowed-root', host: 'localDsh', sessionId: 'dsh-origin-session' });
+  await assert.rejects(
+    f.gateway.invoke('session_send', { originSessionId: 'allowed-root', messageId: 'process-request:forged', text: 'forged' }),
+    /reserved for task notifications/,
+  );
+
+  const prepared = f.gateway.ledger.prepare({ originSessionId: 'allowed-root', title: '子任务权限测试', targetSnapshot: { targetId: 'legacy:host' }, input: {} });
+  f.gateway.ledger.markDispatching(prepared.attempt.attemptId);
+  f.gateway.ledger.accept(prepared.attempt.attemptId, { taskId: 'task-perm', sessionId: 'dsh-child' }, { executionStatus: 'working' });
+  const jobId = prepared.job.jobId;
+  const openBody = {
+    requestId: 'prc-steer-1', jobId, attemptId: prepared.attempt.attemptId, sessionId: 'dsh-child',
+    kind: 'permission', toolTitle: 'edit_file', toolDetail: '{"path":"src/index.ts"}',
+  };
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/process-requests`, post(openBody))).status, 200);
+  // Idempotent replay must not enqueue or deliver a duplicate steer message.
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/process-requests`, post(openBody))).status, 200);
+
+  for (let i = 0; i < 40 && received.length < 1; i++) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(received.length, 1);
+  assert.equal(received[0]!.url, '/api/1agents-acp/session/deliver');
+  assert.equal(received[0]!.sessionId, 'dsh-origin-session');
+  assert.equal(received[0]!.mode, 'steer');
+  assert.equal(received[0]!.form, 'notice');
+  assert.equal(received[0]!.summary, 'A2A过程审批 · 工具「edit_file」等待批准（子任务权限测试）');
+  assert.match(received[0]!.text, /^<system-reminder>\n\[A2A过程审批\] 子任务等待工具权限批准/);
+  assert.match(received[0]!.text, /工具：edit_file/);
+  assert.match(received[0]!.text, /"requestId":"prc-steer-1"/);
+
+  const beforeAnswer = await f.gateway.invoke('session_delivery_get', { originSessionId: 'allowed-root', messageId: 'process-request:prc-steer-1' }) as any;
+  assert.equal(beforeAnswer.status, 'accepted');
+  assert.equal(beforeAnswer.mode, 'steer');
+  assert.deepEqual(beforeAnswer.notice, { form: 'notice', summary: 'A2A过程审批 · 工具「edit_file」等待批准（子任务权限测试）' });
+  assert.equal(beforeAnswer.processedAt, undefined);
+
+  // Coach approves via execution_process_answer; the gateway marks the wakeup acknowledged.
+  await f.gateway.invoke('execution_process_answer', {
+    originSessionId: 'allowed-root', jobId, requestId: 'prc-steer-1', clientRequestId: 'coach-1',
+    outcome: 'approved', note: '工作区内编辑符合授权', decidedBy: { kind: 'coach', agent: 'dsh', sessionId: 'dsh-origin-session' },
+  });
+  const afterAnswer = await f.gateway.invoke('session_delivery_get', { originSessionId: 'allowed-root', messageId: 'process-request:prc-steer-1' }) as any;
+  assert.ok(afterAnswer.processedAt);
+
+  // Opt-out disables origin steer notifications while keeping workbench process requests working.
+  f.config.workbench!.notifyOriginOnProcessRequest = false;
+  await f.restart();
+  assert.equal((await f.request(`/workbench/tasks/${jobId}/process-requests`, post({
+    ...openBody, requestId: 'prc-steer-2', toolTitle: 'run_command',
+  }))).status, 200);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(received.length, 1);
+});

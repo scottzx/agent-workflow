@@ -29,4 +29,14 @@ export type { CapacityOptions, CapacityLease, CapacitySnapshot } from '../capaci
 export { SessionDelivery } from './session-delivery.js';
 export type { SessionBinding, SessionDeliveryReceipt, SessionDeliveryStatus } from './session-delivery.js';
 export { sessionHostSchema, deliverSessionMessage, SessionDeliveryError } from './session-hosts.js';
-export type { SessionHost } from './session-hosts.js';
+export type { SessionDeliveryMode, SessionHost, SessionNoticeMeta } from './session-hosts.js';
+export { formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary } from './notices.js';
+export type { ProcessRequestNotice } from './notices.js';
+export {
+  A2A_APPROVAL_MCP_SERVER_NAME,
+  A2A_APPROVAL_MCP_SERVICE_ID,
+  A2A_APPROVAL_MCP_TOOLS,
+  createA2AApprovalMcpHandler,
+  runA2AApprovalMcpStdio,
+} from './approval-mcp.js';
+export type { A2AApprovalMcpOptions, JsonRpcRequest, JsonRpcResponse, McpToolCallResult, McpToolDefinition } from './approval-mcp.js';

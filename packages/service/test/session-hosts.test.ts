@@ -236,3 +236,38 @@ test('oversized DSH responses are bounded and cannot fabricate a receipt', async
   const f = await fixtureDsh(t, (_request, response) => response.end('x'.repeat(70 * 1024)));
   await deliveryError(deliverSessionMessage(sessionHostSchema.parse({ kind: 'dsh', url: f.url }), input), false, true);
 });
+
+test('DSH forwards explicit steer delivery mode while Codex keeps queue CLI semantics', async t => {
+  const f = await fixtureDsh(t);
+  const receipt = await deliverSessionMessage(sessionHostSchema.parse({ kind: 'dsh', url: f.url }), { ...input, mode: 'steer' });
+  assert.deepEqual(receipt, { hostReceiptId: input.messageId });
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0]!.body.payload.args.request.mode, 'steer');
+});
+
+test('DSH structured notice prefers /api/1agents-acp/session/deliver, falls back on plain 404, and does not fall back on structured RPC 404', async t => {
+  const notice = { form: 'notice' as const, summary: 'A2A过程审批 · 工具「bash」等待批准' };
+  const upgraded = await fixtureDsh(t);
+  const receipt1 = await deliverSessionMessage(sessionHostSchema.parse({ kind: 'dsh', url: upgraded.url }), { ...input, mode: 'steer', notice });
+  assert.deepEqual(receipt1, { hostReceiptId: input.messageId });
+  assert.equal(upgraded.requests.length, 1);
+  assert.equal(upgraded.requests[0]!.url, '/api/1agents-acp/session/deliver');
+  assert.equal((upgraded.requests[0]!.body.payload.args.request as any).form, 'notice');
+  assert.equal((upgraded.requests[0]!.body.payload.args.request as any).summary, notice.summary);
+
+  const legacy = await fixtureDsh(t, (req, res) => {
+    if (req.url === '/api/1agents-acp/session/deliver') { res.statusCode = 404; res.end('{}'); return; }
+    reply(res, req);
+  });
+  const receipt2 = await deliverSessionMessage(sessionHostSchema.parse({ kind: 'dsh', url: legacy.url }), { ...input, mode: 'steer', notice });
+  assert.deepEqual(receipt2, { hostReceiptId: input.messageId });
+  assert.deepEqual(legacy.requests.map(r => r.url), ['/api/1agents-acp/session/deliver', '/api/session/prompt']);
+  assert.equal(legacy.requests[1]!.body.payload.args.request.mode, 'steer');
+
+  const missingSession = await fixtureDsh(t, (req, res) => {
+    res.statusCode = 404;
+    reply(res, req, { ok: false, error: { message: 'Session not found' } });
+  });
+  await deliveryError(deliverSessionMessage(sessionHostSchema.parse({ kind: 'dsh', url: missingSession.url }), { ...input, mode: 'steer', notice }), false, false);
+  assert.equal(missingSession.requests.length, 1);
+});

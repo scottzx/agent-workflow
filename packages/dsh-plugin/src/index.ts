@@ -24,6 +24,7 @@ import { syncGlobalAcpService } from './sync-global.js';
 import { handoffTools } from './handoff-tools.js';
 import { runHandoffTool } from './handoff-executor.js';
 import { TICKET_PATH } from './ticket-spec.js';
+import { createSessionDeliverHandler, SESSION_DELIVER_PATH } from './session-notice.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
@@ -80,11 +81,16 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     try { await closeA2A?.(); await Promise.all([nativeSessions.dispose(), adapter.dispose()]); }
     finally { await diagnosticOwner.close(); }
   });
+  const sessionDeliverHandler = createSessionDeliverHandler(ctx);
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/api/1agents-acp', handler: async (req, res) => {
+    const url = new URL(req.url!, 'http://localhost');
+    if (url.pathname === SESSION_DELIVER_PATH && req.method === 'POST') {
+      await sessionDeliverHandler(req, res);
+      return;
+    }
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     try {
-      const url = new URL(req.url!, 'http://localhost');
       if (url.pathname !== '/api/1agents-acp/session' || !['GET', 'POST'].includes(req.method!)) { res.statusCode = 404; res.end('{}'); return; }
       const id = url.searchParams.get('id');
       if (!id || id.length > 256) throw new Error('Session id required');
