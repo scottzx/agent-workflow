@@ -7,6 +7,7 @@ export const flowOriginal = 'new Set(["acpx/flows", "@scottzx/1acp/flows"])';
 export const flowReplacement = 'new Set(["acpx/flows", "@scottzx/1acp/flows", "@1agents/acp-service/flows"])';
 export const runtimeCopyEntries = ['dist', 'skills', 'LICENSE', 'README.md'];
 export const dshSidecarFiles = ['cordis.patch.yml', 'README.md', 'LICENSE'];
+export const dshA2ASidecarFiles = ['README.md'];
 
 export function rewriteRuntimeSource(source) {
   const flowHooks = source.split(flowOriginal).length - 1;
@@ -92,6 +93,14 @@ export function expectedDshFiles(pluginRoot) {
   const files = new Map();
   for (const rel of listFiles(join(pluginRoot, 'dist'))) files.set(rel, readFileSync(join(pluginRoot, 'dist', rel)));
   for (const name of dshSidecarFiles) files.set(name, readFileSync(join(pluginRoot, name)));
+  return files;
+}
+
+/** Built DSH A2A modules and docs staged into `packages/service/vendor/dsh-a2a`. */
+export function expectedDshA2AFiles(pluginRoot) {
+  const files = new Map();
+  for (const rel of listFiles(join(pluginRoot, 'dist'))) files.set(rel, readFileSync(join(pluginRoot, 'dist', rel)));
+  for (const name of dshA2ASidecarFiles) files.set(name, readFileSync(join(pluginRoot, name)));
   return files;
 }
 

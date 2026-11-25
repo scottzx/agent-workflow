@@ -17,7 +17,7 @@ function fixture(t) {
   const targets = [...Object.values(manifest.exports).flatMap(value => typeof value === 'string' ? [value] : Object.values(value)), ...Object.values(manifest.bin), 'vendor/runtime/package.json', 'vendor/dsh/service-worker.js'];
   for (const target of targets) save(join(packageDirectory, target), 'fixture\n');
   saveJSON(join(packageDirectory, 'package.json'), manifest);
-  save(join(packageDirectory, manifest.dsh.bundle.patch), `- name: '${manifest.name}'\n`);
+  save(join(packageDirectory, manifest.dsh.bundle.patch), `- name: '${manifest.name}'\n- name: '${manifest.name}/dsh-a2a'\n`);
   save(join(packageDirectory, manifest.exports['./client']), `load({id:"${manifest.name}"});\n`);
   saveJSON(join(dependencies, 'sample/package.json'), { name: 'sample', version: '1.3.0' });
   save(join(dependencies, 'sample/index.js'), 'module.exports = {};\n');
@@ -77,7 +77,7 @@ test('archive checksum corruption is rejected before staging or activation', t =
 test('both package faces and root-loading DSH patch must be present', t => {
   const f=fixture(t); assert.equal(verifyInstalledPackage(f.packageDirectory).name,sourceManifest.name);
   save(join(f.packageDirectory,sourceManifest.dsh.bundle.patch),"- name: '@1agents/acp-service/dsh'\n"); assert.throws(()=>verifyInstalledPackage(f.packageDirectory),/package root/);
-  save(join(f.packageDirectory,sourceManifest.dsh.bundle.patch),`- name: '${sourceManifest.name}'\n`);
+  save(join(f.packageDirectory,sourceManifest.dsh.bundle.patch),`- name: '${sourceManifest.name}'\n- name: '${sourceManifest.name}/dsh-a2a'\n`);
   save(join(f.packageDirectory,sourceManifest.exports['./client']),'load({id:"wrong"});'); assert.throws(()=>verifyInstalledPackage(f.packageDirectory),/Client registration/);
 });
 test('activation and rollback replace only the package slot and preserve unrelated profile/config state', t => {

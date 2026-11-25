@@ -1,13 +1,9 @@
 {
   "name": "@1agents/dsh-a2a",
-  "version": "0.2.6",
-  "description": "DSH headless runtime execution over a standalone A2A endpoint.",
+  "private": true,
+  "description": "Private source of the DSH headless A2A plugin and CLI. Embedded into @1agents/acp-service and not published separately.",
   "type": "module",
   "license": "MIT",
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/scottzx/agent-workflow.git",
@@ -17,45 +13,27 @@
     ".": "./dist/index.js",
     "./server": "./dist/server.js",
     "./executor": "./dist/executor.js",
-    "./client": "./dist/client.js",
-    "./package.json": "./package.json",
-    "./cordis.patch.yml": "./cordis.patch.yml"
+    "./package.json": "./package.json"
   },
   "bin": {
     "dsh-a2a": "./dist/cli.js"
   },
   "files": [
     "dist",
-    "skills",
-    "cordis.patch.yml",
     "README.md"
   ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-sidebar",
-        "@deepseek-ai/dsh-client-ui-workspace"
-      ]
-    }
-  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "node scripts/check.mjs",
     "test": "node scripts/build.mjs && node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@1agents/acp-service": "workspace:^",
     "@a2a-js/sdk": "1.3.0",
     "dsh-zod": "npm:zod@4.4.3",
-    "zod": "^4.6.5"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@1agents/acp-service": "workspace:^",
     "esbuild": "^0.28.0"
   },
   "engines": {

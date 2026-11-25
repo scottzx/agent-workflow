@@ -1,4 +1,5 @@
 /** Place the bundled ACP usage skill where DSH's user skill root reads it. */
+import { existsSync, readFileSync } from 'node:fs';
 import { access, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 export const ACP_SKILL_NAME = 'acp-service';
 const MARKER = '.installed-by-dsh-a2a.json';
-const OWNER = '@1agents/dsh-a2a';
+const OWNER = '@1agents/acp-service/dsh-a2a';
 
 /** `<dshHome>/skills`. `$DSH_HOME` wins; otherwise `~/.dsh`, matching DSH's user-dsh root. */
 export function dshSkillsDirectory(env = process.env, home = homedir()) {
@@ -14,8 +15,26 @@ export function dshSkillsDirectory(env = process.env, home = homedir()) {
   return join(configured || join(home, '.dsh'), 'skills');
 }
 
+/** Resolve the bundled `acp-service` skill whether embedded under `vendor/dsh-a2a/` or run in the workspace. */
 export function packagedSkillDirectory(moduleUrl = import.meta.url) {
-  return fileURLToPath(new URL('../skills/acp-service', moduleUrl));
+  for (const relative of ['../../skills/acp-service', '../skills/acp-service', '../../service/skills/acp-service']) {
+    const candidate = fileURLToPath(new URL(relative, moduleUrl));
+    if (existsSync(join(candidate, 'SKILL.md'))) return candidate;
+  }
+  return fileURLToPath(new URL('../../skills/acp-service', moduleUrl));
+}
+
+/** Resolve the owning package version (`@1agents/acp-service` when embedded, workspace manifest otherwise). */
+export function packagedVersion(moduleUrl = import.meta.url) {
+  for (const relative of ['../../package.json', '../../service/package.json', '../package.json']) {
+    const candidate = fileURLToPath(new URL(relative, moduleUrl));
+    if (!existsSync(candidate)) continue;
+    try {
+      const manifest = JSON.parse(readFileSync(candidate, 'utf8'));
+      if (typeof manifest.version === 'string' && manifest.version.trim()) return manifest.version.trim();
+    } catch { /* fall through to next candidate */ }
+  }
+  return undefined;
 }
 
 async function exists(path) {

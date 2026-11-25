@@ -10,6 +10,8 @@ import {
   orderModelProviders,
   resolveLocalizedText,
 } from './model-select.js';
+import { registerWorkbenchPanel } from './workbench-panel.js';
+import { registerRowConfigPanels } from './row-config-panel.js';
 
 export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'conversation'];
 
@@ -397,4 +399,17 @@ export function apply(ctx) {
       },
     },
   }));
+
+  // Mount the A2A Workbench sidebar panel when the bundled `oneagents-dsh-a2a` host row
+  // serves `/workbench/ui/`. Using `ctx.inject` keeps `uiWorkspace` optional for hosts
+  // without a workspace shell while reusing the single bundle client face.
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['slots', 'locale', 'uiWorkspace'], subCtx => registerWorkbenchPanel(subCtx));
+  } else if (ctx.uiWorkspace) {
+    registerWorkbenchPanel(ctx);
+  }
+
+  // Register per-row `plugins.row.config` panels for `oneagents-acp` and `oneagents-dsh-a2a`
+  // when the host supports Typert remote mounting and Plugin Manager row config slots.
+  registerRowConfigPanels(ctx);
 }

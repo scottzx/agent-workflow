@@ -141,7 +141,7 @@ test('host workbench honours the host browser admission before doing any work', 
 
 test('client half uses only Host client APIs the declared inject provides', async () => {
   const { readFile } = await import('node:fs/promises');
-  const source = await readFile(new URL('../src/client.js', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../../dsh-plugin/src/workbench-panel.js', import.meta.url), 'utf8');
   // `ctx.locale.preferred` does not exist on the Host client; using it threw during
   // module registration and removed the whole sidebar panel.
   assert.doesNotMatch(source, /locale\.preferred/);
@@ -149,11 +149,12 @@ test('client half uses only Host client APIs the declared inject provides', asyn
   assert.match(source, /ctx\.locale\.bind\(/);
   // Optional capabilities must not break the panel when a host omits them.
   assert.match(source, /ctx\.uiWorkspace\?\./);
-  // Every service the module touches must be reachable through dsh.client.inject.
-  const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  // Every service the module touches must be reachable through the unified bundle's dsh.client.inject.
+  const manifest = JSON.parse(await readFile(new URL('../../service/package.json', import.meta.url), 'utf8'));
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-locale'),
     'ctx.locale needs @deepseek-ai/dsh-client-locale in dsh.client.inject');
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-sidebar'));
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-workspace'));
 });
 
 test('apply keeps the workbench page when another instance owns the A2A storage', async t => {

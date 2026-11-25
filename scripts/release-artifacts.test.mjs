@@ -13,6 +13,7 @@ test('unified package rejects split-package dependencies, changed entrypoints an
   for (const override of [
     { version: '0.4.0' }, { private: true }, { dsh: undefined }, { exports: { '.': './dist/src/index.js' } },
     { dependencies: { '@scottzx/1acp': '^0.16.0' } }, { dependencies: { '@1agents/dsh-acp': '^0.2.2' } },
+    { dependencies: { '@1agents/dsh-a2a': '^0.2.6' } },
   ]) assert.throws(() => validateManifest({ ...source, ...override }, source));
   const leaked = { ...source, dependencies: { ...source.dependencies, other: 'workspace:*' } };
   assert.throws(() => validateManifest(leaked, leaked), /workspace/);
@@ -35,7 +36,7 @@ test('release validates commit, checksum and both installed entrypoints before p
   ];
   for (const target of targets) if (target !== './package.json') write(`package/${target.replace(/^\.\//, '')}`, 'fixture');
   write('package/vendor/runtime/package.json', JSON.stringify(runtime));
-  write('package/vendor/dsh/cordis.patch.yml', `- name: '${source.name}'\n`);
+  write('package/vendor/dsh/cordis.patch.yml', `- name: '${source.name}'\n- name: '${source.name}/dsh-a2a'\n`);
   write('package/vendor/dsh/client.js', `load({id:"${source.name}"});`);
   const filename = `1agents-acp-service-${source.version}.tgz`;
   const archive = join(root, 'release', filename);
@@ -57,6 +58,9 @@ test('release validates commit, checksum and both installed entrypoints before p
   repack();
   assert.throws(() => validateArtifacts(sha, root), /package root/);
   write('package/vendor/dsh/cordis.patch.yml', `- name: '${source.name}'\n`);
+  repack();
+  assert.throws(() => validateArtifacts(sha, root), /dsh-a2a/);
+  write('package/vendor/dsh/cordis.patch.yml', `- name: '${source.name}'\n- name: '${source.name}/dsh-a2a'\n`);
   write('package/vendor/dsh/client.js', 'load({id:"@1agents/dsh-acp"});');
   repack();
   assert.throws(() => validateArtifacts(sha, root), /Browser registration/);

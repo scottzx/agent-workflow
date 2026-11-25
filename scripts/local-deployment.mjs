@@ -69,14 +69,15 @@ export function verifyDependencies(dependencyRoot, manifest) {
 export function verifyInstalledPackage(packageDirectory) {
   const manifest = json(join(packageDirectory, 'package.json'));
   assert.equal(manifest.name, ownPackage);
-  assert.ok(!manifest.dependencies?.['@scottzx/1acp'] && !manifest.dependencies?.['@1agents/dsh-acp'], 'Split packages must be embedded');
-  const targets = [...Object.values(manifest.exports).flatMap(v => typeof v === 'string' ? [v] : Object.values(v)), ...Object.values(manifest.bin), 'vendor/runtime/package.json', 'vendor/dsh/service-worker.js'];
+  assert.ok(!manifest.dependencies?.['@scottzx/1acp'] && !manifest.dependencies?.['@1agents/dsh-acp'] && !manifest.dependencies?.['@1agents/dsh-a2a'], 'Split packages must be embedded');
+  const targets = [...Object.values(manifest.exports).flatMap(v => typeof v === 'string' ? [v] : Object.values(v)), ...Object.values(manifest.bin), 'vendor/runtime/package.json', 'vendor/dsh/service-worker.js', 'vendor/dsh-a2a/index.js'];
   for (const target of targets) {
     const path = resolve(packageDirectory, target);
     assert.ok(inside(packageDirectory, path) && statSync(path).isFile(), `Missing installed entrypoint: ${target}`);
   }
   const patch = readFileSync(join(packageDirectory, manifest.dsh.bundle.patch), 'utf8');
   assert.ok(patch.includes(`name: '${manifest.name}'`), 'DSH patch must load the package root');
+  assert.ok(patch.includes(`name: '${manifest.name}/dsh-a2a'`), 'DSH patch must declare the embedded dsh-a2a subpath row');
   const client = readFileSync(join(packageDirectory, manifest.exports['./client']), 'utf8');
   assert.ok(client.includes(`id:"${manifest.name}"`), 'Client registration must match package name');
   return manifest;

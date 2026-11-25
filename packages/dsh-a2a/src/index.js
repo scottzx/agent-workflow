@@ -6,8 +6,7 @@ import { startA2AService } from './server.js';
 import { createHostWorkbench, WORKBENCH_UI_PATH } from './host-workbench.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { dshSkillsDirectory, installAcpSkill, packagedSkillDirectory } from './install-skill.js';
+import { dshSkillsDirectory, installAcpSkill, packagedSkillDirectory, packagedVersion } from './install-skill.js';
 
 export const name = 'oneagents-dsh-a2a';
 // `webServer` hosts the workbench page on the GUI origin; `connection` admits the
@@ -29,20 +28,12 @@ async function resolveWorkbench(workbench, workbenchConfigFile) {
 
 export async function apply(ctx, config = {}) {
   const { hostWorkbench, port, ...serviceConfig } = config;
-  try {
-    const packageJson = JSON.parse(await readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
-    const placed = await installAcpSkill({ source: packagedSkillDirectory(), skillsDirectory: dshSkillsDirectory(), version: packageJson.version });
-    if (!placed.installed && placed.reason !== 'current') {
-      console.error(`[dsh-a2a] ACP skill was not installed: ${placed.reason}`);
-    }
-  } catch (error) {
-    console.error(`[dsh-a2a] ACP skill was not installed: ${error instanceof Error ? error.message : error}`);
-  }
   const enableHost = hostWorkbench !== false;
 
-  // The host consumes both entries through `ctx.webServer`. A profile that only
-  // embeds the workbench page does not need a second listener, so `port: false`
-  // skips the standalone service.
+  // The host consumes both entries through `ctx.webServer`. Register `/workbench/ui`
+  // before non-critical skill installation so the sidebar panel can detect it promptly.
+  // A profile that only embeds the workbench page does not need a second listener, so
+  // `port: false` skips the standalone service.
   if (enableHost) {
     const workbench = await resolveWorkbench(serviceConfig.workbench, serviceConfig.workbenchConfigFile);
     const handler = createHostWorkbench({
@@ -51,6 +42,16 @@ export async function apply(ctx, config = {}) {
       admit: ctx.connection?.admit ? req => ctx.connection.admit(req) : undefined,
     });
     ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: WORKBENCH_UI_PATH, handler }));
+  }
+
+  try {
+    const version = packagedVersion(import.meta.url);
+    const placed = await installAcpSkill({ source: packagedSkillDirectory(import.meta.url), skillsDirectory: dshSkillsDirectory(), version });
+    if (!placed.installed && placed.reason !== 'current') {
+      console.error(`[dsh-a2a] ACP skill was not installed: ${placed.reason}`);
+    }
+  } catch (error) {
+    console.error(`[dsh-a2a] ACP skill was not installed: ${error instanceof Error ? error.message : error}`);
   }
 
   if (port === false) return;

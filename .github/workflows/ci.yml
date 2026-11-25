@@ -135,6 +135,9 @@ jobs:
         run: tar -xzf service-build.tgz -C packages/service
       - run: pnpm --filter @1agents/dsh-acp build
       - run: pnpm --filter @1agents/dsh-acp test:only
+      - run: pnpm --filter @1agents/dsh-a2a build
+      - run: pnpm --filter @1agents/dsh-a2a typecheck
+      - run: pnpm --filter @1agents/dsh-a2a test
       - uses: actions/download-artifact@v4
         with:
           name: runtime-tests

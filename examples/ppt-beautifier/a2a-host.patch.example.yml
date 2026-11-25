@@ -1,5 +1,5 @@
 # EXAMPLE ONLY. Do not install this file as the role bundle patch.
-# Install @1agents/dsh-a2a as a separate bundle from @1agents/dsh-acp.
+# `@1agents/acp-service` bundles both `oneagents-acp` and `oneagents-dsh-a2a` (`@1agents/acp-service/dsh-a2a`).
 # Preserve every existing oneagents-acp configuration field before applying.
 # Provision DSH_PPT_A2A_TOKEN securely in the managed DSH Web host environment.
 - id: oneagents-acp

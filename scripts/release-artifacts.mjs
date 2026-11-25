@@ -18,6 +18,7 @@ export function validateManifest(packed, source) {
   assert.ok(!packed.private, 'Cannot publish a private package');
   assert.ok(!packed.dependencies?.['@scottzx/1acp'], 'Runtime must be embedded');
   assert.ok(!packed.dependencies?.['@1agents/dsh-acp'], 'DSH plugin must be embedded');
+  assert.ok(!packed.dependencies?.['@1agents/dsh-a2a'], 'DSH A2A plugin must be embedded');
   assert.deepEqual(packed.dependencies, source.dependencies, 'Packed dependencies differ from source');
   assert.ok(Object.values(packed.dependencies).every(range => !range.startsWith('workspace:')), 'Unresolved workspace dependency');
   for (const key of ['main', 'types', 'exports', 'bin', 'dsh']) {
@@ -48,6 +49,7 @@ export function validateArtifacts(sha, root = process.cwd()) {
   for (const target of targets) execFileSync('tar', ['-xOf', archive, `package/${target.replace(/^\.\//, '')}`], { maxBuffer: 16 * 1024 * 1024 });
   const patch = execFileSync('tar', ['-xOf', archive, `package/${packed.dsh.bundle.patch.replace(/^\.\//, '')}`], { encoding: 'utf8' });
   assert.ok(patch.includes(`name: '${packed.name}'`), 'DSH patch must load the package root');
+  assert.ok(patch.includes(`name: '${packed.name}/dsh-a2a'`), 'DSH patch must declare the embedded dsh-a2a subpath row');
   const client = execFileSync('tar', ['-xOf', archive, `package/${packed.exports['./client'].replace(/^\.\//, '')}`], { encoding: 'utf8' });
   assert.ok(client.includes(`id:"${packed.name}"`), 'Browser registration must match the package name');
   return [{ archive, packed }];

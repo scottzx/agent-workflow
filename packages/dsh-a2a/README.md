@@ -1,6 +1,14 @@
-# @1agents/dsh-a2a
+# @1agents/dsh-a2a（已内嵌进 `@1agents/acp-service` 插件组合包）
 
-独立的 A2A HTTP 服务，仅调用已安装的 DSH headless runtime。它不依赖 `@1agents/dsh-acp`，不连接 ACP 端口，不注册 ACP preset，不管理 ACP 进程。
+独立的 DSH headless/SDK A2A HTTP 服务与同源 `/workbench/ui` 工作台挂载模块，**随 `@1agents/acp-service` 作为同一个 DSH 插件组合包统一发布和维护**（本目录为内部源码包，不再单独发布 npm 包）。
+
+在 DSH 中只需安装 `@1agents/acp-service` 一个包，即可在插件管理页独立管理两个组件行：
+- `oneagents-acp`（`@1agents/acp-service`）：ACP 外部 Agent 适配与模型选择控件（默认启用）。
+- `oneagents-dsh-a2a`（`@1agents/acp-service/dsh-a2a`）：独立 DSH headless/SDK A2A 端点与同源 `/workbench/ui`（默认关闭，需在插件管理页开启或在 profile 的 `cordis.patch.yml` 中配置 `disabled: false` 与 token 后启用）。
+
+启用 `oneagents-dsh-a2a` 后，`@1agents/acp-service` 统一前端入口会自动检测 `/workbench/ui/api/session` 并在侧边栏展示“A2A 工作台”面板；关闭该组件行时面板自动隐藏。
+
+它仍然不依赖 `@1agents/dsh-acp`，不连接 ACP 端口，不注册 ACP preset，不管理 ACP 进程。安装 `@1agents/acp-service` 后同时提供 `dsh-a2a` 命令行入口与 `@1agents/acp-service/dsh-a2a`、`@1agents/acp-service/dsh-a2a/server`、`@1agents/acp-service/dsh-a2a/executor` 子路径导出：
 
 ```sh
 dsh-a2a ./dsh-a2a.local.json

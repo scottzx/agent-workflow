@@ -21,6 +21,7 @@ assert.equal(typeof api.serveAcpService, 'function');
 assert.equal(typeof api.apply, 'function');
 assert.equal(api.default, undefined, 'Cordis must see the namespace and its inject metadata');
 assert.throws(() => require.resolve('@1agents/dsh-acp'), 'No separately installed plugin');
+assert.throws(() => require.resolve('@1agents/dsh-a2a'), 'No separately installed DSH A2A plugin');
 assert.throws(() => require.resolve('@deepseek-ai/cordis'), 'DSH must not be an installed package dependency');
 
 // Exercise the same profile metadata/patch reader used by `dsh plugin add`.
@@ -31,8 +32,12 @@ const profile = loadProfileDirectory('dsh', process.cwd(), installAnchor, { user
 assert.deepEqual(profile.skippedBundles, []);
 assert.equal(profile.layers.length, 1);
 const patch = profile.layers[0].patches;
-const row = patch.flatMap(value => value.insert ?? []).find(value => value.id === 'oneagents-acp');
+const rows = patch.flatMap(value => value.insert ?? []);
+const row = rows.find(value => value.id === 'oneagents-acp');
 assert.equal(row.name, '@1agents/acp-service');
+const a2aRow = rows.find(value => value.id === 'oneagents-dsh-a2a');
+assert.equal(a2aRow.name, '@1agents/acp-service/dsh-a2a');
+assert.equal(a2aRow.disabled, true);
 assert.ok(patch.some(value => value.id === 'ui-model-selection' && value.disabled));
 
 // Activate the installed package root through DSH's real Cordis Loader.
@@ -78,6 +83,14 @@ try {
   assert.equal(typeof ctx.oneagentsAcpSessions.importSession, 'function');
   assert.equal(typeof routes.get('/.well-known/agent-card.json')?.handler, 'function');
   assert.equal(typeof routes.get('/a2a')?.handler, 'function');
+
+  // Activate the bundled dsh-a2a subpath row alongside the root row; ClientModuleRegistry
+  // must still resolve only one client source (`@1agents/acp-service`) with no collision.
+  const a2aId = await ctx.loader.create({ name: a2aRow.name, config: { port: false, hostWorkbench: true } });
+  const a2aFiber = ctx.loader.resolve(a2aId).fiber;
+  assert.ok(a2aFiber);
+  await a2aFiber.await();
+  assert.equal(typeof routes.get('/workbench/ui')?.handler, 'function');
 
   // Verify DSH discovers, serves and registers this same package's client face.
   await ctx.plugin(ClientModuleRegistry);

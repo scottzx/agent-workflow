@@ -9,7 +9,7 @@
  * session: DSH login stands in for the workbench login, and the page is framed by
  * the host (`frameAncestors: 'self'`). Gateway credentials stay on this side.
  */
-import { serveWorkbenchPage, isAgentRequest, WORKBENCH_UI_PATH } from '../dist/shared/a2a/workbench-ui.js';
+import { serveWorkbenchPage, isAgentRequest, WORKBENCH_UI_PATH } from '@1agents/acp-service/a2a-standalone';
 
 const API = `${WORKBENCH_UI_PATH}/api`;
 const BODY_LIMIT = 1024 * 1024;

@@ -25,9 +25,11 @@ import { handoffTools } from './handoff-tools.js';
 import { runHandoffTool } from './handoff-executor.js';
 import { TICKET_PATH } from './ticket-spec.js';
 import { createSessionDeliverHandler, SESSION_DELIVER_PATH } from './session-notice.js';
+import { registerRowConfigRpc } from './row-config.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
+  registerRowConfigRpc(ctx);
   // One plugin install updates the global acp-service CLI. A failure must not stop DSH.
   try {
     const synced = await syncGlobalAcpService();

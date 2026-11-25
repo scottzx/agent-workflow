@@ -1,4 +1,4 @@
-import { WorkbenchUi, WORKBENCH_UI_PATH } from '../dist/shared/a2a/workbench-ui.js';
+import { WorkbenchUi, WORKBENCH_UI_PATH } from '@1agents/acp-service/a2a-standalone';
 
 const json = (res, status, body) => {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });

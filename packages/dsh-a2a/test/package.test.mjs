@@ -5,11 +5,15 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
-test('A2A source and manifest have no dependency on the ACP plugin or SDK', async () => {
+const serviceRoot = new URL('../../service/', import.meta.url);
+const pluginRoot = new URL('../../dsh-plugin/', import.meta.url);
+
+test('A2A source is private, embedded into @1agents/acp-service, and has no dependency on the ACP plugin or SDK', async () => {
   const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8'));
+  assert.equal(manifest.private, true, 'dsh-a2a must be private and embedded into @1agents/acp-service');
+  assert.equal(manifest.publishConfig, undefined);
   const dependencies = { ...manifest.dependencies, ...manifest.devDependencies, ...manifest.peerDependencies };
   assert.equal(dependencies['@1agents/dsh-acp'], undefined);
-  assert.equal(manifest.dependencies['@1agents/acp-service'], undefined);
   assert.equal(dependencies['@agentclientprotocol/sdk'], undefined);
   assert.equal(dependencies['@1agents/acp-runtime-sdk'], undefined);
   for (const name of await readdir(new URL('src/', root))) {
@@ -17,43 +21,50 @@ test('A2A source and manifest have no dependency on the ACP plugin or SDK', asyn
     const source = await readFile(new URL(`src/${name}`, root), 'utf8');
     assert.doesNotMatch(source, /(?:from\s*|import\s*\()['"]@1agents\/dsh-acp(?:\/|['"])/);
     assert.doesNotMatch(source, /(?:from\s*|import\s*\()['"]@agentclientprotocol\//);
-    // The source uses the narrow standalone entry only for local bundling; published dist must be self-contained.
-    assert.doesNotMatch(source, /(?:from\s*|import\s*\()['"]@1agents\/dsh-acp/);
   }
 });
+
 test('built exports and CLI load without a DSH Host or ACP plugin', async () => {
   const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8'));
   for (const [name, target] of Object.entries(manifest.exports)) {
     await access(new URL(target, root));
     if (name === './package.json' || !target.endsWith('.js')) continue;
-    // The client half is browser code for the host's module loader, not a Node module.
-    if (name === './client') continue;
     const exports = await import(new URL(target, root).href);
-    // Host services this bundle needs; it must not depend on the ACP plugin.
+    // Host services this plugin row needs; it must not depend on the ACP plugin.
     if (name === '.') assert.deepEqual(exports.inject, ['webServer', 'connection']);
   }
   const cli = spawnSync(process.execPath, [fileURLToPath(new URL(manifest.bin['dsh-a2a'], root)), '--help'], { encoding: 'utf8' });
-  assert.equal(cli.status, 0, cli.stderr); assert.match(cli.stdout, /Usage: dsh-a2a/);
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.match(cli.stdout, /Usage: dsh-a2a/);
 });
-test('client half loads through the host module loader and owns the workbench panel', async () => {
-  const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8'));
-  assert.deepEqual(manifest.dsh.client.platform, 'web');
-  const source = await readFile(new URL(manifest.exports['./client'], root), 'utf8');
-  // The host hands this file to its own loader; a bare import would break the page.
-  assert.match(source, /window\.__ModuleLoader__\.load\(\{id:"@1agents\/dsh-a2a"/);
-  assert.match(source, /oneagents-a2a-workbench/);
-  // The panel frames the page this plugin's host half serves, on the GUI's own origin.
-  assert.match(source, /src:\s*"\/workbench\/ui\/"/);
-  // Browser code must not pull Node built-ins or the DSH host packages into the bundle.
-  assert.doesNotMatch(source, /require\("node:/);
+
+test('unified @1agents/acp-service bundle declares dsh-a2a subpath export, bin, and independent patch row', async () => {
+  const serviceManifest = JSON.parse(await readFile(new URL('package.json', serviceRoot), 'utf8'));
+  assert.equal(serviceManifest.exports['./dsh-a2a'], './vendor/dsh-a2a/index.js');
+  assert.equal(serviceManifest.exports['./dsh-a2a/server'], './vendor/dsh-a2a/server.js');
+  assert.equal(serviceManifest.exports['./dsh-a2a/executor'], './vendor/dsh-a2a/executor.js');
+  assert.equal(serviceManifest.bin['dsh-a2a'], 'vendor/dsh-a2a/cli.js');
+  assert.equal(serviceManifest.dependencies['@1agents/dsh-a2a'], undefined);
+  const patch = await readFile(new URL('cordis.patch.yml', pluginRoot), 'utf8');
+  assert.match(patch, /id:\s*oneagents-acp/);
+  assert.match(patch, /id:\s*oneagents-dsh-a2a/);
+  assert.match(patch, /name:\s*'@1agents\/acp-service\/dsh-a2a'/);
 });
-test('client half depends on nothing from the ACP plugin', async () => {
-  const source = await readFile(new URL('src/client.js', root), 'utf8');
-  assert.doesNotMatch(source, /@1agents\/acp-service|@1agents\/dsh-acp/);
+
+test('unified browser client owns the workbench panel and stays inside @1agents/acp-service', async () => {
+  const serviceManifest = JSON.parse(await readFile(new URL('package.json', serviceRoot), 'utf8'));
+  assert.deepEqual(serviceManifest.dsh.client.platform, 'web');
+  assert.ok(serviceManifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-locale'));
+  assert.ok(serviceManifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-sidebar'));
+  assert.ok(serviceManifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-workspace'));
+  const workbenchPanel = await readFile(new URL('src/workbench-panel.js', pluginRoot), 'utf8');
+  assert.match(workbenchPanel, /oneagents-a2a-workbench/);
+  assert.match(workbenchPanel, /src:\s*'\/workbench\/ui\/'/);
+  assert.doesNotMatch(workbenchPanel, /require\("node:/);
 });
+
 test('legacy ACP A2A export keeps a package-local compatible target', async () => {
-  const url = new URL('../dsh-plugin/package.json', root);
-  const manifest = JSON.parse(await readFile(url, 'utf8'));
+  const manifest = JSON.parse(await readFile(new URL('package.json', pluginRoot), 'utf8'));
   assert.deepEqual(manifest.exports['./a2a'], { types: './dist/a2a.d.ts', import: './dist/a2a.js' });
   assert.equal(manifest.dependencies['@1agents/dsh-a2a'], undefined);
 });

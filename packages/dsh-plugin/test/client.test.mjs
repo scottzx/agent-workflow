@@ -587,3 +587,73 @@ test("ACP external Agent session renders official capsule trigger and two-level 
   assert.ok(textOf(updatedTrigger).includes("High"));
   f.dispose();
 });
+
+test("unified client mounts A2A Workbench sidebar panel when /workbench/ui/api/session is served and hides it on 404", async () => {
+  for (const [status, expected] of [[200, true], [401, true], [404, false]]) {
+    let client;
+    const slots = new Map();
+    const cleanups = [];
+    const opened = [];
+    const messageListeners = new Set();
+    const hooks = hookRenderer();
+    runInNewContext(readFileSync(process.env.ACP_CLIENT_BUNDLE ?? new URL("../dist/client.js", import.meta.url), "utf8"), {
+      AbortController,
+      setInterval: () => 0,
+      clearInterval: () => {},
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      location: { origin: "http://127.0.0.1:3466" },
+      window: {
+        __ModuleLoader__: {
+          load: mod => {
+            client = mod.factory(() => ({
+              createElement: (type, props, ...children) => ({ type, props, children }),
+              ...hooks.hooks,
+            }));
+          },
+        },
+        addEventListener: (_type, fn) => messageListeners.add(fn),
+        removeEventListener: (_type, fn) => messageListeners.delete(fn),
+      },
+      document: { createElement: () => ({ remove() {} }), head: { append() {} } },
+      fetch: async () => ({ status, ok: status >= 200 && status < 300, json: async () => ({}) }),
+    });
+    const ctx = {
+      effect: setup => { const cleanup = setup(); if (cleanup) cleanups.push(cleanup); return cleanup ?? (() => {}); },
+      on: () => {},
+      inject: (_deps, fn) => fn(ctx),
+      conversation: { blocks: { set: () => {} } },
+      locale: { register: () => {}, bind: () => key => key },
+      slots: {
+        entries: key => key === "conversation.chat.node" ? [{ options: { key: "assistant-step", priority: 0 }, locale: "conversation", inject: () => ({ hooks: { presentation: {} } }), component: () => null }] : [],
+        inject: (_key, setup) => { const cleanup = setup(); if (cleanup) cleanups.push(cleanup); return cleanup ?? (() => {}); },
+        register: (options, component) => {
+          const key = options.key ?? options.id ?? options.name;
+          slots.set(`${options.name}:${key}`, { options, component });
+          return () => slots.delete(`${options.name}:${key}`);
+        },
+      },
+      sessions: { binding: () => ({ session: { projections: { faceOf: () => ({ subscribe: () => () => {}, getSnapshot: () => "standard" }) } } }), subagentAddress: () => undefined },
+      remote: { $on: () => {}, session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }), selectModel: async () => ({ ok: true }) } },
+      commandUi: { register: () => {} },
+      uiWorkspace: { openSession: id => opened.push(id) },
+    };
+    client.apply(ctx);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(slots.has("main:oneagents-a2a-workbench"), expected, `status=${status} main slot`);
+    assert.equal(slots.has("sidebar.panellist:oneagents-a2a-workbench"), expected, `status=${status} sidebar slot`);
+    if (expected) {
+      const panel = hooks.render(slots.get("main:oneagents-a2a-workbench").component, {});
+      assert.equal(panel.type, "iframe");
+      assert.equal(panel.props.src, "/workbench/ui/");
+      const fakeFrameWindow = {};
+      panel.props.ref.current = { contentWindow: fakeFrameWindow };
+      for (const listener of messageListeners) {
+        listener({ origin: "http://127.0.0.1:3466", source: fakeFrameWindow, data: { type: "1agents:open-session", sessionId: "session-42" } });
+      }
+      assert.deepEqual(opened, ["session-42"]);
+    }
+    for (const cleanup of cleanups.reverse()) cleanup();
+    assert.equal(slots.has("main:oneagents-a2a-workbench"), false);
+  }
+});

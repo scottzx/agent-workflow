@@ -9,7 +9,7 @@ pnpm dsh plugin --profile web add @1agents/acp-service
 # 本地构建也可使用绝对包目录或构建好的 tgz
 ```
 
-安装后按该部署的方式重启 DSH。若使用已安装的 `dsh` 可执行文件，省略 `pnpm`。同一个包还提供 CLI，无需独立安装旧 `@1agents/dsh-acp` 或 runtime 包。
+安装后按该部署的方式重启 DSH。若使用已安装的 `dsh` 可执行文件，省略 `pnpm`。同一个包同时内嵌 `oneagents-acp`（`@1agents/acp-service`，默认启用）和 `oneagents-dsh-a2a`（`@1agents/acp-service/dsh-a2a`，默认关闭，可在 DSH 插件管理页单独启停或在 `cordis.patch.yml` 中配置 `disabled: false`），并提供 `acp-service` 与 `dsh-a2a` CLI，无需独立安装旧 `@1agents/dsh-acp`、`@1agents/dsh-a2a` 或 runtime 包。
 
 已有旧 bundle 时先停止 DSH，移除旧 bundle，再安装统一包；保留自定义配置和绑定文件。使用 profile 的 `cordis.patch.yml` 配置插件，不修改 DSH 源码或默认 profile。
 
