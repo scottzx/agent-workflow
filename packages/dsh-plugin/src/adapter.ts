@@ -758,7 +758,7 @@ export class AcpAdapter implements LlmAdapter {
         diagnosticId = await this.diagnostics!.begin({ sessionId: agent.id, turn,
           turnStartSeq, stepStartSeq: boundary?.lastStepStartSeq ?? 0, nativeRequestId: requestId,
           messageIds: [...new Set(admitted.flatMap(m => m.id === undefined ? [] : [m.id]))],
-          requestIds: [...new Set(admitted.flatMap(m => m.role === 'user' && isForwardableSource(m.source?.kind) && 'rpcId' in m.source
+          requestIds: [...new Set(admitted.flatMap(m => m.role === 'user' && m.source && isForwardableSource(m.source.kind) && 'rpcId' in m.source
             && typeof m.source.rpcId === 'string' ? [m.source.rpcId] : []))],
         });
       });

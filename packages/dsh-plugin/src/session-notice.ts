@@ -79,7 +79,7 @@ export async function deliverSessionNotice(
   const pending = [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])];
   const events = typeof agent.session?.snapshotEvents === 'function' ? agent.session.snapshotEvents() : [];
   const alreadyPresent = pending.some((msg: UserMessage) => sameDelivery(msg, input.requestId))
-    || events.some((event: { type?: unknown; data?: UserMessage }) => event.type === 'user/message' && sameDelivery(event.data, input.requestId));
+    || events.some(event => event.type === 'user/message' && sameDelivery((event as { data?: UserMessage }).data, input.requestId));
   if (alreadyPresent) return { accepted: true, deduplicated: true };
 
   const source = input.form === 'notice'
@@ -89,7 +89,7 @@ export async function deliverSessionNotice(
     id: input.requestId as MessageId,
     role: 'user',
     content: [{ type: 'text', text: input.text }],
-    source,
+    source: source as unknown as UserMessage['source'],
   };
   if (input.mode === 'steer') agent.steer(message);
   else agent.followup(message);
