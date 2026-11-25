@@ -24,6 +24,7 @@ description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通�
 | 查询任务/执行轮次、续派、关闭、记录验收、处理通知 | `execution_*`；按通知类型选择 ack | [角色管理与任务调用](references/roles-and-tasks.md) |
 | 把已记录产物交给另一个角色，或登记共享产物空间 | 主会话调用 `handoff_*`；接受后再 `execution_submit` 并带 `handoffId` | [交接](references/roles-and-tasks.md#交接) |
 | 把消息或 A2A 完成通知送回已存在的 Codex/DSH 主会话 | 配置 gateway `sessionHosts`，使用 `session_bind`、`session_send` 和投递查询工具 | [原会话排队投递](references/a2a.md#原会话排队投递本次新增) |
+| 审批 A2A 子任务过程请求（工具权限/计划/提问）或处理任务单提议 | 轻量 MCP `acp-service mcp`（DreamMate `mcp-a2a-approval`，支持跳过 search/inspect 直调） | [审批与任务单 MCP](references/approval-mcp.md) |
 | 为其他 A2A 客户端开放 DSH 能力 | DSH `a2a` 配置、Agent Card、标准 JSON-RPC/SSE | [A2A 调度与收件箱](references/a2a.md) |
 
 先检查现有服务和安装版本；服务已经可用时直接复用。需要哪种入口就读对应引用文件。不要为了派发一次远端任务重新安装或重启正常运行的服务。
@@ -66,6 +67,18 @@ acp-service --skill install acp-service --agent codex --scope repo
 ## 远端任务的最短工作流
 
 如果宿主已有 DreamMate 工具，检索服务 `a2a-gateway`，按需查看方法契约，再通过 `dreammate_invoke` 调用。没有 DreamMate 时，使用同名 CLI `a2a invoke`；两者调用同一个 gateway。
+
+### A2A 审批与任务单直调（跳过 `search → inspect`）
+
+本机已注册 DreamMate MCP `mcp-a2a-approval`（由 `acp-service mcp` 提供）时，以下方法契约固定，**可直接调用 `dreammate_invoke`（`node: "localhost"`, `service_id: "mcp-a2a-approval"`），无需先执行 `dreammate_search_tools` 或 `dreammate_inspect`**：
+
+- 查全部待审批过程请求 / 任务单提议：`method: "mcp-a2a-approval.a2a_pending_approvals"`, `params: { originSessionId?, jobId? }`
+- 审批或答复过程请求（收到 DSH `steer` 提醒后一步落盘）：`method: "mcp-a2a-approval.a2a_process_answer"`, `params: { originSessionId, jobId, requestId, outcome: "approved"|"rejected"|"accepted"|"cancelled"|"abandoned", note?, stopTask?: true, answers?, coachAgent?, coachSessionId? }`（自动生成幂等 `clientRequestId` 并强制记录为 `coach`）
+- 查任务单：`method: "mcp-a2a-approval.a2a_ticket_get"`, `params: { originSessionId, jobId }`
+- 裁决任务单提议：`method: "mcp-a2a-approval.a2a_ticket_proposal_decide"`, `params: { originSessionId, jobId, proposalId, state: "accepted"|"rejected"|"done", note? }`
+- 提交教练级业务验收：`method: "mcp-a2a-approval.a2a_execution_review"`, `params: { originSessionId, jobId, attemptId, resultRevision, resultDigest, reviewStatus: "accepted"|"changes_requested"|"pending", note? }`
+
+完整示例、注册命令及与页面强人工关口（`PAGE_ONLY_ROUTES`）的安全边界见 [审批与任务单 MCP](references/approval-mcp.md)。
 
 1. 取得当前主会话的稳定 ID，作为 `originSessionId`；保留真实会话归属，不使用每次随机生成的 ID。
    如需自动回投，先将该 ID 用 `session_bind` 绑定到已配置宿主和真实原会话 ID；未绑定时保留原收件箱/webhook 路径。

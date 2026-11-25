@@ -65,6 +65,7 @@ function printUnifiedHelp(binName: string) {
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
   ticket show|events|proposal --job <id>  Read a job's task ticket and its events, or settle a proposal
   process list|answer --job <id>          Read a job's process requests, or answer one as the coach or a person
+  mcp [--url <url>] [--agent <name>]      Start lightweight A2A approval & task-ticket MCP server (stdio)
   trail --job <id>                        One task's record: who asked, what ran, who approved, what came out, who read it
   dsh archive --days <n> [--dry-run]     Archive DSH sessions that have been silent for n days (manual; no timer)
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
@@ -166,6 +167,11 @@ async function main() {
   if (rawArgs[0] === 'process') {
     const { runProcessCli } = await import('./process.js');
     await runProcessCli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'mcp') {
+    const { runMcpCli } = await import('./mcp.js');
+    await runMcpCli(rawArgs.slice(1));
     return;
   }
   if (rawArgs[0] === 'trail') {
