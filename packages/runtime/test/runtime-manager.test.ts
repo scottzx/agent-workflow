@@ -6154,3 +6154,129 @@ test("AcpRuntimeManager refuses adoption when the real session key already exist
   assert.equal((await store.load(source.acpxRecordId))?.acpSessionId, "sid-source");
   assert.equal((await store.load(target.acpxRecordId))?.acpSessionId, "sid-target");
 });
+
+test("AcpRuntimeManager retains cold control client for persistent sessions and reuses it on subsequent controls and turns", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "cold-control-retain-session",
+    acpSessionId: "cold-control-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      config_options: [
+        {
+          id: "effort",
+          name: "Effort",
+          type: "select",
+          currentValue: "medium",
+          options: [
+            { value: "medium", name: "Medium" },
+            { value: "high", name: "High" },
+          ],
+        },
+      ],
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  let factoryCalls = 0;
+  let startCalls = 0;
+  let closeCalls = 0;
+  let setConfigCalls = 0;
+  let setModeCalls = 0;
+  let promptCalls = 0;
+  let logoutCalls = 0;
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () => {
+        factoryCalls += 1;
+        let alive = false;
+        return {
+          start: async () => {
+            startCalls += 1;
+            alive = true;
+          },
+          close: async () => {
+            closeCalls += 1;
+            alive = false;
+          },
+          createSession: async () => ({ sessionId: "unused" }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: (sessionId: string) => alive && sessionId === "cold-control-sid",
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => ({
+            agentSessionId: "agent-cold-control-sid",
+            configOptions: record.acpx?.config_options,
+          }),
+          getAgentLifecycleSnapshot: () => ({ running: alive }),
+          prompt: async () => {
+            promptCalls += 1;
+            return { stopReason: "end_turn" };
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          hasUnresolvedPrompt: () => false,
+          setSessionMode: async () => {
+            setModeCalls += 1;
+          },
+          setSessionConfigOption: async (_sessionId: string, key: string, value: string) => {
+            setConfigCalls += 1;
+            return {
+              configOptions: [
+                {
+                  id: key,
+                  name: "Effort",
+                  type: "select",
+                  currentValue: value,
+                  options: [{ value, name: value }],
+                },
+              ],
+            };
+          },
+          logout: async () => {
+            logoutCalls += 1;
+          },
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        } as never;
+      },
+    },
+  );
+
+  const handle = createHandle(record.acpxRecordId);
+  await manager.setConfigOption(handle, "effort", "high");
+  assert.equal(factoryCalls, 1);
+  assert.equal(startCalls, 1);
+  assert.equal(closeCalls, 0);
+  assert.equal(setConfigCalls, 1);
+
+  await manager.setMode(handle, "plan");
+  assert.equal(factoryCalls, 1);
+  assert.equal(startCalls, 1);
+  assert.equal(closeCalls, 0);
+  assert.equal(setModeCalls, 1);
+
+  const turn = manager.startTurn({
+    handle,
+    text: "follow up after control",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "req-after-control",
+  });
+  const eventsPromise = collectEvents(turn.events);
+  const result = await turn.result;
+  await eventsPromise;
+  assert.equal(result.status, "completed");
+  assert.equal(factoryCalls, 1);
+  assert.equal(startCalls, 1);
+  assert.equal(closeCalls, 0);
+  assert.equal(promptCalls, 1);
+
+  await manager.close(handle);
+  assert.equal(closeCalls, 1);
+
+  await manager.logoutSession({ handle });
+  assert.equal(factoryCalls, 2);
+  assert.equal(logoutCalls, 1);
+  assert.equal(closeCalls, 2, "logoutSession must not retain the cold control client");
+});

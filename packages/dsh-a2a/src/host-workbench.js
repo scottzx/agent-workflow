@@ -36,7 +36,7 @@ async function bounded(req) {
 /**
  * @param options.workbench Gateway origin plus the bearer token and page relay secret.
  * @param options.admit     Host browser admission; returns `{ rejection }` when the request is not the owner's.
- * @param options.onOpenSession Receives a session id the page asks to open in the host.
+ * @param options.hostControls Returns in-process A2A host controls (`taskSession`, `sessionTask`) when `oneagents-acp` mounts A2A on this host.
  */
 export function createHostWorkbench(options = {}) {
   const workbench = options.workbench;
@@ -67,11 +67,32 @@ export function createHostWorkbench(options = {}) {
     const route = pathname.slice(API.length);
     if (route === '/session') return json(res, 200, { authenticated: true, loginRequired: false });
 
-    // Headless executions have no DSH GUI session to take over, so the page is told
-    // the task is not openable instead of linking to a session that cannot exist.
+    // When the in-process A2A host is mounted on this DSH instance, resolve the live
+    // session so the workbench can offer "Take over in DSH". Headless executions have
+    // no DSH GUI session on this host and report `headless_runtime`.
     const task = /^\/dsh\/tasks\/([^/]+)$/.exec(route);
     if (task) {
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+      const controls = typeof options.hostControls === 'function' ? options.hostControls() : undefined;
+      if (controls) {
+        const taskId = decodeURIComponent(task[1]);
+        const sessionId = controls.taskSession?.(taskId);
+        if (!sessionId) return json(res, 200, { available: false, reason: 'not_on_this_host' });
+        const info = controls.sessionTask?.(sessionId);
+        return json(res, 200, {
+          available: true,
+          sessionId,
+          ...(info ? {
+            task: {
+              taskId: info.taskId,
+              ...(info.jobId ? { jobId: info.jobId } : {}),
+              state: info.state,
+              running: info.running,
+              resubmittable: info.resubmittable,
+            },
+          } : {}),
+        });
+      }
       return json(res, 200, { available: false, reason: 'headless_runtime' });
     }
 

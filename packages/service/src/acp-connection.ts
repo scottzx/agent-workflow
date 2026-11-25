@@ -17,6 +17,14 @@ const calls = new AsyncLocalStorage<{ events: RecordValue[]; active: boolean }>(
 const NS = '1agents';
 const EXT = '_1agents/';
 
+function emitConnectionTiming(stage: string, fields: Record<string, string | number | boolean | undefined>): void {
+  if (process.env.ACP_TIMING_LOG === '0') return;
+  const parts = Object.entries(fields)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${typeof value === 'number' ? value.toFixed(1) : String(value)}`);
+  console.log(`[acp-timing] ${stage} ${parts.join(' ')}`);
+}
+
 /** Error envelopes have a closed projection; provider data never becomes metadata. */
 function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): RecordValue {
   // Process-slot admission is not a turn failure. Keep the queue position for the caller.
@@ -317,6 +325,7 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     }
   }
   async function ensure(params: RecordValue, fresh: boolean, replay: boolean, signal?: AbortSignal) {
+    const startedAt = performance.now();
     requireInitialized();
     signal?.throwIfAborted();
     // Read-only status/replay work may be abandoned after cancellation; the
@@ -337,8 +346,11 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     catch { throw RequestError.invalidParams('cwd must name an existing directory'); }
     const id = fresh ? randomUUID() : params.sessionId;
     const custom = extensions ? metadata(params) : {};
+    const method = fresh ? (custom.resumeSessionId ? 'session/import' : 'session/new') : (replay ? 'session/load' : 'session/resume');
     const stored = state.get(id);
+    const tRecordLoad = performance.now();
     const record = fresh ? undefined : await readWhileActive(backend.record(stored?.runtimeRecordId || id));
+    const recordLoadMs = performance.now() - tRecordLoad;
     signal?.throwIfAborted();
     if (!fresh) {
       const live = backend.sessions.get(id);
@@ -386,29 +398,65 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     try {
       signal?.throwIfAborted();
       dispatchStarted = true;
+      const tDispatch = performance.now();
       const events = await peer.command(backend, { ...custom, action: 'ensure_session', sessionId: id, workspacePath: params.cwd, agentType: agentName, mcpServers: params.mcpServers, runtimeSessionKey: stored?.runtimeRecordId, resumeSessionId: fresh ? custom.resumeSessionId : record?.acpSessionId, responsePolicy: 'stream', initializationSignal: signal });
+      const ensureDispatchMs = performance.now() - tDispatch;
       signal?.throwIfAborted();
+      const tStateCreate = performance.now();
       state.create({ sessionId: id, agentType: agentName, cwd: params.cwd, completeHistory: fresh ? !custom.resumeSessionId : stored?.completeHistory === true, runtimeRecordId: backend.sessions.get(id)?.handle?.acpxRecordId });
+      const stateCreateMs = performance.now() - tStateCreate;
       attached.add(id);
       const session = backend.sessions.get(id);
       if (session) session.acpResponsePolicy = custom.responsePolicy || session.acpResponsePolicy || 'stream';
-      for (const update of state.history(id)) if (update.sessionUpdate === 'tool_call') toolsSeen.add(`${id}:${update.toolCallId}`);
-      if (replay) {
-        for (const update of state.history(id)) {
+      const tHistoryScan = performance.now();
+      let historyCount = 0;
+      let replayHistory: SessionUpdate[] | undefined;
+      if (!fresh) {
+        if (replay) {
+          replayHistory = state.history(id);
+          historyCount = replayHistory.length;
+          for (const update of replayHistory) {
+            if (update.sessionUpdate === 'tool_call') toolsSeen.add(`${id}:${update.toolCallId}`);
+          }
+        } else if (typeof state.toolCallIds === 'function') {
+          const seenIds = state.toolCallIds(id);
+          historyCount = seenIds.length;
+          for (const toolCallId of seenIds) toolsSeen.add(`${id}:${toolCallId}`);
+        } else {
+          const scannedHistory = state.history(id);
+          historyCount = scannedHistory.length;
+          for (const update of scannedHistory) {
+            if (update.sessionUpdate === 'tool_call') toolsSeen.add(`${id}:${update.toolCallId}`);
+          }
+        }
+      }
+      const historyScanMs = performance.now() - tHistoryScan;
+      let historyReplayMs = 0;
+      let replayCount = 0;
+      if (replay && replayHistory) {
+        const tReplay = performance.now();
+        replayCount = replayHistory.length;
+        for (const update of replayHistory) {
           notify('session/update', { sessionId: id, update });
         }
         await readWhileActive(output);
+        historyReplayMs = performance.now() - tReplay;
         signal?.throwIfAborted();
       }
+      const tStatus = performance.now();
       const status = await readWhileActive(backend.status(id));
+      const statusMs = performance.now() - tStatus;
       signal?.throwIfAborted();
       if (backend.sessions.get(id)?.ws !== peer) throw new RequestError(-32000, 'Session taken over during attachment');
+      let commandsNotifyMs = 0;
       if (status.availableCommands) {
+        const tCmds = performance.now();
         notify('session/update', { sessionId: id, update: {
           sessionUpdate: 'available_commands_update',
           availableCommands: status.availableCommands.map((c: RecordValue) => ({ name: c.name, description: c.description || '', ...(c.hasInput ? { input: { hint: c.inputHint || 'Arguments' } } : {}) })),
         } });
         await readWhileActive(output);
+        commandsNotifyMs = performance.now() - tCmds;
         signal?.throwIfAborted();
       }
       const ready = events.find(e => e.event === 'session_ready') || {};
@@ -417,6 +465,23 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
           previousPeer && previousPeer !== peer && previousPeer.readyState === 1) {
         previousPeer.send(JSON.stringify({ event: 'session_taken_over', sessionId: id }));
       }
+      emitConnectionTiming('acp.ensure', {
+        method,
+        agent: agentName,
+        session: id,
+        live_hit: Boolean(previousSession),
+        mcp_count: Array.isArray(params.mcpServers) ? params.mcpServers.length : 0,
+        total_ms: performance.now() - startedAt,
+        record_load_ms: recordLoadMs,
+        ensure_dispatch_ms: ensureDispatchMs,
+        state_create_ms: stateCreateMs,
+        history_scan_ms: historyScanMs,
+        history_count: historyCount,
+        history_replay_ms: historyReplayMs,
+        replay_count: replayCount,
+        status_ms: statusMs,
+        commands_notify_ms: commandsNotifyMs,
+      });
       return { ...(fresh ? { sessionId: id } : {}), ...(status.modes ? { modes: status.modes } : {}), configOptions: configOptions(status), _meta: { [NS]: { agentSessionId: ready.agentSessionId, turnProtocolVersion: 3, agentType: agentName } } };
     } catch (error) {
       if (signal?.aborted && dispatchStarted) {
@@ -569,7 +634,7 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
    */
   function releaseOrphanedSessions() {
     const parsed = Number(process.env.ACP_DISCONNECT_GRACE_MS);
-    const grace = Number.isFinite(parsed) && parsed >= 0 ? parsed : 30_000;
+    const grace = Number.isFinite(parsed) && parsed >= 0 ? parsed : 120_000;
     for (const [sessionId, session] of [...backend.sessions]) {
       if (session?.ws !== peer) continue;
       const timer = setTimeout(() => {

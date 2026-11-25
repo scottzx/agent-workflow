@@ -1207,3 +1207,63 @@ test('adapter drops cached link on idle session_closed notification and races -3
   assert.equal(await runTurn('m3', 'turn-3-after-notify'), 'reply:turn-3-after-notify');
   assert.deepEqual(attaches, ['session/new', 'session/load:remote-idle-1', 'session/load:remote-idle-1']);
 });
+
+test('adapter defaults to session/resume when server advertises resume capability and skips no-op pinned RPCs', { timeout: 5000 }, async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-resume-cap-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(r => wss.once('listening', r));
+  t.after(() => new Promise(r => { for (const c of wss.clients) c.terminate(); wss.close(() => r()); }));
+  const attaches = [];
+  const changes = [];
+  const defaultOptions = [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'fast', options: [{ value: 'fast', name: 'Fast' }, { value: 'deep', name: 'Deep' }] }];
+  const defaultModes = { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] };
+  wss.on('connection', ws => {
+    const app = acpAgent()
+      .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} }, _meta: { '1agents': { version: 1 } } } }))
+      .onRequest('session/new', () => { attaches.push('session/new'); return { sessionId: 'remote-resumable-1', configOptions: structuredClone(defaultOptions), modes: structuredClone(defaultModes) }; })
+      .onRequest('session/resume', ({ params }) => { attaches.push(`session/resume:${params.sessionId}`); return { configOptions: structuredClone(defaultOptions), modes: structuredClone(defaultModes) }; })
+      .onRequest('session/load', () => { throw new Error('Should prefer session/resume when server advertises resume capability'); })
+      .onRequest('session/set_config_option', ({ params }) => { changes.push(params); return { configOptions: defaultOptions.map(o => o.id === params.configId ? { ...o, currentValue: params.value } : o) }; })
+      .onRequest('session/set_mode', ({ params }) => { changes.push(params); return {}; });
+    app.connect(stream(ws));
+  });
+  const makeLocal = id => ({ id, session: { header: { cwd: directory, agentPreset: 'oneagents-acp-codex' }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: { inject: async () => ({ dispose: async () => {} }) } });
+  const locals = new Map();
+  const addLocal = id => { const item = makeLocal(id); locals.set(id, item); return item; };
+  const first = addLocal('dsh-first');
+  const second = addLocal('dsh-second');
+  const ctx = {
+    sessionProjections: { stateOf: (session, key) => key === 'turnBoundary' ? session.boundary : session.header.agentPreset },
+    agents: { get: id => locals.get(id) },
+    approval: { request: async () => 'allowed-once' },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+  };
+  const stateDir = join(directory, 'state');
+  const adapter = new AcpAdapter(ctx, {
+    serviceUrl: `http://127.0.0.1:${wss.address().port}`,
+    agents: ['codex'],
+    stateDirectory: stateDir,
+    reconnectAttempts: 1,
+    reconnectDelayMs: 10,
+  });
+  t.after(() => adapter.dispose());
+
+  // Pin values that ALREADY match the agent's advertised defaults.
+  await adapter.describe(first);
+  await adapter.configure(first, 'model', 'fast');
+  await adapter.configure(first, '$mode', 'read');
+  changes.length = 0;
+
+  // A new session with pinned values matching defaults must send zero redundant RPCs.
+  await adapter.describe(second);
+  assert.deepEqual(changes, []);
+
+  // Reattaching a saved binding without explicit restoreMethod must use session/resume.
+  const endpoint = new URL('/agents/codex', `http://127.0.0.1:${wss.address().port}`);
+  endpoint.protocol = 'ws:';
+  const existing = addLocal('dsh-saved');
+  new State(stateDir).save(existing.id, { agent: 'codex', cwd: directory, endpoint: endpoint.href, sessionId: 'remote-resumable-1' });
+  await adapter.describe(existing);
+  assert.equal(attaches.at(-1), 'session/resume:remote-resumable-1');
+});

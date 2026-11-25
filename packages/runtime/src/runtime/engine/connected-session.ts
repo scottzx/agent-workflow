@@ -72,6 +72,11 @@ export type WithConnectedSessionOptions<T> = {
   onClientClosed?: () => void;
   onConnectedRecord?: (record: SessionRecord) => void;
   onInterrupt?: (params: { client: AcpClient; record: SessionRecord }) => Promise<void>;
+  shouldRetainClient?: (params: {
+    client: AcpClient;
+    record: SessionRecord;
+    sessionId: string;
+  }) => boolean;
   run: (context: ConnectedSessionContext) => Promise<T>;
 };
 
@@ -80,6 +85,7 @@ export type WithConnectedSessionResult<T> = {
   record: SessionRecord;
   resumed: boolean;
   loadError?: string;
+  retainedClient?: AcpClient;
 };
 
 function createActiveSessionController(params: {
@@ -138,6 +144,7 @@ export async function withConnectedSession<T>(
   const client = options.createClient?.(clientOptions) ?? new AcpClient(clientOptions);
   let activeSessionIdForControl = record.acpSessionId;
   let notifiedClientAvailable = false;
+  let retainClient = false;
   const activeController = createActiveSessionController({
     client,
     record,
@@ -187,11 +194,14 @@ export async function withConnectedSession<T>(
         applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
         await options.saveRecord(record);
 
+        retainClient = options.shouldRetainClient?.({ client, record, sessionId }) === true;
+
         return {
           value,
           record,
           resumed,
           loadError,
+          ...(retainClient ? { retainedClient: client } : {}),
         };
       },
       async () => {
@@ -212,10 +222,12 @@ export async function withConnectedSession<T>(
     if (notifiedClientAvailable) {
       options.onClientClosed?.();
     }
-    await client.close();
-    applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
-    await options.saveRecord(record).catch(() => {
-      // best effort on close
-    });
+    if (!retainClient) {
+      await client.close();
+      applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+      await options.saveRecord(record).catch(() => {
+        // best effort on close
+      });
+    }
   }
 }

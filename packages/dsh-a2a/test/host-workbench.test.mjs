@@ -106,6 +106,32 @@ test('host workbench reports headless tasks as not openable instead of offering 
   assert.deepEqual(await task.json(), { available: false, reason: 'headless_runtime' });
 });
 
+test('host workbench resolves in-process A2A sessions when hostControls is active', async t => {
+  const controls = {
+    taskSession: id => (id === 'task-live' ? 'session-live-1' : undefined),
+    sessionTask: sid => (sid === 'session-live-1'
+      ? { taskId: 'task-live', contextId: 'ctx-1', jobId: 'job-1', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true }
+      : undefined),
+  };
+  const handler = createHostWorkbench({
+    workbench: { url: 'http://127.0.0.1:1' },
+    hostControls: () => controls,
+  });
+  const origin = await listen(t, handler);
+
+  const live = await fetch(`${origin}${WORKBENCH_UI_PATH}/api/dsh/tasks/task-live`, { headers: { 'sec-fetch-site': 'same-origin' } });
+  assert.equal(live.status, 200);
+  assert.deepEqual(await live.json(), {
+    available: true,
+    sessionId: 'session-live-1',
+    task: { taskId: 'task-live', jobId: 'job-1', state: 'TASK_STATE_COMPLETED', running: false, resubmittable: true },
+  });
+
+  const foreign = await fetch(`${origin}${WORKBENCH_UI_PATH}/api/dsh/tasks/task-elsewhere`, { headers: { 'sec-fetch-site': 'same-origin' } });
+  assert.equal(foreign.status, 200);
+  assert.deepEqual(await foreign.json(), { available: false, reason: 'not_on_this_host' });
+});
+
 test('host workbench refuses process requests from the page and reports a missing gateway', async t => {
   const { origin: gatewayOrigin, seen } = await gateway(t);
   const configured = createHostWorkbench({ workbench: { url: gatewayOrigin, token: 'private' } });

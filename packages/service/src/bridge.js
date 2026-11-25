@@ -33,6 +33,20 @@ const ALLOW_RULES_FILENAME = path.join(".1agents", "allow-rules.json");
 // Ensure state dir exists
 fs.mkdirSync(DEFAULT_STATE_DIR, { recursive: true });
 
+if (process.env.ACP_TIMING_LOG === undefined) {
+  process.env.ACP_TIMING_LOG = "1";
+}
+
+function emitBridgeTiming(stage, fields) {
+  if (process.env.ACP_TIMING_LOG === "0") {
+    return;
+  }
+  const parts = Object.entries(fields)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${typeof value === "number" ? value.toFixed(1) : String(value)}`);
+  console.log(`[acp-timing] ${stage} ${parts.join(" ")}`);
+}
+
 const HISTORY_UPDATE_TAGS = new Set([
   "user_message_chunk",
   "agent_message_chunk",
@@ -128,10 +142,10 @@ function interactionTimeoutText() {
 // Inactive sessions (no running turn, no queued prompt, no pending interactive prompt,
 // no running background task) release their child process and capacity lease while
 // keeping their durable session record on disk for fast session/load (~0.5-1.5s).
-// Defaults: interactive (user-opened) 5min, background A2A job 60s, pressure eviction grace 15s.
+// Defaults: interactive (user-opened) 30min, background A2A job 60s, pressure eviction grace 15s.
 // Set ACP_IDLE_SESSION_TTL_MS=0 to disable periodic idle reaping.
 // Set ACP_PRESSURE_EVICT_ENABLED=0 to disable on-demand capacity eviction.
-const DEFAULT_IDLE_SESSION_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_IDLE_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_IDLE_JOB_TTL_MS = 60 * 1000;
 const DEFAULT_PRESSURE_EVICT_GRACE_MS = 15 * 1000;
 const RUNNING_BACKGROUND_TASK_STATUSES = new Set(["running", "in_progress", "pending"]);
@@ -195,6 +209,7 @@ const runtime = createAcpRuntime({
   // processes outside this service are not admitted through this governor.
   processLifecycle: {
     async onBeforeSpawn(launch) {
+      const startedAt = performance.now();
       const sessionKey = launch.scope.kind === "runtime-session" ? launch.scope.sessionKey : undefined;
       const session = sessionKey ? sessionLaunchControllers.get(sessionKey) : undefined;
       // Capture the generation before the lifecycle's deferred acquire runs.
@@ -204,6 +219,7 @@ const runtime = createAcpRuntime({
       ]);
       capacityLaunchSignals.set(launch.launchId, signal);
       signal.throwIfAborted();
+      const hadPreparedLease = Boolean(sessionKey && preparedProcessLeases.has(sessionKey));
       if (sessionKey && preparedProcessLeases.has(sessionKey)) {
         const lease = preparedProcessLeases.get(sessionKey);
         preparedProcessLeases.delete(sessionKey);
@@ -214,14 +230,19 @@ const runtime = createAcpRuntime({
         ? "prewarm"
         : typeof sessionKey === "string" && sessionKey ? "user-opened" : undefined;
       if (origin) launchOrigins.set(launch.launchId, origin);
+      let evictCheckMs = 0;
       if (!preparedByLaunch.has(launch.launchId) && pressureEvictEnabled()) {
+        const tEvict = performance.now();
         const snapshot = await processCapacity.snapshot("process");
         if (snapshot.availableAutomatic < 1) {
           await evictIdleSessionsForCapacity({ excludeSessionId: sessionKey, signal });
           signal.throwIfAborted();
         }
+        evictCheckMs = performance.now() - tEvict;
       }
+      const tAcquire = performance.now();
       await capacityLifecycle.onBeforeSpawn(launch);
+      const capacityAcquireMs = performance.now() - tAcquire;
       signal.throwIfAborted();
       // The 60s budget starts only after the process slot is held.
       if (preparedLaunches.has(launch.launchId)) {
@@ -233,12 +254,25 @@ const runtime = createAcpRuntime({
         timer.unref?.();
         handshakeTimers.set(launch.launchId, timer);
       }
+      emitBridgeTiming("bridge.before_spawn", {
+        session: sessionKey,
+        prepared: hadPreparedLease,
+        total_ms: performance.now() - startedAt,
+        evict_check_ms: evictCheckMs,
+        capacity_acquire_ms: capacityAcquireMs,
+      });
     },
     async onSpawned(started) {
+      const startedAt = performance.now();
       clearHandshake(started.launchId);
       await capacityLifecycle.onSpawned(started);
       capacityLaunchSignals.delete(started.launchId);
       launchOrigins.delete(started.launchId);
+      emitBridgeTiming("bridge.spawned", {
+        session: started.scope.kind === "runtime-session" ? started.scope.sessionKey : undefined,
+        pid: started.pid,
+        capacity_spawned_ms: performance.now() - startedAt,
+      });
     },
     onSpawnFailed(failure) {
       clearHandshake(failure.launchId);
@@ -1249,6 +1283,7 @@ async function reconcileTurnJournal(sessionId, session, recoverOutstanding) {
     record?.acpx?.turn_results && typeof record.acpx.turn_results === "object"
       ? record.acpx.turn_results
       : {};
+  let dirty = false;
 
   for (const [runtimeRequestId, result] of Object.entries(runtimeResults)) {
     if (!result || typeof result !== "object") {
@@ -1295,6 +1330,7 @@ async function reconcileTurnJournal(sessionId, session, recoverOutstanding) {
       completedAt: result.completed_at,
     });
     known.set(turnId, reconciled.turn);
+    dirty = true;
   }
 
   if (record?.messages?.length > 0) {
@@ -1346,10 +1382,14 @@ async function reconcileTurnJournal(sessionId, session, recoverOutstanding) {
         occurredAt: record.lastUsedAt || record.createdAt,
       });
       known.set(turnId, imported.turn);
+      dirty = true;
     }
   }
 
-  snapshot = await turnJournal.snapshot(sessionId);
+  if (dirty) {
+    snapshot = await turnJournal.snapshot(sessionId);
+  }
+  let recovered = false;
   if (recoverOutstanding && !session?.activeTurn) {
     if (snapshot.active) {
       await turnJournal.record({
@@ -1365,6 +1405,7 @@ async function reconcileTurnJournal(sessionId, session, recoverOutstanding) {
         stopReason: "runtime_restarted",
         terminalSource: "recovery_policy",
       });
+      recovered = true;
     }
     for (const queued of snapshot.queued) {
       await turnJournal.record({
@@ -1379,9 +1420,10 @@ async function reconcileTurnJournal(sessionId, session, recoverOutstanding) {
         stopReason: "runtime_restarted",
         terminalSource: "recovery_policy",
       });
+      recovered = true;
     }
   }
-  return await turnJournal.snapshot(sessionId);
+  return recovered ? await turnJournal.snapshot(sessionId) : snapshot;
 }
 
 export function resolveResponsePolicy(explicitPolicy, sessionPolicy) {
@@ -1639,8 +1681,8 @@ export async function dispatchCommand(ws, payload) {
             launch,
           } = payload;
           const normalizedResponsePolicy = responsePolicy === "summary" ? "summary" : "stream";
+          const ensureStartedAt = performance.now();
 
-          console.time(`ensure_session_${sessionId}`);
           console.log(
             `[DEBUG] ensure_session started for agent=${agentType || "unknown"}, session=${sessionId}`,
           );
@@ -1808,7 +1850,9 @@ export async function dispatchCommand(ws, payload) {
             // must not invalidate the original user's live request first.
             if (!initializationSignal) notifySessionTakenOver(existingSession.ws, ws, sessionId);
             existingSession.ws = ws;
+            let ensureArgvMs = 0;
             if (launchArgv.length > 0) {
+              const tArgv = performance.now();
               await runtime.ensureSession({
                 sessionKey: runtimeSessionKey,
                 agent: agentType,
@@ -1819,6 +1863,7 @@ export async function dispatchCommand(ws, payload) {
                 agentArgv: launchArgv,
                 authCredentials: transientCredentials,
               });
+              ensureArgvMs = performance.now() - tArgv;
             }
             // Only seed the in-memory mode from the store when nothing is
             // set yet. Never overwrite a live mode with a (possibly stale)
@@ -1857,8 +1902,11 @@ export async function dispatchCommand(ws, payload) {
               }
             }
             registerAgentSessionMapping(sessionId, existingSession.handle);
+            let turnSyncMs = 0;
             if (existingSession.responsePolicy !== "summary") {
+              const tSync = performance.now();
               await sendAuthoritativeTurnSync(ws, sessionId, existingSession);
+              turnSyncMs = performance.now() - tSync;
             }
             ws.send(
               JSON.stringify({
@@ -1871,7 +1919,16 @@ export async function dispatchCommand(ws, payload) {
               }),
             );
             void sendSessionMeta(ws, sessionId, existingSession.handle);
-            console.timeEnd(`ensure_session_${sessionId}`);
+            emitBridgeTiming("bridge.ensure_session", {
+              path: "active_reuse",
+              agent: agentType,
+              session: sessionId,
+              resume: Boolean(resumeId),
+              mcp_count: hasMcpServers ? mcpServers.length : 0,
+              total_ms: performance.now() - ensureStartedAt,
+              ensure_argv_ms: ensureArgvMs,
+              turn_sync_ms: turnSyncMs,
+            });
             break;
           }
 
@@ -1881,21 +1938,28 @@ export async function dispatchCommand(ws, payload) {
             );
             const initialization = initializingSessionControllers.get(sessionId);
             try {
+              const tWaitInit = performance.now();
               const handle = await initializingSessions.get(sessionId);
+              const waitInitMs = performance.now() - tWaitInit;
               initialization?.controller.signal.throwIfAborted();
               const sess = activeSessions.get(sessionId);
+              let grokModeMs = 0;
               if (sess) {
                 if (!initializationSignal) notifySessionTakenOver(sess.ws, ws, sessionId);
                 sess.ws = ws;
                 sess.agentType = agentType;
+                const tGrok = performance.now();
                 sess.sessionMode = await resolveGrokPermissionMode(handle, agentType);
+                grokModeMs = performance.now() - tGrok;
                 if (seededMode) {
                   sess.permissionMode = seededMode;
                 }
               }
               initialization?.controller.signal.throwIfAborted();
               registerAgentSessionMapping(sessionId, handle);
+              const tSync = performance.now();
               await sendAuthoritativeTurnSync(ws, sessionId, sess || { handle, agentType });
+              const turnSyncMs = performance.now() - tSync;
               initialization?.controller.signal.throwIfAborted();
               ws.send(
                 JSON.stringify({
@@ -1906,6 +1970,16 @@ export async function dispatchCommand(ws, payload) {
                 }),
               );
               void sendSessionMeta(ws, sessionId, handle);
+              emitBridgeTiming("bridge.ensure_session", {
+                path: "initializing_join",
+                agent: agentType,
+                session: sessionId,
+                resume: Boolean(resumeId),
+                total_ms: performance.now() - ensureStartedAt,
+                wait_init_ms: waitInitMs,
+                grok_mode_ms: grokModeMs,
+                turn_sync_ms: turnSyncMs,
+              });
             } catch (err) {
               sendError(ws, sessionId, "INITIALIZATION_FAILED", describeActionError(err));
             }
@@ -1921,7 +1995,6 @@ export async function dispatchCommand(ws, payload) {
           // The spare was created without this session's MCP servers, so such a session starts its own process.
           if (agentType === "grok-build" && launchArgv.length === 0 && !resumeId && !hasMcpServers && prewarmedGrokHandle) {
             if (prewarmedGrokCwd === normalizedPath) {
-              console.time(`ensure_session_${sessionId}`);
               console.log(
                 `[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`,
               );
@@ -1929,17 +2002,21 @@ export async function dispatchCommand(ws, payload) {
               const spare = prewarmedGrokHandle;
               prewarmedGrokHandle = null;
               prewarmedGrokCwd = null;
+              const tAdopt = performance.now();
               const handle = await runtime.adoptSession({
                 handle: spare,
                 sessionKey: sessionId,
               });
-              console.timeEnd(`ensure_session_${sessionId}`);
+              const adoptMs = performance.now() - tAdopt;
               // An earlier CAPACITY_PENDING attempt left this capacityId queued. The adopted process
               // already holds its own lease, so the entry would sit at the FIFO head and block every later launch.
               if (typeof payload.capacityId === "string" && payload.capacityId.trim()) {
                 await processCapacity.cancel({ id: payload.capacityId.trim(), kind: "process" });
               }
 
+              const tGrok = performance.now();
+              const prewarmSessionMode = await resolveGrokPermissionMode(handle, agentType);
+              const grokModeMs = performance.now() - tGrok;
               activeSessions.set(sessionId, {
                 handle,
                 activeTurn: null,
@@ -1950,7 +2027,7 @@ export async function dispatchCommand(ws, payload) {
                   typeof payload.capacityId === "string" && payload.capacityId.trim().startsWith("a2a-")
                     ? "job"
                     : "user-opened",
-                sessionMode: await resolveGrokPermissionMode(handle, agentType),
+                sessionMode: prewarmSessionMode,
                 permissionMode: seededMode ?? "approve-reads",
                 responsePolicy: normalizedResponsePolicy,
                 reqHost: ws._acpxReqHost,
@@ -1958,8 +2035,11 @@ export async function dispatchCommand(ws, payload) {
               });
               scheduleIdleReap();
               registerAgentSessionMapping(sessionId, handle);
+              let turnSyncMs = 0;
               if (normalizedResponsePolicy !== "summary") {
+                const tSync = performance.now();
                 await sendAuthoritativeTurnSync(ws, sessionId, activeSessions.get(sessionId), true);
+                turnSyncMs = performance.now() - tSync;
               }
               ws.send(
                 JSON.stringify({
@@ -1971,6 +2051,15 @@ export async function dispatchCommand(ws, payload) {
                 }),
               );
               void sendSessionMeta(ws, sessionId, handle);
+              emitBridgeTiming("bridge.ensure_session", {
+                path: "prewarm_hit",
+                agent: agentType,
+                session: sessionId,
+                total_ms: performance.now() - ensureStartedAt,
+                adopt_ms: adoptMs,
+                grok_mode_ms: grokModeMs,
+                turn_sync_ms: turnSyncMs,
+              });
               break;
             } else {
               console.log(
@@ -1990,11 +2079,12 @@ export async function dispatchCommand(ws, payload) {
             typeof payload.capacityId === "string" && payload.capacityId.trim().startsWith("a2a-")
               ? "job"
               : "user-opened";
+          let capacityAdmitMs = 0;
           if (typeof payload.capacityId === "string" && payload.capacityId.trim()) {
+            const tCapacity = performance.now();
             const capacityId = payload.capacityId.trim();
             if (capacityId.length > 4096) {
               sendError(ws, sessionId, "INVALID_PARAMS", "capacityId is invalid");
-              console.timeEnd(`ensure_session_${sessionId}`);
               break;
             }
             const origin = sessionOrigin;
@@ -2015,7 +2105,6 @@ export async function dispatchCommand(ws, payload) {
               }
               if (capacity.availableAutomatic < 1) {
                 sendCapacityExhausted(ws, sessionId, capacity);
-                console.timeEnd(`ensure_session_${sessionId}`);
                 break;
               }
             }
@@ -2037,7 +2126,6 @@ export async function dispatchCommand(ws, payload) {
             }
             if (admission?.pending === true) {
               sendCapacityPending(ws, sessionId, admission);
-              console.timeEnd(`ensure_session_${sessionId}`);
               break;
             }
             const previousLease = preparedProcessLeases.get(runtimeSessionKey);
@@ -2045,13 +2133,14 @@ export async function dispatchCommand(ws, payload) {
               try { await previousLease.release(); } catch { /* A later exit observation retries release. */ }
             }
             preparedProcessLeases.set(runtimeSessionKey, admission);
+            capacityAdmitMs = performance.now() - tCapacity;
           }
 
           console.log(
             `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
 
-          console.time(`ensure_session_${sessionId}`);
+          const tRuntimeEnsure = performance.now();
           let profileResumeFallback = profileChanged && !resumeId;
           const ensureInput = {
             sessionKey: runtimeSessionKey,
@@ -2092,11 +2181,13 @@ export async function dispatchCommand(ws, payload) {
           let initializedHandle;
           try {
             const handle = await sessionPromise;
+            const runtimeEnsureMs = performance.now() - tRuntimeEnsure;
             initializedHandle = handle;
             initialization.controller.signal.throwIfAborted();
+            const tGrokMode = performance.now();
             const sessionMode = await resolveGrokPermissionMode(handle, agentType);
+            const grokModeMs = performance.now() - tGrokMode;
             initialization.controller.signal.throwIfAborted();
-            console.timeEnd(`ensure_session_${sessionId}`);
             console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);
 
             activeSessions.set(sessionId, {
@@ -2123,8 +2214,11 @@ export async function dispatchCommand(ws, payload) {
             scheduleIdleReap();
             registerAgentSessionMapping(sessionId, handle);
 
+            let turnSyncMs = 0;
             if (normalizedResponsePolicy !== "summary") {
+              const tSync = performance.now();
               await sendAuthoritativeTurnSync(ws, sessionId, activeSessions.get(sessionId), true);
+              turnSyncMs = performance.now() - tSync;
             }
             initialization.controller.signal.throwIfAborted();
             ws.send(
@@ -2137,6 +2231,19 @@ export async function dispatchCommand(ws, payload) {
               }),
             );
             void sendSessionMeta(ws, sessionId, handle);
+            emitBridgeTiming("bridge.ensure_session", {
+              path: "initialize",
+              agent: agentType,
+              session: sessionId,
+              origin: sessionOrigin,
+              resume: Boolean(resumeId),
+              mcp_count: hasMcpServers ? mcpServers.length : 0,
+              total_ms: performance.now() - ensureStartedAt,
+              capacity_admit_ms: capacityAdmitMs,
+              runtime_ensure_ms: runtimeEnsureMs,
+              grok_mode_ms: grokModeMs,
+              turn_sync_ms: turnSyncMs,
+            });
             if (profileChanged) {
               ws.send(
                 JSON.stringify({

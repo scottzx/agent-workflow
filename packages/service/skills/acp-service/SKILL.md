@@ -1,6 +1,6 @@
 ---
 name: acp-service
-version: 1.1.0
+version: 1.1.1
 description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通过 A2A 调用固定角色、派发临时任务、查询父子任务和执行轮次、记录业务验收及处理通知，并回投 Codex/DSH 原会话。也用于把已记录产物交给另一个角色（handoff_propose、handoff_decide、handoff_offer）、登记共享产物空间、项目/角色候选探查、目标登记和网络技能更新。用户说交接、下一跳、交给另一个角色、共享产物或 caseId 时使用。不用于无关的系统巡检或模型配置；执行中的 ACP 会话没有 handoff 工具。
 ---
 

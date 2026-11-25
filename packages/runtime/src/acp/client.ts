@@ -182,6 +182,27 @@ const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
 const AGENT_CLEANUP_BUDGET_MS = 8_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
+
+function emitAcpClientTiming(
+  stage: string,
+  fields: Record<string, string | number | boolean | undefined>,
+): void {
+  if (process.env.ACP_TIMING_LOG !== "1") {
+    return;
+  }
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) {
+      parts.push(`${key}=${typeof value === "number" ? value.toFixed(1) : String(value)}`);
+    }
+  }
+  process.stderr.write(`[acp-timing] client.${stage} ${parts.join(" ")}\n`);
+}
+
+function timingLabelForAgent(agentCommand: string, agentArgv?: string[]): string {
+  const token = agentArgv?.[0] ?? agentCommand.split(/\s+/u)[0] ?? agentCommand;
+  return token.replace(/\\/gu, "/").split("/").pop() ?? token;
+}
 // Align with Grok CLI `--permission-mode` / config `defaultMode`:
 // default | acceptEdits | auto | dontAsk | bypassPermissions | plan
 const GROK_PERMISSION_MODE_IDS = [
@@ -846,6 +867,7 @@ export class AcpClient {
     authority?: AcpControlAuthority,
     options?: Pick<AcpClientOptions, "sessionOptions">,
   ): Promise<void> {
+    const startedAt = performance.now();
     assertControlAuthority(authority);
     if (options) {
       this.options.sessionOptions = structuredClone(options.sessionOptions);
@@ -853,14 +875,25 @@ export class AcpClient {
     if (this.hasLiveConnection()) {
       return;
     }
+    const tPrevClose = performance.now();
     const epoch = await this.waitForPreviousClose();
+    const waitPrevCloseMs = performance.now() - tPrevClose;
     const maxMessageBytes = readMaxAcpMessageBytes();
+    const tLaunchPlan = performance.now();
     const launch = await this.resolveAgentLaunchPlan(epoch, authority);
+    const launchPlanMs = performance.now() - tLaunchPlan;
     this.assertCommandProbeActive(epoch, authority);
     this.logAgentLaunch(launch);
+    const tLaunchSupport = performance.now();
     await this.ensureLaunchSupport(launch);
+    const launchSupportMs = performance.now() - tLaunchSupport;
     this.assertCommandProbeActive(epoch, authority);
-    const { child, process: startedProcess } = await this.spawnAgentProcess(launch, authority);
+    const {
+      child,
+      process: startedProcess,
+      beforeSpawnMs,
+      spawnMs,
+    } = await this.spawnAgentProcess(launch, authority);
     if (this.closeEpoch === epoch) {
       this.agent = child;
       this.closing = false;
@@ -878,6 +911,7 @@ export class AcpClient {
       process.stderr.write(chunk);
     });
     const startupFailure = this.createStartupFailureWatcher(child, startupStderr);
+    const tAdmitSpawned = performance.now();
     try {
       await this.admitAndObserveSpawnedProcess(child, startedProcess);
       const admissionExit = startupFailure.getError();
@@ -888,6 +922,7 @@ export class AcpClient {
       startupFailure.dispose();
       throw error;
     }
+    const admitSpawnedMs = performance.now() - tAdmitSpawned;
     await this.stopIfClosedDuringLaunch(epoch, child, startupFailure, authority);
 
     const input = Writable.toWeb(child.stdin);
@@ -924,7 +959,7 @@ export class AcpClient {
       );
     };
     connection.signal.addEventListener("abort", onConnectionClose, { once: true });
-    await this.initializeAgentConnection({
+    const initTimings = await this.initializeAgentConnection({
       child,
       connection,
       startupFailure,
@@ -935,6 +970,30 @@ export class AcpClient {
     if (connection.signal.aborted) {
       onConnectionClose();
     }
+    this.emitClientTiming("start", {
+      launch_source: launch.resolvedBuiltInLaunch?.source,
+      total_ms: performance.now() - startedAt,
+      wait_prev_close_ms: waitPrevCloseMs,
+      launch_plan_ms: launchPlanMs,
+      launch_support_ms: launchSupportMs,
+      before_spawn_ms: beforeSpawnMs,
+      spawn_ms: spawnMs,
+      admit_spawned_ms: admitSpawnedMs,
+      initialize_ms: initTimings.initializeMs,
+      authenticate_ms: initTimings.authenticateMs,
+      descendants_ms: initTimings.descendantsMs,
+    });
+  }
+
+  private emitClientTiming(
+    stage: string,
+    fields: Record<string, string | number | boolean | undefined>,
+  ): void {
+    emitAcpClientTiming(stage, {
+      agent: timingLabelForAgent(this.options.agentCommand, this.options.agentArgv),
+      mcp_count: this.options.mcpServers?.length ?? 0,
+      ...fields,
+    });
   }
 
   private async waitForPreviousClose(): Promise<number> {
@@ -1089,12 +1148,15 @@ export class AcpClient {
   ): Promise<{
     child: ChildProcessByStdio<Writable, Readable, Readable>;
     process: AcpProcessStarted;
+    beforeSpawnMs: number;
+    spawnMs: number;
   }> {
     if (plan.claudeAcp) {
       applyClaudeSettingsEnvironment(plan.spawnOptions.env);
     }
     const prepared = this.prepareProcessLaunch(plan.spawnCommand, plan.args, plan.spawnOptions);
     const { launch } = prepared;
+    const tBeforeSpawn = performance.now();
     try {
       await this.options.processLifecycle?.onBeforeSpawn?.(launch);
       assertControlAuthority(authority);
@@ -1102,7 +1164,9 @@ export class AcpClient {
       this.notifyProcessSpawnFailure(launch, error);
       throw error;
     }
+    const beforeSpawnMs = performance.now() - tBeforeSpawn;
 
+    const tSpawn = performance.now();
     let spawnedChild: ChildProcessByStdio<Writable, Readable, Readable>;
     try {
       spawnedChild = spawn(launch.command, [...launch.args], {
@@ -1119,6 +1183,7 @@ export class AcpClient {
       this.notifyProcessSpawnFailure(launch, spawnError);
       throw spawnError;
     }
+    const spawnMs = performance.now() - tSpawn;
 
     const child = requireAgentStdio(spawnedChild);
     this.agentDescendants.set(child, new ProcessDescendants(child));
@@ -1132,7 +1197,7 @@ export class AcpClient {
       await this.terminateAgentProcess(child);
       throw spawnError;
     }
-    return { child, process: this.startedProcess(launch, pid) };
+    return { child, process: this.startedProcess(launch, pid), beforeSpawnMs, spawnMs };
   }
 
   private assertCommandProbeActive(epoch: number, authority?: AcpControlAuthority): void {
@@ -1361,20 +1426,24 @@ export class AcpClient {
     startupStderr: string[];
     launch: AgentLaunchPlan;
     capabilities: ClientCapabilities;
-  }): Promise<void> {
+  }): Promise<{ initializeMs: number; authenticateMs: number; descendantsMs: number }> {
     try {
-      const initResult = await Promise.race([
+      const { initialized: initResult, initializeMs, authenticateMs } = await Promise.race([
         this.initializeProtocolConnection(params.connection, params.launch, params.capabilities),
         params.startupFailure.promise,
       ]);
       params.startupFailure.dispose();
       this.connection = params.connection;
       this.initResult = initResult;
+      const tDescendants = performance.now();
       await this.captureAgentDescendants(params.child);
+      const descendantsMs = performance.now() - tDescendants;
       this.log(`initialized protocol version ${initResult.protocolVersion}`);
+      return { initializeMs, authenticateMs, descendantsMs };
     } catch (error) {
       params.connection.close(error);
       await this.handleInitializeFailure(params, error);
+      throw error;
     }
   }
 
@@ -1382,7 +1451,8 @@ export class AcpClient {
     connection: ClientConnection,
     launch: Pick<AgentLaunchPlan, "devinAcp" | "geminiAcp">,
     capabilities: ClientCapabilities,
-  ): Promise<InitializeResponse> {
+  ): Promise<{ initialized: InitializeResponse; initializeMs: number; authenticateMs: number }> {
+    const tInit = performance.now();
     const initializePromise = connection.agent.request<InitializeResponse, InitializeRequest>(
       methods.agent.initialize,
       {
@@ -1394,8 +1464,11 @@ export class AcpClient {
     const initialized = launch.geminiAcp
       ? await withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
       : await initializePromise;
+    const initializeMs = performance.now() - tInit;
+    const tAuth = performance.now();
     await this.authenticateIfRequired(connection, initialized.authMethods ?? []);
-    return initialized;
+    const authenticateMs = performance.now() - tAuth;
+    return { initialized, initializeMs, authenticateMs };
   }
 
   private async handleInitializeFailure(
@@ -1460,6 +1533,7 @@ export class AcpClient {
     cwd = this.options.cwd,
     authority?: AcpControlAuthority,
   ): Promise<SessionCreateResult> {
+    const startedAt = performance.now();
     assertControlAuthority(authority);
     const connection = this.getConnection();
     const { command, args } = resolveAgentCommandParts(
@@ -1467,8 +1541,11 @@ export class AcpClient {
       this.options.agentArgv,
     );
     const claudeAcp = isClaudeAcpCommand(command, args);
+    const tCwd = performance.now();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    const cwdMs = performance.now() - tCwd;
 
+    const tRpc = performance.now();
     let result: NewSessionResponse;
     try {
       const createPromise = this.runConnectionRequest(
@@ -1492,6 +1569,7 @@ export class AcpClient {
       }
       throw error;
     }
+    const rpcMs = performance.now() - tRpc;
 
     this.loadedSessionId = result.sessionId;
     const configOptions = this.applyGrokPermissionModeCompatibility(
@@ -1499,7 +1577,16 @@ export class AcpClient {
       normalizeResponseConfigOptions(result),
     );
     const models = modelStateFromSessionResponse({ configOptions, response: result });
+    const tDescendants = performance.now();
     await this.captureAgentDescendants(this.agent);
+    const descendantsMs = performance.now() - tDescendants;
+
+    this.emitClientTiming("session_new", {
+      total_ms: performance.now() - startedAt,
+      cwd_ms: cwdMs,
+      rpc_ms: rpcMs,
+      descendants_ms: descendantsMs,
+    });
 
     return {
       sessionId: result.sessionId,
@@ -1522,15 +1609,22 @@ export class AcpClient {
     cwd = this.options.cwd,
     options: LoadSessionOptions = {},
   ): Promise<SessionLoadResult> {
+    const startedAt = performance.now();
     const connection = this.getConnection();
+    const tCwd = performance.now();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    const cwdMs = performance.now() - tCwd;
     assertControlAuthority(options.authority);
     const previousSuppression = this.suppressSessionUpdates;
     this.suppressSessionUpdates = previousSuppression || Boolean(options.suppressReplayUpdates);
+    const updatesBefore = this.observedSessionUpdates;
 
     let response: LoadSessionResponse | undefined;
+    let rpcMs = 0;
+    let replayDrainMs = 0;
 
     try {
+      const tRpc = performance.now();
       response = await this.runConnectionRequest(
         () =>
           connection.agent.request(methods.agent.session.load, {
@@ -1541,11 +1635,14 @@ export class AcpClient {
           }),
         options.authority,
       );
+      rpcMs = performance.now() - tRpc;
 
+      const tDrain = performance.now();
       await this.waitForSessionUpdateDrain(
-        options.replayIdleMs ?? REPLAY_IDLE_MS,
+        this.resolveReplayIdleMs(options, this.observedSessionUpdates - updatesBefore),
         options.replayDrainTimeoutMs ?? REPLAY_DRAIN_TIMEOUT_MS,
       );
+      replayDrainMs = performance.now() - tDrain;
     } finally {
       this.suppressSessionUpdates = previousSuppression;
     }
@@ -1558,8 +1655,27 @@ export class AcpClient {
     );
     result.configOptionsPresent = result.configOptionsPresent || result.configOptions !== undefined;
     this.updateRememberedSessionModels(sessionId, result);
-    await this.captureAgentDescendants(this.agent);
+    this.scheduleAgentDescendantsCapture(this.agent);
+    this.emitClientTiming("session_load", {
+      suppress_replay: Boolean(options.suppressReplayUpdates),
+      replay_updates: this.observedSessionUpdates - updatesBefore,
+      total_ms: performance.now() - startedAt,
+      cwd_ms: cwdMs,
+      rpc_ms: rpcMs,
+      replay_drain_ms: replayDrainMs,
+      descendants_ms: 0,
+    });
     return result;
+  }
+
+  private resolveReplayIdleMs(options: LoadSessionOptions, observedReplayUpdates: number): number {
+    if (options.replayIdleMs !== undefined) {
+      return options.replayIdleMs;
+    }
+    if (options.suppressReplayUpdates) {
+      return observedReplayUpdates === 0 ? 15 : 30;
+    }
+    return REPLAY_IDLE_MS;
   }
 
   async resumeSession(
@@ -1567,9 +1683,13 @@ export class AcpClient {
     cwd = this.options.cwd,
     authority?: AcpControlAuthority,
   ): Promise<SessionResumeResult> {
+    const startedAt = performance.now();
     assertControlAuthority(authority);
     const connection = this.getConnection();
+    const tCwd = performance.now();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    const cwdMs = performance.now() - tCwd;
+    const tRpc = performance.now();
     const response = await this.runConnectionRequest(
       () =>
         connection.agent.request(methods.agent.session.resume, {
@@ -1580,6 +1700,7 @@ export class AcpClient {
         }),
       authority,
     );
+    const rpcMs = performance.now() - tRpc;
 
     this.loadedSessionId = sessionId;
     const result = toReconnectedSessionResult(response);
@@ -1589,7 +1710,13 @@ export class AcpClient {
     );
     result.configOptionsPresent = result.configOptionsPresent || result.configOptions !== undefined;
     this.updateRememberedSessionModels(sessionId, result);
-    await this.captureAgentDescendants(this.agent);
+    this.scheduleAgentDescendantsCapture(this.agent);
+    this.emitClientTiming("session_resume", {
+      total_ms: performance.now() - startedAt,
+      cwd_ms: cwdMs,
+      rpc_ms: rpcMs,
+      descendants_ms: 0,
+    });
     return result;
   }
 
@@ -2233,6 +2360,10 @@ export class AcpClient {
 
   private closeConnection(): void {
     this.connection?.close();
+  }
+
+  private scheduleAgentDescendantsCapture(child: ChildProcess | undefined): void {
+    void this.captureAgentDescendants(child).catch(() => {});
   }
 
   private async captureAgentDescendants(child: ChildProcess | undefined): Promise<void> {

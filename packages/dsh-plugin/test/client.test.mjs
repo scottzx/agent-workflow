@@ -81,10 +81,13 @@ test('native writer contention disables only its composer, then clears after res
   assert.equal(f.blocks.get(context.sessionId), undefined);
 });
 
-test('the client leaves the chat transcript to DSH and does not replace assistant-step', () => {
+test('the client keeps one assistant row and projects remote tools into it', () => {
   for (const preset of ['standard', 'oneagents-acp-codex']) {
     const f = mount(preset);
-    assert.equal(f.slots.has('assistant-step'), false);
+    const assistant = f.slots.get('assistant-step');
+    assert.ok(assistant !== undefined);
+    assert.equal(assistant.options.priority, -1);
+    assert.ok(f.slots.has('acp-tool-calls'));
     f.dispose();
   }
 });

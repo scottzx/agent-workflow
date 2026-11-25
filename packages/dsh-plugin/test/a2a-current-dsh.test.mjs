@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DshA2ABackend, inspectSession, projectModelCatalog } from '../dist/a2a-executor.js';
+import { resolveA2AToken, resolveA2AWorkbench } from '../dist/a2a.js';
 
 /** A context shaped like DSH 0.2.2: no sessionController.inspect, headers through sessionQuery, models on the agent. */
 function currentDsh(cwd) {
@@ -105,4 +106,24 @@ test('the host default route is accepted when the catalog cannot enumerate it', 
   assert.equal(`${target.provider}/${target.model}`, 'magpie/group/daily-choice');
   await assert.rejects(backend.prepare({ sessionId: 'stored', cwd, provider: 'magpie', model: 'missing-model' }),
     error => error.code === 'UNKNOWN_MODEL_OR_GROUP' && error.message === 'Unknown model or routing group: magpie/missing-model');
+});
+
+test('resolveA2AToken and resolveA2AWorkbench load 0600 secret files and reject permissive modes', async t => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-a2a-creds-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const tokenFile = join(dir, 'a2a.token');
+  writeFileSync(tokenFile, 'secret-token-value\n', { mode: 0o600 });
+  assert.equal(await resolveA2AToken({ tokenFile, tokenEnv: 'NONEXISTENT_A2A_ENV_TEST' }), 'secret-token-value');
+
+  chmodSync(tokenFile, 0o644);
+  await assert.rejects(resolveA2AToken({ tokenFile, tokenEnv: 'NONEXISTENT_A2A_ENV_TEST' }), /must not be accessible/);
+
+  const gwFile = join(dir, 'gateway.json');
+  writeFileSync(gwFile, JSON.stringify({ workbench: { token: 'wb-tok', pageRelaySecret: 'relay-sec' } }), { mode: 0o600 });
+  const wb = await resolveA2AWorkbench({ url: 'http://127.0.0.1:36814' }, gwFile);
+  assert.deepEqual(wb, { url: 'http://127.0.0.1:36814', token: 'wb-tok', pageRelaySecret: 'relay-sec' });
+
+  chmodSync(gwFile, 0o640);
+  await assert.rejects(resolveA2AWorkbench({ url: 'http://127.0.0.1:36814' }, gwFile), /must not be accessible/);
 });

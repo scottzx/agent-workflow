@@ -36,4 +36,24 @@ export class AcpState {
     if (text && !text.endsWith('\n')) throw new Error('ACP history has an incomplete final record');
     return text.trim() ? text.trimEnd().split('\n').map(line => JSON.parse(line) as SessionUpdate) : [];
   }
+  /** Fast tool_call ID scan for session/resume without JSON-parsing every message chunk. */
+  toolCallIds(id: string): string[] {
+    const file = this.file(id, 'jsonl');
+    if (!existsSync(file)) return [];
+    const text = readFileSync(file, 'utf8');
+    if (!text.includes('"tool_call"')) return [];
+    const ids: string[] = [];
+    for (const line of text.trimEnd().split('\n')) {
+      if (!line.includes('"tool_call"')) continue;
+      try {
+        const update = JSON.parse(line) as SessionUpdate;
+        if (update.sessionUpdate === 'tool_call' && typeof update.toolCallId === 'string') {
+          ids.push(update.toolCallId);
+        }
+      } catch {
+        // Ignore a torn trailing line during non-replay resume; load still validates strictly.
+      }
+    }
+    return ids;
+  }
 }

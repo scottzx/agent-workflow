@@ -10,7 +10,7 @@ import { AcpAdapter, validateSessionPolicies, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
-import { mountDshA2A, type DshA2AOptions } from './a2a.js';
+import { mountDshA2A, resolveA2AWorkbench, type A2AHostRef, type DshA2AOptions } from './a2a.js';
 import { createWorkbenchProcessClient } from './process-requests.js';
 import { selectAcpRoute } from './preset-route.js';
 import { registerNativeApprovals } from './native-approvals.js';
@@ -55,7 +55,9 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   const { diagnostics } = diagnosticOwner;
   if (diagnosticOwner.mode === 'read-only') console.warn('oneagents-acp diagnostics are read-only because another instance owns the storage');
   let closeA2A: (() => Promise<void>) | undefined;
-  const processRequests = input.a2a?.workbench ? createWorkbenchProcessClient(input.a2a.workbench) : undefined;
+  const a2aEnabled = Boolean(input.a2a && input.a2a.enabled !== false);
+  const workbench = a2aEnabled ? await resolveA2AWorkbench(input.a2a?.workbench, input.a2a?.workbenchConfigFile) : undefined;
+  const processRequests = workbench ? createWorkbenchProcessClient(workbench) : undefined;
   const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
   // Archiving a Session in DSH stops its work but never reaches the service daemon, where the
@@ -128,7 +130,9 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     void selectAcpRoute(ctx, sessionId, agentPreset, presets.map(preset => preset.id));
   });
   if (input.a2a) {
-    const review = await ReviewHandBack.open(join(home, 'plugins', '1agents-acp', 'review.secret'), input.a2a.workbench);
+    const a2aHost: A2AHostRef = {};
+    ctx.provide('oneagentsA2aHost', a2aHost);
+    const review = await ReviewHandBack.open(join(home, 'plugins', '1agents-acp', 'review.secret'), workbench);
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: REVIEW_SUBMIT_PATH, handler: review.handler }));
     ctx.effect(() => ctx.tools.register(defineTool({
       name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
@@ -141,8 +145,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       },
     })));
     // The executor's task ticket lives on the gateway; native agents handle it through these tools.
-    if (input.a2a.workbench) {
-      const gateway = createTicketGateway(input.a2a.workbench);
+    if (workbench) {
+      const gateway = createTicketGateway(workbench);
       for (const tool of ticketTools(gateway)) ctx.effect(() => ctx.tools.register(tool));
       // The executor may propose the next hop. It never dispatches it; a person decides on the workbench page.
       for (const tool of handoffTools(gateway)) ctx.effect(() => ctx.tools.register(tool));
@@ -161,6 +165,6 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       release: sessionId => adapter.releaseSession(sessionId),
       delete: sessionId => adapter.deleteSession(sessionId),
       status: sessionId => adapter.sessionStatus(sessionId),
-    }, host => { review.host = host; });
+    }, host => { review.host = host; a2aHost.current = host; });
   }
 }

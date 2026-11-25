@@ -12,8 +12,10 @@ import {
 } from './model-select.js';
 import { registerWorkbenchPanel } from './workbench-panel.js';
 import { registerRowConfigPanels } from './row-config-panel.js';
+import { acpToolDefinition } from './acp-tool-definition.js';
+import { installAcpToolCards } from './acp-tool-cards.js';
 
-export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'conversation'];
+export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'conversation', 'uiConversation'];
 
 const dictionaries = {
   zh: {
@@ -110,6 +112,10 @@ async function acpRequest(sessionId, change, signal) {
 
 export function apply(ctx) {
   installModelSelectStyles(ctx);
+  // Remote ACP tool calls are projected onto the host's own Tool rows. The
+  // Definition folds them from the Assistant stream; the row draws them.
+  if (ctx.uiConversation?.events?.register) ctx.uiConversation.events.register(acpToolDefinition);
+  installAcpToolCards(ctx);
   ctx.effect(() => ctx.locale.register('oneagentsAcp', dictionaries));
   const t = ctx.locale.bind('oneagentsAcp');
   const catalogStore = createModelCatalogStore(ctx);

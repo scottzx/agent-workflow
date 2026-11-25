@@ -130,17 +130,29 @@ export function parseMacOSAvailableMemory(output: string, totalBytes: number): n
   return Math.min(totalBytes, available);
 }
 
+const MEMORY_CACHE_TTL_MS = 1_500;
+let cachedMemoryReading: { reading: CapacityMemoryReading; expiresAt: number } | undefined;
+
 function currentMemory(): CapacityMemoryReading {
+  const now = Date.now();
+  if (cachedMemoryReading && now < cachedMemoryReading.expiresAt) {
+    return cachedMemoryReading.reading;
+  }
   const totalBytes = totalmem();
+  let reading: CapacityMemoryReading | undefined;
   if (process.platform === 'darwin') {
     try {
       const output = execFileSync('/usr/bin/vm_stat', [], { encoding: 'utf8', timeout: 1000, maxBuffer: 65536, stdio: ['ignore', 'pipe', 'ignore'] });
-      return { totalBytes, availableBytes: parseMacOSAvailableMemory(output, totalBytes), source: 'macos-reclaimable-estimate' };
+      reading = { totalBytes, availableBytes: parseMacOSAvailableMemory(output, totalBytes), source: 'macos-reclaimable-estimate' };
     } catch { /* Fall back conservatively when the host cannot read its reclaimable-page estimate. */ }
   }
-  // availableMemory also respects the process/container allocation when the Node host exposes it.
-  const processAvailable = process.availableMemory?.();
-  return { totalBytes, availableBytes: Math.min(freemem(), processAvailable ?? Infinity), source: 'system-available' };
+  if (!reading) {
+    // availableMemory also respects the process/container allocation when the Node host exposes it.
+    const processAvailable = process.availableMemory?.();
+    reading = { totalBytes, availableBytes: Math.min(freemem(), processAvailable ?? Infinity), source: 'system-available' };
+  }
+  cachedMemoryReading = { reading, expiresAt: now + MEMORY_CACHE_TTL_MS };
+  return reading;
 }
 
 /** Only ESRCH proves death. Permission failures and PID reuse retain the reservation. */

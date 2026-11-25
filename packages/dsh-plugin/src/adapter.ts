@@ -100,6 +100,14 @@ function isCancellationRejection(error: unknown, signal: AbortSignal): boolean {
 
 const ownedFailures = new WeakMap<Error, ReturnType<typeof toSafeError>>();
 
+function emitAdapterTiming(stage: string, fields: Record<string, string | number | boolean | undefined>): void {
+  if (process.env.ACP_TIMING_LOG === '0') return;
+  const parts = Object.entries(fields)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${typeof value === 'number' ? value.toFixed(1) : String(value)}`);
+  console.log(`[acp-timing] ${stage} ${parts.join(' ')}`);
+}
+
 /** The official host receives its normal error; complete facts live in the plugin domain. */
 function publicFailure(safe: ReturnType<typeof toSafeError>, _requestId: string): LlmError {
   const error = Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED'), safe);
@@ -272,9 +280,10 @@ export class AcpAdapter implements LlmAdapter {
     }
   }
   /** Replay this Agent's own accepted values. Another Agent's catalog is never consulted. */
-  private async applyPinnedSettings(name: string, cwd: string, link: Link, sessionId: string, capabilities: Capabilities, policy: SessionPolicy | undefined, cancellationSignal: AbortSignal): Promise<void> {
+  private async applyPinnedSettings(name: string, cwd: string, link: Link, sessionId: string, capabilities: Capabilities, policy: SessionPolicy | undefined, cancellationSignal: AbortSignal): Promise<{ optionsApplied: number; modeApplied: boolean }> {
     const pinned = this.sessionSettings.get(cwd, name);
     let advertised = capabilities.configOptions;
+    let optionsApplied = 0;
     for (const option of replayPinnedOptions(pinned?.options ?? [])) {
       const mismatch = pinnedOptionError(name, option, advertised);
       if (mismatch) {
@@ -285,18 +294,23 @@ export class AcpAdapter implements LlmAdapter {
         if (option.model) continue;
         throw new Error(mismatch);
       }
+      const current = advertised.find(item => item.id === option.id);
+      if (current?.currentValue === option.value) continue;
       const next = await link.rpc.request('session/set_config_option', { sessionId, configId: option.id, value: option.value }, { cancellationSignal });
       advertised = next.configOptions ?? [];
       capabilities.configOptions = advertised;
+      optionsApplied += 1;
     }
     const modeId = pinned?.modeId ?? policy?.initialModeId;
-    if (!modeId) return;
+    if (!modeId) return { optionsApplied, modeApplied: false };
     const mismatch = pinned?.modeId
       ? pinnedModeError(name, modeId, capabilities.modes?.availableModes)
       : capabilities.modes?.availableModes.some(mode => mode.id === modeId) ? undefined : 'Configured initial ACP mode is not advertised by the Agent';
     if (mismatch) throw new Error(mismatch);
+    if (capabilities.modes?.currentModeId === modeId) return { optionsApplied, modeApplied: false };
     await link.rpc.request('session/set_mode', { sessionId, modeId }, { cancellationSignal });
     if (capabilities.modes) capabilities.modes.currentModeId = modeId;
+    return { optionsApplied, modeApplied: true };
   }
   private async connection(agent: Agent, capacityId?: string, callerSignal?: AbortSignal): Promise<Link> {
     const operation = (this.connections.get(agent.id) ?? Promise.resolve())
@@ -341,6 +355,7 @@ export class AcpAdapter implements LlmAdapter {
       this.state.save(agent.id, binding);
     }
     const operation = (async () => {
+      const openStartedAt = performance.now();
       if (!this.commandContexts.has(agent.id)) {
         const fiber = await agent.ctx.inject(['commands'], scope => {
           this.commandContexts.set(agent.id, scope);
@@ -366,6 +381,7 @@ export class AcpAdapter implements LlmAdapter {
       this.capabilities.set(agent.id, capabilities);
       const interactionSignal = (signal: AbortSignal) => AbortSignal.any([signal, this.lifetime.signal, ...(this.controllers.has(agent.id) ? [this.controllers.get(agent.id)!.signal] : [])]);
       let linkRef: Link | undefined;
+      const tWsConnect = performance.now();
       const link = await connect(endpoint.href, {
         update: update => {
           if (this.capabilities.get(agent.id) !== capabilities) return;
@@ -386,6 +402,7 @@ export class AcpAdapter implements LlmAdapter {
           linkRef?.close();
         },
       }, this.lifetime.signal);
+      const wsConnectInitMs = performance.now() - tWsConnect;
       linkRef = link;
       let createdBinding: Binding | undefined;
       try {
@@ -394,7 +411,8 @@ export class AcpAdapter implements LlmAdapter {
         // sent. Mode and reasoning effort come from ACP 设置: session/set_mode,
         // session/set_config_option, or the settings kept by a native import.
         // initialModeId below still selects an advertised native mode.
-        const params: NewSessionRequest = { cwd, mcpServers: this.mcpServersFor?.(agent.id) ?? [], ...(capacityId ? { _meta: { '1agents': { capacityId } } } : {}) };
+        const mcpServers = this.mcpServersFor?.(agent.id) ?? [];
+        const params: NewSessionRequest = { cwd, mcpServers, ...(capacityId ? { _meta: { '1agents': { capacityId } } } : {}) };
         const admit = <T>(request: () => Promise<T>): Promise<T> => capacityId
           ? requestWhenAdmitted({
             request,
@@ -406,19 +424,46 @@ export class AcpAdapter implements LlmAdapter {
           : request();
         // Queue waits return immediately. This 60s bound covers only the attempt that holds the slot.
         const handshake = () => AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000), ...(callerSignal ? [callerSignal] : [])]);
-        const restoreMethod = binding ? binding.restoreMethod ?? 'session/load' : undefined;
+        const restoreMethod = binding ? binding.restoreMethod ?? (link.supportsResume ? 'session/resume' : 'session/load') : undefined;
+        const tRpc = performance.now();
         const result = binding
           ? await admit(() => link.rpc.request(restoreMethod!, { ...params, sessionId: binding.sessionId! }, { cancellationSignal: handshake() }))
           : await admit(() => link.rpc.request('session/new', params, { cancellationSignal: handshake() }));
+        const rpcMs = performance.now() - tRpc;
         if (binding && restoreMethod) noteSessionRestore(agent.id, restoreMethod);
         if (!binding) createdBinding = { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId };
         capabilities.configOptions = result.configOptions ?? capabilities.configOptions;
         capabilities.modes = result.modes ?? undefined;
         // A new session replays only this Agent's accepted settings. Loading an
         // existing session keeps the mode and options already on that session.
-        if (!binding) await this.applyPinnedSettings(name, resolve(cwd), link, (result as { sessionId: string }).sessionId, capabilities, policy, handshake());
+        let pinnedSettingsMs = 0;
+        let pinnedOptions = 0;
+        let pinnedModeApplied = false;
+        if (!binding) {
+          const tPinned = performance.now();
+          const applied = await this.applyPinnedSettings(name, resolve(cwd), link, (result as { sessionId: string }).sessionId, capabilities, policy, handshake());
+          pinnedSettingsMs = performance.now() - tPinned;
+          pinnedOptions = applied.optionsApplied;
+          pinnedModeApplied = applied.modeApplied;
+        }
+        const tStateSave = performance.now();
         if (createdBinding) this.state.save(agent.id, createdBinding);
+        const stateSaveMs = performance.now() - tStateSave;
         void link.closed.then(() => { if (this.links.get(agent.id) === operation) this.links.delete(agent.id); });
+        emitAdapterTiming('dsh.open_connection', {
+          method: restoreMethod ?? 'session/new',
+          agent: name,
+          dsh_session: agent.id,
+          acp_session: binding?.sessionId ?? createdBinding?.sessionId,
+          mcp_count: mcpServers.length,
+          total_ms: performance.now() - openStartedAt,
+          ws_connect_init_ms: wsConnectInitMs,
+          rpc_ms: rpcMs,
+          pinned_settings_ms: pinnedSettingsMs,
+          pinned_options: pinnedOptions,
+          pinned_mode_applied: pinnedModeApplied,
+          state_save_ms: stateSaveMs,
+        });
         return link;
       } catch (error) {
         if (binding && isDeletedAcpSession(error)) {

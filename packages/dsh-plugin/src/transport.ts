@@ -60,7 +60,8 @@ export async function connect(endpoint: string, handlers: Handlers, signal: Abor
       clientCapabilities: { _meta: { '1agents': { version: 1 } } },
     }, { cancellationSignal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) });
     if (initialized.protocolVersion !== 1 || !initialized.agentCapabilities?._meta?.['1agents']) throw new Error('Requires acp-service 0.2 with 1agents turn recovery');
-    return { rpc: connection.agent, ws, close: () => ws.close(), closed: connection.closed };
+    const supportsResume = Boolean(initialized.agentCapabilities?.sessionCapabilities?.resume);
+    return { rpc: connection.agent, ws, supportsResume, close: () => ws.close(), closed: connection.closed };
   } catch (error) { ws.terminate(); throw error; }
   finally { signal.removeEventListener('abort', abort); }
 }

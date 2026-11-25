@@ -26,7 +26,7 @@ import {
   SessionModelReplayError,
   SessionResumeRequiredError,
 } from "../../errors.js";
-import { incrementPerfCounter } from "../../perf-metrics.js";
+import { emitRuntimeTiming, incrementPerfCounter } from "../../perf-metrics.js";
 import { isProcessAlive } from "../../process-liveness.js";
 import {
   applyConfigOptionsToRecord,
@@ -454,6 +454,7 @@ function restoreOriginalSessionState(params: {
 export async function connectAndLoadSession(
   options: ConnectAndLoadSessionOptions,
 ): Promise<ConnectAndLoadSessionResult> {
+  const startedAt = performance.now();
   const record = options.record;
   const client = options.client;
   assertControlAuthority(options.authority);
@@ -469,6 +470,7 @@ export async function connectAndLoadSession(
 
   logReconnectAttempt(record, storedProcessAlive, shouldReconnect, options.verbose);
 
+  const tStart = performance.now();
   const reusingLoadedSession = client.hasReusableSession(record.acpSessionId);
   if (reusingLoadedSession) {
     incrementPerfCounter("runtime.connect_and_load.reused_session");
@@ -483,6 +485,7 @@ export async function connectAndLoadSession(
       options.timeoutMs,
     );
   }
+  const startMs = performance.now() - tStart;
   assertControlAuthority(options.authority);
   options.onClientAvailable?.(options.activeController);
   applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
@@ -490,6 +493,7 @@ export async function connectAndLoadSession(
   record.closedAt = undefined;
   options.onConnectedRecord?.(record);
 
+  const tLoad = performance.now();
   const loadState = await loadOrCreateRuntimeSession({
     client,
     record,
@@ -500,6 +504,7 @@ export async function connectAndLoadSession(
     promptRecorded: options.promptRecorded,
     strictResume: options.strictResume,
   });
+  const loadOrCreateMs = performance.now() - tLoad;
   const {
     resumed,
     loadError,
@@ -517,6 +522,7 @@ export async function connectAndLoadSession(
     createdFreshSession,
   );
 
+  const tReplayPrefs = performance.now();
   const preferenceReplay = await replaySessionPreferences({
     client,
     record,
@@ -537,6 +543,7 @@ export async function connectAndLoadSession(
     suppressWarnings: options.suppressWarnings,
     authority: options.authority,
   });
+  const replayPrefsMs = performance.now() - tReplayPrefs;
 
   applyReconnectedModelState(
     record,
@@ -547,6 +554,17 @@ export async function connectAndLoadSession(
   );
 
   options.onSessionIdResolved?.(sessionId);
+
+  emitRuntimeTiming("runtime.connect_and_load", {
+    session: record.acpxRecordId,
+    reused: reusingLoadedSession,
+    resumed,
+    fresh: createdFreshSession,
+    total_ms: performance.now() - startedAt,
+    start_ms: startMs,
+    load_or_create_ms: loadOrCreateMs,
+    replay_prefs_ms: replayPrefsMs,
+  });
 
   return {
     reusingLoadedSession,

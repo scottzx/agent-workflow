@@ -40,6 +40,8 @@ export async function apply(ctx, config = {}) {
       workbench,
       // Absent only on a host without browser sessions; the page then trusts the host.
       admit: ctx.connection?.admit ? req => ctx.connection.admit(req) : undefined,
+      // Resolve live in-process A2A sessions when `oneagents-acp` mounts A2A on this host.
+      hostControls: () => ctx.get?.('oneagentsA2aHost')?.current,
     });
     ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: WORKBENCH_UI_PATH, handler }));
   }

@@ -86,3 +86,23 @@ export function resetPerfMetrics(): void {
 export function formatPerfMetric(name: string, durationMsValue: number): string {
   return `${name}=${roundMetric(durationMsValue)}ms`;
 }
+
+export function isAcpTimingLogEnabled(): boolean {
+  return process.env.ACP_TIMING_LOG === "1";
+}
+
+export function emitRuntimeTiming(
+  stage: string,
+  fields: Record<string, string | number | boolean | undefined>,
+): void {
+  if (!isAcpTimingLogEnabled()) {
+    return;
+  }
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) {
+      parts.push(`${key}=${typeof value === "number" ? value.toFixed(1) : String(value)}`);
+    }
+  }
+  process.stderr.write(`[acp-timing] ${stage} ${parts.join(" ")}\n`);
+}
