@@ -65,6 +65,8 @@ export interface LedgerEntry {
   mustIssues: number; proposals: NonNullable<QualityReview['proposals']>; workDirectory: string; ticketPath: string;
   /** The executor's job, which carries the ticket; the gate reads the proposals' current state from it. */
   jobId?: string; originSessionId?: string;
+  /** SHA-256 of checklist.json and checks/ at this run, so a later version can see whether the rules changed. */
+  checksDigest?: string;
 }
 export interface OutlineRunOptions {
   roleDirectory: string; caseId: string; projectPath: string; workspace: string;
@@ -466,11 +468,15 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     ...(hostError ? { error: hostError instanceof Error ? hostError.message : String(hostError) } : {}) };
   await writeFile(path.join(work, 'run.json'), JSON.stringify(report, null, 2) + '\n');
   const first = rounds[0];
+  // A missing digest only means this line cannot be compared later; the run itself is still recorded.
+  let checksDigest: string | undefined;
+  try { checksDigest = await (await import('./calibrate.js')).computeChecksDigest(roleDirectory); }
+  catch { checksDigest = undefined; }
   const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed, stopReason,
     firstDraftPassed: first?.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
     scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
     mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath,
-    jobId, originSessionId: options.originSessionId };
+    jobId, originSessionId: options.originSessionId, ...(checksDigest ? { checksDigest } : {}) };
   await appendFile(ledgerPath(options.workspace, roleId), JSON.stringify(entry) + '\n');
   log(`停止原因：${stopReason}`);
   if (hostError) throw hostError;
