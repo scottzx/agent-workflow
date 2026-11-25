@@ -1,8 +1,9 @@
 /**
- * Lightweight MCP server (stdio, newline-delimited JSON-RPC 2.0) for A2A approvals and task tickets.
- * Proxies to a running local a2a-gateway (/invoke) and exposes a compact, first-class tool surface
- * so agents (or DreamMate MCP) can inspect pending approvals, answer process requests, settle ticket
- * proposals and submit coach-level execution reviews without search/inspect round-trips.
+ * Lightweight MCP server (stdio, newline-delimited JSON-RPC 2.0) for A2A task dispatch, approvals
+ * and task tickets. Proxies to a running local a2a-gateway (/invoke) and exposes a compact,
+ * first-class MCP tool surface so agents (via DreamMate MCP or standalone stdio MCP clients) can
+ * dispatch tasks, bind sessions, inspect pending approvals, answer process requests, settle ticket
+ * proposals and submit coach-level reviews without calling raw HTTP ports or search/inspect loops.
  *
  * Security boundary: all write operations through this MCP server are unconditionally stamped as
  * `kind: "coach"` and never impersonate `kind: "person"` or bypass PAGE_ONLY_ROUTES.
@@ -11,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { z } from 'zod';
 import { processRequestAnswerSchema } from '../execution/process-request.js';
+import { sessionLifecycleSchema } from './session-lifecycle.js';
 
 export const A2A_APPROVAL_MCP_SERVER_NAME = 'a2a-approval';
 export const A2A_APPROVAL_MCP_SERVICE_ID = 'mcp-a2a-approval';
@@ -19,10 +21,80 @@ export const DEFAULT_COACH_AGENT = 'dreammate-mcp';
 
 const id = z.string().trim().min(1).max(512);
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
+const promptText = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'prompt must contain text');
 const coachOverrides = {
   coachAgent: id.optional(),
   coachSessionId: id.optional(),
 };
+
+const emptyArgsSchema = z.object({}).strict();
+
+const sessionBindArgsSchema = z.object({
+  originSessionId: id,
+  host: id,
+  sessionId: id,
+}).strict();
+
+const taskDispatchArgsSchema = z.object({
+  originSessionId: id,
+  targetId: id.optional(),
+  remote: id.optional(),
+  cwd: id.optional(),
+  prompt: promptText.optional(),
+  input: z.record(z.string(), z.unknown()).optional(),
+  agentPreset: id.optional(),
+  title: id.optional(),
+  roleId: id.optional(),
+  provider: id.optional(),
+  model: id.optional(),
+  lifecycle: sessionLifecycleSchema.optional(),
+  notificationTarget: id.optional(),
+  caseId: id.optional(),
+  handoffId: id.optional(),
+  purpose: id.optional(),
+  resultRevision: id.optional(),
+  parentJobRef: z.object({ sourceId: id, jobId: id }).strict().optional(),
+  parentAttemptId: id.optional(),
+  replacesJobRef: z.object({ sourceId: id, jobId: id }).strict().optional(),
+  clientRequestId: id.optional(),
+  ...coachOverrides,
+}).strict();
+
+const taskGetArgsSchema = z.object({
+  originSessionId: id,
+  jobId: id.optional(),
+  remote: id.optional(),
+  taskId: id.optional(),
+}).strict();
+
+const taskListArgsSchema = z.object({
+  originSessionId: id,
+  targetId: id.optional(),
+  executionStatus: id.optional(),
+  limit: z.number().int().min(1).max(200).optional(),
+  offset: z.number().int().min(0).optional(),
+}).strict();
+
+const taskContinueArgsSchema = z.object({
+  originSessionId: id,
+  jobId: id,
+  prompt: promptText.optional(),
+  input: z.record(z.string(), z.unknown()).optional(),
+  clientRequestId: id.optional(),
+  ...coachOverrides,
+}).strict();
+
+const taskCancelArgsSchema = z.object({
+  originSessionId: id,
+  jobId: id,
+  cascade: z.boolean().optional(),
+}).strict();
+
+const noticeAckArgsSchema = z.object({
+  originSessionId: id,
+  noticeId: id,
+  kind: z.enum(['remote', 'execution']).optional(),
+}).strict();
 
 const pendingApprovalsArgsSchema = z.object({
   originSessionId: id.optional(),
@@ -76,6 +148,46 @@ export interface McpToolDefinition {
 
 export const A2A_APPROVAL_MCP_TOOLS: readonly McpToolDefinition[] = [
   {
+    name: 'a2a_target_list',
+    description: '列出已登记的 A2A 执行目标（固定角色 resident_agent、通用宿主 agent_host、路径智能体及健康状态），不派单。',
+    inputSchema: z.toJSONSchema(emptyArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_session_bind',
+    description: '将发起方 originSessionId 绑定到已配置的宿主会话（如 host="dsh-local" 或 "codex-local"），用于自动接收过程审批 steer 提醒与任务完成通知。',
+    inputSchema: z.toJSONSchema(sessionBindArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_task_dispatch',
+    description: '通过 MCP 发起 A2A 子任务（无需直连 HTTP 端口）：支持两种模式——① 传 targetId + (prompt 或 input) 向已登记目标/固定角色提交（execution_submit）；② 传 remote + cwd + prompt 直接向远端宿主派发（remote_agent_spawn）。自动补齐幂等 clientRequestId 并强制记录 initiatedBy 为 coach。派单后立即返回 taskId/jobId，不阻塞等待完成。',
+    inputSchema: z.toJSONSchema(taskDispatchArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_task_get',
+    description: '单次查询 A2A 任务当前状态、执行轮次与结果：传 jobId 查询统一账本（execution_get），或传 remote + taskId 查询远端任务（remote_agent_get）。禁止循环轮询。',
+    inputSchema: z.toJSONSchema(taskGetArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_task_list',
+    description: '按 originSessionId 分页列出该主会话发起的 A2A 任务，可按 targetId 或 executionStatus 过滤。',
+    inputSchema: z.toJSONSchema(taskListArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_task_continue',
+    description: '对已有 A2A 任务显式继续或返工（新建执行轮次），传 prompt 或 input；自动补齐 clientRequestId 并记录 initiatedBy 为 coach。',
+    inputSchema: z.toJSONSchema(taskContinueArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_task_cancel',
+    description: '取消并持久关闭指定 A2A 任务；可选 cascade=true 级联取消子任务。',
+    inputSchema: z.toJSONSchema(taskCancelArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_notice_ack',
+    description: '确认已处理 A2A 任务通知（支持 remote_agent_ack 与 execution_ack；省略 kind 时自动匹配）。',
+    inputSchema: z.toJSONSchema(noticeAckArgsSchema) as Record<string, unknown>,
+  },
+  {
     name: 'a2a_pending_approvals',
     description: '列出当前待审批的 A2A 过程请求（工具权限 permission、计划审批 plan、提问 question）以及待裁决的任务单改进提议与活跃任务单。可按 originSessionId 或 jobId 过滤；省略参数返回全部待处理项。',
     inputSchema: z.toJSONSchema(pendingApprovalsArgsSchema) as Record<string, unknown>,
@@ -110,9 +222,9 @@ export const A2A_APPROVAL_MCP_TOOLS: readonly McpToolDefinition[] = [
 export interface A2AApprovalMcpOptions {
   /** Base URL of the local a2a-gateway HTTP server (default: http://127.0.0.1:36814). */
   gatewayUrl?: string;
-  /** Default coach agent name stamped into decidedBy/by when caller omits coachAgent. */
+  /** Default coach agent name stamped into decidedBy/by/initiatedBy when caller omits coachAgent. */
   coachAgent?: string;
-  /** Default coach session ID stamped into decidedBy/by when caller omits coachSessionId. */
+  /** Default coach session ID stamped into decidedBy/by/initiatedBy when caller omits coachSessionId. */
   coachSessionId?: string;
   /** Request timeout in milliseconds (default: 30000). */
   timeoutMs?: number;
@@ -199,6 +311,131 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
       const args = rawArgs === undefined ? {} : rawArgs;
       let data: unknown;
       switch (name) {
+        case 'a2a_target_list': {
+          emptyArgsSchema.parse(args);
+          data = await invokeGateway('execution_target_list', {});
+          break;
+        }
+        case 'a2a_session_bind': {
+          const input = sessionBindArgsSchema.parse(args);
+          data = await invokeGateway('session_bind', input);
+          break;
+        }
+        case 'a2a_task_dispatch': {
+          const input = taskDispatchArgsSchema.parse(args);
+          const hasTarget = Boolean(input.targetId);
+          const hasRemote = Boolean(input.remote);
+          if (hasTarget === hasRemote) {
+            throw new Error('Provide either targetId (registered target/role) or remote (direct spawn), not both');
+          }
+          const initiatedBy = coachActor(input.originSessionId, input.coachAgent, input.coachSessionId);
+          const clientRequestId = input.clientRequestId ?? `mcp:${randomUUID()}`;
+          if (hasTarget) {
+            const taskInput: Record<string, unknown> = { ...(input.input ?? {}) };
+            if (input.prompt !== undefined && taskInput.prompt === undefined) taskInput.prompt = input.prompt;
+            if (input.cwd !== undefined && taskInput.cwd === undefined) taskInput.cwd = input.cwd;
+            if (input.agentPreset !== undefined && taskInput.agentPreset === undefined) taskInput.agentPreset = input.agentPreset;
+            if (input.roleId !== undefined && taskInput.roleId === undefined) taskInput.roleId = input.roleId;
+            if (input.provider !== undefined && taskInput.provider === undefined) taskInput.provider = input.provider;
+            if (input.model !== undefined && taskInput.model === undefined) taskInput.model = input.model;
+            if (input.lifecycle !== undefined && taskInput.lifecycle === undefined) taskInput.lifecycle = input.lifecycle;
+            if (input.notificationTarget !== undefined && taskInput.notificationTarget === undefined) taskInput.notificationTarget = input.notificationTarget;
+            const payload: Record<string, unknown> = {
+              originSessionId: input.originSessionId,
+              targetId: input.targetId,
+              input: taskInput,
+              clientRequestId,
+              initiatedBy,
+            };
+            if (input.title !== undefined) payload.title = input.title;
+            if (input.caseId !== undefined) payload.caseId = input.caseId;
+            if (input.handoffId !== undefined) payload.handoffId = input.handoffId;
+            if (input.purpose !== undefined) payload.purpose = input.purpose;
+            if (input.resultRevision !== undefined) payload.resultRevision = input.resultRevision;
+            if (input.parentJobRef !== undefined) payload.parentJobRef = input.parentJobRef;
+            if (input.parentAttemptId !== undefined) payload.parentAttemptId = input.parentAttemptId;
+            if (input.replacesJobRef !== undefined) payload.replacesJobRef = input.replacesJobRef;
+            data = await invokeGateway('execution_submit', payload);
+          } else {
+            if (!input.cwd) throw new Error('cwd is required when dispatching by remote');
+            if (!input.prompt) throw new Error('prompt is required when dispatching by remote');
+            const payload: Record<string, unknown> = {
+              originSessionId: input.originSessionId,
+              remote: input.remote,
+              cwd: input.cwd,
+              prompt: input.prompt,
+              clientRequestId,
+              initiatedBy,
+            };
+            if (input.agentPreset !== undefined) payload.agentPreset = input.agentPreset;
+            if (input.title !== undefined) payload.title = input.title;
+            if (input.roleId !== undefined) payload.roleId = input.roleId;
+            if (input.provider !== undefined) payload.provider = input.provider;
+            if (input.model !== undefined) payload.model = input.model;
+            if (input.lifecycle !== undefined) payload.lifecycle = input.lifecycle;
+            if (input.notificationTarget !== undefined) payload.notificationTarget = input.notificationTarget;
+            data = await invokeGateway('remote_agent_spawn', payload);
+          }
+          break;
+        }
+        case 'a2a_task_get': {
+          const input = taskGetArgsSchema.parse(args);
+          if (input.jobId) {
+            if (input.remote || input.taskId) throw new Error('Provide either jobId or remote+taskId, not both');
+            data = await invokeGateway('execution_get', { originSessionId: input.originSessionId, jobId: input.jobId });
+          } else if (input.remote && input.taskId) {
+            data = await invokeGateway('remote_agent_get', { originSessionId: input.originSessionId, remote: input.remote, taskId: input.taskId });
+          } else {
+            throw new Error('Provide either jobId or both remote and taskId');
+          }
+          break;
+        }
+        case 'a2a_task_list': {
+          const input = taskListArgsSchema.parse(args);
+          data = await invokeGateway('execution_list', input);
+          break;
+        }
+        case 'a2a_task_continue': {
+          const input = taskContinueArgsSchema.parse(args);
+          const taskInput: Record<string, unknown> = { ...(input.input ?? {}) };
+          if (input.prompt !== undefined && taskInput.prompt === undefined) taskInput.prompt = input.prompt;
+          if (!Object.keys(taskInput).length) throw new Error('Provide prompt or input when continuing a task');
+          data = await invokeGateway('execution_continue', {
+            originSessionId: input.originSessionId,
+            jobId: input.jobId,
+            input: taskInput,
+            clientRequestId: input.clientRequestId ?? `mcp:${randomUUID()}`,
+            initiatedBy: coachActor(input.originSessionId, input.coachAgent, input.coachSessionId),
+          });
+          break;
+        }
+        case 'a2a_task_cancel': {
+          const input = taskCancelArgsSchema.parse(args);
+          const payload: Record<string, unknown> = { originSessionId: input.originSessionId, jobId: input.jobId };
+          if (input.cascade !== undefined) payload.cascade = input.cascade;
+          data = await invokeGateway('execution_cancel', payload);
+          break;
+        }
+        case 'a2a_notice_ack': {
+          const input = noticeAckArgsSchema.parse(args);
+          const ackParams = { originSessionId: input.originSessionId, noticeId: input.noticeId };
+          if (input.kind === 'execution') {
+            data = await invokeGateway('execution_ack', ackParams);
+          } else if (input.kind === 'remote') {
+            data = await invokeGateway('remote_agent_ack', ackParams);
+          } else {
+            try {
+              data = await invokeGateway('remote_agent_ack', ackParams);
+            } catch (error) {
+              if (error instanceof Error && /not found/i.test(error.message)) {
+                data = await invokeGateway('execution_ack', ackParams);
+              } else {
+                throw error;
+              }
+            }
+          }
+          break;
+        }
         case 'a2a_pending_approvals': {
           const input = pendingApprovalsArgsSchema.parse(args);
           data = await invokeGateway('execution_pending_approvals', input);
@@ -303,7 +540,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
   return { tools: A2A_APPROVAL_MCP_TOOLS, invokeTool, handleJsonRpc };
 }
 
-/** Runs the A2A approval/ticket MCP server on stdio (newline-delimited JSON-RPC 2.0). Never writes logs to stdout. */
+/** Runs the A2A dispatch/approval/ticket MCP server on stdio (newline-delimited JSON-RPC 2.0). Never writes logs to stdout. */
 export async function runA2AApprovalMcpStdio(
   options: A2AApprovalMcpOptions = {},
   io: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {},

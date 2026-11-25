@@ -26,7 +26,16 @@ DreamMate registration (local sharing):
 
 Direct DreamMate invoke (skip search/inspect):
   service_id: "${A2A_APPROVAL_MCP_SERVICE_ID}"
-  methods:
+  methods (dispatch & lifecycle):
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_target_list
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_session_bind
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_task_dispatch
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_task_get
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_task_list
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_task_continue
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_task_cancel
+    ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_notice_ack
+  methods (approvals, tickets & reviews):
     ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_pending_approvals
     ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_process_requests
     ${A2A_APPROVAL_MCP_SERVICE_ID}.a2a_process_answer

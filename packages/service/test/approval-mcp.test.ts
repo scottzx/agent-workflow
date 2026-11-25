@@ -106,7 +106,7 @@ async function setupGateway(t: TestContext) {
   };
 }
 
-test('MCP handler lists 6 tools, aggregates pending approvals, and executes coach-scoped approvals/tickets/reviews', async (t) => {
+test('MCP handler lists 14 tools, dispatches/queries tasks, aggregates pending approvals, and executes coach-scoped approvals/tickets/reviews', async (t) => {
   const env = await setupGateway(t);
   const mcp = createA2AApprovalMcpHandler({ gatewayUrl: env.gatewayUrl, coachAgent: 'dsh-coach' });
 
@@ -118,11 +118,42 @@ test('MCP handler lists 6 tools, aggregates pending approvals, and executes coac
   assert.deepEqual(ping?.result, {});
   const list = await mcp.handleJsonRpc({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
   const tools = (list?.result as { tools: typeof A2A_APPROVAL_MCP_TOOLS }).tools;
-  assert.equal(tools.length, 6);
+  assert.equal(tools.length, 14);
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object');
     assert.ok(tool.description.trim().length > 0);
   }
+
+  // 0. Task target discovery, task list, task get, and dispatch validation
+  const targets = await mcp.invokeTool('a2a_target_list', {});
+  assert.ok(!targets.isError);
+  assert.ok(Array.isArray((targets.structuredContent as { targets: unknown[] }).targets));
+
+  const listed = await mcp.invokeTool('a2a_task_list', { originSessionId: env.originA });
+  assert.ok(!listed.isError);
+  assert.equal((listed.structuredContent as { total: number }).total, 1);
+
+  const got = await mcp.invokeTool('a2a_task_get', { originSessionId: env.originA, jobId: env.runningJobId });
+  assert.ok(!got.isError);
+  assert.equal((got.structuredContent as { jobId: string }).jobId, env.runningJobId);
+
+  const badDispatchBoth = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: env.originA,
+    targetId: 'host-a',
+    remote: 'scott-mac-dsh',
+    cwd: '/tmp',
+    prompt: 'ambiguous',
+  });
+  assert.equal(badDispatchBoth.isError, true);
+  assert.match(badDispatchBoth.content[0]?.text ?? '', /either targetId.*or remote/i);
+
+  const badDispatchNoCwd = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: env.originA,
+    remote: 'scott-mac-dsh',
+    prompt: 'missing cwd',
+  });
+  assert.equal(badDispatchNoCwd.isError, true);
+  assert.match(badDispatchNoCwd.content[0]?.text ?? '', /cwd is required/i);
 
   // 1. Cross-task pending approvals (unfiltered and filtered)
   const pendingAll = await mcp.invokeTool('a2a_pending_approvals', {});
@@ -248,7 +279,7 @@ test('acp-service mcp stdio subprocess speaks clean newline-delimited JSON-RPC o
   assert.equal((init.result as { serverInfo: { name: string } }).serverInfo.name, A2A_APPROVAL_MCP_SERVER_NAME);
 
   const list = await rpc(2, 'tools/list');
-  assert.equal((list.result as { tools: unknown[] }).tools.length, 6);
+  assert.equal((list.result as { tools: unknown[] }).tools.length, 14);
 
   const pending = await rpc(3, 'tools/call', { name: 'a2a_pending_approvals', arguments: {} });
   const result = pending.result as { isError?: boolean; structuredContent: { counts: { pendingProcessRequests: number } } };
@@ -258,4 +289,67 @@ test('acp-service mcp stdio subprocess speaks clean newline-delimited JSON-RPC o
   child.stdin.end();
   const exitCode = await new Promise<number | null>(resolveExit => child.once('exit', code => resolveExit(code)));
   assert.equal(exitCode, 0);
+});
+
+test('a2a_task_dispatch, continue, cancel, bind and ack forward coach-stamped payloads without direct HTTP calls from caller', async () => {
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const fakeFetch: typeof globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { method: string; params: Record<string, unknown> };
+    calls.push(body);
+    if (body.method === 'remote_agent_ack' && body.params.noticeId === 'exec-notice-1') {
+      return new Response(JSON.stringify({ error: 'Notice not found for this origin session' }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ ok: true, echoedMethod: body.method, jobId: 'job-echo-1' }), { status: 200 });
+  };
+
+  const mcp = createA2AApprovalMcpHandler({ gatewayUrl: 'http://127.0.0.1:36814', coachAgent: 'dsh', fetch: fakeFetch });
+
+  // 1. Dispatch via remote (remote_agent_spawn)
+  const r1 = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: 'sess-1',
+    remote: 'scott-mac-dsh',
+    cwd: '/tmp/work',
+    agentPreset: 'standard',
+    title: 'Spawn via MCP',
+    prompt: 'Run check',
+  });
+  assert.ok(!r1.isError, r1.content[0]?.text);
+  assert.equal(calls[0]?.method, 'remote_agent_spawn');
+  assert.match(String(calls[0]?.params.clientRequestId), /^mcp:/);
+  assert.deepEqual(calls[0]?.params.initiatedBy, { kind: 'coach', agent: 'dsh', sessionId: 'sess-1' });
+
+  // 2. Dispatch via targetId (execution_submit) with top-level prompt shortcut
+  const r2 = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: 'sess-1',
+    targetId: 'ppt-beautifier',
+    title: 'Submit via MCP',
+    prompt: 'Beautify slides',
+    caseId: 'case-9',
+    coachAgent: 'antigravity',
+    coachSessionId: 'coach-9',
+  });
+  assert.ok(!r2.isError, r2.content[0]?.text);
+  assert.equal(calls[1]?.method, 'execution_submit');
+  assert.deepEqual(calls[1]?.params.input, { prompt: 'Beautify slides' });
+  assert.equal(calls[1]?.params.caseId, 'case-9');
+  assert.deepEqual(calls[1]?.params.initiatedBy, { kind: 'coach', agent: 'antigravity', sessionId: 'coach-9' });
+
+  // 3. Session bind, task continue, task cancel
+  assert.ok(!(await mcp.invokeTool('a2a_session_bind', { originSessionId: 'sess-1', host: 'dsh-local', sessionId: 'sess-1' })).isError);
+  assert.equal(calls[2]?.method, 'session_bind');
+
+  assert.ok(!(await mcp.invokeTool('a2a_task_continue', { originSessionId: 'sess-1', jobId: 'job-1', prompt: 'Follow up' })).isError);
+  assert.equal(calls[3]?.method, 'execution_continue');
+  assert.deepEqual(calls[3]?.params.input, { prompt: 'Follow up' });
+  assert.deepEqual(calls[3]?.params.initiatedBy, { kind: 'coach', agent: 'dsh', sessionId: 'sess-1' });
+
+  assert.ok(!(await mcp.invokeTool('a2a_task_cancel', { originSessionId: 'sess-1', jobId: 'job-1', cascade: true })).isError);
+  assert.equal(calls[4]?.method, 'execution_cancel');
+  assert.equal(calls[4]?.params.cascade, true);
+
+  // 4. Notice ack auto-fallback from remote_agent_ack to execution_ack
+  const ackRes = await mcp.invokeTool('a2a_notice_ack', { originSessionId: 'sess-1', noticeId: 'exec-notice-1' });
+  assert.ok(!ackRes.isError, ackRes.content[0]?.text);
+  assert.equal(calls[5]?.method, 'remote_agent_ack');
+  assert.equal(calls[6]?.method, 'execution_ack');
 });
