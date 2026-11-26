@@ -1,15 +1,18 @@
 /** Coach-facing runs of a role's cases through the local A2A gateway. Publishing and acceptance stay on the workbench page. */
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate } from '../src/rsi/gate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
+import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
 import { stampActor } from './ticket.js';
 
 const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [options]
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
+       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
 executor, runs the role's program checks and sends failures back to the same session.
@@ -36,6 +39,13 @@ rsi calibrate replays the current checks, read-only, on historical outlines from
 Passed runs are positive samples; QA revise rounds are negative samples. A block failure on
 a positive sample is a false positive and the command exits 1. --only scores just those item
 ids. The report is <workspace>/<role-id>/calibration.json.
+
+rsi eval-cr loads evals/manifest.json, checks that every baseCommit is an ancestor of its
+headCommit, and prints the evalDigest of the manifest plus QA.md, checklist.json and routing.json.
+With --results, each item is a structured CR result or { caseId, markdown }. The command exits 1
+unless promotionReady: every negative defect was caught, every positive sample is a clean PASS,
+and both kinds are present. Without --results the mode is verify-only and does not claim promotion.
+--repo defaults to the nearest .git above --role.
 
 Options:
   --target ID            agent_host target on the gateway (default legacy:ppt-beautifier)
@@ -69,6 +79,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
   if (argv[0] === 'gate') return runGate(argv.slice(1));
   if (argv[0] === 'calibrate') return runCalibrate(argv.slice(1));
+  if (argv[0] === 'eval-cr') return runEvalCr(argv.slice(1));
   if (argv[0] !== 'run') throw new Error('Unknown rsi command; use rsi --help');
   const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
     role: { type: 'string' }, case: { type: 'string' }, project: { type: 'string' },
@@ -139,4 +150,61 @@ async function runCalibrate(argv: string[]): Promise<void> {
   console.log(`校准报告：${calibrationPath(resolve(values.workspace!), report.roleId)}`);
   console.log(report.passed ? '回放校准通过（历史正样本 0 误报）。' : '回放校准未通过：历史正样本有误报。');
   if (!report.passed) process.exitCode = 1;
+}
+
+async function runEvalCr(argv: string[]): Promise<void> {
+  const { values } = parseArgs({ args: argv, strict: true, options: {
+    role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' }, json: { type: 'boolean', default: false },
+  } });
+  if (!values.role) throw new Error('--role is required');
+  const roleDirectory = resolve(values.role);
+  const manifest = await loadCrEvalManifest(roleDirectory);
+  const evalDigest = await computeCrEvalDigest(roleDirectory);
+  const repoRoot = values.repo ? resolve(values.repo) : await findRepoRoot(roleDirectory);
+  const verification = await verifyCrEvalCommits(manifest, repoRoot);
+  const negativeCases = manifest.cases.filter(item => item.kind === 'negative').length;
+  const positiveCases = manifest.cases.filter(item => item.kind === 'positive').length;
+  if (!values.results) {
+    const report = {
+      mode: 'verify-only' as const, roleId: manifest.roleId, evalDigest, repoRoot,
+      ok: verification.ok, checkedCommits: verification.checkedCommits, errors: verification.errors,
+      totalCases: manifest.cases.length, negativeCases, positiveCases,
+      totalDefects: manifest.cases.reduce((sum, item) => sum + (item.requiredDefects?.length ?? 0), 0),
+      cases: manifest.cases.map(item => ({
+        id: item.id, pr: item.pr, kind: item.kind, baseCommit: item.baseCommit, headCommit: item.headCommit,
+        expectedVerdict: item.expectedVerdict, requiredDefects: item.requiredDefects?.length ?? 0,
+      })),
+    };
+    if (values.json) console.log(JSON.stringify(report));
+    else {
+      console.log(`角色 ${report.roleId}，摘要 ${evalDigest.slice(0, 12)}，样本 ${report.totalCases}（负 ${negativeCases}，正 ${positiveCases}）`);
+      console.log(`提交核验：${verification.checkedCommits} 个端点，${verification.ok ? '通过' : '未通过'}`);
+      for (const error of verification.errors) console.log(`  ${error}`);
+      console.log('mode: verify-only（未打分，不声明晋升）');
+    }
+    if (!verification.ok) process.exitCode = 1;
+    return;
+  }
+  let raw: unknown;
+  try { raw = JSON.parse((await readFile(resolve(values.results), 'utf8')).replace(/^\uFEFF/, '')); }
+  catch { throw new Error(`results file is not JSON: ${values.results}`); }
+  const score = scoreCrEvalSuite(manifest, coerceCrEvalResults(raw));
+  const ready = verification.ok && score.promotionReady;
+  const report = {
+    mode: 'score' as const, roleId: manifest.roleId, evalDigest, repoRoot,
+    verification, ...score, ok: ready,
+  };
+  if (values.json) console.log(JSON.stringify(report));
+  else {
+    console.log(`角色 ${manifest.roleId}，摘要 ${evalDigest.slice(0, 12)}，样本 ${score.totalCases}（负 ${score.negativeCases}，正 ${score.positiveCases}）`);
+    console.log(`提交核验：${verification.checkedCommits} 个端点，${verification.ok ? '通过' : '未通过'}`);
+    for (const error of verification.errors) console.log(`  ${error}`);
+    console.log(`负样本召回 ${score.negativeRecall}，缺陷召回 ${score.defectRecall}，误报率 ${score.falsePositiveRate}`);
+    if (score.missingCases.length) console.log(`缺样本：${score.missingCases.join('、')}`);
+    for (const item of score.caseResults.filter(row => !row.passed)) {
+      console.log(`  未通过 ${item.caseId}：结论 ${item.actualVerdict}${item.missedDefects.length ? `，漏检 ${item.missedDefects.join('、')}` : ''}${item.falsePositive ? '，误报' : ''}`);
+    }
+    console.log(ready ? '达到 trial → formal 晋升门槛。' : '未达到 trial → formal 晋升门槛。');
+  }
+  if (!ready) process.exitCode = 1;
 }

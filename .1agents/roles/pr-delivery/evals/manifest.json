@@ -1,0 +1,218 @@
+{
+  "schemaVersion": 1,
+  "roleId": "pr-delivery",
+  "cases": [
+    {
+      "id": "pr11-neg-non-atomic-notify",
+      "pr": 11,
+      "kind": "negative",
+      "baseCommit": "69c136b5",
+      "headCommit": "cc1b0ac3",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "cc1b0ac3 把 notifySessions 的 attachSubscriptions 放在 ledger.prepare 落盘之后。订阅校验失败时作业和 request id 已经持久化，幂等重放直接返回，不再补订，形成半持久化。",
+      "requiredDefects": [
+        {
+          "id": "notify-after-persist",
+          "description": "notifySessions 在作业落盘之后才订阅。失败时留下已持久化的作业，重放短路漏订。",
+          "anyFilePatterns": [
+            "packages/service/src/a2a/gateway.ts",
+            "packages/service/src/a2a/notifications.ts"
+          ],
+          "anyTextPatterns": [
+            "ledger.prepare",
+            "半持久化",
+            "attachSubscriptions",
+            "重放漏订"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr11-pos-atomic-notify",
+      "pr": 11,
+      "kind": "positive",
+      "baseCommit": "cc1b0ac3",
+      "headCommit": "46153655",
+      "expectedVerdict": "PASS",
+      "summary": "46153655 在 ledger.prepare 之前对整批 notifySessions 做 validateSubscriptions，先校验再物化。坏 subscriber 不会留下孤儿 request id，重放也不会漏订。"
+    },
+    {
+      "id": "pr12-neg-sandbox-and-inherit",
+      "pr": 12,
+      "kind": "negative",
+      "baseCommit": "dc53c181",
+      "headCommit": "57df97e6",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "57df97e6 用 worktreeRepoRoot 把作业目录放到仓库根的 .1agents/runtime/jobs，越出 cwd 和 workspace-write 沙箱；execution_continue 在请求和 resultContract 都缺省时也不继承上一轮 deliveryMode。",
+      "requiredDefects": [
+        {
+          "id": "job-dir-outside-cwd",
+          "description": "默认作业目录被放到 worktree 外的 <repoRoot>/.1agents/runtime/jobs，越出 cwd 与沙箱边界。",
+          "anyFilePatterns": [
+            "packages/service/src/a2a/job-directory.ts",
+            "packages/service/src/a2a/result-metadata.ts",
+            "packages/service/src/a2a/gateway.ts"
+          ],
+          "anyTextPatterns": [
+            "runtime/jobs",
+            "worktreeRepoRoot",
+            "越出 cwd",
+            "沙箱"
+          ]
+        },
+        {
+          "id": "continue-misses-delivery-mode",
+          "description": "execution_continue 未把上一轮 deliveryMode 传给 requestedDeliveryMode，缺省时回落成 artifacts，而不是继承。",
+          "anyFilePatterns": [
+            "packages/service/src/a2a/gateway.ts"
+          ],
+          "anyTextPatterns": [
+            "execution_continue",
+            "requestedDeliveryMode",
+            "不继承上一轮"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr12-neg-worktree-abs-path",
+      "pr": 12,
+      "kind": "negative",
+      "baseCommit": "57df97e6",
+      "headCommit": "4c282757",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "4c282757 的 isSensitiveWorkspaceFile 按绝对路径分段判断 .1agents。cwd 落在 <repo>/.1agents/worktrees/<name> 时，worktree 内所有正常文件都被当成敏感路径拒绝。",
+      "requiredDefects": [
+        {
+          "id": "abs-worktree-false-sensitive",
+          "description": "绝对路径上的 .1agents 段把 .1agents/worktrees 内的正常文件误判为敏感路径。",
+          "anyFilePatterns": [
+            "packages/service/src/a2a/result-metadata.ts"
+          ],
+          "anyTextPatterns": [
+            "isSensitiveWorkspaceFile",
+            ".1agents/worktrees",
+            "绝对路径",
+            "artifact-sensitive-path"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr12-pos-relpath-fix",
+      "pr": 12,
+      "kind": "positive",
+      "baseCommit": "4c282757",
+      "headCommit": "3e01f7a2",
+      "expectedVerdict": "PASS",
+      "summary": "3e01f7a2 先取相对 cwdRoot 的路径再判断敏感段。绝对路径里的 .1agents/worktrees 不再误杀 worktree 内正常文件；相对路径上的 .git、.1agents 和 .env 仍然敏感。"
+    },
+    {
+      "id": "pr13-neg-schema-symlink-ignore",
+      "pr": 13,
+      "kind": "negative",
+      "baseCommit": "a9cc0d57",
+      "headCommit": "8bf5c0cf",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "8bf5c0cf 的 checklist.json / workflow.json 使用消费方不接受的 kind、run 和 policies 字段；投影未做 realpath containment，符号链接可把写入带出 worktree 或留下半份；.gitignore 的 **/.agents/ 会遮蔽已跟踪文件。",
+      "requiredDefects": [
+        {
+          "id": "checklist-workflow-schema",
+          "description": "checklist.json 与 workflow.json 的 schemaVersion、kind 和策略字段与 checklist v2 / workflow 消费方不兼容。",
+          "anyFilePatterns": [
+            ".1agents/roles/pr-delivery/checklist.json",
+            ".1agents/roles/pr-delivery/workflow.json"
+          ],
+          "anyTextPatterns": [
+            "schemaVersion",
+            "不兼容",
+            "readonly_review",
+            "maxReworkLoops"
+          ]
+        },
+        {
+          "id": "projection-symlink-half-write",
+          "description": "worktree-projection 未拒绝逃出 worktree 的符号链接，写入中断或校验失败会留下半份投影。",
+          "anyFilePatterns": [
+            "packages/service/src/roles/worktree-projection.ts"
+          ],
+          "anyTextPatterns": [
+            "符号链接",
+            "symlink",
+            "realpath",
+            "半写",
+            "writeAtomic"
+          ]
+        },
+        {
+          "id": "gitignore-masks-tracked",
+          "description": ".gitignore 用 **/.agents/ 忽略整个目录，遮蔽仓库已经跟踪的 .agents/skills/autoreview 和 packages/runtime/.agents。",
+          "anyFilePatterns": [
+            ".gitignore"
+          ],
+          "anyTextPatterns": [
+            "**/.agents/",
+            "autoreview",
+            "已跟踪",
+            "packages/runtime/.agents"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr13-pos-projection-hardened",
+      "pr": 13,
+      "kind": "positive",
+      "baseCommit": "8bf5c0cf",
+      "headCommit": "83b32e48",
+      "expectedVerdict": "PASS",
+      "summary": "83b32e48 改为 checklist schemaVersion 2 和可加载的 workflow，投影按 realpath 拒绝符号链接逃逸，.gitignore 只忽略 worktree 投影并保留已跟踪的 autoreview 树。"
+    },
+    {
+      "id": "pr14-neg-forged-git-and-config",
+      "pr": 14,
+      "kind": "negative",
+      "baseCommit": "23bb0d37",
+      "headCommit": "e648d09b",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "e648d09b 把符号链接 .git 和手写 gitdir: 当成同一仓库的证据，从而绕过固定项目根。l1-gate 用 .1agents/config 前缀误拒 .gitignore 已放行的 *.example.json。",
+      "requiredDefects": [
+        {
+          "id": "forged-git-containment",
+          "description": "伪造的 .git 符号链接或手写 gitdir: 被当成已注册 worktree，绕过固定根 containment。",
+          "anyFilePatterns": [
+            "packages/service/src/roles/role-rules.ts"
+          ],
+          "anyTextPatterns": [
+            "gitdir:",
+            "伪造",
+            "handwritten",
+            "符号链接"
+          ]
+        },
+        {
+          "id": "l1-config-example-prefix",
+          "description": "l1-gate 把 .1agents/config 前缀下的合法 *.example.json 也当成泄漏拒绝。",
+          "anyFilePatterns": [
+            ".1agents/roles/pr-delivery/checks/l1-gate.mjs"
+          ],
+          "anyTextPatterns": [
+            ".1agents/config",
+            "example.json",
+            "误拒",
+            "*.example.json"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr14-pos-verified-worktree-fix",
+      "pr": 14,
+      "kind": "positive",
+      "baseCommit": "e648d09b",
+      "headCommit": "9bda36fe",
+      "expectedVerdict": "PASS",
+      "summary": "9bda36fe 拒绝伪造 .git 符号链接和手写 gitdir:，只有 gitdir 回指匹配的已注册 worktree 才算同一仓库。l1-gate 放行 .1agents/config 下的 *.example.json 与 *.example.yml。"
+    }
+  ]
+}

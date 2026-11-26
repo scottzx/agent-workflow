@@ -64,6 +64,7 @@ function printUnifiedHelp(binName: string) {
   a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
+  rsi eval-cr --role <dir> [--results <file>] [--json]   Score L3 golden CR evals; exit 1 unless promotion-ready
   ticket show|events|proposal --job <id>  Read a job's task ticket and its events, or settle a proposal
   process list|answer --job <id>          Read a job's process requests, or answer one as the coach or a person
   mcp [--url <url>] [--agent <name>]      Start lightweight A2A approval & task-ticket MCP server (stdio)
