@@ -29,3 +29,10 @@ dsh-image-gen/
 /skills/
 .tmp/
 packages/*/.tmp/
+
+# Worktree projections only. Do not ignore the tracked .agents/skills/autoreview tree or packages/runtime/.agents.
+/.agents/skills/*
+!/.agents/skills/autoreview/
+/.claude/
+**/AGENTS.local.md
+**/CLAUDE.local.md

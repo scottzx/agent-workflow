@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 2,
+  "roleId": "pr-delivery",
+  "artifacts": ["commit"],
+  "items": [
+    {
+      "id": "self_check",
+      "kind": "self",
+      "severity": "must",
+      "locked": true,
+      "selfCheck": true,
+      "rule": "实现者按 ROLE.md 自检：隔离 worktree、只改授权文件、未 push、未开 PR、投影未进入 git status，并写了能打回退的回归测试"
+    },
+    {
+      "id": "l1_deterministic",
+      "kind": "program",
+      "severity": "must",
+      "locked": true,
+      "rule": "node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <worktree> 退出码为 0，且 JSON 摘要 ok 为 true",
+      "runner": { "id": "l1-gate", "cmd": ["node", ".1agents/roles/pr-delivery/checks/l1-gate.mjs"] }
+    },
+    {
+      "id": "cross_model_cr",
+      "kind": "self_and_qa",
+      "severity": "must",
+      "locked": true,
+      "rule": "异模型只读 CR，路由见 routing.json（magpie / group/deepseek-v4.1）。实现模型不得改文件，也不得用自评代替本项"
+    },
+    {
+      "id": "ci_status",
+      "kind": "self_and_qa",
+      "severity": "must",
+      "locked": true,
+      "rule": "必需 CI 检查为成功。失败、未跑或 pending 不得标成 Ready for review"
+    },
+    {
+      "id": "proj_git_anchor",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": "<worktree>/.git 存在，可以是文件或目录。没有 .git 的裸目录必须拒绝，防止 DSH findProjectRoot 上溯到父仓库"
+    },
+    {
+      "id": "proj_skill_frontmatter",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": "若存在投影 .agents/skills/*/SKILL.md，name 必须是 kebab-case 且与目录名一致，description 必须是非空字符串，并拒绝 BOM、disableModelInvocation、modelInvocable、userInvocable"
+    },
+    {
+      "id": "proj_claude_symlink",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": "若已投影技能，.claude/skills 必须是指向 ../.agents/skills 的目录软链；指向别处或是普通文件则拒绝"
+    },
+    {
+      "id": "proj_agents_local_header",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": "AGENTS.local.md 若由投影写入，首行必须是自动生成标记。已存在的符号链接或没有该标记的手写文件不得覆盖，且不得改写 AGENTS.md"
+    },
+    {
+      "id": "proj_no_hooks",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": "worktree 中不得出现 .agents/hooks/。本流程不使用钩子目录，也不依赖 ~/.dsh/.agent-presets/"
+    }
+  ]
+}

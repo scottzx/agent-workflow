@@ -1,7 +1,10 @@
 /**
- * Role skills for a working directory. Skills live in `<cwd>/.agents/skills/<name>/` (read by DSH and Codex when a
- * session starts) and are exposed to Claude Code through `<cwd>/.claude/skills`. Nothing here talks to a network
- * catalogue or pins revisions: the directory is used as it is, and acceptance checks are what guard drift.
+ * Role skills for a working directory. Skills live in `<cwd>/.agents/skills/<name>/` and are exposed to Claude Code
+ * through `<cwd>/.claude/skills`. DSH native `standard` sessions anchor on the nearest `.git` root and hot-load that
+ * root's instructions and `.agents/skills` on every step (the catalog is replaced when it changes; a skill body is
+ * reread when the skill is loaded). ACP sessions are loaded by the underlying agent for that session (Codex from
+ * `.agents/skills`, Claude Code through the `.claude/skills` link). Nothing here talks to a network catalogue or pins
+ * revisions: the directory is used as it is, and acceptance checks are what guard drift.
  * `syncRoleSkills` copies skills, assets included, from a distribution directory when a role is set up.
  */
 import { cp, lstat, mkdir, readFile, realpath, rename, rm, stat, symlink } from 'node:fs/promises';
