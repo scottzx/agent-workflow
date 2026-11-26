@@ -53,6 +53,8 @@ export function ApprovalsModule({
     const [busy, setBusy] = useState(false);
     const [detail, setDetail] = useState<AcpTaskDetail | null>(null);
     const [note, setNote] = useState('');
+    const [shown, setShown] = useState(20);
+    const [showDetail, setShowDetail] = useState(false);
     const now = Date.now();
     const items = view?.items ?? [];
     const queue = useMemo(
@@ -60,6 +62,12 @@ export function ApprovalsModule({
         [items, kind, channel, now]
     );
     const selected = queue.find(item => item.id === selectedId) ?? queue[0];
+    const visibleQueue = queue.slice(0, shown);
+    const remaining = queue.length - visibleQueue.length;
+
+    useEffect(() => {
+        setShown(20);
+    }, [kind, channel]);
 
     useEffect(() => {
         if (!selected || selected.kind !== 'review') {
@@ -73,6 +81,7 @@ export function ApprovalsModule({
 
     const open = (item: AcpApprovalItem) => {
         setSelectedId(item.id);
+        setShowDetail(true);
         setError('');
         setNotice('');
         setNote('');
@@ -157,9 +166,9 @@ export function ApprovalsModule({
             {!view && <p class="acp-muted">{text('正在读取待审批…', 'Loading approvals…')}</p>}
             {view && !items.length && <p class="acp-muted">{text('没有待审批的事项。', 'Nothing is waiting for a decision.')}</p>}
             {!!queue.length && (
-                <div class="acp-approvals-split">
+                <div class={`acp-approvals-split${showDetail ? ' is-showing-detail' : ''}`}>
                     <ul class="acp-approval-queue" aria-label={text('待审批队列', 'Approval queue')}>
-                        {queue.map(item => {
+                        {visibleQueue.map(item => {
                             const unseen = seenTick >= 0 && !readSeen().has(approvalKey(item));
                             return (
                                 <li key={item.id}>
@@ -173,9 +182,21 @@ export function ApprovalsModule({
                                 </li>
                             );
                         })}
+                        {remaining > 0 && (
+                            <li>
+                                <button type="button" class="acp-button" onClick={() => setShown(count => count + 20)}>
+                                    {text(`显示更多剩余 ${remaining} 条`, `Show the remaining ${remaining}`)}
+                                </button>
+                            </li>
+                        )}
                     </ul>
                     {selected && (
                         <section class="acp-approval-detail" aria-live="polite">
+                            <div class="acp-backbar">
+                                <button type="button" class="acp-button" onClick={() => setShowDetail(false)}>
+                                    {text('← 返回列表', '← Back to list')}
+                                </button>
+                            </div>
                             <header class="acp-approval-detail-head">
                                 <div>
                                     <h2>{selected.title}</h2>
@@ -209,7 +230,7 @@ export function ApprovalsModule({
                                         <p key={index}><strong>{slide.title}</strong> {slide.message}</p>
                                     ))}
                                     <textarea value={note} maxLength={4000} placeholder={text('意见（要求修改或评论时必填）', 'Note, required to request changes or comment')} onInput={event => setNote(event.currentTarget.value)} />
-                                    <div class="acp-review-buttons">
+                                    <div class="acp-review-buttons acp-sticky-actions">
                                         <button type="button" class="acp-button acp-primary" disabled={busy} onClick={() => void decideReview('approve')}>{text('通过', 'Approve')}</button>
                                         <button type="button" class="acp-button" disabled={busy} onClick={() => void decideReview('changes_requested')}>{text('要求修改', 'Request changes')}</button>
                                         <button type="button" class="acp-button" disabled={busy} onClick={() => void decideReview('comment')}>{text('评论', 'Comment')}</button>
@@ -223,7 +244,7 @@ export function ApprovalsModule({
                                     <p class="acp-muted">{selected.handoff.toTargetId} / {selected.handoff.purpose} · {selected.handoff.artifactRevision} · {selected.handoff.artifactDigest.slice(0, 8)}</p>
                                     {selected.handoff.snapshots?.map(file => <p key={file.digest}>{file.name}</p>)}
                                     <textarea value={note} maxLength={4000} placeholder={text('备注（可选）', 'Note (optional)')} onInput={event => setNote(event.currentTarget.value)} />
-                                    <div class="acp-review-buttons">
+                                    <div class="acp-review-buttons acp-sticky-actions">
                                         <button type="button" class="acp-button acp-primary" disabled={busy} onClick={() => void decideHandoff('accept')}>{text('接受这一版', 'Accept this version')}</button>
                                         <button type="button" class="acp-button" disabled={busy} onClick={() => void decideHandoff('reject')}>{text('拒绝', 'Reject')}</button>
                                     </div>
@@ -237,7 +258,7 @@ export function ApprovalsModule({
                                     </p>
                                     {selected.roleId && <p class="acp-muted">{selected.roleId}</p>}
                                     <textarea value={note} maxLength={2000} placeholder={text('理由（必填）', 'Reason (required)')} onInput={event => setNote(event.currentTarget.value)} />
-                                    <div class="acp-review-buttons">
+                                    <div class="acp-review-buttons acp-sticky-actions">
                                         <button type="button" class="acp-button acp-primary" disabled={busy} onClick={() => void decideProposal('accepted')}>{text('采纳', 'Accept')}</button>
                                         <button type="button" class="acp-button" disabled={busy} onClick={() => void decideProposal('rejected')}>{text('拒绝', 'Reject')}</button>
                                         <button type="button" class="acp-button" disabled={busy} onClick={() => void decideProposal('done')}>{text('已完成', 'Done')}</button>

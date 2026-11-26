@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { serveA2AGateway } from '../src/a2a/gateway.js';
+
+const uiDir = fileURLToPath(new URL('../dist/workbench-ui/', import.meta.url));
 
 const token = 'workbench-page-test-credential';
 
@@ -74,6 +77,37 @@ test('page login uses an HttpOnly cookie, and page writes need a same-origin bro
   const logout = await fetch(`${base}/workbench/ui/api/session`, { method: 'DELETE', headers: browser(cookie) });
   assert.equal(logout.status, 200);
   assert.equal((await fetch(`${base}/workbench/ui/api/tasks`, { headers: { Cookie: cookie } })).status, 401);
+});
+
+test('the workbench entry is code-split and only hashed chunks are immutable', async t => {
+  const { base } = await fixture(t);
+  const names = await readdir(uiDir);
+  const chunks = names.filter(name => /^chunk-[A-Za-z0-9_-]+\.js$/.test(name));
+  assert.ok(chunks.length >= 2, `expected module chunks, got ${names.join(', ')}`);
+  const entry = await readFile(join(uiDir, 'app.js'), 'utf8');
+  const entryStat = await stat(join(uiDir, 'app.js'));
+  assert.ok(entryStat.size < 60 * 1024, `app.js is ${entryStat.size} bytes; expected a slim shell under 60KB`);
+  assert.match(entry, /import\(/, 'the shell should lazy-load module chunks');
+  assert.ok(chunks.some(name => entry.includes(name) || entry.includes('chunk-')), 'the shell should reference a split chunk');
+
+  const page = await fetch(`${base}/workbench/ui/`);
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('cache-control'), 'no-store');
+  const app = await fetch(`${base}/workbench/ui/app.js`);
+  assert.equal(app.status, 200);
+  assert.equal(app.headers.get('cache-control'), 'no-store');
+  const css = await fetch(`${base}/workbench/ui/app.css`);
+  assert.equal(css.status, 200);
+  assert.equal(css.headers.get('cache-control'), 'no-store');
+  const session = await fetch(`${base}/workbench/ui/api/session`);
+  assert.equal(session.headers.get('cache-control'), 'no-store');
+
+  const chunk = await fetch(`${base}/workbench/ui/${chunks[0]}`);
+  assert.equal(chunk.status, 200);
+  assert.equal(chunk.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+  assert.equal((await fetch(`${base}/workbench/ui/chunk-MISSING.js`)).status, 404);
+  assert.equal((await fetch(`${base}/workbench/ui/chunk-..%2Fapp.js`)).status, 404);
+  assert.equal((await fetch(`${base}/workbench/ui/chunk-x.css`)).status, 404);
 });
 
 test('the bearer workbench API still refuses browser origins', async t => {

@@ -1,14 +1,12 @@
 import { render } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { acpTaskService, loginRequired, session } from './api';
-import { AgentModule } from './AgentModule';
-import { ApprovalsModule } from './ApprovalsModule';
 import { countUnread, postApprovalsState } from './approvals-sync';
-import { CaseModule, navigateCase } from './CaseModule';
-import { executionLabels, taskDepth } from './model';
-import { AcpTaskDetailPanel } from './TaskDetail';
-import { TicketLights } from './TicketPanel';
-import type { AcpApprovals, AcpTaskFilter, AcpTaskList, AcpTaskSummary } from './types';
+import { LazyView, preloadProps, Skeleton } from './LazyView';
+import { executionLabels, navigateCase, taskDepth } from './model';
+import { useChunkedList, useLoadMoreSentinel } from './paging';
+import { TicketLights } from './TicketLights';
+import type { AcpApprovals, AcpTaskFilter, AcpTaskSummary } from './types';
 import {
     channelLabel,
     date,
@@ -29,7 +27,25 @@ import {
 
 const filters: AcpTaskFilter[] = ['all', 'pending', 'working', 'failed'];
 const emptyCounts = { all: 0, pending: 0, working: 0, failed: 0 };
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 20;
+const loadApprovals = () => import('./ApprovalsModule');
+const loadCases = () => import('./CaseModule');
+const loadAgents = () => import('./AgentModule');
+const loadTaskDetail = () => import('./TaskDetail');
+
+function TabIcon({ name }: { name: 'approvals' | 'cases' | 'tasks' | 'agents' }) {
+    const paths = {
+        approvals: 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11',
+        cases: 'M3 7h5l2 2h11v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
+        tasks: 'M9 6h12M9 12h12M9 18h12M4 6h.01M4 12h.01M4 18h.01',
+        agents: 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8',
+    };
+    return (
+        <svg class="acp-tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d={paths[name]} />
+        </svg>
+    );
+}
 
 function Login({ onDone }: { onDone: () => void }) {
     const [token, setToken] = useState('');
@@ -78,45 +94,24 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
     const [approvals, setApprovals] = useState<AcpApprovals | null>(null);
     const [seenTick, setSeenTick] = useState(0);
     const [filter, setFilter] = useState<AcpTaskFilter>('all');
-    const [offset, setOffset] = useState(0);
-    const [payload, setPayload] = useState<AcpTaskList | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState('');
+    const [counts, setCounts] = useState(emptyCounts);
     const [refreshKey, setRefreshKey] = useState(0);
-    const generation = useRef(0);
-    const activeRequest = useRef(false);
-
-    useEffect(() => {
-        const gen = ++generation.current;
-        let disposed = false;
-        activeRequest.current = false;
-        setLoading(true);
-        const load = async () => {
-            // Load once even in a background tab; visibility only suppresses later polling.
-            if (activeRequest.current) return;
-            activeRequest.current = true;
-            try {
-                const next = await acpTaskService.list(filter, offset, PAGE_SIZE);
-                if (!disposed && gen === generation.current) {
-                    setPayload(next);
-                    setError('');
-                }
-            } catch (err) {
-                if (!disposed && gen === generation.current) setError(errorText(err));
-            } finally {
-                if (!disposed && gen === generation.current) {
-                    setLoading(false);
-                    activeRequest.current = false;
-                }
-            }
-        };
-        void load();
-        const interval = window.setInterval(() => void load(), 5000);
-        return () => {
-            disposed = true;
-            window.clearInterval(interval);
-        };
-    }, [filter, offset, refreshKey]);
+    const filterRef = useRef(filter);
+    filterRef.current = filter;
+    const list = useChunkedList<AcpTaskSummary>({
+        active: module === 'tasks',
+        refreshKey,
+        resetKey: filter,
+        pageSize: PAGE_SIZE,
+        idOf: task => task.jobId,
+        fetchPage: async (offset, limit) => {
+            const requested = filterRef.current;
+            const next = await acpTaskService.list(requested, offset, limit);
+            if (filterRef.current === requested) setCounts(next.counts);
+            return next;
+        },
+    });
+    const sentinel = useLoadMoreSentinel(module === 'tasks' && list.items.length < list.total, list.items.length, list.loadMore);
 
     // A task link opened while another module is showing still lands on that task.
     useEffect(() => {
@@ -170,8 +165,9 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
         return () => window.removeEventListener('keydown', close);
     }, [route.jobId]);
 
-    const rows = [...(payload?.items || [])].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    const counts = payload?.counts || emptyCounts;
+    const rows = [...list.items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const loading = module === 'tasks' && list.loading;
+    const error = list.error;
     const open = (task: AcpTaskSummary, reviewId?: string) => navigateAcpTask({ jobId: task.jobId, reviewId, full: false });
 
     return (
@@ -180,25 +176,30 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                 <div class="acp-workbench-title">
                     <h1>{text('任务工作台', 'Task workbench')}</h1>
                     <nav class="acp-module-switch" aria-label={text('工作台模块', 'Workbench modules')}>
-                        <button type="button" aria-pressed={module === 'approvals'} onClick={() => { landed.current = true; setModule('approvals'); }}>
-                            {text('待审批', 'Approvals')}
+                        <button type="button" aria-pressed={module === 'approvals'} {...preloadProps('module:approvals', loadApprovals)} onClick={() => { landed.current = true; setModule('approvals'); }}>
+                            <TabIcon name="approvals" />
+                            <span>{text('待审批', 'Approvals')}</span>
                             {!!approvals?.totalPending && <span class="acp-tab-count">{approvals.totalPending}</span>}
                         </button>
-                        <button type="button" aria-pressed={module === 'cases'} onClick={() => { landed.current = true; setModule('cases'); }}>
-                            {text('事情', 'Cases')}
+                        <button type="button" aria-pressed={module === 'cases'} {...preloadProps('module:cases', loadCases)} onClick={() => { landed.current = true; setModule('cases'); }}>
+                            <TabIcon name="cases" />
+                            <span>{text('事情', 'Cases')}</span>
                         </button>
-                        <button type="button" aria-pressed={module === 'tasks'} onClick={() => setModule('tasks')}>
-                            {text('任务', 'Tasks')}
+                        <button type="button" aria-pressed={module === 'tasks'} {...preloadProps('module:task-detail', loadTaskDetail)} onClick={() => setModule('tasks')}>
+                            <TabIcon name="tasks" />
+                            <span>{text('任务', 'Tasks')}</span>
                         </button>
                         <button
                             type="button"
                             aria-pressed={module === 'agents'}
+                            {...preloadProps('module:agents', loadAgents)}
                             onClick={() => {
                                 setModule('agents');
                                 if (route.jobId) navigateAcpTask({ full: false });
                             }}
                         >
-                            {text('智能体', 'Agents')}
+                            <TabIcon name="agents" />
+                            <span>{text('智能体', 'Agents')}</span>
                         </button>
                     </nav>
                 </div>
@@ -217,35 +218,45 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                 {text('数据来源：本机 A2A 网关账本。', 'Source: this A2A gateway ledger.')}
             </p>
             {module === 'approvals' ? (
-                <ApprovalsModule
-                    view={approvals}
-                    seenTick={seenTick}
-                    onReload={() => setRefreshKey(key => key + 1)}
-                    onViewed={() => {
-                        setSeenTick(tick => tick + 1);
-                        if (approvals) postApprovalsState(approvals.totalPending, countUnread(approvals.items ?? []), approvals.counts);
-                    }}
-                    onOpenTask={(jobId, reviewId) => {
-                        landed.current = true;
-                        setModule('tasks');
-                        navigateAcpTask({ jobId, reviewId, full: false });
-                    }}
-                    onOpenCase={(caseId, originSessionId) => {
-                        landed.current = true;
-                        setModule('cases');
-                        navigateCase(caseId, originSessionId);
-                    }}
-                />
+                <LazyView cacheKey="module:approvals" load={loadApprovals} lines={8}>
+                    {mod => (
+                        <mod.ApprovalsModule
+                            view={approvals}
+                            seenTick={seenTick}
+                            onReload={() => setRefreshKey(key => key + 1)}
+                            onViewed={() => {
+                                setSeenTick(tick => tick + 1);
+                                if (approvals) postApprovalsState(approvals.totalPending, countUnread(approvals.items ?? []), approvals.counts);
+                            }}
+                            onOpenTask={(jobId, reviewId) => {
+                                landed.current = true;
+                                setModule('tasks');
+                                navigateAcpTask({ jobId, reviewId, full: false });
+                            }}
+                            onOpenCase={(caseId, originSessionId) => {
+                                landed.current = true;
+                                setModule('cases');
+                                navigateCase(caseId, originSessionId);
+                            }}
+                        />
+                    )}
+                </LazyView>
             ) : module === 'agents' ? (
-                <AgentModule
-                    refreshKey={refreshKey}
-                    onOpenTask={jobId => {
-                        setModule('tasks');
-                        navigateAcpTask({ jobId, full: false });
-                    }}
-                />
+                <LazyView cacheKey="module:agents" load={loadAgents} lines={8}>
+                    {mod => (
+                        <mod.AgentModule
+                            refreshKey={refreshKey}
+                            onOpenTask={jobId => {
+                                setModule('tasks');
+                                navigateAcpTask({ jobId, full: false });
+                            }}
+                        />
+                    )}
+                </LazyView>
             ) : module === 'cases' ? (
-                <CaseModule refreshKey={refreshKey} />
+                <LazyView cacheKey="module:cases" load={loadCases} lines={8}>
+                    {mod => <mod.CaseModule refreshKey={refreshKey} />}
+                </LazyView>
             ) : (
                 <>
                     <nav class="acp-workbench-views" aria-label={text('任务视图', 'Task views')}>
@@ -254,10 +265,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                 key={view}
                                 type="button"
                                 aria-pressed={filter === view}
-                                onClick={() => {
-                                    setFilter(view);
-                                    setOffset(0);
-                                }}
+                                onClick={() => setFilter(view)}
                             >
                                 {
                                     {
@@ -267,12 +275,13 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                         failed: text('异常', 'Needs attention'),
                                     }[view]
                                 }
-                                {payload && <span>{counts[view]}</span>}
+                                {(list.items.length > 0 || list.total > 0 || !list.loading) && module === 'tasks' && <span class="acp-nums">{counts[view]}</span>}
                             </button>
                         ))}
                     </nav>
                     <div class="acp-workbench-body">
                         <div class="acp-workbench-table">
+                            {!list.settled && !error && <Skeleton lines={7} />}
                             {error && (
                                 <ErrorState
                                     title={text('任务读取失败', 'Could not load tasks')}
@@ -280,7 +289,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                     onRetry={() => setRefreshKey(key => key + 1)}
                                 />
                             )}
-                            <table>
+                            <table class="acp-desktop-only">
                                 <thead>
                                     <tr>
                                         <th>{text('任务名称', 'Task')}</th>
@@ -295,7 +304,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {!loading && !rows.length && (
+                                    {list.settled && !rows.length && (
                                         <tr>
                                             <td colSpan={9} class="acp-muted">
                                                 {filter === 'all'
@@ -313,6 +322,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                                         class="acp-link acp-name-link"
                                                         title={title(task)}
                                                         onClick={() => open(task, filter === 'pending' ? task.pendingReviewId : undefined)}
+                                                        {...preloadProps('module:task-detail', loadTaskDetail)}
                                                     >
                                                         <span class="acp-title-text">{title(task)}</span>
                                                         <small title={task.jobId}>
@@ -360,41 +370,67 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                                     </span>
                                                 )}
                                             </td>
-                                            <td class="acp-task-updated">{date(task.updatedAt)}</td>
+                                            <td class="acp-task-updated acp-nums">{date(task.updatedAt)}</td>
                                         </tr>
                                     ))}
                                 </tbody>
                             </table>
-                            {payload && (
-                                <div class="acp-pagination">
-                                    <span>{text(`${payload.total} 条任务记录`, `${payload.total} task records`)}</span>
+                            <div class="acp-mobile-cards">
+                                {list.settled && !rows.length && (
+                                    <p class="acp-muted">
+                                        {filter === 'all'
+                                            ? text('当前没有 ACP 执行任务', 'No ACP execution tasks yet')
+                                            : text('当前视图没有匹配的任务', 'No tasks in this view')}
+                                    </p>
+                                )}
+                                {rows.map(task => (
                                     <button
+                                        key={task.jobId}
                                         type="button"
-                                        class="acp-button"
-                                        disabled={offset === 0 || loading}
-                                        onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                                        class={`acp-mobile-card is-${taskStatus(task).replace(/[^a-z_]/gi, '')}${route.jobId === task.jobId ? ' is-selected' : ''}`}
+                                        onClick={() => open(task, filter === 'pending' ? task.pendingReviewId : undefined)}
+                                        {...preloadProps('module:task-detail', loadTaskDetail)}
                                     >
-                                        {text('上一页', 'Previous')}
+                                        <span class="acp-mobile-card-head">
+                                            <strong>{title(task)}</strong>
+                                            <Status value={taskStatus(task)} />
+                                        </span>
+                                        <span class="acp-mobile-card-meta">
+                                            <span class="acp-mode-label">{channelLabel(task.channel)}</span>
+                                            <span class="acp-mode-label">{executionLabels(task.execution, language).mode}</span>
+                                            <TicketLights summary={task.ticketSummary} />
+                                        </span>
+                                        <span class="acp-task-blocker">
+                                            {task.pendingReviewId
+                                                ? text('查看并确认', 'Review content')
+                                                : task.pendingProcessRequestId
+                                                  ? text('回答过程请求', 'Answer request')
+                                                  : progressExcerpt(task.progressSummary)}
+                                        </span>
+                                        <time class="acp-task-updated acp-nums">{date(task.updatedAt)}</time>
                                     </button>
-                                    <button
-                                        type="button"
-                                        class="acp-button"
-                                        disabled={offset + rows.length >= payload.total || loading}
-                                        onClick={() => setOffset(offset + PAGE_SIZE)}
-                                    >
-                                        {text('下一页', 'Next')}
+                                ))}
+                            </div>
+                            {rows.length < list.total && (
+                                <div class="acp-pagination">
+                                    <button type="button" class="acp-button" disabled={list.loadingMore} onClick={list.loadMore}>
+                                        {text(`加载更多（已显示 ${rows.length} / 共 ${list.total} 条）`, `Load more (${rows.length} of ${list.total})`)}
                                     </button>
                                 </div>
                             )}
+                            <div ref={sentinel} class="acp-load-sentinel" />
                         </div>
                         {route.jobId && (
-                            <AcpTaskDetailPanel
-                                key={route.jobId}
-                                jobId={route.jobId}
-                                requestedReviewId={route.reviewId}
-                                full={route.full}
-                                onChanged={() => setRefreshKey(key => key + 1)}
-                            />
+                            <LazyView key={route.jobId} cacheKey="module:task-detail" load={loadTaskDetail} lines={8}>
+                                {mod => (
+                                    <mod.AcpTaskDetailPanel
+                                        jobId={route.jobId!}
+                                        requestedReviewId={route.reviewId}
+                                        full={route.full}
+                                        onChanged={() => setRefreshKey(key => key + 1)}
+                                    />
+                                )}
+                            </LazyView>
                         )}
                     </div>
                 </>

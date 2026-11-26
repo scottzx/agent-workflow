@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { ChatView, useChatPages, type ChatPageLoader } from '@1agents/chat-view';
 import { FilePreview, renderMarkdown } from '@1agents/file-preview';
 import { acpTaskService } from './api';
-import { safeArtifactUrl } from './model';
+import { safeArtifactUrl, snapshotUrl } from './model';
 import { language, text } from './ui';
 
 // The gateway page runs under a strict CSP: no inline <style> from diagram renderers, same-origin loads only.
@@ -30,10 +30,7 @@ export function artifactUrl(jobId: string, artifact: ArtifactRef): string | unde
     return new URL(`/workbench/ui/api/tasks/${encodeURIComponent(jobId)}/artifacts/${artifact.sha256}`, location.origin).href;
 }
 
-/** The frozen bytes of an accepted handoff. The gateway re-checks the digest on every read. */
-export function snapshotUrl(caseId: string, handoffId: string, digest: string): string {
-    return new URL(`/workbench/ui/api/cases/${encodeURIComponent(caseId)}/handoffs/${encodeURIComponent(handoffId)}/artifacts/${digest}`, location.origin).href;
-}
+export { snapshotUrl };
 
 function artifactName(artifact: ArtifactRef, url?: string): string {
     return (

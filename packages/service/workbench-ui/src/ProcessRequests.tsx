@@ -2,7 +2,7 @@ import { Fragment } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpProcessQuestion, AcpProcessRequest } from './types';
-import { Md } from './Preview';
+import { LazyMd as Md } from './lazy-panels';
 import { text } from './ui';
 
 const statusLabel = (status: string) =>

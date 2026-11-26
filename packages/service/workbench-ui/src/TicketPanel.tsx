@@ -1,23 +1,9 @@
 import { useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
-import type { AcpTaskDetail, AcpTicket, AcpTicketItem, AcpTicketProposal, AcpTicketSummary, AcpWorkflowNode } from './types';
+import type { AcpTaskDetail, AcpTicket, AcpTicketItem, AcpTicketProposal, AcpWorkflowNode } from './types';
 import { errorText, text } from './ui';
 
-export function TicketLights({ summary }: { summary?: AcpTicketSummary }) {
-    if (!summary) return null;
-    const self = `${summary.selfCheckDone}/${summary.selfCheckTotal}`;
-    const program = summary.openMust > 0 ? text(`必改 ${summary.openMust}`, `${summary.openMust} must-fix`) : text('机检', 'Checks');
-    return (
-        <span class="acp-ticket-lights" title={text('任务单', 'Ticket')}>
-            <span>R{summary.round}</span>
-            <span class={summary.selfCheckTotal > 0 && summary.selfCheckDone < summary.selfCheckTotal ? 'is-wait' : 'is-ok'}>
-                {text('自检', 'Self')} {self}
-            </span>
-            <span class={summary.openMust > 0 ? 'is-bad' : 'is-ok'}>{program}</span>
-            {summary.mismatches > 0 && <span class="is-warn">{text(`分歧 ${summary.mismatches}`, `${summary.mismatches} mismatches`)}</span>}
-        </span>
-    );
-}
+export { TicketLights } from './TicketLights';
 
 function settlerLabel(proposal: AcpTicketProposal): string {
     if (!proposal.by) return '';
@@ -73,8 +59,9 @@ export function TicketPanel({ detail, onChanged }: { detail: AcpTaskDetail; onCh
                 {checks.length ? checks.map(check => {
                     const finding = findingOf(ticket, check.id);
                     const level = finding?.crossCheck?.kind;
+                    const tone = level === 'self_vs_program' ? ' is-l1' : level === 'self_vs_qa' ? ' is-l2' : passedState(check.state) ? ' is-pass' : '';
                     return (
-                        <article key={check.id} class={`acp-ticket-card${level === 'self_vs_program' ? ' is-l1' : ''}${level === 'self_vs_qa' ? ' is-l2' : ''}`}>
+                        <article key={check.id} class={`acp-ticket-card${tone}`}>
                             <header>
                                 <strong>{check.id}</strong>
                                 <span class="acp-mode-label">{check.state}</span>
@@ -96,7 +83,7 @@ export function TicketPanel({ detail, onChanged }: { detail: AcpTaskDetail; onCh
             <section class="acp-detail-section">
                 <h3>{text('程序检查', 'Program checks')}</h3>
                 {program.length ? program.map(item => (
-                    <article key={item.id} class="acp-ticket-card">
+                    <article key={item.id} class={`acp-ticket-card${passedState(item.state) ? ' is-pass' : ''}`}>
                         <header><strong>{item.id}</strong><span class="acp-mode-label">{item.state}</span>{item.severity === 'must' && <span class="acp-mode-label is-locked">{text('必改', 'Must')}</span>}</header>
                         <p>{item.where} · {item.problem}</p>
                         {item.suggestion && <p class="acp-muted">{item.suggestion}</p>}
@@ -114,7 +101,7 @@ export function TicketPanel({ detail, onChanged }: { detail: AcpTaskDetail; onCh
                     </article>
                 ))}
                 {qa.map(item => (
-                    <article key={item.id} class={`acp-ticket-card${item.crossCheck ? ' is-l2' : ''}`}>
+                    <article key={item.id} class={`acp-ticket-card${item.crossCheck ? ' is-l2' : passedState(item.state) ? ' is-pass' : ''}`}>
                         <header><strong>{item.id}</strong><span class="acp-mode-label">{item.state}</span></header>
                         <p>{item.where} · {item.problem}</p>
                         {item.log.filter(line => line.note || line.action === 'done' || line.action === 'disputed').map((line, index) => (
@@ -152,6 +139,15 @@ export function TicketPanel({ detail, onChanged }: { detail: AcpTaskDetail; onCh
     );
 }
 
+function passedState(state: string) {
+    return state === 'done' || state === 'passed' || state === 'closed' || state === 'ok';
+}
+
+function clip(value: string, max: number) {
+    const chars = Array.from(value);
+    return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : value;
+}
+
 function SkippedNodes({ nodes }: { nodes?: AcpWorkflowNode[] }) {
     const skipped = (nodes ?? []).filter(node => node.status === 'skipped');
     if (!skipped.length) return null;
@@ -166,37 +162,62 @@ function SkippedNodes({ nodes }: { nodes?: AcpWorkflowNode[] }) {
 
 export function MicroDag({ nodes }: { nodes: AcpWorkflowNode[] }) {
     const rounds = [...new Set(nodes.map(node => node.round ?? 1))].sort((a, b) => a - b);
-    const width = 640;
+    const nodeW = 128;
+    const gapX = 36;
     const rowH = 78;
-    const height = Math.max(96, rounds.length * rowH + 24);
+    const widest = Math.max(1, ...rounds.map(round => nodes.filter(node => (node.round ?? 1) === round).length));
+    const width = Math.max(560, 24 + widest * (nodeW + gapX));
+    const height = Math.max(120, rounds.length * rowH + 28);
     const revise = nodes.filter(node => node.status === 'failed').length;
     return (
         <section class="acp-detail-section">
             <h3>{text('角色内检查图', 'Role micro-DAG')}</h3>
-            <p class="acp-muted">
+            <p class="acp-muted acp-nums">
                 {text(`节点 ${nodes.filter(node => node.status === 'completed').length}/${nodes.length}`, `${nodes.filter(node => node.status === 'completed').length}/${nodes.length} completed`)}
                 {nodes.some(node => node.cached) ? text(' · 含续跑缓存', ' · includes cached nodes') : ''}
                 {revise ? text(` · 失败 ${revise}`, ` · ${revise} failed`) : ''}
             </p>
-            <svg class="acp-dag" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={text('Micro-DAG', 'Micro-DAG')}>
-                {rounds.map((round, row) => {
-                    const group = nodes.filter(node => (node.round ?? 1) === round);
-                    const gap = width / Math.max(group.length, 1);
-                    return group.map((node, index) => {
-                        const x = gap * index + 16;
-                        const y = 16 + row * rowH;
-                        const next = group[index + 1];
-                        return (
-                            <g key={`${round}-${node.nodeId}-${index}`}>
-                                {next && <line x1={x + 108} y1={y + 22} x2={gap * (index + 1) + 16} y2={y + 22} class="acp-dag-edge" />}
-                                <rect x={x} y={y} width={112} height={44} rx={8} class={`acp-dag-node is-${node.status || 'unknown'}${node.cached ? ' is-cached' : ''}`} />
-                                <text x={x + 8} y={y + 18} class="acp-dag-label">{node.nodeId || 'node'}</text>
-                                <text x={x + 8} y={y + 34} class="acp-dag-sub">{node.cached ? 'cached' : node.status || ''}</text>
-                            </g>
-                        );
-                    });
-                })}
-            </svg>
+            <div class="acp-dag-scroll">
+                <svg class="acp-dag" width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={text('角色内检查图', 'Role micro-DAG')}>
+                    <defs>
+                        <marker id="acp-dag-arrow-micro" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+                            <path d="M0,0 L7,3 L0,6 Z" class="acp-dag-arrow" />
+                        </marker>
+                    </defs>
+                    {rounds.map((round, row) => {
+                        const group = nodes.filter(node => (node.round ?? 1) === round);
+                        return group.map((node, index) => {
+                            const x = 16 + index * (nodeW + gapX);
+                            const y = 18 + row * rowH;
+                            const next = group[index + 1];
+                            const label = node.nodeId || 'node';
+                            const status = node.status || 'unknown';
+                            return (
+                                <g key={`${round}-${node.nodeId}-${index}`} class="acp-dag-click">
+                                    {next && (
+                                        <line x1={x + nodeW} y1={y + 22} x2={x + nodeW + gapX} y2={y + 22} class="acp-dag-edge" marker-end="url(#acp-dag-arrow-micro)" />
+                                    )}
+                                    <rect x={x} y={y} width={nodeW} height={48} rx={8} class={`acp-dag-node is-${status}${node.cached ? ' is-cached' : ''}`} />
+                                    <circle cx={x + 14} cy={y + 16} r={4} class={`acp-dag-dot is-${status}`} />
+                                    <text x={x + 24} y={y + 20} class="acp-dag-label">
+                                        <title>{label}</title>
+                                        {clip(label, 12)}
+                                    </text>
+                                    <text x={x + 8} y={y + 38} class="acp-dag-sub">
+                                        <title>{node.cached ? 'cached' : status}</title>
+                                        {clip(node.cached ? 'cached' : status, 16)}
+                                    </text>
+                                </g>
+                            );
+                        });
+                    })}
+                </svg>
+            </div>
+            <ul class="acp-dag-legend">
+                <li><span class="acp-dag-swatch is-solid" />{text('实线：已交接', 'Solid: handed over')}</li>
+                <li><span class="acp-dag-swatch is-dashed" />{text('虚线：待确认提议', 'Dashed: awaiting confirmation')}</li>
+                <li><span class="acp-dag-swatch is-cached" />{text('蓝底：续跑缓存', 'Blue: cached rerun')}</li>
+            </ul>
         </section>
     );
 }

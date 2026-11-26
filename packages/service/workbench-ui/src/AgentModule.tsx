@@ -167,7 +167,7 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                     description={text('常驻角色会直接出现在已上线。新的试跑从开发中的草稿开始。', 'Resident roles appear under Published. A new trial starts from a developing draft.')}
                 />
             )}
-            <div class="acp-agent-layout">
+            <div class={`acp-agent-layout${selectedId || creating || registering ? ' is-showing-detail' : ''}`}>
                 <div class="acp-agent-list">
                     {phase === 'developing' && (
                         <>
@@ -195,6 +195,13 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
                     ))}
                 </div>
                 <div class="acp-agent-detail">
+                    {(selectedId || creating || registering) && (
+                        <div class="acp-backbar">
+                            <button type="button" class="acp-button" onClick={() => { setSelectedId(''); setCreating(false); setRegistering(false); }}>
+                                {text('← 返回列表', '← Back to list')}
+                            </button>
+                        </div>
+                    )}
                     {registering && (
                         <form
                             class="acp-agent-form"

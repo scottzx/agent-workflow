@@ -4,8 +4,18 @@ import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpDecisionInput, AcpDshSession, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
-import { ArtifactDrawer, ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
-import { MicroDag, TicketPanel } from './TicketPanel';
+import type { ArtifactRef } from './Preview';
+import {
+    LazyArtifactDrawer as ArtifactDrawer,
+    LazyArtifactItem as ArtifactItem,
+    LazyMd as Md,
+    LazyMicroDag as MicroDag,
+    LazyReportPreview as ReportPreview,
+    LazyTaskChat as TaskChat,
+    LazyTicketPanel as TicketPanel,
+    previewHover,
+    ticketHover,
+} from './lazy-panels';
 import {
     channelLabel,
     date,
@@ -222,9 +232,14 @@ export function AcpTaskDetailPanel({
         const interval = window.setInterval(() => {
             if (!document.hidden) void load();
         }, 5000);
+        const onVisible = () => {
+            if (!document.hidden) void load();
+        };
+        document.addEventListener('visibilitychange', onVisible);
         return () => {
             alive.current = false;
             window.clearInterval(interval);
+            document.removeEventListener('visibilitychange', onVisible);
         };
     }, [load]);
 
@@ -342,6 +357,11 @@ export function AcpTaskDetailPanel({
     ];
     return (
         <aside class="acp-detail" aria-label={text('任务详情', 'Task details')}>
+            <div class="acp-backbar">
+                <button type="button" class="acp-button" onClick={() => navigateAcpTask({ full: false })}>
+                    {text('← 返回列表', '← Back to list')}
+                </button>
+            </div>
             <header class="acp-detail-header">
                 <div class="acp-detail-tools">
                     <span>{text('任务详情', 'Task details')}</span>
@@ -430,6 +450,7 @@ export function AcpTaskDetailPanel({
                         aria-selected={tab === id}
                         aria-controls="acp-detail-content"
                         onClick={() => setTab(id)}
+                        {...(id === 'chat' || id === 'review' ? previewHover : id === 'ticket' || id === 'progress' ? ticketHover : {})}
                     >
                         {label}
                         {!!count && <span class="acp-tab-count">{count}</span>}
@@ -557,7 +578,7 @@ export function AcpTaskDetailPanel({
                                                         'Reference page numbers. Feedback is required when requesting changes.'
                                                     )}
                                                 />
-                                                <div class="acp-review-buttons">
+                                                <div class="acp-review-buttons acp-sticky-actions">
                                                     <button
                                                         type="button"
                                                         class="acp-link"
@@ -1202,12 +1223,16 @@ function ReviewHistory({ review }: { review: AcpReview }) {
 }
 
 function TaskEvents({ detail }: { detail: AcpTaskDetail }) {
+    const [expanded, setExpanded] = useState(false);
+    const ordered = [...detail.events].reverse();
+    const visible = expanded ? ordered : ordered.slice(0, 30);
+    const earlier = ordered.length - visible.length;
     return (
         <section class="acp-detail-section">
             <h3>{text('任务事件', 'Task events')}</h3>
-            {detail.events.length ? (
+            {visible.length ? (
                 <ol class="acp-event-list">
-                    {[...detail.events].reverse().map(event => (
+                    {visible.map(event => (
                         <li key={event.eventId}>
                             <time>{date(event.observedAt)}</time>
                             <div>
@@ -1230,6 +1255,11 @@ function TaskEvents({ detail }: { detail: AcpTaskDetail }) {
                 </ol>
             ) : (
                 <p class="acp-muted">{text('暂无任务事件', 'No task events')}</p>
+            )}
+            {earlier > 0 && (
+                <button type="button" class="acp-button" onClick={() => setExpanded(true)}>
+                    {text(`展开更早事件（还有 ${earlier} 条）`, `Show ${earlier} earlier events`)}
+                </button>
             )}
         </section>
     );
