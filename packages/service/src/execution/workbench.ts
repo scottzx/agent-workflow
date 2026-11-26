@@ -1,5 +1,8 @@
 /** Human-readable projections of the execution ledger. Reading never dispatches or acknowledges work. */
+import { lstatSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import type { BusinessAcceptance, JobRef, LedgerActor, LedgerAttempt, LedgerEvent, LedgerJob, LedgerState } from './ledger.js';
+import type { Ticket } from './ticket.js';
 import type { ReportReviewRun } from './report-review.js';
 import type { PptDeliveryRun } from './ppt-delivery.js';
 import { deliveryProgress } from './delivery-progress.js';
@@ -37,6 +40,12 @@ export interface AcpTaskSummary {
   /** A finished top-level result with no conclusion yet and no review flow of its own, so a person can mark it read. */
   canAccept?: boolean;
   initiatedBy?: LedgerActor;
+  /** Compact ticket lights for the task row. Absent when the job has no ticket. */
+  ticketSummary?: TicketSummary;
+}
+export interface TicketSummary {
+  status: string; round: number; selfCheckDone: number; selfCheckTotal: number;
+  openMust: number; openProposals: number; mismatches: number;
 }
 export interface WorkbenchStage { stage: string; name: string; status: string; planned: boolean; jobId?: string; attemptId?: string }
 export interface WorkbenchProgress { stage: string; phase: string; stages: WorkbenchStage[]; completedStages: string[];
@@ -55,6 +64,10 @@ export interface AcpTaskDetail extends AcpTaskSummary {
   /** Conventions that apply to this job. Unachieved ones are not drawn as edges. */
   legalNext?: LegalNext[];
   artifacts: { revision: string; digest?: string; artifacts: unknown[] }[];
+  /** The job's ticket, cloned. Absent when this job has none. */
+  ticket?: Ticket;
+  /** Micro-DAG node records from the task work directory's `run-state.json`, when that file is readable. */
+  workflowRun?: { nodes: unknown[] };
 }
 export interface WorkbenchSource { ledger: LedgerState; runs: readonly PptDeliveryRun[]; reviews: readonly HumanReviewRequest[];
   reportRuns?: readonly ReportReviewRun[]; processRequests?: readonly ProcessRequest[]; actorId: string; allowedOrigins?: readonly string[]; now?: number }
@@ -228,6 +241,33 @@ function blockedTools(requests: readonly ProcessRequest[], job: LedgerJob, now: 
   return [...latest.values()].filter(request => request.answer?.outcome !== 'approved')
     .map(request => request.toolTitle ?? '').filter((name, index, all) => name && all.indexOf(name) === index);
 }
+function summarizeTicket(ticket: Ticket | undefined): TicketSummary | undefined {
+  if (!ticket) return;
+  const checks = ticket.selfChecks ?? [];
+  return {
+    status: ticket.status, round: ticket.round,
+    selfCheckDone: checks.filter(check => check.state === 'pass' || check.state === 'na').length,
+    selfCheckTotal: checks.length,
+    openMust: ticket.items.filter(item => item.severity === 'must' && (item.state === 'open' || item.state === 'reopened')).length,
+    openProposals: ticket.proposals.filter(proposal => proposal.state === 'open').length,
+    mismatches: ticket.items.filter(item => item.crossCheck).length,
+  };
+}
+
+/** `run-state.json` beside the ticket export. A missing, huge, or non-file path is omitted rather than failing the projection. */
+function workflowRunOf(ticket: Ticket | undefined): { nodes: unknown[] } | undefined {
+  const exportPath = ticket?.exportPath;
+  if (!exportPath || !path.isAbsolute(exportPath)) return;
+  const file = path.join(path.dirname(exportPath), 'run-state.json');
+  try {
+    const info = lstatSync(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 1_048_576) return;
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { nodes?: unknown };
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.nodes)) return;
+    return { nodes: parsed.nodes };
+  } catch { return; }
+}
+
 function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: readonly HumanReviewRequest[], ledger: LedgerState, actorId: string, requests: readonly ProcessRequest[], now: number): AcpTaskSummary {
   const attempt = ledger.attempts[job.currentAttemptId], review = latestReview(reviews, job), pending = review?.status === 'pending' && !terminal.has(job.executionStatus) && (!run || !terminal.has(run.executionStatus));
   const pendingRequest = terminal.has(job.executionStatus) ? undefined : pendingProcessRequest(requests, job, now);
@@ -248,6 +288,7 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
   const execution = executionView(attempt, job.targetId, Boolean(run));
   const development = describeTaskDevelopment(attempt?.targetSnapshot?.development, { targetId: job.targetId, resident: execution.kind === 'resident', residentName: execution.targetName });
   const pendingHandoff = (ledger.handoffs ?? []).find(item => item.fromJobId === job.jobId && item.status === 'proposed');
+  const ticketSummary = summarizeTicket(ledger.tickets?.[job.jobId]);
   return { sourceId: job.sourceId, jobId: job.jobId, title: job.title ?? `${purposeNames[job.purpose ?? ''] ?? '执行任务'} ${job.jobId.slice(0, 8)}`,
     channel: development.channel, ...(development.agentId ? { agentId: development.agentId, agentName: development.name, agentPhase: development.phase } : {}),
     originSessionId: job.originSessionId, ...(job.caseId ? { caseId: job.caseId } : {}), ...(job.parentJobRef ? { parentJobRef: job.parentJobRef } : {}), ...(job.parentAttemptId ? { parentAttemptId: job.parentAttemptId } : {}),
@@ -260,7 +301,7 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
     ...(acceptance ? { businessAcceptance: structuredClone(acceptance) } : {}), ...(blocked.length ? { blockedTools: blocked } : {}),
     ...(job.executionStatus === 'failed' && !run && !job.parentJobRef && !job.unresolvedAttemptIds.length ? { canContinue: true } : {}),
     ...(job.executionStatus === 'completed' && !run && !job.parentJobRef && !acceptance && attempt?.result?.resultAvailable && attempt.result.resultRevision && attempt.result.resultDigest ? { canAccept: true } : {}),
-    ...(job.initiatedBy ? { initiatedBy: job.initiatedBy } : {}) };
+    ...(job.initiatedBy ? { initiatedBy: job.initiatedBy } : {}), ...(ticketSummary ? { ticketSummary } : {}) };
 }
 function bubbleProcessWait(summaries: Map<string, AcpTaskSummary>): void {
   const tasks = [...summaries.values()];
@@ -332,7 +373,10 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
     const asked = Object.values(ledger.attempts).filter(attempt => attempt.jobId === job.jobId)
       .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''))[0]?.input as { prompt?: unknown } | undefined;
     const description = typeof asked?.prompt === 'string' && asked.prompt.trim() ? asked.prompt.slice(0, 20_000) : undefined;
+    const ticket = ledger.tickets?.[job.jobId];
+    const workflowRun = workflowRunOf(ticket);
     details[job.jobId] = { ...summaries.get(job.jobId)!, ...(description ? { description } : {}), attempts, children, ancestors, ...(next.length ? { legalNext: next } : {}), progress: progress(job, run, source.reviews, ledger.attempts[job.currentAttemptId], source.now ?? Date.now()),
+      ...(ticket ? { ticket: structuredClone(ticket) } : {}), ...(workflowRun ? { workflowRun } : {}),
       processRequests: (source.processRequests ?? []).filter(request => request.jobId === job.jobId || children.some(child => child.jobId === request.jobId)).map(request => {
         const projected = projectProcessRequest(request, now);
         const owner = ledger.jobs[request.jobId];

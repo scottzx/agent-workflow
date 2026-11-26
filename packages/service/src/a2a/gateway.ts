@@ -29,7 +29,7 @@ import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '.
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
-import { invokeTicket, reopenForContinue, TICKET_METHODS } from '../execution/ticket.js';
+import { invokeTicket, reopenForContinue, TicketError, TICKET_METHODS } from '../execution/ticket.js';
 import { continueByConvention, decideHandoff, HANDOFF_METHODS, invokeHandoff, offerConvention, proposeByFact, type Handoff, type HandoffSnapshot } from '../execution/handoff.js';
 import { rolePublicationDirectory } from '../execution/spaces.js';
 import { caseOpenSchema, CaseError, openCase, projectCase, requireCase } from '../execution/cases.js';
@@ -40,6 +40,8 @@ import { answerProcessRequest, createProcessRequest, expireProcessRequest, proce
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
 import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { workbenchCases, getWorkbenchCase } from '../execution/case-view.js';
+import { projectApprovals } from '../execution/approvals-view.js';
+import { discoverProjectRoots, readRoleRsi, RoleRsiError } from '../execution/role-rsi.js';
 import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
 import { agentNamePattern, listAgentFiles } from '../execution/agent-files.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
@@ -76,7 +78,9 @@ const configSchema = z.object({
     /** Show a macOS notification when a request starts waiting. */
     desktopNotifications: z.boolean().default(false),
     /** Push a steer wakeup to the bound origin session when a child task opens a process request. */
-    notifyOriginOnProcessRequest: z.boolean().default(true) }).strict().optional(),
+    notifyOriginOnProcessRequest: z.boolean().default(true),
+    /** Project whose `.1agents/roles` the RSI panel reads. Omitted, the gateway walks up from its state directory and the process cwd. */
+    projectRoot: z.string().min(1).refine(value => path.isAbsolute(value) && !value.includes('\0'), 'projectRoot must be an absolute path').optional() }).strict().optional(),
   /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
   capacityDirectory: z.string().min(1).optional(),
   /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
@@ -1900,6 +1904,27 @@ export class RemoteAgentGateway {
     if (reviewer !== this.config.workbench!.reviewerId) throw new Error(`发布放行的负责人是 ${reviewer}。`);
     return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() }));
   }
+  /** The four gates a person still has to clear. `summary` drops the rows and keeps the counts. */
+  workbenchApprovals() { return projectApprovals(this.workbenchSource()); }
+  /** Checklist, workflow, gate and calibration for one role directory. The role id cannot leave `.1agents/roles`. */
+  workbenchRoleRsi(roleId: string) {
+    const root = this.config.workbench?.projectRoot;
+    const roots = root ? [root] : discoverProjectRoots([this.config.stateDirectory, process.cwd()]);
+    return readRoleRsi(roots, roleId);
+  }
+  /**
+   * Settle one ticket proposal as the person on the page. The body cannot name `by`: the route writes it,
+   * so an agent holding the bearer token cannot claim a person decided.
+   */
+  async decideWorkbenchProposal(jobId: string, proposalId: string, input: unknown, via: 'page' | 'relay') {
+    return this.workbench(async () => {
+      const scope = this.workbenchTask(jobId);
+      const parsed = z.object({ state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional() }).strict().parse(input);
+      const ticket = invokeTicket(this.ledger, 'ticket_proposal', { originSessionId: scope.originSessionId, jobId, proposalId,
+        state: parsed.state, ...(parsed.note ? { note: parsed.note } : {}), by: { kind: 'person' as const, via } });
+      return { ticket, task: this.workbenchTask(jobId) };
+    });
+  }
   workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
   /** Read-only transcript from the stored A2A history of the job's attempts; the same scope check as the task detail. */
   workbenchChat(jobId: string, query: { limit?: number; before?: number } = {}) {
@@ -2284,7 +2309,7 @@ function authenticated(req: IncomingMessage, token: string): boolean {
 }
 /** Publishing, review decisions and handoff decisions are a person's acts, made on the workbench page. */
 const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/, /^\/workbench\/tasks\/[^/]+\/acceptance$/,
-  /^\/workbench\/cases\/[^/]+\/handoffs\/[^/]+\/decisions$/];
+  /^\/workbench\/cases\/[^/]+\/handoffs\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/ticket\/proposals\/[^/]+$/];
 function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
   if (!secret) return false;
   const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
@@ -2371,13 +2396,31 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           if (gateway.config.workbench.token && !authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
           if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
           if (req.method === 'POST' && PAGE_ONLY_ROUTES.some(route => route.test(pathname)) && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) {
-            return json(res, 403, { error: 'page_action_required', message: '发布、验收决定和继续任务只能由人在工作台页面发起。' });
+            return json(res, 403, { error: 'page_action_required', message: '发布、验收决定、继续任务和规范提议只能由人在工作台页面发起。' });
           }
         }
         if (req.method === 'GET' && pathname === '/workbench/tasks') {
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
+        }
+        if (pathname === '/workbench/approvals') {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          const query = z.object({ summary: z.literal('1').optional() }).strict().parse(Object.fromEntries(url.searchParams));
+          const view = gateway.workbenchApprovals();
+          if (query.summary !== '1') return json(res, 200, view);
+          const { items: _items, ...summary } = view;
+          return json(res, 200, summary);
+        }
+        const roleRsi = /^\/workbench\/roles\/([^/]+)\/rsi$/.exec(pathname);
+        if (roleRsi) {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+          try { return json(res, 200, await gateway.workbenchRoleRsi(decodeURIComponent(roleRsi[1]!))); }
+          catch (error) {
+            if (error instanceof RoleRsiError) return json(res, error.status, { error: error.status === 400 ? 'invalid_role' : 'not_found', message: error.message });
+            throw error;
+          }
         }
         if (pathname === '/workbench/cases') {
           if (req.method === 'GET') {
@@ -2495,6 +2538,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         const review = /^\/reviews\/([^/]+)\/decisions$/.exec(rest);
         const answer = /^\/process-requests\/([^/]+)\/answers$/.exec(rest);
         const one = /^\/process-requests\/([^/]+)$/.exec(rest);
+        const proposal = /^\/ticket\/proposals\/([^/]+)$/.exec(rest);
         try {
           if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
           if (rest === '/refresh' && req.method === 'POST') return json(res, 200, await gateway.refreshWorkbenchTask(jobId));
@@ -2511,6 +2555,10 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             catch (error) { return json(res, 409, { error: 'accept_refused', message: error instanceof Error ? error.message : String(error) }); }
           }
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
+          if (proposal && req.method === 'POST') {
+            if (!page && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) return json(res, 403, { error: 'page_action_required', message: '规范提议只能由人在工作台页面发起。' });
+            return json(res, 200, await gateway.decideWorkbenchProposal(jobId, decodeURIComponent(proposal[1]!), await body(req), page ? 'page' : 'relay'));
+          }
           if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
           // The page, here or relayed by its host, always answers as a person; only the gateway's own callers name a coach.
           if (answer && req.method === 'POST') {
@@ -2518,7 +2566,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), asPerson ? { ...(input as object), decidedBy: { kind: 'person' } } : input));
           }
           if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
-          if (rest === '' || rest === '/refresh' || rest === '/continue' || rest === '/acceptance' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' || rest === '/refresh' || rest === '/continue' || rest === '/acceptance' || review || answer || one || proposal || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
           return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });
@@ -2526,6 +2574,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             const status = error.code === 'forbidden' ? 403 : error.code === 'not_found' ? 404 : error.code === 'invalid' ? 400 : 409;
             return json(res, status, { error: error.code, message: error.message });
           }
+          if (error instanceof TicketError) return json(res, 409, { error: 'conflict', message: error.message });
           if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
           return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
         }

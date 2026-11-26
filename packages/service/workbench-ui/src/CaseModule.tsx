@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { acpCaseService } from './api';
 import { acpCaseHash, parseAcpCaseHash } from './model';
-import type { AcpCaseDetail, AcpCaseEdge, AcpCaseList, AcpInboxItem } from './types';
+import type { AcpCaseDetail, AcpCaseEdge, AcpCaseList, AcpInboxItem, AcpTaskSummary } from './types';
 import { ArtifactDrawer, ArtifactItem, snapshotUrl } from './Preview';
-import { date, EmptyState, ErrorState, errorText, Status, taskStatus, text } from './ui';
+import { channelLabel, date, EmptyState, ErrorState, errorText, navigateAcpTask, Status, taskStatus, text } from './ui';
 
 /**
  * The workbench's first screen is a thing: what it is for, who is working on it, what waits for a person, and
@@ -50,16 +50,18 @@ function EdgeRow({
     onDecide,
     busy,
     onPreview,
+    focused,
 }: {
     edge: AcpCaseEdge;
     caseId: string;
     onDecide: (edge: AcpCaseEdge, decision: 'accept' | 'reject') => void;
     busy: boolean;
     onPreview: (artifact: { url: string; name: string; mediaType?: string }) => void;
+    focused?: boolean;
 }) {
     const label = edgeLabels[edge.status];
     return (
-        <li class={`acp-case-edge${edge.happened ? ' is-happened' : ' is-proposed'}`}>
+        <li id={`handoff-${edge.handoffId}`} class={`acp-case-edge${edge.happened ? ' is-happened' : ' is-proposed'}${focused ? ' is-focused' : ''}`}>
             <span class="acp-case-edge-line" aria-hidden="true" />
             <div>
                 <strong>
@@ -110,23 +112,108 @@ function EdgeRow({
 }
 
 function InboxRow({ item, onOpen }: { item: AcpInboxItem; onOpen: (item: AcpInboxItem) => void }) {
-    const kind = item.kind === 'review' ? text('审核', 'Review') : item.kind === 'process_request' ? text('过程请求', 'Request') : text('交接提议', 'Handoff');
+    const kind = item.kind === 'review' ? text('审核', 'Review') : item.kind === 'process_request' ? text('过程请求', 'Request') : item.kind === 'proposal' ? text('规范提议', 'Proposal') : text('交接提议', 'Handoff');
     return (
         <li class="acp-inbox-row">
-            <span class="acp-mode-label">{kind}</span>
+            <span class={`acp-mode-label${item.proposalKind === 'locked' ? ' is-locked' : ''}`}>{kind}</span>
             <div>
                 <strong>{item.title}</strong>
                 <small class="acp-muted">
                     {item.summary}
                     {item.revision ? ` · ${item.revision}` : ''}
+                    {item.channel ? ` · ${channelLabel(item.channel)}` : ''}
                 </small>
             </div>
-            {item.kind === 'handoff' ? null : (
-                <button type="button" class="acp-link" onClick={() => onOpen(item)}>
-                    {text('去处理', 'Open')}
-                </button>
-            )}
+            <button type="button" class="acp-link" onClick={() => onOpen(item)}>
+                {text('去处理', 'Open')}
+            </button>
         </li>
+    );
+}
+
+function CaseDag({
+    detail,
+    onOpenTask,
+    onOpenEdge,
+}: {
+    detail: AcpCaseDetail;
+    onOpenTask: (jobId: string) => void;
+    onOpenEdge: (handoffId: string) => void;
+}) {
+    const tasks = detail.tasks;
+    if (!tasks.length) return null;
+    const depth = new Map(tasks.map(task => [task.jobId, 0]));
+    const links = detail.edges.filter(edge => edge.status !== 'rejected' && edge.childJobId && depth.has(edge.childJobId));
+    for (let pass = 0; pass < tasks.length; pass++) {
+        let changed = false;
+        for (const edge of links) {
+            const next = (depth.get(edge.fromJobId) ?? 0) + 1;
+            if ((depth.get(edge.childJobId!) ?? 0) < next) { depth.set(edge.childJobId!, next); changed = true; }
+        }
+        if (!changed) break;
+    }
+    const columns = new Map<number, AcpTaskSummary[]>();
+    for (const task of tasks) {
+        const column = depth.get(task.jobId) ?? 0;
+        columns.set(column, [...(columns.get(column) ?? []), task]);
+    }
+    const nodeW = 168, nodeH = 78, gapX = 56, gapY = 22;
+    const pos = new Map<string, { x: number; y: number }>();
+    let maxX = nodeW + 32, maxY = nodeH + 32;
+    for (const [column, list] of columns) {
+        list.forEach((task, index) => {
+            const point = { x: 20 + column * (nodeW + gapX), y: 20 + index * (nodeH + gapY) };
+            pos.set(task.jobId, point);
+            maxX = Math.max(maxX, point.x + nodeW + 40);
+            maxY = Math.max(maxY, point.y + nodeH + 28);
+        });
+    }
+    const ghosts = detail.edges.filter(edge => edge.status === 'proposed' && !edge.childJobId);
+    ghosts.forEach((edge, index) => {
+        const from = pos.get(edge.fromJobId);
+        if (!from) return;
+        maxX = Math.max(maxX, from.x + nodeW + gapX + nodeW);
+        maxY = Math.max(maxY, from.y + index * 18 + nodeH);
+    });
+    return (
+        <section class="acp-detail-section">
+            <h3>{text('跨角色流转', 'Cross-role flow')}</h3>
+            <svg class="acp-dag acp-case-dag" viewBox={`0 0 ${maxX} ${maxY}`} role="img" aria-label={text('事情流转图', 'Case flow')}>
+                {detail.edges.filter(edge => edge.status !== 'rejected').map(edge => {
+                    const from = pos.get(edge.fromJobId);
+                    const to = edge.childJobId ? pos.get(edge.childJobId) : undefined;
+                    if (!from) return null;
+                    const x2 = to ? to.x : from.x + nodeW + gapX;
+                    const y2 = to ? to.y + nodeH / 2 : from.y + nodeH / 2;
+                    const dashed = edge.status === 'proposed';
+                    return (
+                        <g key={edge.handoffId}>
+                            <line x1={from.x + nodeW} y1={from.y + nodeH / 2} x2={x2} y2={y2} class={`acp-dag-edge${dashed ? ' is-dashed' : ''}`} />
+                            {dashed && (
+                                <line x1={from.x + nodeW} y1={from.y + nodeH / 2} x2={x2} y2={y2} class="acp-dag-hit" onClick={() => onOpenEdge(edge.handoffId)} />
+                            )}
+                            <text x={(from.x + nodeW + x2) / 2} y={(from.y + nodeH / 2 + y2) / 2 - 4} class="acp-dag-sub">{edge.artifactDigest.slice(0, 8)}</text>
+                        </g>
+                    );
+                })}
+                {tasks.map(task => {
+                    const point = pos.get(task.jobId)!;
+                    const waiting = detail.conventions.filter(rule => !rule.achieved && (!rule.fromTargetId || rule.fromTargetId === task.targetId) && (!rule.fromPurpose || rule.fromPurpose === task.purpose));
+                    return (
+                        <g key={task.jobId} class="acp-dag-click" onClick={() => onOpenTask(task.jobId)}>
+                            <rect x={point.x} y={point.y} width={nodeW} height={nodeH} rx={8} class="acp-dag-node is-case" />
+                            <text x={point.x + 8} y={point.y + 16} class="acp-dag-label">{(task.title || task.jobId).slice(0, 18)}</text>
+                            <text x={point.x + 8} y={point.y + 32} class="acp-dag-sub">{channelLabel(task.channel)} · {task.executionStatus}</text>
+                            <text x={point.x + 8} y={point.y + 48} class="acp-dag-sub">
+                                {task.ticketSummary ? `R${task.ticketSummary.round} ${task.ticketSummary.selfCheckDone}/${task.ticketSummary.selfCheckTotal}` : text('无任务单', 'No ticket')}
+                                {task.ticketSummary && task.ticketSummary.mismatches > 0 ? ` · ${text('分歧', 'mismatch')} ${task.ticketSummary.mismatches}` : ''}
+                            </text>
+                            {!!waiting.length && <text x={point.x + 8} y={point.y + 64} class="acp-dag-sub">{text('待触发', 'Waiting')} {waiting.length}</text>}
+                        </g>
+                    );
+                })}
+            </svg>
+        </section>
     );
 }
 
@@ -135,6 +222,11 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
     const [error, setError] = useState('');
     const [message, setMessage] = useState('');
     const [artifact, setArtifact] = useState<{ url: string; name: string; path?: string; mediaType?: string } | null>(null);
+    const [focusHandoff, setFocusHandoff] = useState<string | undefined>();
+    useEffect(() => {
+        if (!focusHandoff) return;
+        document.getElementById(`handoff-${focusHandoff}`)?.scrollIntoView({ block: 'nearest' });
+    }, [focusHandoff]);
     const decide = async (edge: AcpCaseEdge, decision: 'accept' | 'reject') => {
         setBusy(true);
         setError('');
@@ -178,6 +270,7 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
             <div class="acp-detail-content">
                 {error && <p class="acp-decision-error">{error}</p>}
                 {message && <p class="acp-decision-message">{message}</p>}
+                <CaseDag detail={detail} onOpenTask={jobId => navigateAcpTask({ jobId, full: false })} onOpenEdge={setFocusHandoff} />
 
                 <section class="acp-detail-section">
                     <h3>
@@ -186,7 +279,11 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
                     {detail.inbox.length ? (
                         <ul class="acp-stage-list acp-inbox-list">
                             {detail.inbox.map(item => (
-                                <InboxRow key={`${item.kind}-${item.id}`} item={item} onOpen={() => navigateCase(detail.caseId, detail.originSessionId)} />
+                                <InboxRow key={`${item.kind}-${item.id}`} item={item} onOpen={item => {
+                                    if (item.kind === 'handoff') setFocusHandoff(item.id);
+                                    else if (item.kind === 'review') navigateAcpTask({ jobId: item.jobId, reviewId: item.id, full: false });
+                                    else navigateAcpTask({ jobId: item.jobId, full: false });
+                                }} />
                             ))}
                         </ul>
                     ) : (
@@ -199,7 +296,7 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
                     {detail.edges.length ? (
                         <ul class="acp-stage-list acp-case-edges">
                             {detail.edges.map(edge => (
-                                <EdgeRow key={edge.handoffId} edge={edge} caseId={detail.caseId} onDecide={decide} busy={busy} onPreview={setArtifact} />
+                                <EdgeRow key={edge.handoffId} edge={edge} caseId={detail.caseId} onDecide={decide} busy={busy} onPreview={setArtifact} focused={focusHandoff === edge.handoffId} />
                             ))}
                         </ul>
                     ) : (

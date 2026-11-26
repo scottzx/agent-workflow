@@ -5,6 +5,7 @@ import type { AcpDecisionInput, AcpDshSession, AcpExecution, AcpReview, AcpRevie
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
 import { ArtifactDrawer, ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
+import { MicroDag, TicketPanel } from './TicketPanel';
 import {
     channelLabel,
     date,
@@ -25,7 +26,7 @@ import {
     title,
 } from './ui';
 
-type DetailTab = 'overview' | 'progress' | 'review' | 'chat' | 'events';
+type DetailTab = 'overview' | 'ticket' | 'progress' | 'review' | 'chat' | 'events';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const CONTINUE_PROMPT = '上一轮执行中断了，已经完成的不用重做，请接着把任务做完。';
 
@@ -329,8 +330,11 @@ export function AcpTaskDetailPanel({
             setDecisionMessage(text('无法复制链接，可复制地址栏链接', 'Could not copy. Copy the address bar URL.'));
         }
     };
-    const tabs: [DetailTab, string][] = [
+    const openTicket = (detail?.ticket?.items.filter(item => item.state === 'open' || item.state === 'reopened').length ?? 0)
+        + (detail?.ticket?.proposals.filter(item => item.state === 'open' && (item.kind === 'locked' || item.kind === 'check')).length ?? 0);
+    const tabs: [DetailTab, string, number?][] = [
         ['overview', text('概览', 'Overview')],
+        ['ticket', text('任务单与对校', 'Ticket'), openTicket],
         ['progress', text('进展', 'Progress')],
         ['review', text('产物与审核', 'Artifacts & review')],
         ['chat', text('对话', 'Conversation')],
@@ -417,7 +421,7 @@ export function AcpTaskDetailPanel({
                 )}
             </header>
             <nav class="acp-detail-tabs" aria-label={text('任务详情视图', 'Task detail views')} role="tablist">
-                {tabs.map(([id, label]) => (
+                {tabs.map(([id, label, count]) => (
                     <button
                         key={id}
                         id={`acp-detail-tab-${id}`}
@@ -428,6 +432,7 @@ export function AcpTaskDetailPanel({
                         onClick={() => setTab(id)}
                     >
                         {label}
+                        {!!count && <span class="acp-tab-count">{count}</span>}
                     </button>
                 ))}
             </nav>
@@ -483,6 +488,7 @@ export function AcpTaskDetailPanel({
                 )}
                 {detail && (
                     <Fragment>
+                        {tab === 'ticket' && detail && <TicketPanel detail={detail} onChanged={() => { void load(); onChanged(); }} />}
                         {tab === 'overview' && (
                             <TaskOverview
                                 detail={detail}
@@ -789,6 +795,7 @@ function TaskProgress({
                 requests={detail.processRequests?.filter(request => request.status !== 'pending')}
                 onReload={onReload}
             />
+            {!!detail.workflowRun?.nodes?.length && <MicroDag nodes={detail.workflowRun.nodes} />}
             {stages.length > 0 && (
                 <section class="acp-detail-section">
                     <h3>{text('阶段进展', 'Stage progress')}</h3>

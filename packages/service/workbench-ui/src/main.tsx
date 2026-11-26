@@ -1,11 +1,14 @@
 import { render } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { acpTaskService, loginRequired, session } from './api';
 import { AgentModule } from './AgentModule';
-import { CaseModule } from './CaseModule';
+import { ApprovalsModule } from './ApprovalsModule';
+import { countUnread, postApprovalsState } from './approvals-sync';
+import { CaseModule, navigateCase } from './CaseModule';
 import { executionLabels, taskDepth } from './model';
 import { AcpTaskDetailPanel } from './TaskDetail';
-import type { AcpTaskFilter, AcpTaskList, AcpTaskSummary } from './types';
+import { TicketLights } from './TicketPanel';
+import type { AcpApprovals, AcpTaskFilter, AcpTaskList, AcpTaskSummary } from './types';
 import {
     channelLabel,
     date,
@@ -68,8 +71,12 @@ function Login({ onDone }: { onDone: () => void }) {
 /** The table and detail read one ACP projection; neither writes task states. */
 function Workbench({ onLogout }: { onLogout?: () => void }) {
     const route = useRoute();
-    // A thing is the first screen of the workbench; tasks and agents are its other views.
-    const [module, setModule] = useState<'cases' | 'tasks' | 'agents'>('cases');
+    const explicitModule = /^#acp\/(approvals|cases|tasks|agents)\b/.test(location.hash);
+    const landed = useRef(explicitModule);
+    // Approvals lead when something is waiting and the page was opened without a hash.
+    const [module, setModule] = useState<'approvals' | 'cases' | 'tasks' | 'agents'>(explicitModule && location.hash.startsWith('#acp/tasks') ? 'tasks' : explicitModule && location.hash.startsWith('#acp/agents') ? 'agents' : explicitModule && location.hash.startsWith('#acp/approvals') ? 'approvals' : 'cases');
+    const [approvals, setApprovals] = useState<AcpApprovals | null>(null);
+    const [seenTick, setSeenTick] = useState(0);
     const [filter, setFilter] = useState<AcpTaskFilter>('all');
     const [offset, setOffset] = useState(0);
     const [payload, setPayload] = useState<AcpTaskList | null>(null);
@@ -111,10 +118,49 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
         };
     }, [filter, offset, refreshKey]);
 
-    // A task link opened while the agents module is showing still lands on that task.
+    // A task link opened while another module is showing still lands on that task.
     useEffect(() => {
         if (route.jobId) setModule('tasks');
     }, [route.jobId]);
+
+    const publishApprovals = useCallback((view: AcpApprovals) => {
+        setApprovals(view);
+        postApprovalsState(view.totalPending, countUnread(view.items ?? []), view.counts);
+    }, []);
+
+    useEffect(() => {
+        let dead = false;
+        let stamp = '';
+        const tick = async () => {
+            if (document.hidden) return;
+            try {
+                const summary = await acpTaskService.approvals(true);
+                if (dead) return;
+                const nextStamp = `${summary.totalPending}:${summary.latestCreatedAt ?? ''}`;
+                if (nextStamp !== stamp) {
+                    stamp = nextStamp;
+                    const full = await acpTaskService.approvals(false);
+                    if (!dead) publishApprovals(full);
+                } else {
+                    setApprovals(current => {
+                        const view = { ...(current ?? summary), totalPending: summary.totalPending, counts: summary.counts, latestCreatedAt: summary.latestCreatedAt, items: current?.items ?? [] };
+                        postApprovalsState(view.totalPending, countUnread(view.items ?? []), view.counts);
+                        return view;
+                    });
+                }
+                if (!landed.current) {
+                    landed.current = true;
+                    const bare = !location.hash || location.hash === '#';
+                    if (summary.totalPending > 0 && bare) setModule('approvals');
+                }
+            } catch { /* The tab badge waits for the next tick. */ }
+        };
+        void tick();
+        const timer = window.setInterval(() => void tick(), 8000);
+        const onVisible = () => { if (!document.hidden) void tick(); };
+        document.addEventListener('visibilitychange', onVisible);
+        return () => { dead = true; window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+    }, [publishApprovals, refreshKey]);
 
     useEffect(() => {
         const close = (event: KeyboardEvent) => {
@@ -134,7 +180,11 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                 <div class="acp-workbench-title">
                     <h1>{text('任务工作台', 'Task workbench')}</h1>
                     <nav class="acp-module-switch" aria-label={text('工作台模块', 'Workbench modules')}>
-                        <button type="button" aria-pressed={module === 'cases'} onClick={() => setModule('cases')}>
+                        <button type="button" aria-pressed={module === 'approvals'} onClick={() => { landed.current = true; setModule('approvals'); }}>
+                            {text('待审批', 'Approvals')}
+                            {!!approvals?.totalPending && <span class="acp-tab-count">{approvals.totalPending}</span>}
+                        </button>
+                        <button type="button" aria-pressed={module === 'cases'} onClick={() => { landed.current = true; setModule('cases'); }}>
                             {text('事情', 'Cases')}
                         </button>
                         <button type="button" aria-pressed={module === 'tasks'} onClick={() => setModule('tasks')}>
@@ -166,7 +216,27 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
             <p class="acp-workbench-source">
                 {text('数据来源：本机 A2A 网关账本。', 'Source: this A2A gateway ledger.')}
             </p>
-            {module === 'agents' ? (
+            {module === 'approvals' ? (
+                <ApprovalsModule
+                    view={approvals}
+                    seenTick={seenTick}
+                    onReload={() => setRefreshKey(key => key + 1)}
+                    onViewed={() => {
+                        setSeenTick(tick => tick + 1);
+                        if (approvals) postApprovalsState(approvals.totalPending, countUnread(approvals.items ?? []), approvals.counts);
+                    }}
+                    onOpenTask={(jobId, reviewId) => {
+                        landed.current = true;
+                        setModule('tasks');
+                        navigateAcpTask({ jobId, reviewId, full: false });
+                    }}
+                    onOpenCase={(caseId, originSessionId) => {
+                        landed.current = true;
+                        setModule('cases');
+                        navigateCase(caseId, originSessionId);
+                    }}
+                />
+            ) : module === 'agents' ? (
                 <AgentModule
                     refreshKey={refreshKey}
                     onOpenTask={jobId => {
@@ -254,6 +324,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                             <td>
                                                 <span class="acp-mode-label">{channelLabel(task.channel)}</span>
                                                 {task.agentName && <small class="acp-cell-note">{task.agentName}</small>}
+                                                <TicketLights summary={task.ticketSummary} />
                                             </td>
                                             <td>
                                                 <Status value={taskStatus(task)} />

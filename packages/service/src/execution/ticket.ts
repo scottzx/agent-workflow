@@ -32,7 +32,11 @@ export type QualityReview = z.infer<typeof qualityReviewSchema>;
 
 export type TicketActor = 'executor' | 'qa' | 'host' | 'person' | 'coach';
 /** Who settled a proposal: a person, or a coach agent identified by the harness session it runs in. */
-export interface ProposalSettler { kind: 'person' | 'coach'; agent?: string; sessionId?: string }
+export interface ProposalSettler {
+  kind: 'person' | 'coach'; agent?: string; sessionId?: string;
+  /** How a person's decision reached the ledger. Absent on records written before the page named its path. */
+  via?: 'page' | 'relay';
+}
 export type ItemState = 'open' | 'done' | 'disputed' | 'verified' | 'reopened' | 'withdrawn';
 export type TicketStatus = 'drafting' | 'in_revision' | 'ready_for_review' | 'in_review' | 'closed' | 'stopped';
 export type SelfCheckState = 'pending' | 'pass' | 'na';
@@ -287,8 +291,9 @@ const selfCheckSpecSchema = z.object({ id: z.string().trim().min(1).max(80), kin
 const openSchema = jobSchema.extend({ roleId: id, caseId: id,
   exportPath: z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && value.endsWith('.json'), 'exportPath must be an absolute .json path').optional(),
   artifacts: z.array(z.string().trim().min(1).max(1024)).max(50).optional(), selfChecks: z.array(selfCheckSpecSchema).max(100).optional() }).strict();
-const settlerSchema = z.object({ kind: z.enum(['person', 'coach']), agent: id.optional(), sessionId: id.optional() }).strict()
-  .refine(by => by.kind === 'coach' || (!by.agent && !by.sessionId), 'Only a coach names an agent session');
+const settlerSchema = z.object({
+  kind: z.enum(['person', 'coach']), agent: id.optional(), sessionId: id.optional(), via: z.enum(['page', 'relay']).optional(),
+}).strict().refine(by => by.kind === 'coach' || (!by.agent && !by.sessionId), 'Only a coach names an agent session');
 const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200) }).strict();
 const reviewSchema = jobSchema.extend({ review: qualityReviewSchema, qaJobId: id.optional() }).strict();
 const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).optional() }).strict();

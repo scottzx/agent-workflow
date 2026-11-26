@@ -60,6 +60,8 @@ export interface AcpTaskSummary {
     blockedTools?: string[];
     canContinue?: boolean;
     canAccept?: boolean;
+    pendingHandoffId?: string;
+    ticketSummary?: AcpTicketSummary;
 }
 
 export interface AcpBusinessAcceptance {
@@ -273,6 +275,8 @@ export interface AcpTaskDetail extends AcpTaskSummary {
     dependencies?: AcpDependency[];
     legalNext?: { conventionId: string; toTargetId: string; purpose: string; requireHuman: boolean; when: 'acceptance_accepted' | 'ticket_closed'; achieved: boolean }[];
     artifacts?: { revision: string; digest?: string; artifacts: unknown[] }[];
+    ticket?: AcpTicket;
+    workflowRun?: { nodes: AcpWorkflowNode[] };
 }
 export interface AcpDecisionInput {
     action: AcpReviewAction;
@@ -349,7 +353,7 @@ export interface AcpCaseConvention {
 }
 
 export interface AcpInboxItem {
-    kind: 'review' | 'process_request' | 'handoff';
+    kind: 'review' | 'process_request' | 'handoff' | 'proposal';
     id: string;
     caseId?: string;
     jobId: string;
@@ -359,6 +363,11 @@ export interface AcpInboxItem {
     digest?: string;
     createdAt: string;
     canDecide: boolean;
+    channel?: 'trial' | 'formal' | 'standalone';
+    proposalId?: string;
+    proposalKind?: 'locked' | 'check' | 'role' | 'qa';
+    text?: string;
+    roleId?: string;
 }
 
 export interface AcpCaseArtifact {
@@ -419,6 +428,164 @@ export interface AcpConventionInput {
     when: 'acceptance_accepted' | 'ticket_closed' | 'fact_reached';
     requireHuman?: boolean;
     condition?: { metric: string; operator: 'gte' | 'lte' | 'gt' | 'lt'; value: number };
+}
+
+export interface AcpTicketSummary {
+    status: string;
+    round: number;
+    selfCheckDone: number;
+    selfCheckTotal: number;
+    openMust: number;
+    openProposals: number;
+    mismatches: number;
+}
+
+export interface AcpTicketLog {
+    round: number;
+    by: string;
+    action: string;
+    note?: string;
+}
+
+export interface AcpCrossCheck {
+    kind: 'self_vs_program' | 'self_vs_qa';
+    checkId: string;
+    claimedState: string;
+    claimedNote?: string;
+    actualVerdict: 'fail' | 'disagree';
+    actualNote?: string;
+}
+
+export interface AcpTicketItem {
+    id: string;
+    source: 'qa' | 'program';
+    raisedInRound: number;
+    severity: 'must' | 'should';
+    where: string;
+    problem: string;
+    suggestion?: string;
+    checkId?: string;
+    state: string;
+    log: AcpTicketLog[];
+    crossCheck?: AcpCrossCheck;
+}
+
+export interface AcpTicketProposal {
+    id: string;
+    kind: 'check' | 'role' | 'qa' | 'locked';
+    text: string;
+    raisedInRound: number;
+    state: 'open' | 'accepted' | 'rejected' | 'done';
+    note?: string;
+    by?: { kind: 'person' | 'coach'; agent?: string; sessionId?: string; via?: 'page' | 'relay' };
+}
+
+export interface AcpTicketSelfCheck {
+    id: string;
+    kind: 'self' | 'self_and_qa' | 'program';
+    severity: 'must' | 'should';
+    rule: string;
+    evidenceHint?: string;
+    state: 'pending' | 'pass' | 'na';
+    checkedInRound?: number;
+    note?: string;
+    log: AcpTicketLog[];
+}
+
+export interface AcpTicket {
+    roleId: string;
+    caseId: string;
+    status: string;
+    round: number;
+    selfChecks?: AcpTicketSelfCheck[];
+    items: AcpTicketItem[];
+    proposals: AcpTicketProposal[];
+    history: { round: number; by: string; action: string; verdict?: string; scores?: Record<string, number>; summary?: string; note?: string }[];
+}
+
+export interface AcpWorkflowNode {
+    round?: number;
+    nodeId?: string;
+    status?: 'completed' | 'failed' | 'skipped' | string;
+    cached?: boolean;
+    skipReason?: string;
+    error?: string;
+    startedAt?: string;
+    finishedAt?: string;
+    inputDigest?: string;
+}
+
+export type AcpApprovalKind = 'process_request' | 'review' | 'handoff' | 'proposal';
+
+export interface AcpApprovalItem {
+    kind: AcpApprovalKind;
+    id: string;
+    jobId: string;
+    originSessionId: string;
+    caseId?: string;
+    channel: 'trial' | 'formal' | 'standalone';
+    title: string;
+    summary: string;
+    createdAt: string;
+    updatedAt: string;
+    canDecide: boolean;
+    deadlineAt?: string;
+    revision?: string;
+    digest?: string;
+    roleId?: string;
+    proposalId?: string;
+    proposalKind?: AcpTicketProposal['kind'];
+    text?: string;
+    processRequest?: AcpProcessRequest;
+    handoff?: {
+        handoffId: string;
+        toTargetId: string;
+        purpose: string;
+        reason: string;
+        artifactRevision: string;
+        artifactDigest: string;
+        snapshots?: { digest: string; name: string; size: number; mediaType?: string }[];
+    };
+}
+
+export interface AcpApprovalCounts {
+    process_request: number;
+    review: number;
+    handoff: number;
+    proposal: number;
+}
+
+export interface AcpApprovals {
+    totalPending: number;
+    counts: AcpApprovalCounts;
+    latestCreatedAt: string | null;
+    items?: AcpApprovalItem[];
+}
+
+export interface AcpRoleRsi {
+    roleId: string;
+    version: { commit?: string; dirty: boolean };
+    checklist: unknown;
+    workflow: unknown;
+    gate: {
+        ready?: boolean;
+        reasons?: string[];
+        error?: string;
+        required?: number;
+        l1Mismatches?: number;
+        devRuns?: unknown[];
+        testCases?: { caseId: string; kind: string; result: string }[];
+        calibration?: { required: boolean; status: string; checksDigest?: string; falsePositives?: number };
+    };
+    calibration: {
+        passed?: boolean;
+        calibratedAt?: string;
+        falsePositives?: unknown[];
+        positiveSamples?: number;
+        negativeSamples?: number;
+        checksDigest?: string;
+        role?: { commit?: string; dirty?: boolean };
+    } | null;
 }
 
 export interface AcpChatPage {

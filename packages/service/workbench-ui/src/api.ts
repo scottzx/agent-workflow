@@ -9,7 +9,9 @@ import type {
     AcpDecisionInput,
     AcpDshSession,
     AcpHandoffDecisionInput,
+    AcpApprovals,
     AcpProcessAnswerInput,
+    AcpRoleRsi,
     AcpTaskDetail,
     AcpTaskFilter,
     AcpTaskList,
@@ -116,4 +118,8 @@ export const acpTaskService = {
     /** Registers each agents/*.md under the path as a developing draft with its own path-agent target. */
     registerAgentPath: (input: AcpAgentPathInput): Promise<AcpAgentCatalog & { registered: { agentId: string; name: string; targetId: string; file: string }[] }> =>
         post('/agents/register-path', input),
+    approvals: (summary = false): Promise<AcpApprovals> => call(summary ? '/approvals?summary=1' : '/approvals'),
+    roleRsi: (roleId: string): Promise<AcpRoleRsi> => call(`/roles/${encodeURIComponent(roleId)}/rsi`),
+    decideProposal: (jobId: string, proposalId: string, input: { state: 'accepted' | 'rejected' | 'done'; note?: string }): Promise<unknown> =>
+        post(`/tasks/${encodeURIComponent(jobId)}/ticket/proposals/${encodeURIComponent(proposalId)}`, input),
 };

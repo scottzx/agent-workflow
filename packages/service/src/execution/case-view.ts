@@ -9,7 +9,7 @@ import type { Handoff, HandoffConvention, HandoffStatus, HandoffWhen, HandoffSna
 import type { CaseFact, CaseReceipt } from './externals.js';
 import type { AcpTaskSummary, WorkbenchSnapshot, WorkbenchSource } from './workbench.js';
 import { legalNextForJob } from './workbench.js';
-import { projectProcessRequest } from './process-request.js';
+import { projectApprovals, type ApprovalItem } from './approvals-view.js';
 
 export interface WorkbenchCaseSummary {
   caseId: string;
@@ -70,7 +70,7 @@ export interface WorkbenchCaseArtifact {
 }
 
 export interface WorkbenchInboxItem {
-  kind: 'review' | 'process_request' | 'handoff';
+  kind: 'review' | 'process_request' | 'handoff' | 'proposal';
   id: string;
   caseId?: string;
   jobId: string;
@@ -81,6 +81,11 @@ export interface WorkbenchInboxItem {
   createdAt: string;
   /** True when the person on this page may answer it. */
   canDecide: boolean;
+  channel?: 'trial' | 'formal' | 'standalone';
+  proposalId?: string;
+  proposalKind?: 'locked' | 'check' | 'role' | 'qa';
+  text?: string;
+  roleId?: string;
 }
 
 export interface WorkbenchCaseDetail extends WorkbenchCaseSummary {
@@ -179,32 +184,17 @@ export function workbenchCases(source: WorkbenchSource, snapshot: WorkbenchSnaps
   return { list, details };
 }
 
-/** Reviews, questions and handoff proposals of one case, in one column. */
-function inboxFor(source: WorkbenchSource, caseId: string, jobIds: Set<string>, actorId: string): WorkbenchInboxItem[] {
-  const items: WorkbenchInboxItem[] = [];
-  for (const review of source.reviews) {
-    if (!jobIds.has(review.jobId) || review.status !== 'pending') continue;
-    items.push({ kind: 'review', id: review.reviewId, caseId, jobId: review.jobId, title: review.title,
-      summary: `确认 ${review.revision}`, revision: review.revision, digest: review.digest, createdAt: review.createdAt,
-      canDecide: review.reviewerId === actorId });
-  }
-  const now = source.now ?? Date.now();
-  for (const request of source.processRequests ?? []) {
-    if (!jobIds.has(request.jobId)) continue;
-    const projected = projectProcessRequest(request, now);
-    if (projected.status !== 'pending') continue;
-    items.push({ kind: 'process_request', id: projected.requestId, caseId, jobId: request.jobId,
-      title: projected.kind === 'plan' ? '计划待批准' : projected.kind === 'permission' ? `工具「${projected.toolTitle ?? ''}」待批准` : '有待回答的问题',
-      summary: projected.kind === 'plan' ? projected.planContent ?? '' : projected.kind === 'permission' ? projected.toolTitle ?? '' : projected.questions?.[0]?.question ?? '',
-      createdAt: projected.createdAt, canDecide: true });
-  }
-  for (const handoff of source.ledger.handoffs ?? []) {
-    if (!jobIds.has(handoff.fromJobId) || handoff.status !== 'proposed') continue;
-    items.push({ kind: 'handoff', id: handoff.handoffId, caseId, jobId: handoff.fromJobId, title: '交接提议',
-      summary: `${handoff.reason}（交给 ${handoff.toTargetId}）`, revision: handoff.artifactRevision,
-      digest: handoff.artifactDigest, createdAt: handoff.createdAt, canDecide: true });
-  }
-  return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+function inboxItem(item: ApprovalItem): WorkbenchInboxItem {
+  return { kind: item.kind, id: item.kind === 'proposal' ? item.proposalId ?? item.id : item.id, caseId: item.caseId, jobId: item.jobId,
+    title: item.title, summary: item.summary, createdAt: item.createdAt, canDecide: item.canDecide, channel: item.channel,
+    ...(item.revision ? { revision: item.revision } : {}), ...(item.digest ? { digest: item.digest } : {}),
+    ...(item.proposalId ? { proposalId: item.proposalId } : {}), ...(item.proposalKind ? { proposalKind: item.proposalKind } : {}),
+    ...(item.text ? { text: item.text } : {}), ...(item.roleId ? { roleId: item.roleId } : {}) };
+}
+
+/** The same four gates as the approvals tab, limited to this case, newest first. */
+function inboxFor(source: WorkbenchSource, caseId: string, jobIds: Set<string>, _actorId: string): WorkbenchInboxItem[] {
+  return projectApprovals(source, { jobIds, caseId }).items.map(inboxItem).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 /** One case, or nothing when this scope cannot see it. */
