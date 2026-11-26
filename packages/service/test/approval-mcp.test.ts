@@ -430,6 +430,32 @@ test('approval MCP fills the default origin, binds it idempotently, and lets an 
   assert.equal((fallbackIdentity.structuredContent as { configured: boolean }).configured, true);
 });
 
+test('a2a_task_dispatch forwards deliveryMode to execution_submit and remote_agent_spawn', async () => {
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const fakeFetch: typeof globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { method: string; params: Record<string, unknown> };
+    calls.push(body);
+    return new Response(JSON.stringify({ ok: true, jobId: 'job-mode' }), { status: 200 });
+  };
+  const mcp = createA2AApprovalMcpHandler({ gatewayUrl: 'http://127.0.0.1:36814', fetch: fakeFetch });
+  const submitted = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: 'sess-1', targetId: 'role-a', prompt: 'edit in place', deliveryMode: 'workspace_git',
+  });
+  assert.equal(submitted.isError, undefined, submitted.content[0]?.text);
+  assert.equal(calls[0]?.method, 'execution_submit');
+  assert.equal((calls[0]?.params.input as { deliveryMode?: string }).deliveryMode, 'workspace_git');
+  const spawned = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: 'sess-1', remote: 'scott-mac-dsh', cwd: '/tmp/work', prompt: 'read only', deliveryMode: 'none',
+  });
+  assert.equal(spawned.isError, undefined, spawned.content[0]?.text);
+  assert.equal(calls[1]?.method, 'remote_agent_spawn');
+  assert.equal(calls[1]?.params.deliveryMode, 'none');
+  const rejected = await mcp.invokeTool('a2a_task_dispatch', {
+    originSessionId: 'sess-1', targetId: 'role-a', prompt: 'bad', deliveryMode: 'sideways',
+  });
+  assert.equal(rejected.isError, true);
+});
+
 test('mcp cli help documents the default origin session', async () => {
   const { spawn } = await import('node:child_process');
   const binPath = resolve(import.meta.dirname, '../bin/acp-service.ts');

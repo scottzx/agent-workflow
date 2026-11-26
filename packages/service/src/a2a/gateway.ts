@@ -18,9 +18,9 @@ import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestN
 import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
-import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { a2aResultContractSchema, type A2AResultContract, type A2AResultMetadata } from './result-metadata.js';
 import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
-import { artifactInstructions, defaultJobDirectory, defaultManifestPath, snapshotInstructions, spaceInstructions } from './job-directory.js';
+import { deliveryInstructions, deliveryModeSchema, resolveDefaultJobDirectory, snapshotInstructions, spaceInstructions, type DeliveryMode } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
 import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
@@ -120,6 +120,7 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
   roleId: string.optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
+  deliveryMode: deliveryModeSchema.optional(),
   clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
   provider: string.optional(), model: string.optional(), initiatedBy: actorSchema.optional(),
   notifySessions: notifySessionsSchema,
@@ -266,6 +267,13 @@ function atomicJson(file: string, value: unknown): void {
   renameSync(temp, file);
   const dir = openSync(path.dirname(file), 'r');
   try { fsyncSync(dir); } finally { closeSync(dir); }
+}
+
+function requestedDeliveryMode(field: unknown, declared: DeliveryMode | undefined): DeliveryMode {
+  if (field !== undefined && declared !== undefined && field !== declared) {
+    throw new Error('deliveryMode does not match resultContract.deliveryMode');
+  }
+  return deliveryModeSchema.parse(field ?? declared ?? 'artifacts');
 }
 
 export class RemoteAgentGateway {
@@ -660,13 +668,24 @@ export class RemoteAgentGateway {
       const sandboxed = resolved.sandbox ? { ...declaredRequirements, sandbox: resolved.sandbox } : declaredRequirements;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
       const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
-      // Unless the caller declared its own artifact location, every task gets <cwd>/.1agents/jobs/<jobId>/ and a
-      // per-attempt manifest, announced to the agent in the prompt. The host creates the directory during preflight.
-      let artifacts = !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && resolved.cwd
-        ? { directory: defaultJobDirectory(resolved.cwd, job.jobId), manifest: defaultManifestPath(resolved.cwd, job.jobId, attempt.attemptId) } : undefined;
-      const withArtifacts = <T>(declared: T, add: (found: NonNullable<typeof artifacts>) => T): T => artifacts ? add(artifacts) : declared;
-      let requirements = withArtifacts(sandboxed, found => ({ ...sandboxed, jobDirectory: found.directory }));
-      let resultContract = withArtifacts(declaredResult, found => ({ ...(declaredResult ?? { jobId: job.jobId }), artifactManifestPath: found.manifest }));
+      const mode = requestedDeliveryMode(fields.deliveryMode, declaredResult?.deliveryMode);
+      const includeMode = mode !== 'artifacts' || declaredResult?.deliveryMode !== undefined || fields.deliveryMode !== undefined;
+      const contractBase = (): A2AResultContract | undefined => {
+        if (!declaredResult && !includeMode) return undefined;
+        return { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: mode } : {}) };
+      };
+      // artifacts and workspace_files get a per-attempt manifest unless the caller already named a location.
+      // A worktree cwd parks that directory under <repoRoot>/.1agents/runtime/jobs. none and workspace_git do not
+      // invent one; an explicit jobDirectory or manifest is kept. The host creates a managed directory at preflight.
+      const located = resolved.cwd ? resolveDefaultJobDirectory(resolved.cwd, job.jobId) : undefined;
+      const autoLocate = (mode === 'artifacts' || mode === 'workspace_files')
+        && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && Boolean(located);
+      let artifacts = autoLocate && located
+        ? { directory: located, manifest: path.posix.join(located, `manifest-${attempt.attemptId}.json`) } : undefined;
+      let requirements = artifacts ? { ...sandboxed, jobDirectory: artifacts.directory } : sandboxed;
+      let resultContract = artifacts
+        ? { ...(contractBase() ?? { jobId: job.jobId }), artifactManifestPath: artifacts.manifest }
+        : contractBase();
       const boundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
       try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
@@ -674,7 +693,7 @@ export class RemoteAgentGateway {
         // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
         // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
         if (!artifacts) throw error;
-        artifacts = undefined; requirements = sandboxed; resultContract = declaredResult;
+        artifacts = undefined; requirements = sandboxed; resultContract = contractBase();
         await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       }
       const publicationRole = boundRole ?? explicitRole ?? job.roleId;
@@ -704,10 +723,14 @@ export class RemoteAgentGateway {
       this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
+      let hasTicket = false;
+      try { this.ledger.ticket(input.originSessionId, job.jobId); hasTicket = true; }
+      catch (error) { if (!(error instanceof TicketError)) throw error; }
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '')
+        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
+          + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest)
           + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
-            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication })
+            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
           + snapshotInstructions(input.input?.handoffSnapshot) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
           ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),

@@ -12,7 +12,11 @@ import type { A2APreflightInput, A2ABackend, A2APrepareInput, A2ARunResult, A2AT
 
 class Backend implements A2ABackend {
   beforePrepare?: () => Promise<void>;
-  async preflight(input: A2APreflightInput) { return { ok: true, cwd: input.cwd, checkedAt: new Date().toISOString(), checks: [{ id: 'fixture-host', ok: true }] }; }
+  readonly preflights: A2APreflightInput[] = [];
+  async preflight(input: A2APreflightInput) {
+    this.preflights.push(structuredClone(input));
+    return { ok: true, cwd: input.cwd, checkedAt: new Date().toISOString(), checks: [{ id: 'fixture-host', ok: true }] };
+  }
   readonly runs: Array<{ target: A2ATarget; prompt: string; signal: AbortSignal; finish: (result: A2ARunResult) => void }> = [];
   async prepare(input: A2APrepareInput): Promise<A2ATarget> {
     await this.beforePrepare?.();
@@ -598,4 +602,57 @@ test('the task ticket lives on the job: the gateway enforces each actor at the c
   const restarted = f.gateway();
   assert.equal((await restarted.invoke('ticket_get', scope) as any).status, 'ready_for_review', 'the ticket is persisted with the ledger');
   assert.equal((await restarted.invoke('ticket_close', { ...scope, status: 'closed', stopReason: 'passed' }) as any).status, 'closed');
+});
+
+test('deliveryMode chooses the prompt suffix and whether a default job directory is admitted', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const worktree = '/repo/.1agents/worktrees/demo';
+  const none = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, cwd: worktree, prompt: 'read only', deliveryMode: 'none', clientRequestId: 'mode-none' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  assert.equal(f.backend.runs[0]!.prompt, 'read only');
+  assert.equal(f.backend.preflights.some(item => item.jobDirectory), false);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'ok' });
+  await until(() => gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: none.taskId }) as Promise<any>, item => item.state === 'TASK_STATE_COMPLETED');
+
+  const submitted = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'legacy:local', clientRequestId: 'mode-none-fields',
+    input: { cwd: worktree, prompt: 'review the diff', agentPreset: 'standard', deliveryMode: 'none' } }) as any;
+  await until(async () => f.backend.runs.length, count => count === 2);
+  assert.equal(f.backend.runs[1]!.prompt, 'review the diff');
+  assert.equal(submitted.error, undefined);
+  f.backend.runs[1]!.finish({ outcome: 'completed', text: 'ok' });
+
+  const gitPrompt = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, prompt: 'edit code', deliveryMode: 'workspace_git', clientRequestId: 'mode-git',
+    preflight: { jobDirectory: '/project/custom' } }) as any;
+  await until(async () => f.backend.runs.length, count => count === 3);
+  assert.match(f.backend.runs[2]!.prompt, /\[代码交付约定\]/);
+  assert.doesNotMatch(f.backend.runs[2]!.prompt, /\[产物约定\]/);
+  assert.doesNotMatch(f.backend.runs[2]!.prompt, /\/project\/\.1agents\/jobs\//);
+  assert.equal(f.backend.preflights.at(-1)?.jobDirectory, '/project/custom');
+  f.backend.runs[2]!.finish({ outcome: 'completed', text: 'ok' });
+  const gitView = await until(() => gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: gitPrompt.taskId }) as Promise<any>, item => item.state === 'TASK_STATE_COMPLETED');
+  assert.equal(gitView.resultMetadata?.lineage?.deliveryMode, 'workspace_git');
+  assert.equal(gitView.resultMetadata?.lineage?.artifactManifestPath, undefined);
+
+  const files = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, cwd: worktree, prompt: 'write the doc', deliveryMode: 'workspace_files', clientRequestId: 'mode-files' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 4);
+  const filesPrompt = f.backend.runs[3]!.prompt;
+  assert.match(filesPrompt, /\[项目文档交付约定\]/);
+  assert.match(filesPrompt, new RegExp(`/repo/\\.1agents/runtime/jobs/${files.jobId}/manifest-${files.attemptId}\\.json`));
+  assert.doesNotMatch(filesPrompt, /\/repo\/\.1agents\/worktrees\/demo\/\.1agents\/jobs\//);
+  assert.equal(f.backend.preflights.at(-1)?.jobDirectory, `/repo/.1agents/runtime/jobs/${files.jobId}`);
+  f.backend.runs[3]!.finish({ outcome: 'completed', text: 'ok' });
+
+  const relocated = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, cwd: worktree, prompt: 'ship the deck', clientRequestId: 'mode-artifacts' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 5);
+  const artifactPrompt = f.backend.runs[4]!.prompt;
+  assert.match(artifactPrompt, /\[产物约定\]/);
+  assert.match(artifactPrompt, new RegExp(`/repo/\\.1agents/runtime/jobs/${relocated.jobId}/`));
+  assert.doesNotMatch(artifactPrompt, /\[空间\]/);
+  assert.equal(f.backend.preflights.at(-1)?.jobDirectory, `/repo/.1agents/runtime/jobs/${relocated.jobId}`);
+  f.backend.runs[4]!.finish({ outcome: 'completed', text: 'ok' });
+
+  const mismatched = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'legacy:local', clientRequestId: 'mode-mismatch',
+    input: { cwd: '/project', prompt: 'nope', agentPreset: 'standard', deliveryMode: 'workspace_git', resultContract: { jobId: 'j', deliveryMode: 'none' } } }) as any;
+  assert.match(String(mismatched.error), /deliveryMode/);
+  await assert.rejects(gateway.invoke('remote_agent_spawn', { ...rawSpawn, deliveryMode: 'sideways', clientRequestId: 'mode-bad' }));
 });
