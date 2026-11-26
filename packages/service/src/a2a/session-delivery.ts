@@ -45,6 +45,9 @@ export interface SessionDeliverySummary {
   bindings: number;
   deliveries: SessionDeliveryCounts;
   blockedOrigins: number;
+  /** Subscriber queues only. A blocked target is not an owner origin. */
+  subscriberDeliveries: SessionDeliveryCounts;
+  blockedTargets: number;
 }
 export interface SessionDeliveryReceipt extends SessionBinding {
   messageId: string;
@@ -191,9 +194,12 @@ export class SessionDelivery {
   private save(): void {
     if (this.storageFailed) throw new Error('Session delivery storage is unavailable; repair storage and restart the gateway');
     const temporary = `${this.file}.${randomUUID()}.tmp`;
+    // Old gateways reject an unknown key. Omit the subscriber queue until it is used.
+    const { targetDeliveries, ...ownerState } = this.state;
+    const payload = targetDeliveries.length ? this.state : ownerState;
     try {
       const fd = openSync(temporary, 'wx', 0o600);
-      try { writeFileSync(fd, JSON.stringify(this.state)); fsyncSync(fd); } finally { closeSync(fd); }
+      try { writeFileSync(fd, JSON.stringify(payload)); fsyncSync(fd); } finally { closeSync(fd); }
       renameSync(temporary, this.file);
       const dir = openSync(path.dirname(this.file), 'r');
       try { fsyncSync(dir); } finally { closeSync(dir); }
@@ -329,15 +335,20 @@ export class SessionDelivery {
   }
   /** In-memory counters for /health. A storage failure stays on `healthy` and must not hide this read. */
   summary(): SessionDeliverySummary {
-    const counts = this.tally(this.state.deliveries);
-    const deliveries: SessionDeliveryCounts = {
+    const deliveries = this.countsOf(this.state.deliveries);
+    const subscriberDeliveries = this.countsOf(this.state.targetDeliveries);
+    const blockedOrigins = new Set(this.state.deliveries.flatMap(delivery => delivery.status === 'unknown' || delivery.status === 'rejected' ? [delivery.originSessionId] : []));
+    const blockedTargets = new Set(this.state.targetDeliveries.flatMap(delivery => delivery.status === 'unknown' || delivery.status === 'rejected' ? [delivery.targetKey] : []));
+    return { bindings: this.state.bindings.length, deliveries, blockedOrigins: blockedOrigins.size, subscriberDeliveries, blockedTargets: blockedTargets.size };
+  }
+  private countsOf(deliveries: readonly { status: SessionDeliveryStatus; processedAt?: string }[]): SessionDeliveryCounts {
+    const counts = this.tally(deliveries);
+    return {
       total: counts.total, pending: counts.pending, dispatching: counts.dispatching, retrying: counts.retrying,
       accepted: counts.accepted, unknown: counts.unknown, rejected: counts.rejected,
     };
-    const blockedOrigins = new Set(this.state.deliveries.flatMap(delivery => delivery.status === 'unknown' || delivery.status === 'rejected' ? [delivery.originSessionId] : []));
-    return { bindings: this.state.bindings.length, deliveries, blockedOrigins: blockedOrigins.size };
   }
-  private tally(deliveries: readonly Delivery[]): SessionDeliveryCounts & { unprocessed: number } {
+  private tally(deliveries: readonly { status: SessionDeliveryStatus; processedAt?: string }[]): SessionDeliveryCounts & { unprocessed: number } {
     const counts: SessionDeliveryCounts & { unprocessed: number } = {
       total: deliveries.length, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0, unprocessed: 0,
     };

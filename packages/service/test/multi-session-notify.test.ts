@@ -267,3 +267,88 @@ test('case and job subscriptions fan out without duplicating the owner or blocki
   assert.equal(JSON.stringify(listed).includes('synthetic-dsh-token'), false);
   assert.equal(JSON.stringify(gateway.sessions.summary()).includes('synthetic-dsh-token'), false);
 });
+
+test('illegal notifySessions is rejected before a job, case, or remote dispatch is stored', { timeout: 20_000 }, async (t: TestContext) => {
+  const root = await mkdtemp(join(tmpdir(), 'notify-atomic-'));
+  const local = createServer((req, res) => {
+    void (async () => {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = raw ? JSON.parse(raw) : {};
+      if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: { accepted: true } } }));
+    })().catch(() => { if (!res.headersSent) { res.writeHead(400); res.end(); } });
+  });
+  const dshUrl = await listen(local);
+  const backend = new Backend();
+  let host: Awaited<ReturnType<typeof createA2AServer>>;
+  const remoteServer = createServer((req, res) => {
+    if (req.url === '/.well-known/agent-card.json') host.cardHandler(req, res);
+    else void host.handler(req, res);
+  });
+  const remoteUrl = await listen(remoteServer);
+  host = await createA2AServer({ backend, capacity: testCapacity(root), publicUrl: remoteUrl, stateDirectory: join(root, 'remote'), token: 'synthetic-remote-token', defaultAgentPreset: 'coding' });
+  const gateway = new RemoteAgentGateway({
+    stateDirectory: join(root, 'gateway'), port: 0,
+    remotes: { remote: { url: remoteUrl, token: 'synthetic-remote-token' } },
+    sessionHosts: {
+      dsh: { kind: 'dsh', url: dshUrl, timeoutMs: 1000 },
+      codex: { kind: 'codex', executable: 'codex' },
+    },
+    pollIntervalMs: 60_000,
+  });
+  t.after(async () => {
+    await gateway.close();
+    await host.close();
+    await Promise.all([stop(remoteServer), stop(local)]);
+    await rm(root, { recursive: true, force: true });
+  });
+  const origin = 'origin-atomic';
+  const clientRequestId = 'same-request';
+  const badBatch = [
+    { role: 'downstream' as const, target: { host: 'dsh', sessionId: 'ok-session' } },
+    { role: 'observer' as const, target: { host: 'codex', sessionId: 'not-a-uuid' } },
+  ];
+  await assert.rejects(gateway.invoke('execution_submit', {
+    originSessionId: origin, targetId: 'legacy:remote', clientRequestId,
+    input: { cwd: '/synthetic/project', prompt: 'must not be stored', agentPreset: 'coding' },
+    notifySessions: badBatch,
+  }), /UUID/);
+  const empty = await gateway.invoke('execution_list', { originSessionId: origin }) as { total: number };
+  const subs = async () => (await gateway.invoke('notification_subscriptions', { originSessionId: origin }) as { subscriptions: unknown[] }).subscriptions;
+  assert.equal(empty.total, 0);
+  assert.equal((await subs()).length, 0);
+  assert.equal(backend.runs.length, 0);
+
+  await assert.rejects(gateway.invoke('case_open', {
+    originSessionId: origin, caseId: 'case-orphan', goal: 'must not stick',
+    notifySessions: [
+      { role: 'observer', target: { host: 'dsh', sessionId: 'ok-session' } },
+      { role: 'observer', target: { host: 'missing-host', sessionId: 'x' } },
+    ],
+  }), /Unknown session host/);
+  await assert.rejects(gateway.invoke('case_get', { originSessionId: origin, caseId: 'case-orphan' }), /No such case/);
+  assert.equal((await subs()).length, 0);
+
+  await assert.rejects(gateway.invoke('remote_agent_spawn', {
+    originSessionId: origin, remote: 'remote', cwd: '/synthetic/project', prompt: 'must not reach the remote', agentPreset: 'coding',
+    notifySessions: badBatch,
+  }), /UUID/);
+  assert.equal(backend.runs.length, 0);
+  assert.equal((await gateway.invoke('execution_list', { originSessionId: origin }) as { total: number }).total, 0);
+  assert.equal((await subs()).length, 0);
+
+  const dispatched = await gateway.invoke('execution_submit', {
+    originSessionId: origin, targetId: 'legacy:remote', clientRequestId,
+    input: { cwd: '/synthetic/project', prompt: 'now dispatch for real', agentPreset: 'coding' },
+    notifySessions: [{ role: 'downstream', target: { host: 'dsh', sessionId: 'ok-session' } }],
+  }) as { jobId: string; attemptId: string; error?: string };
+  assert.equal(dispatched.error, undefined, dispatched.error);
+  await until(async () => backend.runs.length, count => count === 1);
+  backend.runs[0]!.finish({ outcome: 'completed', text: 'dispatched after the bad batch was rejected' });
+  assert.equal((await gateway.invoke('execution_list', { originSessionId: origin }) as { total: number }).total, 1);
+  const recorded = await gateway.invoke('notification_subscriptions', { originSessionId: origin, jobId: dispatched.jobId }) as { subscriptions: { target: { sessionId?: string } }[] };
+  assert.equal(recorded.subscriptions.length, 1);
+  assert.equal(recorded.subscriptions[0]?.target.sessionId, 'ok-session');
+});

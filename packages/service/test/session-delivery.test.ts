@@ -198,6 +198,8 @@ test('binding status hides host fingerprints and blocks only unknown or rejected
     bindings: 3,
     blockedOrigins: 2,
     deliveries: { total: 5, pending: 1, dispatching: 0, retrying: 1, accepted: 1, unknown: 1, rejected: 1 },
+    subscriberDeliveries: { total: 0, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0 },
+    blockedTargets: 0,
   });
   const leaked = JSON.stringify({ missing, parentA, parentB, parentC, summary });
   assert.equal(leaked.includes('hostFingerprint'), false);
@@ -274,6 +276,8 @@ test('gateway session_binding_get and health expose binding stats without creden
     bindings: 1,
     blockedOrigins: 0,
     deliveries: { total: 0, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0 },
+    subscriberDeliveries: { total: 0, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0 },
+    blockedTargets: 0,
   });
   const leaked = JSON.stringify({ missing, bound, health });
   assert.equal(leaked.includes('hostFingerprint'), false);
@@ -322,6 +326,8 @@ test('subscriber target queues stay isolated when one target is rejected or unkn
   t.after(() => sessions.close());
   const codexId = '11111111-1111-4111-8111-111111111111';
   sessions.bind({ originSessionId: 'owner', host: 'dsh', sessionId: 'owner-session' });
+  const beforeTargets = JSON.parse(await readFile(join(root, 'session-delivery.json'), 'utf8'));
+  assert.equal(Object.hasOwn(beforeTargets, 'targetDeliveries'), false);
   assert.deepEqual(sessions.resolveTarget({ originSessionId: 'owner' }), { host: 'dsh', sessionId: 'owner-session' });
   assert.throws(() => sessions.resolveTarget({ originSessionId: 'missing' }), /not bound/);
   assert.throws(() => sessions.resolveTarget({ host: 'missing', sessionId: 'x' }), /Unknown session host/);
@@ -361,6 +367,8 @@ test('subscriber target queues stay isolated when one target is rejected or unkn
   const summary = sessions.summary();
   assert.equal(summary.blockedOrigins, 0);
   assert.equal(summary.deliveries.rejected, 0);
+  assert.equal(summary.blockedTargets, 2);
+  assert.deepEqual(summary.subscriberDeliveries, { total: 6, pending: 2, dispatching: 0, retrying: 0, accepted: 2, unknown: 1, rejected: 1 });
   const leaked = JSON.stringify({ status, summary, owner: sessions.get({ originSessionId: 'owner', messageId: 'owner-1' }), healthy: sessions.getTarget({ targetKey: healthyKey, messageId: 'sub-1' }) });
   assert.equal(leaked.includes('secret'), false);
   assert.equal(leaked.includes('hostFingerprint'), false);

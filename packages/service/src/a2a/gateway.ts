@@ -455,20 +455,46 @@ export class RemoteAgentGateway {
     if (target.originSessionId) return;
     this.sessions.resolveTarget(target);
   }
+  /**
+   * Read-only check for a whole notifySessions batch. `pendingJob` / `pendingCase` means that id is about to be
+   * created by this call, so it is not required to exist yet. Every other job or case must already belong to the origin.
+   * Nothing here writes the ledger or the subscription list.
+   */
+  private validateSubscriptions(originSessionId: string, inputs: NotifySubscriptionInput[] | undefined, defaults: { scope: 'job' | 'case'; jobId?: string; caseId?: string; pendingJob?: boolean; pendingCase?: boolean }): void {
+    if (!inputs?.length) return;
+    for (const input of inputs) {
+      const scope = input.scope ?? defaults.scope;
+      const jobId = input.jobId ?? (scope === 'job' ? defaults.jobId : undefined);
+      const caseId = input.caseId ?? defaults.caseId;
+      const jobPending = scope === 'job' && !jobId && defaults.pendingJob === true;
+      const casePending = scope === 'case' && defaults.pendingCase === true && (!caseId || caseId === defaults.caseId);
+      if (scope === 'job' && !jobId && !jobPending) throw new Error('Job subscription requires jobId');
+      if (scope === 'case' && !caseId && !casePending) throw new Error('Case subscription requires caseId');
+      const draft = materializeSubscription(originSessionId, input, {
+        scope, jobId: jobId ?? (jobPending ? 'pending-job' : undefined), caseId: caseId ?? (casePending ? 'pending-case' : undefined),
+      });
+      this.assertSubscriberTarget(draft.target);
+      if (scope === 'job' && jobId) this.ledger.get(originSessionId, jobId);
+      if (scope === 'case' && caseId && !casePending) requireCase(this.ledger, originSessionId, caseId);
+    }
+  }
+  /** Materialize the whole batch first. A later invalid item cannot leave the earlier ones stored. */
   private attachSubscriptions(originSessionId: string, inputs: NotifySubscriptionInput[] | undefined, defaults: { scope: 'job' | 'case'; jobId?: string; caseId?: string }): void {
     if (!inputs?.length) return;
-    const stored = this.state.subscriptions ??= [];
-    let changed = false;
+    const existing = this.state.subscriptions ?? [];
+    const created: NotificationSubscription[] = [];
     for (const input of inputs) {
       const next = materializeSubscription(originSessionId, input, defaults);
       this.assertSubscriberTarget(next.target);
       if (next.scope === 'job' && next.jobId) this.ledger.get(originSessionId, next.jobId);
       if (next.scope === 'case' && next.caseId) requireCase(this.ledger, originSessionId, next.caseId);
-      if (stored.some(item => item.subscriptionId === next.subscriptionId)) continue;
-      stored.push(next);
-      changed = true;
+      if (existing.some(item => item.subscriptionId === next.subscriptionId) || created.some(item => item.subscriptionId === next.subscriptionId)) continue;
+      created.push(next);
     }
-    if (changed) this.save();
+    if (!created.length) return;
+    const previous = this.state.subscriptions;
+    this.state.subscriptions = [...existing, ...created];
+    try { this.save(); } catch (error) { this.state.subscriptions = previous; throw error; }
   }
   private noteHandoffTaken(originSessionId: string, handoffId: string, childJobId: string): void {
     const taken = this.ledger.markHandoffTaken(originSessionId, handoffId, childJobId);
@@ -554,7 +580,9 @@ export class RemoteAgentGateway {
       // The accepted version is the one the handoff names. Another version needs a new proposal.
       if (input.resultRevision && input.resultRevision !== handoff.artifactRevision) throw new Error('Handoff version does not match; propose the new version instead');
       if (handoff.status === 'taken' && handoff.childJobId) {
-        this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: handoff.childJobId, caseId: handoff.caseId });
+        const takenDefaults = { scope: 'job' as const, jobId: handoff.childJobId, caseId: handoff.caseId };
+        this.validateSubscriptions(input.originSessionId, input.notifySessions, takenDefaults);
+        this.attachSubscriptions(input.originSessionId, input.notifySessions, takenDefaults);
         return this.ledgerView(input.originSessionId, handoff.childJobId);
       }
       const frozen = handoff.snapshots ?? [];
@@ -567,6 +595,10 @@ export class RemoteAgentGateway {
     }
     // A task may only join a thing that exists; it never creates one by naming it.
     if (input.caseId) requireCase(this.ledger, input.originSessionId, input.caseId);
+    // Reject the whole notifySessions batch before prepare, so a bad subscriber cannot persist an orphan request id.
+    this.validateSubscriptions(input.originSessionId, input.notifySessions, {
+      scope: 'job', jobId: options.jobId, caseId: input.caseId, pendingJob: !options.jobId,
+    });
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
     if (replay) {
       this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: replay.job.jobId, caseId: replay.job.caseId ?? input.caseId });
@@ -1515,9 +1547,7 @@ export class RemoteAgentGateway {
       const { notifySessions, ...input } = caseOpenSchema.extend({ notifySessions: notifySessionsSchema }).strict().parse(params);
       // This channel is an agent's. It may not write that a person opened the case.
       if (input.createdBy?.kind === 'person') throw new Error('A person opens a case on the workbench page, not through this channel');
-      for (const item of notifySessions ?? []) {
-        if ((item.scope ?? 'case') === 'job' && !item.jobId) throw new Error('Job subscription requires jobId');
-      }
+      this.validateSubscriptions(input.originSessionId, notifySessions, { scope: 'case', caseId: input.caseId, pendingCase: true });
       const opened = openCase(this.ledger, input);
       this.attachSubscriptions(opened.originSessionId, notifySessions, { scope: 'case', caseId: opened.caseId });
       return opened;
