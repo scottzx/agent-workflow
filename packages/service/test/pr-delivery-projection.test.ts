@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { access, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { roleSkillProfileSchema } from '../src/roles/skills.js';
@@ -133,6 +133,11 @@ test('projectRoleToWorktree fills a real git worktree and leaves status clean', 
   const again = await projectRoleToWorktree({ roleDir, worktreeDir: repo.worktree });
   assert.equal(again.digest, projected.digest);
   assert.equal((await git(repo.worktree, ['status', '--porcelain'])).trim(), '');
+  await writeFile(join(repo.worktree, '.agents/skills/.AGENTS.local.md.crash.tmp'), 'partial\n');
+  assert.equal((await git(repo.worktree, ['status', '--porcelain'])).trim(), '', 'a temp file under .agents/skills stays ignored');
+  await writeFile(join(repo.worktree, '.agents/.AGENTS.local.md.crash.tmp'), 'partial\n');
+  assert.match(await git(repo.worktree, ['status', '--porcelain']), /\?\? \.agents\//);
+  await rm(join(repo.worktree, '.agents/.AGENTS.local.md.crash.tmp'));
 
   const clean = await runGate(repo.worktree, ['--role-dir', roleDir]);
   assert.equal(clean.status, 0, JSON.stringify(clean.body));
@@ -291,4 +296,119 @@ test('l1-gate fails a worktree with no .git and a projection path that git would
   assert.equal(leaked.status, 1);
   assert.equal(leaked.body.checks.find(item => item.id === 'git-status')?.ok, false);
   assert.equal(leaked.body.checks.find(item => item.id === 'no-hooks')?.ok, false);
+});
+
+test('projectRoleToWorktree refuses a real .claude/skills directory before copying', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-claude-dir-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, 'repo');
+  await mkdir(join(root, '.claude/skills'), { recursive: true });
+  await git(root, ['init', '-b', 'main']);
+  await assert.rejects(projectRoleToWorktree({ roleDir, worktreeDir: root }), /real directory/);
+  await assert.rejects(access(join(root, '.agents', 'skills')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+});
+
+test('roles project CLI prints the projection summary', async t => {
+  const repo = await initRepo();
+  t.after(() => rm(repo.parent, { recursive: true, force: true }));
+  const cli = join(repoRoot, 'packages/service/bin/acp-service.ts');
+  const run = async (args: string[]) => {
+    try {
+      const result = await exec(process.execPath, ['--import', 'tsx', cli, 'roles', ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      return { status: 0, stdout: result.stdout, stderr: result.stderr ?? '' };
+    } catch (error) {
+      const failed = error as { code?: number; stdout?: string; stderr?: string };
+      return { status: typeof failed.code === 'number' ? failed.code : 1, stdout: failed.stdout ?? '', stderr: failed.stderr ?? '' };
+    }
+  };
+  const help = await run(['--help']);
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /roles project --role-dir DIRECTORY --worktree DIRECTORY \[--skills-source DIRECTORY\]/);
+  const projected = await run(['project', '--role-dir', roleDir, '--worktree', repo.worktree]);
+  assert.equal(projected.status, 0, projected.stderr);
+  const body = JSON.parse(projected.stdout) as { roleId: string; roleVersion: string; worktreeDir: string; skills: { name: string }[]; instructionsFile: string; digest: string };
+  assert.equal(body.roleId, 'pr-delivery');
+  assert.equal(body.roleVersion, '1.0.0');
+  assert.equal(body.skills[0]?.name, 'pr-three-green-delivery');
+  assert.equal(body.instructionsFile.endsWith(`${sep}AGENTS.local.md`) || body.instructionsFile.endsWith('/AGENTS.local.md'), true);
+  assert.match(body.digest, /^[a-f0-9]{64}$/);
+  assert.equal((await git(repo.worktree, ['status', '--porcelain'])).trim(), '');
+});
+
+test('l1-gate rejects a .claude symlink that leaves the worktree', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-claude-escape-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const outside = join(parent, 'outside');
+  const root = join(parent, 'repo');
+  await mkdir(outside);
+  await mkdir(root);
+  await symlink(join('..', '.agents', 'skills'), join(outside, 'skills'));
+  await git(root, ['init', '-b', 'main']);
+  await writeFile(join(root, 'README.md'), 'anchor\n');
+  await git(root, ['add', 'README.md']);
+  await git(root, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await symlink(outside, join(root, '.claude'));
+  const escaped = await runGate(root);
+  assert.equal(escaped.status, 1);
+  const link = escaped.body.checks.find(item => item.id === 'claude-skills-link');
+  assert.equal(link?.ok, false);
+  assert.match(link?.detail ?? '', /outside the worktree/);
+  await assert.rejects(projectRoleToWorktree({ roleDir, worktreeDir: root }), /symlink/);
+  await assert.rejects(access(join(outside, '.agents')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+});
+
+test('l1-gate rejects untracked or newly staged .1agents secrets but not a tracked edit', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-secret-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, 'repo');
+  await mkdir(join(root, '.1agents/config'), { recursive: true });
+  await git(root, ['init', '-b', 'main']);
+  await writeFile(join(root, 'README.md'), 'anchor\n');
+  await git(root, ['add', 'README.md']);
+  await git(root, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await writeFile(join(root, '.1agents/config/host.local.json'), '{"token":"secret"}\n');
+  const untracked = await runGate(root);
+  assert.equal(untracked.status, 1);
+  assert.match(untracked.body.checks.find(item => item.id === 'git-status')?.detail ?? '', /\.1agents\/config\/host\.local\.json/);
+  await rm(join(root, '.1agents/config/host.local.json'));
+  await writeFile(join(root, '.1agents/config/public.json'), 'v1\n');
+  await git(root, ['add', '.1agents/config/public.json']);
+  await git(root, ['commit', '--no-gpg-sign', '-m', 'track config']);
+  await writeFile(join(root, '.1agents/config/public.json'), 'v2\n');
+  const edited = await runGate(root);
+  assert.equal(edited.body.checks.find(item => item.id === 'git-status')?.ok, true, JSON.stringify(edited.body));
+  await git(root, ['add', '.1agents/config/public.json']);
+  const stagedEdit = await runGate(root);
+  assert.equal(stagedEdit.body.checks.find(item => item.id === 'git-status')?.ok, true, JSON.stringify(stagedEdit.body));
+  await mkdir(join(root, '.1agents/cache'), { recursive: true });
+  await writeFile(join(root, '.1agents/cache/lock.json'), '{}\n');
+  await git(root, ['add', '-f', '.1agents/cache/lock.json']);
+  const added = await runGate(root);
+  assert.equal(added.status, 1);
+  assert.match(added.body.checks.find(item => item.id === 'git-status')?.detail ?? '', /\.1agents\/cache\/lock\.json/);
+});
+
+test('l1-gate allows a config example and still rejects a forced local secret', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-example-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, 'repo');
+  await mkdir(join(root, '.1agents/config'), { recursive: true });
+  await git(root, ['init', '-b', 'main']);
+  await writeFile(join(root, 'README.md'), 'anchor\n');
+  await git(root, ['add', 'README.md']);
+  await git(root, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await writeFile(join(root, '.1agents/config/new.example.json'), '{}\n');
+  const untracked = await runGate(root);
+  assert.equal(untracked.status, 0, JSON.stringify(untracked.body));
+  assert.equal(untracked.body.checks.find(item => item.id === 'git-status')?.ok, true);
+  await git(root, ['add', '.1agents/config/new.example.json']);
+  const added = await runGate(root);
+  assert.equal(added.status, 0, JSON.stringify(added.body));
+  assert.equal(added.body.checks.find(item => item.id === 'git-status')?.ok, true);
+  await writeFile(join(root, '.1agents/config/host.local.json'), '{"token":"secret"}\n');
+  await git(root, ['add', '-f', '.1agents/config/host.local.json']);
+  const secret = await runGate(root);
+  assert.equal(secret.status, 1);
+  assert.equal(secret.body.ok, false);
+  assert.match(secret.body.checks.find(item => item.id === 'git-status')?.detail ?? '', /host\.local\.json/);
 });

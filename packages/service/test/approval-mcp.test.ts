@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import test, { type TestContext } from 'node:test';
+import { promisify } from 'node:util';
 import {
   A2A_APPROVAL_MCP_SERVER_NAME,
   A2A_APPROVAL_MCP_TOOLS,
@@ -118,7 +119,7 @@ test('MCP handler lists approval tools, dispatches/queries tasks, aggregates pen
   assert.deepEqual(ping?.result, {});
   const list = await mcp.handleJsonRpc({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
   const tools = (list?.result as { tools: typeof A2A_APPROVAL_MCP_TOOLS }).tools;
-  assert.equal(tools.length, 19);
+  assert.equal(tools.length, 20);
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object');
     assert.ok(tool.description.trim().length > 0);
@@ -279,7 +280,7 @@ test('acp-service mcp stdio subprocess speaks clean newline-delimited JSON-RPC o
   assert.equal((init.result as { serverInfo: { name: string } }).serverInfo.name, A2A_APPROVAL_MCP_SERVER_NAME);
 
   const list = await rpc(2, 'tools/list');
-  assert.equal((list.result as { tools: unknown[] }).tools.length, 19);
+  assert.equal((list.result as { tools: unknown[] }).tools.length, 20);
 
   const pending = await rpc(3, 'tools/call', { name: 'a2a_pending_approvals', arguments: {} });
   const result = pending.result as { isError?: boolean; structuredContent: { counts: { pendingProcessRequests: number } } };
@@ -477,4 +478,134 @@ test('mcp cli help documents the default origin session', async () => {
   assert.match(out, /--session-host/);
   assert.match(out, /--host-session/);
   assert.match(out, /--no-auto-bind/);
+  assert.match(out, /--project-root/);
+  assert.match(out, /A2A_PROJECT_ROOT/);
+  assert.match(out, /a2a_role_rules_get/);
+});
+
+const repoRoot = resolve(import.meta.dirname, '../../..');
+
+test('a2a_role_rules_get is listed, hot-loads from disk, and refuses a projectRoot outside the pinned root', async t => {
+  let fetched = 0;
+  const fetchImpl: typeof globalThis.fetch = async () => {
+    fetched += 1;
+    throw new Error('gateway should not be called');
+  };
+  const pinned = createA2AApprovalMcpHandler({ projectRoot: repoRoot, fetch: fetchImpl });
+  const list = await pinned.handleJsonRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+  const tools = (list?.result as { tools: { name: string; inputSchema: { required?: string[]; additionalProperties?: boolean; properties?: { phase?: { enum?: string[] } } } }[] }).tools;
+  const spec = tools.find(tool => tool.name === 'a2a_role_rules_get');
+  assert.ok(spec);
+  assert.equal(spec.inputSchema.additionalProperties, false);
+  assert.deepEqual([...(spec.inputSchema.required ?? [])].sort(), ['roleId']);
+  assert.deepEqual(spec.inputSchema.properties?.phase?.enum, ['all', 'implement', 'review', 'gate', 'coach']);
+
+  const loaded = await pinned.invokeTool('a2a_role_rules_get', { roleId: 'pr-delivery', phase: 'implement', projectRoot: join(repoRoot, 'packages/service') });
+  assert.equal(loaded.isError, undefined, loaded.content[0]?.text);
+  const implement = loaded.structuredContent as { phase: string; roleInstructions?: string; qaInstructions?: string; digest: string; files: string[] };
+  assert.equal(implement.phase, 'implement');
+  assert.match(implement.roleInstructions ?? '', /PR 交付 Worker/);
+  assert.equal(implement.qaInstructions, undefined);
+  assert.equal(implement.files.includes('QA.md'), false);
+  assert.equal(fetched, 0);
+
+  const outside = await realpath(await mkdtemp(join(tmpdir(), 'role-rules-outside-')));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await mkdir(join(outside, '.1agents/roles/pr-delivery'), { recursive: true });
+  await writeFile(join(outside, '.1agents/roles/pr-delivery/ROLE.md'), 'OUTSIDE-SECRET\n');
+  await writeFile(join(outside, '.1agents/roles/pr-delivery/profile.json'), JSON.stringify({
+    id: 'pr-delivery', version: '9.9.9', skills: [{ key: 'only', name: 'only-skill' }],
+  }));
+  const rejected = await pinned.invokeTool('a2a_role_rules_get', { roleId: 'pr-delivery', projectRoot: outside });
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0]?.text ?? '', /outside the allowed project|does not exist/);
+  assert.equal((rejected.content[0]?.text ?? '').includes('OUTSIDE-SECRET'), false);
+  assert.equal(fetched, 0);
+
+  const unsafe = await pinned.invokeTool('a2a_role_rules_get', { roleId: '../pr-delivery' });
+  assert.equal(unsafe.isError, true);
+  assert.match(unsafe.content[0]?.text ?? '', /Unsafe roleId/);
+
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), 'role-rules-hot-')));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const role = join(scratch, '.1agents/roles/pr-delivery');
+  await mkdir(role, { recursive: true });
+  await writeFile(join(role, 'profile.json'), await readFile(join(repoRoot, '.1agents/roles/pr-delivery/profile.json')));
+  await writeFile(join(role, 'ROLE.md'), 'before\n');
+  const previous = process.env.A2A_PROJECT_ROOT;
+  process.env.A2A_PROJECT_ROOT = scratch;
+  const fromEnv = createA2AApprovalMcpHandler({ fetch: fetchImpl });
+  if (previous === undefined) delete process.env.A2A_PROJECT_ROOT;
+  else process.env.A2A_PROJECT_ROOT = previous;
+  const first = await fromEnv.invokeTool('a2a_role_rules_get', { roleId: 'pr-delivery', phase: 'implement' });
+  assert.equal(first.isError, undefined, first.content[0]?.text);
+  const firstDigest = (first.structuredContent as { digest: string }).digest;
+  await writeFile(join(role, 'ROLE.md'), 'before\nHOT-ROLE\n');
+  const second = await fromEnv.invokeTool('a2a_role_rules_get', { roleId: 'pr-delivery', phase: 'implement' });
+  assert.match((second.structuredContent as { roleInstructions: string }).roleInstructions, /HOT-ROLE/);
+  assert.notEqual((second.structuredContent as { digest: string }).digest, firstDigest);
+  assert.equal(fetched, 0);
+});
+
+test('a2a_role_rules_get rejects a forged .git and accepts a real worktree of the pinned repository', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'role-rules-forge-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const pinned = join(parent, 'repo');
+  const worktree = join(parent, 'wt');
+  const other = join(parent, 'wt-b');
+  await mkdir(join(pinned, '.1agents/roles/demo'), { recursive: true });
+  await writeFile(join(pinned, '.1agents/roles/demo/profile.json'), JSON.stringify({
+    id: 'demo', version: '1.0.0', skills: [{ key: 'only', name: 'only-skill' }],
+  }));
+  await writeFile(join(pinned, '.1agents/roles/demo/ROLE.md'), 'PINNED-ROLE\n');
+  await writeFile(join(pinned, 'README.md'), 'anchor\n');
+  const git = promisify(execFile);
+  const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 'role-rules', GIT_AUTHOR_EMAIL: 'role-rules@example.com', GIT_COMMITTER_NAME: 'role-rules', GIT_COMMITTER_EMAIL: 'role-rules@example.com' };
+  const runGit = (cwd: string, args: string[]) => git('git', args, { cwd, env: gitEnv });
+  await runGit(pinned, ['init', '-b', 'main']);
+  await runGit(pinned, ['add', 'README.md', '.1agents/roles/demo/profile.json', '.1agents/roles/demo/ROLE.md']);
+  await runGit(pinned, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await runGit(pinned, ['worktree', 'add', '-b', 'delivery', worktree]);
+  await runGit(pinned, ['worktree', 'add', '-b', 'delivery-b', other]);
+  const pinnedGit = await realpath(join(pinned, '.git'));
+  const wtGitdir = (await readFile(join(worktree, '.git'), 'utf8')).match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+  assert.ok(wtGitdir);
+  let fetched = 0;
+  const mcp = createA2AApprovalMcpHandler({
+    projectRoot: pinned,
+    fetch: async () => { fetched += 1; throw new Error('gateway should not be called'); },
+  });
+  const forged = [
+    ['link', async (dir: string) => { await symlink(pinnedGit, join(dir, '.git')); }],
+    ['main-gitdir', async (dir: string) => { await writeFile(join(dir, '.git'), `gitdir: ${pinnedGit}\n`); }],
+    ['worktree-gitdir', async (dir: string) => { await writeFile(join(dir, '.git'), `gitdir: ${wtGitdir}\n`); }],
+  ] as const;
+  for (const [name, plant] of forged) {
+    const dir = join(parent, `forged-${name}`);
+    await mkdir(join(dir, '.1agents/roles/demo'), { recursive: true });
+    await writeFile(join(dir, '.1agents/roles/demo/profile.json'), JSON.stringify({
+      id: 'demo', version: '9.9.9', skills: [{ key: 'only', name: 'only-skill' }],
+    }));
+    await writeFile(join(dir, '.1agents/roles/demo/ROLE.md'), 'FORGED-SECRET\n');
+    await plant(dir);
+    const rejected = await mcp.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: dir });
+    assert.equal(rejected.isError, true, name);
+    assert.match(rejected.content[0]?.text ?? '', /outside the allowed project/);
+    assert.equal((rejected.content[0]?.text ?? '').includes('FORGED-SECRET'), false, name);
+  }
+  const fromWorktree = await mcp.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: join(worktree, '.1agents') });
+  assert.equal(fromWorktree.isError, undefined, fromWorktree.content[0]?.text);
+  assert.match((fromWorktree.structuredContent as { roleInstructions?: string }).roleInstructions ?? '', /PINNED-ROLE/);
+  const pinnedOnWorktree = createA2AApprovalMcpHandler({
+    projectRoot: worktree,
+    fetch: async () => { fetched += 1; throw new Error('gateway should not be called'); },
+  });
+  const mainAgain = await pinnedOnWorktree.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: pinned });
+  assert.equal(mainAgain.isError, undefined, mainAgain.content[0]?.text);
+  const sibling = await pinnedOnWorktree.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: other });
+  assert.equal(sibling.isError, undefined, sibling.content[0]?.text);
+  await mkdir(join(other, 'nested'));
+  const nested = await pinnedOnWorktree.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: join(other, 'nested') });
+  assert.equal(nested.isError, undefined, nested.content[0]?.text);
+  assert.equal(fetched, 0);
 });

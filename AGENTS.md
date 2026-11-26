@@ -25,7 +25,7 @@
 
 ## PR 交付流程（热更新模板）
 
-承接本仓开发 PR 时，先用 `session_identity` 绑定总会话，再实时读取 `.1agents/roles/pr-delivery/` 的当前声明（`profile.json`、`workflow.json`、`ROLE.md`、`QA.md`、`checklist.json`、`skills/`）。
+承接本仓开发 PR 时，先用 `session_identity` 绑定总会话，再实时读取 `.1agents/roles/pr-delivery/` 的当前声明（`profile.json`、`workflow.json`、`ROLE.md`、`QA.md`、`checklist.json`、`routing.json`、`skills/`）。
 不要凭记忆复述旧流程，也不要依赖 `~/.dsh/.agent-presets/` 或 `.agents/hooks/`。
 DSH `standard` 以最近的 `.git` 为项目根，每个 step 热加载该根的指令和 `.agents/skills`；改角色包后重新投影即生效。
 开发只在隔离 worktree 中进行。真源单向投影到该 worktree 的 `.agents/skills/`、`.claude/skills` 软链和 `AGENTS.local.md`。

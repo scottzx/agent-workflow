@@ -59,7 +59,8 @@ function printUnifiedHelp(binName: string) {
     );
 
   const serverCommands = `Commands:
-  roles sync|check --profile <file> --cwd <dir> [--source <dir>]   Copy role skills into <dir>/.agents/skills, link .claude/skills
+  roles sync|check --profile <file> --cwd <dir> [--source <dir>]   Copy role skills into <dir>/.agents/skills and link .claude/skills
+  roles project --role-dir <dir> --worktree <dir> [--skills-source <dir>]   Project a role package into a git worktree
   a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
