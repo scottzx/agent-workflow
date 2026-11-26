@@ -29,3 +29,9 @@ dsh-image-gen/
 /skills/
 .tmp/
 packages/*/.tmp/
+
+# One-way projections of a role package into a worktree. The tracked source stays in .1agents/roles/.
+**/.agents/
+**/.claude/
+**/AGENTS.local.md
+**/CLAUDE.local.md

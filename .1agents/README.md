@@ -57,7 +57,9 @@ Git 只跟踪角色声明、说明及示例配置。技能包、缓存、素材�
 
 ## 角色技能
 
-角色的技能放在它的工作目录里：`<cwd>/.agents/skills/<name>/`。DSH 和 Codex 在会话开始时读这个目录，Claude Code 读 `<cwd>/.claude/skills`，后者是指向 `../.agents/skills` 的软链。宿主不再经能力网络下载技能，也不再锁定版本；同一角色的新任务、续派、返工和恢复读到的都是目录当前内容，漂移由验收规则兜底，需要版本控制的是验收规则和要求。
+角色的技能放在它的工作目录里：`<cwd>/.agents/skills/<name>/`。DSH 原生 `standard` 会话不以“会话开始时读一次”为准：它把最近的 `.git`（文件或目录）当作项目根，每个 step 热加载该根的 `AGENTS.md` / `AGENTS.local.md` 和 `.agents/skills`。目录变化会替换技能目录，正文在加载技能时重读。ACP 会话由底层 Agent 按该次会话加载：Codex 读 `.agents/skills`，Claude Code 读 `<cwd>/.claude/skills`（指向 `../.agents/skills` 的软链）。宿主不再经能力网络下载技能，也不再锁定版本；同一角色的新任务、续派、返工和恢复读到的都是目录当前内容，漂移由验收规则兜底，需要版本控制的是验收规则和要求。
+
+本仓 PR 交付的真源是 Git 跟踪的 [`.1agents/roles/pr-delivery/`](roles/pr-delivery/profile.json)。`projectRoleToWorktree` 把它单向投影到隔离 worktree 的 `.agents/skills/`、`.claude/skills` 软链和 `AGENTS.local.md`。没有 `.git` 的裸目录会拒绝投影，避免 DSH 的项目根上溯到父仓库。投影面由根 `.gitignore` 的 `**/.agents/`、`**/.claude/`、`**/AGENTS.local.md`、`**/CLAUDE.local.md` 覆盖，不进入 worktree 的 `git status`。不要把投影当源改，不要建 `.agents/hooks/`，也不要依赖 `~/.dsh/.agent-presets/`。改真源后对目标 worktree 重新投影，下一 step 才会读到新副本。
 
 分发源（例如 `training/rsi-training/scenarios/ppt`，或 Skill Manager 的来源）只是源数据。大文件资源在建角色时随技能目录一起复制，之后工作目录可离线使用：
 
