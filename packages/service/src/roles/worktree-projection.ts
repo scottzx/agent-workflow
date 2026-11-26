@@ -197,9 +197,10 @@ async function assertClaudeSkillsLink(worktreeReal: string): Promise<void> {
     }
     return;
   }
-  if (!info.isDirectory()) {
-    throw new Error('Refusing to project: .claude/skills exists and is not a directory or the .agents/skills symlink');
+  if (info.isDirectory()) {
+    throw new Error('Refusing to project: .claude/skills is a real directory, not a symlink to .agents/skills');
   }
+  throw new Error('Refusing to project: .claude/skills exists and is not a symlink to .agents/skills');
 }
 
 async function assertAgentsLocalWritable(worktreeReal: string): Promise<void> {
@@ -234,14 +235,14 @@ function renderTemplate(template: string, vars: Record<string, string> | undefin
   });
 }
 
-/** Identical content is left in place. The temp file stays under `.agents/`, which the worktree gitignore already covers. */
+/** Identical content is left in place. The temp file stays under `.agents/skills/`, which `/.agents/skills/*` already ignores. */
 async function writeAtomic(destination: string, content: string, worktreeDir: string): Promise<void> {
   const current = await readFile(destination, 'utf8').catch(error => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   });
   if (current === content) return;
-  const staging = join(worktreeDir, '.agents');
+  const staging = join(worktreeDir, '.agents', 'skills');
   await mkdir(staging, { recursive: true });
   const temp = join(staging, `.${basename(destination)}.${randomUUID()}.tmp`);
   try {

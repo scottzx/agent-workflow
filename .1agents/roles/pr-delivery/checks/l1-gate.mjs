@@ -7,8 +7,8 @@
  *   node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <dir> [--role-dir <dir>]
  */
 import { execFile } from 'node:child_process';
-import { lstat, readFile, readdir, readlink, stat } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat, readFile, readdir, readlink, realpath, stat } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -123,7 +123,34 @@ async function checkAgentsLocal(dir) {
   return { id: 'agents-local', ok: true, present: true };
 }
 
+function pathEscapes(root, target) {
+  const rel = relative(root, target);
+  return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+}
+
 async function checkClaudeLink(dir) {
+  let rootReal = dir;
+  try { rootReal = await realpath(dir); } catch { rootReal = dir; }
+  const claude = join(dir, '.claude');
+  let parent;
+  try {
+    parent = await lstat(claude);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { id: 'claude-skills-link', ok: true, present: false };
+    return { id: 'claude-skills-link', ok: false, detail: errorMessage(error) };
+  }
+  if (!parent.isSymbolicLink() && !parent.isDirectory()) {
+    return { id: 'claude-skills-link', ok: false, present: true, detail: '.claude is not a directory' };
+  }
+  let claudeReal;
+  try {
+    claudeReal = await realpath(claude);
+  } catch (error) {
+    return { id: 'claude-skills-link', ok: false, present: true, detail: errorMessage(error) };
+  }
+  if (pathEscapes(rootReal, claudeReal)) {
+    return { id: 'claude-skills-link', ok: false, present: true, detail: `.claude resolves outside the worktree (${claudeReal})` };
+  }
   const link = join(dir, '.claude', 'skills');
   const source = join(dir, '.agents', 'skills');
   let info;
@@ -231,7 +258,10 @@ function isStatusLeak(xy, path) {
     || normalized === '.1agents/jobs' || normalized.startsWith('.1agents/jobs/')
     || normalized === '.1agents/worktrees' || normalized.startsWith('.1agents/worktrees/')
     || normalized === '.1agents/runtime' || normalized.startsWith('.1agents/runtime/')
-    || normalized === '.1agents/state' || normalized.startsWith('.1agents/state/');
+    || normalized === '.1agents/state' || normalized.startsWith('.1agents/state/')
+    || normalized === '.1agents/cache' || normalized.startsWith('.1agents/cache/')
+    || normalized === '.1agents/skills' || normalized.startsWith('.1agents/skills/')
+    || normalized === '.1agents/config' || normalized.startsWith('.1agents/config/');
   if (!watched) return false;
   if (xy === '??') return true;
   const index = xy[0];

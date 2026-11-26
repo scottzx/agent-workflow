@@ -15,6 +15,7 @@ import { processRequestAnswerSchema } from '../execution/process-request.js';
 import { deliveryModeSchema } from './job-directory.js';
 import { notifySubscriptionInputSchema, notifyTargetSchema, subscriptionEventSchema, subscriptionModeSchema, subscriptionRoleSchema } from './notifications.js';
 import { sessionLifecycleSchema } from './session-lifecycle.js';
+import { assertAllowedRoleProjectPath, readRoleRules, resolveProjectRootFromCwd, type RoleRulesPhase } from '../roles/role-rules.js';
 
 export const A2A_APPROVAL_MCP_SERVER_NAME = 'a2a-approval';
 export const A2A_APPROVAL_MCP_SERVICE_ID = 'mcp-a2a-approval';
@@ -160,6 +161,13 @@ const notificationListArgsSchema = z.object({
   caseId: id.optional(),
 }).strict();
 
+const roleRulesPhaseArg = z.enum(['all', 'implement', 'review', 'gate', 'coach']);
+const roleRulesArgsSchema = z.object({
+  roleId: id,
+  phase: roleRulesPhaseArg.optional(),
+  projectRoot: id.optional(),
+}).strict();
+
 const executionReviewArgsSchema = z.object({
   originSessionId: id.optional(),
   jobId: id,
@@ -273,6 +281,11 @@ export const A2A_APPROVAL_MCP_TOOLS: readonly McpToolDefinition[] = [
     description: '只读列出本主归属的订阅，可按 jobId 或 caseId 过滤。省略 originSessionId 时使用默认总会话。不返回凭据。',
     inputSchema: z.toJSONSchema(notificationListArgsSchema) as Record<string, unknown>,
   },
+  {
+    name: 'a2a_role_rules_get',
+    description: '只读热加载项目 `.1agents/roles/<roleId>/`（每次调用直接读盘并返回内容 digest，不访问 a2a-gateway）。phase 省略为 all；implement 不含审查提示词，review 不含实施提示词。显式 projectRoot 不得越出已固定的项目根或其同仓 worktree。',
+    inputSchema: z.toJSONSchema(roleRulesArgsSchema) as Record<string, unknown>,
+  },
 ];
 
 export interface A2AApprovalMcpOptions {
@@ -296,6 +309,11 @@ export interface A2AApprovalMcpOptions {
   version?: string;
   /** Optional fetch implementation for testing. */
   fetch?: typeof globalThis.fetch;
+  /**
+   * Fixed project root for `a2a_role_rules_get`. Env: A2A_PROJECT_ROOT.
+   * When set, an explicit projectRoot must be this directory, a child path, or a worktree of the same repository.
+   */
+  projectRoot?: string;
 }
 
 export interface McpToolCallResult {
@@ -352,6 +370,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
   const defaultSessionHost = (options.defaultSessionHost ?? process.env.A2A_DEFAULT_SESSION_HOST ?? '').trim() || undefined;
   const defaultHostSessionId = (options.defaultHostSessionId ?? process.env.A2A_DEFAULT_HOST_SESSION_ID ?? '').trim() || defaultOriginSessionId;
   const autoBindDefaultSession = options.autoBindDefaultSession ?? envFlag(process.env.A2A_AUTO_BIND_DEFAULT_SESSION, true);
+  const configuredProjectRoot = (options.projectRoot ?? process.env.A2A_PROJECT_ROOT ?? '').trim() || undefined;
   const timeoutMs = options.timeoutMs ?? 30_000;
   const version = options.version ?? '1.0.1';
   const fetchFn = options.fetch ?? globalThis.fetch;
@@ -367,6 +386,20 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
     agent: coachAgent ?? defaultCoachAgent,
     sessionId: coachSessionId ?? defaultCoachSessionId ?? originSessionId,
   });
+
+  async function roleRulesProjectRoot(explicit?: string): Promise<string> {
+    if (explicit) {
+      if (configuredProjectRoot) await assertAllowedRoleProjectPath(explicit, configuredProjectRoot);
+      const resolved = await resolveProjectRootFromCwd(explicit);
+      if (!resolved) throw new Error(`projectRoot does not resolve to a project containing .1agents/roles: ${explicit}`);
+      if (configuredProjectRoot) await assertAllowedRoleProjectPath(resolved, configuredProjectRoot);
+      return resolved;
+    }
+    const base = configuredProjectRoot ?? process.cwd();
+    const resolved = await resolveProjectRootFromCwd(base);
+    if (!resolved) throw new Error(`No project containing .1agents/roles was found from ${base}`);
+    return resolved;
+  }
 
   async function invokeGateway(method: string, params: Record<string, unknown>): Promise<unknown> {
     const response = await fetchFn(invokeEndpoint, {
@@ -641,6 +674,13 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
           const input = notificationListArgsSchema.parse(args);
           const { originSessionId } = resolveOrigin(input.originSessionId);
           data = await invokeGateway('notification_subscriptions', { ...input, originSessionId });
+          break;
+        }
+        case 'a2a_role_rules_get': {
+          const input = roleRulesArgsSchema.parse(args);
+          const projectRoot = await roleRulesProjectRoot(input.projectRoot);
+          const phase = input.phase as RoleRulesPhase | undefined;
+          data = await readRoleRules({ projectRoot, roleId: input.roleId, ...(phase ? { phase } : {}) });
           break;
         }
         default:

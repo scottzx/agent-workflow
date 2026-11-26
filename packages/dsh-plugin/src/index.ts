@@ -18,6 +18,8 @@ import type {} from '@deepseek-ai/dsh-tools';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { ExecutorTicketArgs } from '@1agents/acp-service/a2a';
 import { REVIEW_SUBMIT_PATH, ReviewHandBack, SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
+import { ROLE_RULES_PATH } from './role-rules-spec.js';
+import { readSessionRoleRules } from './role-rules-session.js';
 import { createTicketGateway, runTicketTool, ticketTools } from './ticket-tools.js';
 import { HANDOFF_PATH } from './handoff-spec.js';
 import { syncGlobalAcpService } from './sync-global.js';
@@ -134,6 +136,13 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     ctx.provide('oneagentsA2aHost', a2aHost);
     const review = await ReviewHandBack.open(join(home, 'plugins', '1agents-acp', 'review.secret'), workbench);
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: REVIEW_SUBMIT_PATH, handler: review.handler }));
+    ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: ROLE_RULES_PATH,
+      handler: review.roleRulesHandler((sessionId, args) => readSessionRoleRules({
+        sessionId,
+        roleId: args.roleId,
+        ...(args.phase ? { phase: args.phase } : {}),
+        resolveAgent: id => ctx.sessionController.resolveAgent(id as SessionId),
+      })) }));
     ctx.effect(() => ctx.tools.register(defineTool({
       name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
       parameters: { summary: { type: 'string', required: true, description: SUMMARY_DESCRIPTION } },

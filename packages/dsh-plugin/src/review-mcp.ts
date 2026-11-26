@@ -6,9 +6,10 @@
 import { createInterface } from 'node:readline';
 import { SUBMIT_DESCRIPTION, SUBMIT_TOOL, SUMMARY_DESCRIPTION } from './review.js';
 import { HANDOFF_TOOLS } from './handoff-spec.js';
+import { ROLE_RULES_TOOL, roleRulesArguments } from './role-rules-spec.js';
 import { TICKET_TOOLS } from './ticket-spec.js';
 
-const url = process.env.ONEAGENTS_REVIEW_URL, ticketUrl = process.env.ONEAGENTS_TICKET_URL, handoffUrl = process.env.ONEAGENTS_HANDOFF_URL, session = process.env.ONEAGENTS_REVIEW_SESSION, token = process.env.ONEAGENTS_REVIEW_TOKEN;
+const url = process.env.ONEAGENTS_REVIEW_URL, ticketUrl = process.env.ONEAGENTS_TICKET_URL, handoffUrl = process.env.ONEAGENTS_HANDOFF_URL, roleRulesUrl = process.env.ONEAGENTS_ROLE_RULES_URL, session = process.env.ONEAGENTS_REVIEW_SESSION, token = process.env.ONEAGENTS_REVIEW_TOKEN;
 const defaultHost = process.env.ONEAGENTS_SESSION_HOST?.trim() || 'dsh-local';
 const origin = process.env.ONEAGENTS_DSH_ORIGIN ?? '';
 const identity = { sessionId: session ?? '', defaultHost, origin };
@@ -19,25 +20,38 @@ const tools = [{ name: 'session_identity', description: '只读返回当前 ACP 
   ...(ticketUrl ? TICKET_TOOLS.map(spec => ({ name: spec.name, description: spec.description,
     inputSchema: { type: 'object', properties: spec.parameters, required: Object.keys(spec.parameters), additionalProperties: false } })) : []),
   ...(handoffUrl ? HANDOFF_TOOLS.map(spec => ({ name: spec.name, description: spec.description,
-    inputSchema: { type: 'object', properties: spec.parameters, required: Object.keys(spec.parameters), additionalProperties: false } })) : [])];
+    inputSchema: { type: 'object', properties: spec.parameters, required: Object.keys(spec.parameters), additionalProperties: false } })) : []),
+  ...(roleRulesUrl ? [{ name: ROLE_RULES_TOOL.name, description: ROLE_RULES_TOOL.description,
+    inputSchema: { type: 'object', properties: ROLE_RULES_TOOL.parameters, required: [...ROLE_RULES_TOOL.required], additionalProperties: false } }] : [])];
 
 const write = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
+
+async function postJson(target: string, body: unknown): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+  if (!session || !token) return { content: [{ type: 'text', text: 'This MCP server was started without its DSH session binding' }], isError: true };
+  try {
+    const response = await fetch(target, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Oneagents-Session': session },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(120_000) });
+    const parsed = await response.json() as { text?: string; error?: string };
+    return response.ok ? { content: [{ type: 'text', text: parsed.text ?? '' }] } : { content: [{ type: 'text', text: parsed.error ?? `HTTP ${response.status}` }], isError: true };
+  } catch (error) {
+    return { content: [{ type: 'text', text: `DSH host unreachable: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+  }
+}
 
 async function call(name: string, args: unknown): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
   if (name === 'session_identity') return { content: [{ type: 'text', text: JSON.stringify(identity) }] };
   const summary = (args as { summary?: unknown } | undefined)?.summary;
   if (name === SUBMIT_TOOL && (typeof summary !== 'string' || !summary.trim())) return { content: [{ type: 'text', text: 'summary is required' }], isError: true };
+  if (name === ROLE_RULES_TOOL.name) {
+    const parsed = roleRulesArguments(args);
+    if ('error' in parsed) return { content: [{ type: 'text', text: parsed.error }], isError: true };
+    if (!roleRulesUrl) return { content: [{ type: 'text', text: 'This MCP server was started without its DSH session binding' }], isError: true };
+    return postJson(roleRulesUrl, { tool: name, arguments: parsed.value });
+  }
   const handoff = HANDOFF_TOOLS.some(spec => spec.name === name);
   const target = name === SUBMIT_TOOL ? url : handoff ? handoffUrl : ticketUrl;
-  if (!target || !session || !token) return { content: [{ type: 'text', text: 'This MCP server was started without its DSH session binding' }], isError: true };
-  try {
-    const response = await fetch(target, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Oneagents-Session': session },
-      body: JSON.stringify(name === SUBMIT_TOOL ? { summary } : { tool: name, arguments: args ?? {} }), signal: AbortSignal.timeout(120_000) });
-    const body = await response.json() as { text?: string; error?: string };
-    return response.ok ? { content: [{ type: 'text', text: body.text ?? '' }] } : { content: [{ type: 'text', text: body.error ?? `HTTP ${response.status}` }], isError: true };
-  } catch (error) {
-    return { content: [{ type: 'text', text: `DSH host unreachable: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
-  }
+  if (!target) return { content: [{ type: 'text', text: 'This MCP server was started without its DSH session binding' }], isError: true };
+  return postJson(target, name === SUBMIT_TOOL ? { summary } : { tool: name, arguments: args ?? {} });
 }
 
 createInterface({ input: process.stdin }).on('line', line => {
