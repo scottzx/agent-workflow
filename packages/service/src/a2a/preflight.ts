@@ -145,6 +145,10 @@ export async function runA2APreflight(raw: A2APreflightInput): Promise<A2APrefli
     if (![report.cwd, ...temporaryRoots.filter((path): path is string => path !== undefined)].some(root => within(root, directory))) {
       throw new Error('jobDirectory is outside the DSH workspace-write roots (cwd or platform temporary directories)');
     }
+    if (input.allowedDirectories) {
+      const allowed = (await Promise.all(input.allowedDirectories.map(root => realpath(root).catch(() => undefined)))).filter((root): root is string => root !== undefined);
+      if (!allowed.some(root => within(root, directory))) throw new Error('jobDirectory is outside allowedDirectories');
+    }
     const probe = join(directory, `.a2a-preflight-${randomUUID()}`);
     const handle = await open(probe, 'wx', 0o600);
     try { await handle.writeFile('a2a preflight\n'); await handle.sync(); }

@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { z } from 'zod';
 import { processRequestAnswerSchema } from '../execution/process-request.js';
+import { deliveryModeSchema } from './job-directory.js';
 import { notifySubscriptionInputSchema, notifyTargetSchema, subscriptionEventSchema, subscriptionModeSchema, subscriptionRoleSchema } from './notifications.js';
 import { sessionLifecycleSchema } from './session-lifecycle.js';
 
@@ -54,6 +55,7 @@ const taskDispatchArgsSchema = z.object({
   model: id.optional(),
   lifecycle: sessionLifecycleSchema.optional(),
   notificationTarget: id.optional(),
+  deliveryMode: deliveryModeSchema.optional(),
   caseId: id.optional(),
   handoffId: id.optional(),
   purpose: id.optional(),
@@ -87,6 +89,7 @@ const taskContinueArgsSchema = z.object({
   prompt: promptText.optional(),
   input: z.record(z.string(), z.unknown()).optional(),
   clientRequestId: id.optional(),
+  deliveryMode: deliveryModeSchema.optional(),
   ...coachOverrides,
 }).strict();
 
@@ -451,6 +454,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
             if (input.model !== undefined && taskInput.model === undefined) taskInput.model = input.model;
             if (input.lifecycle !== undefined && taskInput.lifecycle === undefined) taskInput.lifecycle = input.lifecycle;
             if (input.notificationTarget !== undefined && taskInput.notificationTarget === undefined) taskInput.notificationTarget = input.notificationTarget;
+            if (input.deliveryMode !== undefined && taskInput.deliveryMode === undefined) taskInput.deliveryMode = input.deliveryMode;
             const payload: Record<string, unknown> = {
               originSessionId,
               targetId: input.targetId,
@@ -487,6 +491,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
             if (input.model !== undefined) payload.model = input.model;
             if (input.lifecycle !== undefined) payload.lifecycle = input.lifecycle;
             if (input.notificationTarget !== undefined) payload.notificationTarget = input.notificationTarget;
+            if (input.deliveryMode !== undefined) payload.deliveryMode = input.deliveryMode;
             data = await invokeGateway('remote_agent_spawn', payload);
           }
           break;
@@ -515,6 +520,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
           const { originSessionId } = resolveOrigin(input.originSessionId);
           const taskInput: Record<string, unknown> = { ...(input.input ?? {}) };
           if (input.prompt !== undefined && taskInput.prompt === undefined) taskInput.prompt = input.prompt;
+          if (input.deliveryMode !== undefined && taskInput.deliveryMode === undefined) taskInput.deliveryMode = input.deliveryMode;
           if (!Object.keys(taskInput).length) throw new Error('Provide prompt or input when continuing a task');
           data = await invokeGateway('execution_continue', {
             originSessionId,
@@ -522,6 +528,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
             input: taskInput,
             clientRequestId: input.clientRequestId ?? `mcp:${randomUUID()}`,
             initiatedBy: coachActor(originSessionId, input.coachAgent, input.coachSessionId),
+            ...(input.deliveryMode !== undefined ? { deliveryMode: input.deliveryMode } : {}),
           });
           break;
         }
