@@ -13,7 +13,7 @@ import { z } from 'zod';
 import { FileA2AStore } from './store.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
-import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
+import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
 import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, type RemoteAgentNotice } from './notices.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
@@ -197,6 +197,7 @@ export const REMOTE_AGENT_METHODS = {
   session_send: { description: '向已绑定的主会话可靠投递消息。messageId 是稳定幂等键；立即返回持久投递回执，通过 session_delivery_get 查询。accepted 仅表示宿主已接收入队。', parameters: z.toJSONSchema(sessionSendSchema) },
   session_delivery_get: { description: '查询本主会话的消息投递状态。unknown 必须先核实宿主是否已接收，不能盲目重发。', parameters: z.toJSONSchema(sessionMessageSchema) },
   session_delivery_resolve: { description: '核实 unknown 或处理 rejected 投递并记录依据。accepted=true 表示已确认入队；false 仅用于已证实未入队且已处理阻碍后释放重试。note 必填，不等于任务业务处理确认。', parameters: z.toJSONSchema(sessionResolveSchema) },
+  session_binding_get: { description: '只读查询主会话是否已绑定宿主，以及该归属的投递计数和是否阻塞。不返回宿主凭据、hostFingerprint 或消息正文。unknown 或 rejected 大于 0 时 blocked 为 true。', parameters: z.toJSONSchema(sessionOriginSchema) },
 };
 
 interface Job {
@@ -1554,6 +1555,7 @@ export class RemoteAgentGateway {
       void this.reconcile().catch(() => {});
       return result;
     }
+    if (method === 'session_binding_get') return this.sessions.getBindingStatus(sessionOriginSchema.parse(params).originSessionId);
     if (method === 'remote_agent_spawn') {
       const input = spawnSchema.parse(params);
       if (input.notificationTarget && !this.config.notificationTargets[input.notificationTarget]) throw new Error('Unknown notificationTarget');
@@ -2378,6 +2380,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         return json(res, gateway.sessions.healthy ? 200 : 503, {
           status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes),
           sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable',
+          sessionDeliveryStats: gateway.sessions.summary(),
           ...(slots ? { taskSlot: slots.taskSlot, processSlot: slots.processSlot } : {}),
           sessions: gateway.lifecycleReport(),
           ...(callbackHealth.state === 'pending' ? { callback: 'pending' } : {}) });

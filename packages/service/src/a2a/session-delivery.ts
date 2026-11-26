@@ -25,6 +25,27 @@ export interface SessionBinding {
 }
 interface StoredBinding extends SessionBinding { hostFingerprint: string }
 export type SessionDeliveryStatus = 'pending' | 'dispatching' | 'retrying' | 'accepted' | 'unknown' | 'rejected';
+export interface SessionDeliveryCounts {
+  total: number;
+  pending: number;
+  dispatching: number;
+  retrying: number;
+  accepted: number;
+  unknown: number;
+  rejected: number;
+}
+export interface SessionBindingStatus {
+  originSessionId: string;
+  bound: boolean;
+  binding?: SessionBinding;
+  deliveries: SessionDeliveryCounts & { unprocessed: number };
+  blocked: boolean;
+}
+export interface SessionDeliverySummary {
+  bindings: number;
+  deliveries: SessionDeliveryCounts;
+  blockedOrigins: number;
+}
 export interface SessionDeliveryReceipt extends SessionBinding {
   messageId: string;
   mode?: SessionDeliveryMode;
@@ -166,6 +187,35 @@ export class SessionDelivery {
     return receipt(delivery);
   }
   get(input: z.output<typeof sessionMessageSchema>): SessionDeliveryReceipt { this.requireWritable(); return receipt(this.find(input)); }
+  getBindingStatus(originSessionId: string): SessionBindingStatus {
+    this.requireWritable();
+    const stored = this.state.bindings.find(value => value.originSessionId === originSessionId);
+    const deliveries = this.tally(this.state.deliveries.filter(value => value.originSessionId === originSessionId));
+    const blocked = deliveries.unknown > 0 || deliveries.rejected > 0;
+    if (!stored) return { originSessionId, bound: false, deliveries, blocked };
+    const { hostFingerprint, ...binding } = stored;
+    return { originSessionId, bound: true, binding, deliveries, blocked };
+  }
+  /** In-memory counters for /health. A storage failure stays on `healthy` and must not hide this read. */
+  summary(): SessionDeliverySummary {
+    const counts = this.tally(this.state.deliveries);
+    const deliveries: SessionDeliveryCounts = {
+      total: counts.total, pending: counts.pending, dispatching: counts.dispatching, retrying: counts.retrying,
+      accepted: counts.accepted, unknown: counts.unknown, rejected: counts.rejected,
+    };
+    const blockedOrigins = new Set(this.state.deliveries.flatMap(delivery => delivery.status === 'unknown' || delivery.status === 'rejected' ? [delivery.originSessionId] : []));
+    return { bindings: this.state.bindings.length, deliveries, blockedOrigins: blockedOrigins.size };
+  }
+  private tally(deliveries: readonly Delivery[]): SessionDeliveryCounts & { unprocessed: number } {
+    const counts: SessionDeliveryCounts & { unprocessed: number } = {
+      total: deliveries.length, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0, unprocessed: 0,
+    };
+    for (const delivery of deliveries) {
+      counts[delivery.status] += 1;
+      if (!delivery.processedAt) counts.unprocessed += 1;
+    }
+    return counts;
+  }
   private find(input: z.output<typeof sessionMessageSchema>): Delivery {
     const delivery = this.state.deliveries.find(value => value.originSessionId === input.originSessionId && value.messageId === input.messageId);
     if (!delivery) throw new Error('Delivery not found for this origin session');

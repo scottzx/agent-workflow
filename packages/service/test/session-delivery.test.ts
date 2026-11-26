@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { serveA2AGateway } from '../src/a2a/gateway.js';
 import { SessionDelivery } from '../src/a2a/session-delivery.js';
 import { sessionHostSchema } from '../src/a2a/session-hosts.js';
 
@@ -90,6 +91,8 @@ test('a failed durable write cannot be reported as accepted by repeating the sam
     assert.equal(sessions.healthy, false);
     assert.throws(submit, /storage is unavailable/);
     assert.throws(() => sessions.get({ originSessionId: 'parent', messageId: 'work' }), /storage is unavailable/);
+    assert.throws(() => sessions.getBindingStatus('parent'), /storage is unavailable/);
+    assert.equal(typeof sessions.summary().bindings, 'number');
     await sessions.reconcile();
   }
 });
@@ -136,4 +139,156 @@ test('steer mode persists, detects idempotency conflicts, repumps concurrent enq
   await firstArrived;
   for (let i = 0; i < 40 && delivered.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 25));
   assert.deepEqual(delivered.map(item => [item.mode, item.text]), [['queue', 'first'], ['steer', 'approve bash']]);
+});
+
+const zeroDeliveries = { total: 0, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0, unprocessed: 0 };
+
+test('binding status hides host fingerprints and blocks only unknown or rejected admissions', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'session-binding-status-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const hosts = { 'dsh-local': sessionHostSchema.parse({ kind: 'dsh', url: 'http://127.0.0.1:9', headers: { Authorization: 'Bearer status-secret-credential' } }) };
+  const initial = new SessionDelivery(root, hosts);
+  initial.bind({ originSessionId: 'parent-a', host: 'dsh-local', sessionId: 'sess-a' });
+  initial.bind({ originSessionId: 'parent-b', host: 'dsh-local', sessionId: 'sess-b' });
+  initial.bind({ originSessionId: 'parent-c', host: 'dsh-local', sessionId: 'sess-c' });
+  for (const [originSessionId, messageId, text] of [
+    ['parent-a', 'm-unknown', 'body-unknown-secret-text'],
+    ['parent-a', 'm-pending', 'body-pending-secret-text'],
+    ['parent-a', 'm-accepted', 'body-accepted-secret-text'],
+    ['parent-b', 'm-rejected', 'body-rejected-secret-text'],
+    ['parent-b', 'm-retrying', 'body-retrying-secret-text'],
+  ] as const) initial.enqueue({ originSessionId, messageId, text });
+  await initial.close();
+  const file = join(root, 'session-delivery.json');
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  const fingerprint = stored.bindings[0].hostFingerprint as string;
+  assert.equal(typeof fingerprint, 'string'); assert.ok(fingerprint.length > 0);
+  const byId = new Map<string, any>(stored.deliveries.map((delivery: { messageId: string }) => [delivery.messageId, delivery]));
+  byId.get('m-unknown').status = 'unknown';
+  byId.get('m-pending').status = 'pending';
+  byId.get('m-accepted').status = 'accepted';
+  byId.get('m-accepted').processedAt = byId.get('m-accepted').updatedAt;
+  byId.get('m-rejected').status = 'rejected';
+  byId.get('m-retrying').status = 'retrying';
+  await writeFile(file, JSON.stringify(stored));
+  const sessions = new SessionDelivery(root, hosts);
+  t.after(() => sessions.close());
+  const missing = sessions.getBindingStatus('missing-origin');
+  assert.equal(missing.originSessionId, 'missing-origin');
+  assert.equal(missing.bound, false);
+  assert.equal(missing.binding, undefined);
+  assert.equal(missing.blocked, false);
+  assert.deepEqual(missing.deliveries, zeroDeliveries);
+  const parentA = sessions.getBindingStatus('parent-a');
+  assert.equal(parentA.bound, true);
+  assert.equal(parentA.blocked, true);
+  assert.deepEqual(parentA.binding, { originSessionId: 'parent-a', host: 'dsh-local', sessionId: 'sess-a', createdAt: parentA.binding!.createdAt });
+  assert.equal(Object.hasOwn(parentA.binding!, 'hostFingerprint'), false);
+  assert.deepEqual(parentA.deliveries, { total: 3, pending: 1, dispatching: 0, retrying: 0, accepted: 1, unknown: 1, rejected: 0, unprocessed: 2 });
+  const parentB = sessions.getBindingStatus('parent-b');
+  assert.equal(parentB.bound, true);
+  assert.equal(parentB.blocked, true);
+  assert.deepEqual(parentB.deliveries, { total: 2, pending: 0, dispatching: 0, retrying: 1, accepted: 0, unknown: 0, rejected: 1, unprocessed: 2 });
+  const parentC = sessions.getBindingStatus('parent-c');
+  assert.equal(parentC.bound, true);
+  assert.equal(parentC.blocked, false);
+  assert.deepEqual(parentC.deliveries, zeroDeliveries);
+  const summary = sessions.summary();
+  assert.deepEqual(summary, {
+    bindings: 3,
+    blockedOrigins: 2,
+    deliveries: { total: 5, pending: 1, dispatching: 0, retrying: 1, accepted: 1, unknown: 1, rejected: 1 },
+  });
+  const leaked = JSON.stringify({ missing, parentA, parentB, parentC, summary });
+  assert.equal(leaked.includes('hostFingerprint'), false);
+  assert.equal(leaked.includes(fingerprint), false);
+  assert.equal(leaked.includes('status-secret-credential'), false);
+  assert.equal(leaked.includes('secret-text'), false);
+});
+
+test('in-flight host admission counts as dispatching and is not blocked', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'session-binding-dispatch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let release = () => {};
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const server = createServer(async (req, res) => {
+    let raw = ''; for await (const chunk of req) raw += chunk;
+    const request = JSON.parse(raw);
+    await held;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ type: 'server-response', rpcId: request.rpcId, result: { ok: true, value: { accepted: true } } }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const sessions = new SessionDelivery(root, { dsh: sessionHostSchema.parse({ kind: 'dsh', url: `http://127.0.0.1:${address.port}` }) });
+  t.after(() => sessions.close());
+  sessions.bind({ originSessionId: 'parent', host: 'dsh', sessionId: 'sess' });
+  sessions.enqueue({ originSessionId: 'parent', messageId: 'live', text: 'dispatch-body-not-in-status' });
+  const pump = sessions.reconcile();
+  const deadline = Date.now() + 2000;
+  let inflight = sessions.getBindingStatus('parent');
+  while (inflight.deliveries.dispatching !== 1) {
+    if (Date.now() > deadline) break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    inflight = sessions.getBindingStatus('parent');
+  }
+  assert.equal(inflight.deliveries.dispatching, 1);
+  assert.equal(inflight.blocked, false);
+  assert.equal(inflight.bound, true);
+  assert.equal(JSON.stringify(inflight).includes('dispatch-body-not-in-status'), false);
+  assert.equal(JSON.stringify(inflight).includes('hostFingerprint'), false);
+  release();
+  await pump;
+  const done = sessions.getBindingStatus('parent');
+  assert.equal(done.deliveries.accepted, 1);
+  assert.equal(done.deliveries.dispatching, 0);
+  assert.equal(done.deliveries.unprocessed, 1);
+  assert.equal(done.blocked, false);
+});
+
+test('gateway session_binding_get and health expose binding stats without credentials', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'session-binding-gateway-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const host = await serveA2AGateway({
+    stateDirectory: root, port: 0, remotes: {}, pollIntervalMs: 60_000,
+    sessionHosts: { 'dsh-local': { kind: 'dsh', url: 'http://127.0.0.1:9', headers: { Authorization: 'Bearer gateway-status-secret' } } },
+  }, { report: false });
+  t.after(() => host.close());
+  await assert.rejects(host.gateway.invoke('session_binding_get', {}));
+  const missing = await host.gateway.invoke('session_binding_get', { originSessionId: 'missing-origin' }) as any;
+  assert.equal(missing.bound, false);
+  assert.equal(missing.blocked, false);
+  assert.deepEqual(missing.deliveries, zeroDeliveries);
+  await host.gateway.invoke('session_bind', { originSessionId: 'coach-1', host: 'dsh-local', sessionId: 'existing-session' });
+  const bound = await host.gateway.invoke('session_binding_get', { originSessionId: 'coach-1' }) as any;
+  assert.equal(bound.bound, true);
+  assert.equal(bound.blocked, false);
+  assert.equal(bound.binding.host, 'dsh-local');
+  assert.equal(bound.binding.sessionId, 'existing-session');
+  assert.equal(bound.binding.hostFingerprint, undefined);
+  const health = await (await fetch(`http://127.0.0.1:${host.port}/health`)).json() as any;
+  assert.equal(health.status, 'ok');
+  assert.equal(health.sessionDelivery, 'ok');
+  assert.deepEqual(health.sessionDeliveryStats, {
+    bindings: 1,
+    blockedOrigins: 0,
+    deliveries: { total: 0, pending: 0, dispatching: 0, retrying: 0, accepted: 0, unknown: 0, rejected: 0 },
+  });
+  const leaked = JSON.stringify({ missing, bound, health });
+  assert.equal(leaked.includes('hostFingerprint'), false);
+  assert.equal(leaked.includes('gateway-status-secret'), false);
+  const file = join(root, 'session-delivery.json');
+  await rm(file, { force: true }); await mkdir(file);
+  await assert.rejects(host.gateway.invoke('session_bind', { originSessionId: 'coach-2', host: 'dsh-local', sessionId: 'other-session' }), /storage is unavailable/);
+  await assert.rejects(host.gateway.invoke('session_binding_get', { originSessionId: 'coach-1' }), /storage is unavailable/);
+  const degradedResponse = await fetch(`http://127.0.0.1:${host.port}/health`);
+  assert.equal(degradedResponse.status, 503);
+  const degraded = await degradedResponse.json() as any;
+  assert.equal(degraded.status, 'degraded');
+  assert.equal(degraded.sessionDelivery, 'storage-unavailable');
+  assert.equal(degraded.sessionDeliveryStats.bindings, 1);
+  assert.equal(degraded.sessionDeliveryStats.blockedOrigins, 0);
+  assert.equal(JSON.stringify(degraded).includes('gateway-status-secret'), false);
+  assert.equal(JSON.stringify(degraded).includes('hostFingerprint'), false);
 });
