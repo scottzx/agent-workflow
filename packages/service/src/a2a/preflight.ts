@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
-import { isDefaultJobDirectory, isManagedJobDirectory, managedJobAnchor } from './job-directory.js';
+import { isDefaultJobDirectory } from './job-directory.js';
 import { roleIdFromPublication } from '../execution/spaces.js';
 import type { A2APreflightInput, A2APreflightReport } from './types.js';
 
@@ -76,23 +76,15 @@ const within = (root: string, path: string): boolean => {
   const tail = relative(root, path);
   return tail === '' || (!tail.startsWith(`..${sep}`) && tail !== '..' && !isAbsolute(tail));
 };
-/** Creates each segment from anchor to directory, refusing `..` and symbolic links so nothing is created outside the anchor. */
-async function ensureAnchoredDirectory(anchor: string, directory: string): Promise<void> {
-  const tail = relative(anchor, directory);
-  if (tail === '' || tail === '..' || tail.startsWith(`..${sep}`) || isAbsolute(tail)) {
-    throw new Error('the managed job directory must stay inside its anchor');
-  }
-  let current = anchor;
-  for (const segment of tail.split(sep)) {
-    if (!segment || segment === '.' || segment === '..') throw new Error('the default job directory path must not contain symbolic links');
+/** Creates `<cwd>/.1agents/jobs/<id>` segment by segment, refusing symbolic links so nothing is created outside cwd. */
+async function ensureDefaultJobDirectory(cwd: string, directory: string): Promise<void> {
+  let current = cwd;
+  for (const segment of relative(cwd, directory).split(sep)) {
     current = join(current, segment);
     const info = await lstat(current).catch(() => undefined);
     if (info?.isSymbolicLink()) throw new Error('the default job directory path must not contain symbolic links');
     if (!info) await mkdir(current, { mode: 0o700 });
   }
-}
-async function ensureDefaultJobDirectory(cwd: string, directory: string): Promise<void> {
-  await ensureAnchoredDirectory(cwd, directory);
 }
 const failure = (error: unknown): string => error instanceof Error ? error.message.slice(0, 400) : 'Host check failed';
 
@@ -146,18 +138,16 @@ export async function runA2APreflight(raw: A2APreflightInput): Promise<A2APrefli
   }
   if (input.jobDirectory) await check('jobDirectory', async () => {
     if (!cwdOk) throw new Error('Cannot validate writable scope without a valid cwd');
-    const managed = isManagedJobDirectory(input.cwd, input.jobDirectory!);
-    // A worktree's relocated runtime directory is outside cwd but still inside the repo anchor.
-    // An in-worktree `<cwd>/.1agents/jobs/<id>` stays on the legacy creator, which walks from cwd.
-    if (managed) await ensureAnchoredDirectory(managedJobAnchor(input.cwd), input.jobDirectory!);
-    else if (isDefaultJobDirectory(input.cwd, input.jobDirectory!)) await ensureDefaultJobDirectory(input.cwd, input.jobDirectory!);
+    if (isDefaultJobDirectory(input.cwd, input.jobDirectory!)) await ensureDefaultJobDirectory(input.cwd, input.jobDirectory!);
     const directory = await realpath(input.jobDirectory!);
     if (!(await stat(directory)).isDirectory()) throw new Error('jobDirectory must already exist and be a directory');
     const temporaryRoots = await Promise.all(['/tmp', tmpdir()].map(path => realpath(path).catch(() => undefined)));
-    const inWorkspace = [report.cwd, ...temporaryRoots.filter((path): path is string => path !== undefined)].some(root => within(root, directory));
-    const anchor = managed ? await realpath(managedJobAnchor(input.cwd)).catch(() => undefined) : undefined;
-    if (!inWorkspace && !(anchor && within(anchor, directory))) {
+    if (![report.cwd, ...temporaryRoots.filter((path): path is string => path !== undefined)].some(root => within(root, directory))) {
       throw new Error('jobDirectory is outside the DSH workspace-write roots (cwd or platform temporary directories)');
+    }
+    if (input.allowedDirectories) {
+      const allowed = (await Promise.all(input.allowedDirectories.map(root => realpath(root).catch(() => undefined)))).filter((root): root is string => root !== undefined);
+      if (!allowed.some(root => within(root, directory))) throw new Error('jobDirectory is outside allowedDirectories');
     }
     const probe = join(directory, `.a2a-preflight-${randomUUID()}`);
     const handle = await open(probe, 'wx', 0o600);

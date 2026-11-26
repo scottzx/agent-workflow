@@ -114,12 +114,21 @@ function truncateUtf8(text: string, max = DIFF_STAT_LIMIT): string {
   return buffer.subarray(0, end).toString('utf8');
 }
 
+/** Git identity comes from cwd. A caller-injected GIT_DIR must not redirect the sample. */
+function gitSampleEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_COMMON_DIR;
+  return env;
+}
+
 /** Read-only git sample. Never writes the repo; any failure omits the sample instead of failing the task. */
 async function sampleGitDelivery(cwd: string): Promise<A2AGitDelivery | undefined> {
-  const git = async (args: string[]): Promise<string> => {
+  const git = async (args: string[], maxBuffer = 1024 * 1024): Promise<string> => {
     const { stdout } = await executeGit('git', ['--no-optional-locks', ...args], {
-      cwd, timeout: 5000, maxBuffer: 1024 * 1024, encoding: 'utf8', windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      cwd, timeout: 5000, maxBuffer, encoding: 'utf8', windowsHide: true, env: gitSampleEnv(),
     });
     return String(stdout);
   };
@@ -128,14 +137,26 @@ async function sampleGitDelivery(cwd: string): Promise<A2AGitDelivery | undefine
     const headCommit = (await git(['rev-parse', 'HEAD'])).trim();
     if (!/^[0-9a-f]{40,64}$/i.test(headCommit)) return undefined;
     const dirtyCount = (await git(['status', '--porcelain'])).split('\n').filter(line => line.length > 0).length;
-    const diff = truncateUtf8((await git(['show', '--stat', '--format=', 'HEAD'])).trim());
+    let diffStat: string | undefined;
+    try {
+      const diff = truncateUtf8((await git(['show', '--stat', '--stat-count=50', '--format=', 'HEAD'], 64 * 1024)).trim());
+      if (diff) diffStat = diff;
+    } catch { /* A huge or unreadable stat must not drop the commit sample. */ }
     return {
-      ...(branch ? { branch } : {}), headCommit, clean: dirtyCount === 0, dirtyCount,
-      ...(diff ? { diffStat: diff } : {}),
+      ...(branch && branch !== 'HEAD' ? { branch } : {}), headCommit, clean: dirtyCount === 0, dirtyCount,
+      ...(diffStat ? { diffStat } : {}),
     };
   } catch {
     return undefined;
   }
+}
+
+/** workspace_files may register project files, but not credentials or host-internal trees. */
+function isSensitiveWorkspaceFile(file: string): boolean {
+  const name = basename(file);
+  if (name === '.env' || name.startsWith('.env.')) return true;
+  const parts = file.split(sep);
+  return parts.includes('.git') || parts.includes('.1agents');
 }
 
 function isImplicitJobDirectory(cwd: string, directory: string): boolean {
@@ -158,6 +179,8 @@ async function verifiedArtifacts(root: string, extraRoots: string[], manifestPat
   const fileRoots = cwdRoot ? [root, ...extraRoots, cwdRoot] : [root, ...extraRoots];
   for (const item of parsed.data.artifacts) {
     const path = await scopedFile(fileRoots, item.path);
+    const authorized = [root, ...extraRoots].some(candidate => within(candidate, path));
+    if (cwdRoot && !authorized && isSensitiveWorkspaceFile(path)) throw new A2AResultValidationError('artifact-sensitive-path');
     if (seen.has(path)) throw new A2AResultValidationError('duplicate-artifact');
     seen.add(path);
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);

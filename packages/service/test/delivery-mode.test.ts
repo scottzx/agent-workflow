@@ -14,52 +14,33 @@ const git = promisify(execFile);
 async function project() { return realpath(await mkdtemp(join(tmpdir(), 'delivery-mode-'))); }
 const identity = { taskId: 't', contextId: 'c', requestId: 'r', startedAt: new Date().toISOString() };
 
-test('resolveDefaultJobDirectory parks worktree jobs outside the checkout', () => {
+test('resolveDefaultJobDirectory stays inside cwd, including a worktree checkout', () => {
   assert.equal(resolveDefaultJobDirectory('/p', 'j1'), '/p/.1agents/jobs/j1');
   assert.equal(defaultJobDirectory('/p', 'j1'), '/p/.1agents/jobs/j1');
   assert.equal(isDefaultJobDirectory('/p', '/p/.1agents/jobs/j1'), true);
   assert.equal(isManagedJobDirectory('/p', '/p/.1agents/jobs/j1'), true);
-  assert.equal(resolveDefaultJobDirectory('/repo/.1agents/worktrees/demo', 'j1'), '/repo/.1agents/runtime/jobs/j1');
-  assert.equal(resolveDefaultJobDirectory('/repo/.1agents/worktrees/demo/packages/service', 'j1'), '/repo/.1agents/runtime/jobs/j1');
-  assert.equal(resolveDefaultJobDirectory('/repo/.1agents/runtime/worktrees/session/wt', 'j1'), '/repo/.1agents/runtime/jobs/j1');
-  assert.equal(isManagedJobDirectory('/repo/.1agents/worktrees/demo', '/repo/.1agents/runtime/jobs/j1'), true);
-  assert.equal(isManagedJobDirectory('/repo/.1agents/runtime/worktrees/session/wt', '/repo/.1agents/runtime/jobs/j1/extra'), true);
-  assert.equal(isManagedJobDirectory('/repo/.1agents/worktrees/demo', '/repo/.1agents/runtime/jobs'), false);
-  assert.equal(isManagedJobDirectory('/repo/.1agents/worktrees/demo', '/repo/.1agents/worktrees/demo/.1agents/jobs/j1'), false);
-  assert.equal(isManagedJobDirectory('/repo/.1agents/worktrees/demo', '/etc/passwd'), false);
-  assert.equal(isManagedJobDirectory('/repo/.1agents/worktrees/demo', '/repo/.1agents/runtime/jobs/../../secret'), false);
+  const worktree = '/repo/.1agents/worktrees/demo';
+  assert.equal(resolveDefaultJobDirectory(worktree, 'j1'), `${worktree}/.1agents/jobs/j1`);
+  assert.equal(resolveDefaultJobDirectory(`${worktree}/packages/service`, 'j1'), `${worktree}/packages/service/.1agents/jobs/j1`);
+  assert.equal(isManagedJobDirectory(worktree, `${worktree}/.1agents/jobs/j1`), true);
+  assert.equal(isManagedJobDirectory(worktree, '/repo/.1agents/runtime/jobs/j1'), false);
+  assert.equal(isManagedJobDirectory(worktree, '/etc/passwd'), false);
 });
 
-test('preflight creates a managed worktree job directory and refuses symlink escapes', async () => {
+test('preflight keeps a worktree job directory inside cwd and rejects one outside an allowlist', async () => {
   const repo = await project();
   const cwd = join(repo, '.1agents', 'worktrees', 'wt');
   await mkdir(cwd, { recursive: true });
   const directory = resolveDefaultJobDirectory(cwd, 'job-1');
-  assert.equal(directory, join(repo, '.1agents', 'runtime', 'jobs', 'job-1'));
-  const report = await runA2APreflight({ cwd, jobDirectory: directory });
+  assert.equal(directory, join(cwd, '.1agents', 'jobs', 'job-1'));
+  const report = await runA2APreflight({ cwd, allowedDirectories: [cwd], jobDirectory: directory });
   assert.equal(report.ok, true, report.checks.filter(check => !check.ok).map(check => check.detail).join('; '));
   assert.equal(report.jobDirectory, await realpath(directory));
 
-  const runtimeCwd = join(repo, '.1agents', 'runtime', 'worktrees', 'session');
-  await mkdir(runtimeCwd, { recursive: true });
-  const runtimeJob = resolveDefaultJobDirectory(runtimeCwd, 'job-rt');
-  assert.equal(runtimeJob, join(repo, '.1agents', 'runtime', 'jobs', 'job-rt'));
-  const runtimeReport = await runA2APreflight({ cwd: runtimeCwd, jobDirectory: runtimeJob });
-  assert.equal(runtimeReport.ok, true, runtimeReport.checks.filter(check => !check.ok).map(check => check.detail).join('; '));
-  assert.equal(runtimeReport.jobDirectory, await realpath(runtimeJob));
-
-  const escapedRepo = await project();
-  const escapedCwd = join(escapedRepo, '.1agents', 'worktrees', 'wt');
-  await mkdir(escapedCwd, { recursive: true });
-  await mkdir(join(escapedRepo, '.1agents'), { recursive: true });
   const outside = await project();
-  await symlink(outside, join(escapedRepo, '.1agents', 'runtime'));
-  const escaped = await runA2APreflight({ cwd: escapedCwd, jobDirectory: resolveDefaultJobDirectory(escapedCwd, 'evil') });
-  assert.equal(escaped.ok, false);
-  assert.match(escaped.checks.find(check => check.id === 'jobDirectory')?.detail ?? '', /symbolic links/);
-
-  const stray = await runA2APreflight({ cwd, jobDirectory: join(repo, 'not-a-job') });
-  assert.equal(stray.ok, false);
+  const rejected = await runA2APreflight({ cwd, allowedDirectories: [cwd], jobDirectory: outside });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.checks.find(check => check.id === 'jobDirectory')?.detail ?? '', /allowedDirectories/);
 });
 
 test('delivery prompts stay quiet for none and do not leak originSessionId', () => {
@@ -81,9 +62,12 @@ test('delivery prompts stay quiet for none and do not leak originSessionId', () 
 
   const files = deliveryInstructions('workspace_files', '/job', '/job/manifest-a.json');
   assert.match(files, /\[项目文档交付约定\]/);
-  assert.match(files, /\/job\/manifest-a\.json/);
+  assert.match(files, /登记到清单 \/job\/manifest-a\.json/);
   assert.match(files, /无需复制副本/);
   assert.doesNotMatch(files, /\[产物约定\]/);
+  const bareFiles = deliveryInstructions('workspace_files');
+  assert.match(bareFiles, /可以直接在当前项目目录原地写入或修改文件，无需复制副本/);
+  assert.doesNotMatch(bareFiles, /登记到清单/);
 
   const artifacts = deliveryInstructions('artifacts', '/p/.1agents/jobs/j1', '/p/.1agents/jobs/j1/manifest-a1.json');
   assert.match(artifacts, /\[产物约定\]/);
@@ -98,9 +82,13 @@ test('delivery prompts stay quiet for none and do not leak originSessionId', () 
   assert.match(space, /\/work\/shared\//);
   assert.doesNotMatch(space, new RegExp(secret));
   assert.doesNotMatch(space, /originSessionId/);
+  const gitSpace = spaceInstructions({ originSessionId: secret, jobId: 'job-9', attemptId: 'attempt-9', caseId: 'case-9', deliveryMode: 'workspace_git' });
+  assert.match(gitSpace, /handoff_propose/);
+  assert.doesNotMatch(gitSpace, /任务目录只属于这一轮/);
+  assert.doesNotMatch(gitSpace, new RegExp(secret));
 });
 
-test('a relocated manifest is still an optional implicit manifest', async () => {
+test('a default manifest inside a worktree cwd is still optional', async () => {
   const repo = await project();
   const cwd = join(repo, '.1agents', 'worktrees', 'wt');
   await mkdir(cwd, { recursive: true });
@@ -160,6 +148,17 @@ test('workspace_files verifies files in cwd and still rejects symlinks, director
 
   await writeFile(manifest, JSON.stringify({ artifacts: [{ path: join(cwd, 'docs') }] }));
   await assert.rejects(check('workspace_files'), /artifact-is-not-a-file/);
+
+  await mkdir(join(cwd, '.git'), { recursive: true });
+  await writeFile(join(cwd, '.git', 'config'), '[core]\n');
+  await writeFile(join(cwd, '.env'), 'TOKEN=1\n');
+  await writeFile(join(cwd, '.env.local'), 'LOCAL=1\n');
+  await mkdir(join(cwd, '.1agents'), { recursive: true });
+  await writeFile(join(cwd, '.1agents', 'secret.txt'), 'nope\n');
+  for (const secretPath of [join(cwd, '.git', 'config'), join(cwd, '.env'), join(cwd, '.env.local'), join(cwd, '.1agents', 'secret.txt')]) {
+    await writeFile(manifest, JSON.stringify({ artifacts: [{ path: secretPath }] }));
+    await assert.rejects(check('workspace_files'), /artifact-sensitive-path/, secretPath);
+  }
 });
 
 test('workspace_git samples the checkout and ignores a directory that is not a git repo', async () => {
@@ -192,6 +191,40 @@ test('workspace_git samples the checkout and ignores a directory that is not a g
 
   const failed = await createA2AResultMetadata({ ...identity, outcome: 'failed', target, contract });
   assert.equal(failed.gitDelivery, undefined);
+
+  await git('git', ['checkout', '--detach'], { cwd });
+  const detached = await createA2AResultMetadata({ ...identity, outcome: 'completed', target, contract });
+  assert.equal(detached.gitDelivery?.branch, undefined);
+  assert.equal(detached.gitDelivery?.headCommit, head);
+  assert.equal(detached.gitDelivery?.dirtyCount, 1);
+
+  const empty = await project();
+  await git('git', ['init'], { cwd: empty });
+  const unborn = await createA2AResultMetadata({ ...identity, outcome: 'completed', target: { sessionId: 's', cwd: empty }, contract });
+  assert.equal(unborn.outcome, 'completed');
+  assert.equal(unborn.gitDelivery, undefined);
+
+  await git('git', ['checkout', 'feature'], { cwd });
+  const decoy = await project();
+  await git('git', ['init', '-b', 'other'], { cwd: decoy });
+  await git('git', ['config', 'user.email', 'delivery-mode@example.com'], { cwd: decoy });
+  await git('git', ['config', 'user.name', 'Delivery Mode'], { cwd: decoy });
+  await git('git', ['config', 'commit.gpgsign', 'false'], { cwd: decoy });
+  await writeFile(join(decoy, 'other.txt'), 'other\n');
+  await git('git', ['add', 'other.txt'], { cwd: decoy });
+  await git('git', ['commit', '-m', 'other'], { cwd: decoy });
+  const decoyHead = String((await git('git', ['rev-parse', 'HEAD'], { cwd: decoy, encoding: 'utf8' })).stdout).trim();
+  const previousGitDir = process.env.GIT_DIR;
+  process.env.GIT_DIR = join(decoy, '.git');
+  try {
+    const isolated = await createA2AResultMetadata({ ...identity, outcome: 'completed', target, contract });
+    assert.equal(isolated.gitDelivery?.headCommit, head);
+    assert.notEqual(isolated.gitDelivery?.headCommit, decoyHead);
+    assert.equal(isolated.gitDelivery?.branch, 'feature');
+  } finally {
+    if (previousGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = previousGitDir;
+  }
 
   const plain = await project();
   const skipped = await createA2AResultMetadata({ ...identity, outcome: 'completed', target: { sessionId: 's', cwd: plain }, contract });

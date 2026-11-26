@@ -89,6 +89,7 @@ const taskContinueArgsSchema = z.object({
   prompt: promptText.optional(),
   input: z.record(z.string(), z.unknown()).optional(),
   clientRequestId: id.optional(),
+  deliveryMode: deliveryModeSchema.optional(),
   ...coachOverrides,
 }).strict();
 
@@ -519,6 +520,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
           const { originSessionId } = resolveOrigin(input.originSessionId);
           const taskInput: Record<string, unknown> = { ...(input.input ?? {}) };
           if (input.prompt !== undefined && taskInput.prompt === undefined) taskInput.prompt = input.prompt;
+          if (input.deliveryMode !== undefined && taskInput.deliveryMode === undefined) taskInput.deliveryMode = input.deliveryMode;
           if (!Object.keys(taskInput).length) throw new Error('Provide prompt or input when continuing a task');
           data = await invokeGateway('execution_continue', {
             originSessionId,
@@ -526,6 +528,7 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
             input: taskInput,
             clientRequestId: input.clientRequestId ?? `mcp:${randomUUID()}`,
             initiatedBy: coachActor(originSessionId, input.coachAgent, input.coachSessionId),
+            ...(input.deliveryMode !== undefined ? { deliveryMode: input.deliveryMode } : {}),
           });
           break;
         }

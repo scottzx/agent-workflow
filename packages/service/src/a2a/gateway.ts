@@ -128,7 +128,7 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const modelCatalogQuerySchema = z.object({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional(), deliveryMode: deliveryModeSchema.optional() }).strict();
 const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
@@ -143,7 +143,7 @@ const executionJobSchema = z.object({ ...originFields, jobId: string }).strict()
 const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
 const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
   limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0) }).strict();
-const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional(), initiatedBy: actorSchema.optional() }).strict();
+const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional(), initiatedBy: actorSchema.optional(), deliveryMode: deliveryModeSchema.optional() }).strict();
 const executionEventsSchema = z.object({ ...originFields, jobId: string.optional(), afterSequence: z.number().int().nonnegative().optional(),
   limit: z.number().int().min(1).max(500).default(100) }).strict();
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
@@ -229,6 +229,8 @@ interface Job {
   closedAt?: string;
   closeReason?: CloseReason;
   processReleased?: true | 'pending';
+  /** Resolved for this round. A later continue or message inherits it when the caller does not say otherwise. */
+  deliveryMode?: DeliveryMode;
 }
 
 export class WorkbenchArtifactError extends Error {
@@ -269,11 +271,12 @@ function atomicJson(file: string, value: unknown): void {
   try { fsyncSync(dir); } finally { closeSync(dir); }
 }
 
-function requestedDeliveryMode(field: unknown, declared: DeliveryMode | undefined): DeliveryMode {
+function requestedDeliveryMode(field: unknown, declared: DeliveryMode | undefined, inherited?: DeliveryMode): DeliveryMode {
+  if (field === undefined && declared === undefined) return inherited ?? 'artifacts';
   if (field !== undefined && declared !== undefined && field !== declared) {
     throw new Error('deliveryMode does not match resultContract.deliveryMode');
   }
-  return deliveryModeSchema.parse(field ?? declared ?? 'artifacts');
+  return deliveryModeSchema.parse(field ?? declared);
 }
 
 export class RemoteAgentGateway {
@@ -668,15 +671,16 @@ export class RemoteAgentGateway {
       const sandboxed = resolved.sandbox ? { ...declaredRequirements, sandbox: resolved.sandbox } : declaredRequirements;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
       const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
-      const mode = requestedDeliveryMode(fields.deliveryMode, declaredResult?.deliveryMode);
-      const includeMode = mode !== 'artifacts' || declaredResult?.deliveryMode !== undefined || fields.deliveryMode !== undefined;
+      const explicitMode = fields.deliveryMode !== undefined || declaredResult?.deliveryMode !== undefined;
+      const mode = requestedDeliveryMode(fields.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
+      const includeMode = mode !== 'artifacts' || explicitMode;
       const contractBase = (): A2AResultContract | undefined => {
         if (!declaredResult && !includeMode) return undefined;
         return { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: mode } : {}) };
       };
-      // artifacts and workspace_files get a per-attempt manifest unless the caller already named a location.
-      // A worktree cwd parks that directory under <repoRoot>/.1agents/runtime/jobs. none and workspace_git do not
-      // invent one; an explicit jobDirectory or manifest is kept. The host creates a managed directory at preflight.
+      // artifacts and workspace_files get <cwd>/.1agents/jobs/<jobId> unless the caller already named a location.
+      // The directory stays inside cwd; .gitignore keeps it out of git status. none and workspace_git do not
+      // invent one; an explicit jobDirectory or manifest is kept. The host creates a default directory at preflight.
       const located = resolved.cwd ? resolveDefaultJobDirectory(resolved.cwd, job.jobId) : undefined;
       const autoLocate = (mode === 'artifacts' || mode === 'workspace_files')
         && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && Boolean(located);
@@ -721,14 +725,14 @@ export class RemoteAgentGateway {
       const fresh = this.targets.resolve(input.targetId, input.input);
       if (fresh.configVersion !== resolved.configVersion || fresh.connectionVersion !== resolved.connectionVersion) throw new Error('Execution target changed before dispatch');
       this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
-      this.ledger.markDispatching(attempt.attemptId); sent = true;
-      const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       let hasTicket = false;
       try { this.ledger.ticket(input.originSessionId, job.jobId); hasTicket = true; }
       catch (error) { if (!(error instanceof TicketError)) throw error; }
+      this.ledger.markDispatching(attempt.attemptId); sent = true;
+      const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
-          + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest)
+          + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest ?? resultContract?.artifactManifestPath)
           + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
             artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
           + snapshotInstructions(input.input?.handoffSnapshot) }] },
@@ -743,7 +747,7 @@ export class RemoteAgentGateway {
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
-        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}) });
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: mode });
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
@@ -1583,9 +1587,10 @@ export class RemoteAgentGateway {
     }
     if (method === 'execution_continue') {
       const input = executionContinueSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
+      const continueInput = { ...input.input, ...(input.deliveryMode !== undefined ? { deliveryMode: input.deliveryMode } : {}) };
       const replay = this.ledger.replay({ originSessionId: input.originSessionId, jobId: job.jobId,
         operation: 'continue', title: job.title, targetSnapshot: { targetId: job.targetId },
-        input: input.input, requestDigestInput: input.input, clientRequestId: input.clientRequestId });
+        input: continueInput, requestDigestInput: continueInput, clientRequestId: input.clientRequestId });
       if (replay) return { ...this.ledgerView(input.originSessionId, job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
       const attempt = job.attempts.find(item => item.attemptId === job.currentAttemptId)!;
       if (job.unresolvedAttemptIds.length) throw new Error('Job has submission_unknown or unresolved attempts; reconcile before continuing');
@@ -1624,7 +1629,7 @@ export class RemoteAgentGateway {
       if (current.attempts.some(item => current.inFlightAttemptIds.includes(item.attemptId) && item.executionStatus !== 'input_required'))
         throw new Error('Job still has a running round; wait for it to end or cancel it before continuing');
       const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
-        input: { ...(attempt.input as Record<string, unknown>), ...input.input }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: input.input });
+        input: { ...(attempt.input as Record<string, unknown>), ...continueInput }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: continueInput });
       reopenForContinue(this.ledger, input.originSessionId, job.jobId);
       return submitted;
     }
@@ -1795,6 +1800,7 @@ export class RemoteAgentGateway {
           ...(input.roleId ? { roleId: input.roleId } : {}),
           ...(input.lifecycle ? { lifecycle: input.lifecycle } : previous.lifecycle ? { lifecycle: previous.lifecycle } : {}),
           ...(input.provider !== undefined ? { provider: input.provider } : {}), ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.deliveryMode !== undefined ? { deliveryMode: input.deliveryMode } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);

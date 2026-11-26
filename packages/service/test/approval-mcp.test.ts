@@ -450,6 +450,13 @@ test('a2a_task_dispatch forwards deliveryMode to execution_submit and remote_age
   assert.equal(spawned.isError, undefined, spawned.content[0]?.text);
   assert.equal(calls[1]?.method, 'remote_agent_spawn');
   assert.equal(calls[1]?.params.deliveryMode, 'none');
+  const continued = await mcp.invokeTool('a2a_task_continue', {
+    originSessionId: 'sess-1', jobId: 'job-mode', prompt: 'keep going', deliveryMode: 'workspace_files',
+  });
+  assert.equal(continued.isError, undefined, continued.content[0]?.text);
+  assert.equal(calls[2]?.method, 'execution_continue');
+  assert.equal(calls[2]?.params.deliveryMode, 'workspace_files');
+  assert.equal((calls[2]?.params.input as { deliveryMode?: string }).deliveryMode, 'workspace_files');
   const rejected = await mcp.invokeTool('a2a_task_dispatch', {
     originSessionId: 'sess-1', targetId: 'role-a', prompt: 'bad', deliveryMode: 'sideways',
   });
