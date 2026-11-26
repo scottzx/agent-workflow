@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { roleSkillProfileSchema } from '../src/roles/skills.js';
 import { AGENTS_LOCAL_GENERATED_HEADER, projectRoleToWorktree, validateSkillFrontmatter } from '../src/roles/index.js';
+import { loadChecklist } from '../src/rsi/checklist.js';
+import { loadWorkflow } from '../src/rsi/engine.js';
 
 const exec = promisify(execFile);
 const repoRoot = resolve(import.meta.dirname, '../../..');
@@ -19,7 +21,7 @@ const gitEnv = {
   GIT_COMMITTER_NAME: 'projection-test',
   GIT_COMMITTER_EMAIL: 'projection-test@example.com',
 };
-const ignoreRules = ['**/.agents/', '**/.claude/', '**/AGENTS.local.md', '**/CLAUDE.local.md'];
+const ignoreRules = ['/.agents/skills/*', '!/.agents/skills/autoreview/', '/.claude/', '**/AGENTS.local.md', '**/CLAUDE.local.md'];
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const result = await exec('git', args, { cwd, env: gitEnv });
@@ -59,40 +61,49 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
   assert.equal(profile.entrySkill, 'three-green');
   assert.deepEqual(profile.skills, [{ key: 'three-green', name: 'pr-three-green-delivery' }]);
 
-  const workflow = JSON.parse(await readFile(join(roleDir, 'workflow.json'), 'utf8'));
+  const workflow = await loadWorkflow(roleDir);
   assert.equal(workflow.schemaVersion, 1);
-  assert.deepEqual(workflow.nodes.map((node: { id: string }) => node.id),
-    ['implement', 'l1_gate', 'draft_pr', 'cross_model_cr', 'rework_loop', 'ready_for_human']);
-  assert.equal(workflow.routing.worker.provider, 'magpie-responses');
-  assert.equal(workflow.routing.worker.model, 'grok/grok-4.7@500k');
-  assert.equal(workflow.routing.worker.deliveryMode, 'workspace_git');
-  assert.equal(workflow.routing.reviewer.provider, 'magpie');
-  assert.equal(workflow.routing.reviewer.model, 'group/deepseek-v4.1');
-  assert.equal(workflow.routing.reviewer.readOnly, true);
-  assert.equal(workflow.routing.reviewer.deliveryMode, 'none');
-  assert.equal(typeof workflow.policies.trial, 'object');
-  assert.equal(typeof workflow.policies.formal, 'object');
+  assert.deepEqual(workflow.nodes.map(node => node.id), ['implement', 'l1_gate', 'draft_pr', 'cross_model_cr', 'ready_for_human']);
+  assert.equal(workflow.cycles.programBounce.when, 'block_failed');
+  assert.equal(workflow.cycles.programBounce.from, 'l1_gate');
+  assert.equal(workflow.cycles.qaRevise.when, 'verdict_revise');
+  assert.equal(workflow.cycles.qaRevise.to, 'implement');
+  assert.equal(workflow.policies.trial.requireQa, true);
+  assert.equal(workflow.policies.formal.enforceObserveAsBlock, true);
+  assert.equal('routing' in workflow, false);
 
-  const checklist = JSON.parse(await readFile(join(roleDir, 'checklist.json'), 'utf8'));
-  const ids = checklist.items.map((item: { id: string }) => item.id);
+  const checklist = await loadChecklist(roleDir);
+  assert.equal(checklist.schemaVersion, 2);
+  assert.equal(checklist.roleId, 'pr-delivery');
+  assert.deepEqual(checklist.artifacts, ['commit']);
+  const ids = checklist.items.map(item => item.id);
   for (const id of ['self_check', 'l1_deterministic', 'cross_model_cr', 'ci_status', 'proj_git_anchor', 'proj_skill_frontmatter', 'proj_claude_symlink', 'proj_agents_local_header', 'proj_no_hooks']) {
     assert.ok(ids.includes(id), id);
   }
-  const review = checklist.items.find((item: { id: string }) => item.id === 'cross_model_cr');
-  assert.equal(review.provider, 'magpie');
-  assert.equal(review.model, 'group/deepseek-v4.1');
-  assert.equal(review.readOnly, true);
+  assert.equal(checklist.items.find(item => item.id === 'self_check')?.kind, 'self');
+  assert.equal(checklist.items.find(item => item.id === 'l1_deterministic')?.kind, 'program');
+  assert.equal(checklist.items.find(item => item.id === 'cross_model_cr')?.kind, 'self_and_qa');
+  assert.equal(checklist.items.every(item => typeof item.locked === 'boolean'), true);
+
+  const routing = JSON.parse(await readFile(join(roleDir, 'routing.json'), 'utf8'));
+  assert.equal(routing.worker.provider, 'magpie-responses');
+  assert.equal(routing.worker.model, 'grok/grok-4.7@500k');
+  assert.equal(routing.worker.deliveryMode, 'workspace_git');
+  assert.equal(routing.reviewer.provider, 'magpie');
+  assert.equal(routing.reviewer.model, 'group/deepseek-v4.1');
+  assert.equal(routing.reviewer.readOnly, true);
+  assert.equal(routing.reviewer.deliveryMode, 'none');
 
   const skill = await readFile(join(roleDir, 'skills/pr-three-green-delivery/SKILL.md'), 'utf8');
   assert.deepEqual(validateSkillFrontmatter(skill, 'pr-three-green-delivery'), {
     name: 'pr-three-green-delivery',
     description: skill.match(/^description:\s*(.+)$/m)?.[1],
   });
-  assert.match(skill, /^when-to-use: /m);
+  const frontmatter = skill.split(/^---$/m)[1] ?? '';
   assert.match(skill, /^whenToUse: /m);
+  assert.doesNotMatch(frontmatter, /^when-to-use\s*:/m);
   assert.match(skill, /^disable-model-invocation: false$/m);
   assert.match(skill, /^user-invocable: true$/m);
-  const frontmatter = skill.split(/^---$/m)[1] ?? '';
   assert.doesNotMatch(frontmatter, /^(disableModelInvocation|modelInvocable|userInvocable)\s*:/m);
   const template = await readFile(join(roleDir, 'AGENTS.local.template.md'), 'utf8');
   assert.equal(template.split(/\r?\n/, 1)[0], AGENTS_LOCAL_GENERATED_HEADER);
@@ -171,6 +182,92 @@ test('validateSkillFrontmatter rejects legacy keys, a missing description and a 
   assert.throws(() => validateSkillFrontmatter('---\nname: NotKebab\ndescription: x\n---\n', 'pr-three-green-delivery'), /not kebab-case/);
   assert.throws(() => validateSkillFrontmatter('---\nname: other-skill\ndescription: x\n---\n', 'pr-three-green-delivery'), /does not match/);
   assert.throws(() => validateSkillFrontmatter(ok, 'NotKebab'), /not kebab-case/);
+  assert.throws(() => validateSkillFrontmatter(`\uFEFF${ok}`, 'pr-three-green-delivery'), /UTF-8 BOM/);
+  assert.throws(() => validateSkillFrontmatter('---\nname: pr-three-green-delivery\ndescription: 123\n---\n', 'pr-three-green-delivery'), /description must be a string/);
+  assert.throws(() => validateSkillFrontmatter('---\nname: pr-three-green-delivery\ndescription: true\n---\n', 'pr-three-green-delivery'), /description must be a string/);
+  assert.equal(validateSkillFrontmatter('---\nname: pr-three-green-delivery\ndescription: "123"\n---\n', 'pr-three-green-delivery').description, '123');
+});
+
+test('gitignore does not hide any already tracked file', async () => {
+  const ignored = (await git(repoRoot, ['ls-files', '--ignored', '--exclude-standard', '--cached'])).trim();
+  assert.equal(ignored, '');
+});
+
+test('projectRoleToWorktree refuses a symlink that would write outside the worktree', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-escape-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const outside = join(parent, 'outside');
+  const root = join(parent, 'repo');
+  await mkdir(outside);
+  await mkdir(root);
+  await writeFile(join(outside, 'DO-NOT-TOUCH.txt'), 'keep\n');
+  await git(root, ['init', '-b', 'main']);
+  await symlink(outside, join(root, '.agents'));
+  await assert.rejects(projectRoleToWorktree({ roleDir, worktreeDir: root }), /symlink/);
+  assert.equal(await readFile(join(outside, 'DO-NOT-TOUCH.txt'), 'utf8'), 'keep\n');
+  await assert.rejects(access(join(outside, 'skills')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+});
+
+test('a foreign .claude/skills symlink fails before any skill is copied', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-claude-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const elsewhere = join(parent, 'elsewhere');
+  const root = join(parent, 'repo');
+  await mkdir(elsewhere);
+  await mkdir(join(root, '.claude'), { recursive: true });
+  await git(root, ['init', '-b', 'main']);
+  await symlink(elsewhere, join(root, '.claude', 'skills'));
+  await assert.rejects(projectRoleToWorktree({ roleDir, worktreeDir: root }), /points at/);
+  await assert.rejects(access(join(root, '.agents', 'skills')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+  assert.equal(await readlink(join(root, '.claude', 'skills')), elsewhere);
+});
+
+test('handwritten AGENTS.local.md is left untouched', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-local-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, 'repo');
+  await mkdir(root);
+  await git(root, ['init', '-b', 'main']);
+  const handwritten = 'this file was written by a person\n';
+  await writeFile(join(root, 'AGENTS.local.md'), handwritten);
+  await assert.rejects(projectRoleToWorktree({ roleDir, worktreeDir: root }), /handwritten AGENTS\.local\.md/);
+  assert.equal(await readFile(join(root, 'AGENTS.local.md'), 'utf8'), handwritten);
+  await assert.rejects(access(join(root, '.agents')), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+});
+
+test('l1-gate blocks a forced add and allows a tracked .agents edit', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-status-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const staged = join(parent, 'staged');
+  await mkdir(join(staged, '.agents/skills/foo'), { recursive: true });
+  await git(staged, ['init', '-b', 'main']);
+  await writeFile(join(staged, 'README.md'), 'anchor\n');
+  await writeFile(join(staged, '.gitignore'), `${ignoreRules.join('\n')}\n`);
+  await git(staged, ['add', 'README.md', '.gitignore']);
+  await git(staged, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await writeFile(join(staged, '.agents/skills/foo/SKILL.md'), '---\nname: foo\ndescription: x\n---\n');
+  await git(staged, ['add', '-f', '.agents/skills/foo/SKILL.md']);
+  const addedSkill = await runGate(staged);
+  assert.equal(addedSkill.status, 1, JSON.stringify(addedSkill.body));
+  assert.equal(addedSkill.body.checks.find(item => item.id === 'git-status')?.ok, false);
+  await git(staged, ['reset', 'HEAD']);
+  await rm(join(staged, '.agents'), { recursive: true, force: true });
+  await writeFile(join(staged, 'AGENTS.local.md'), `${AGENTS_LOCAL_GENERATED_HEADER}\n\nstaged\n`);
+  await git(staged, ['add', '-f', 'AGENTS.local.md']);
+  const addedLocal = await runGate(staged);
+  assert.equal(addedLocal.status, 1);
+  assert.equal(addedLocal.body.checks.find(item => item.id === 'git-status')?.ok, false);
+
+  const tracked = join(parent, 'tracked');
+  await mkdir(join(tracked, '.agents/skills/autoreview'), { recursive: true });
+  await git(tracked, ['init', '-b', 'main']);
+  await writeFile(join(tracked, '.agents/skills/autoreview/test.md'), 'v1\n');
+  await git(tracked, ['add', '.agents/skills/autoreview/test.md']);
+  await git(tracked, ['commit', '--no-gpg-sign', '-m', 'track']);
+  await writeFile(join(tracked, '.agents/skills/autoreview/test.md'), 'v2\n');
+  const edited = await runGate(tracked);
+  assert.equal(edited.status, 0, JSON.stringify(edited.body));
+  assert.equal(edited.body.checks.find(item => item.id === 'git-status')?.ok, true);
 });
 
 test('l1-gate fails a worktree with no .git and a projection path that git would commit', async t => {

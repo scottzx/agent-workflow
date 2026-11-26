@@ -159,16 +159,14 @@ async function checkGitStatus(dir) {
   try {
     // Ignore the developer's private excludes file. The gate judges the worktree's own rules,
     // so a global AGENTS.local.md ignore cannot hide a repository that forgot to ignore the projection.
-    const result = await execFileAsync('git', ['-c', 'core.excludesFile=/dev/null', 'status', '--porcelain', '--untracked-files=all'], { cwd: dir });
+    const result = await execFileAsync('git', [
+      '-c', 'core.excludesFile=/dev/null', '--no-optional-locks', 'status', '--porcelain=v1', '-z', '-uall',
+    ], { cwd: dir, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
     stdout = result.stdout;
   } catch (error) {
     return { id: 'git-status', ok: false, detail: errorMessage(error) };
   }
-  const leaks = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    const leak = leakedPath(line);
-    if (leak) leaks.push(leak);
-  }
+  const leaks = porcelainLeaks(stdout);
   return leaks.length
     ? { id: 'git-status', ok: false, detail: `projection or untracked role path in git status: ${leaks.join(', ')}` }
     : { id: 'git-status', ok: true };
@@ -201,21 +199,43 @@ async function checkRoleSource(dir) {
     : { id: 'role-source', ok: true, checked: skills.length };
 }
 
-function leakedPath(line) {
-  if (!line.trim()) return undefined;
-  const status = line.slice(0, 2);
-  const body = line.slice(3);
-  const paths = body.includes(' -> ') ? body.split(' -> ') : [body];
-  for (const item of paths) {
-    const path = unquote(item).replaceAll('\\', '/');
-    const projection = path === 'AGENTS.local.md' || path === 'CLAUDE.local.md'
-      || path === '.agents' || path.startsWith('.agents/')
-      || path === '.claude' || path.startsWith('.claude/');
-    if (projection) return path;
-    const role = path === '.1agents' || path.startsWith('.1agents/');
-    if (role && (status === '??' || status[0] === 'A' || status[0] === '?')) return path;
+function porcelainLeaks(stdout) {
+  const leaks = [];
+  let offset = 0;
+  while (offset < stdout.length) {
+    const end = stdout.indexOf('\0', offset);
+    if (end < 0 || end < offset + 3) break;
+    const xy = stdout.slice(offset, offset + 2);
+    const first = stdout.slice(offset + 3, end);
+    offset = end + 1;
+    const renamed = xy.includes('R') || xy.includes('C');
+    let second;
+    if (renamed) {
+      const end2 = stdout.indexOf('\0', offset);
+      if (end2 < 0) break;
+      second = stdout.slice(offset, end2);
+      offset = end2 + 1;
+    }
+    for (const path of [first, second]) {
+      if (path && isStatusLeak(xy, path)) leaks.push(path);
+    }
   }
-  return undefined;
+  return leaks;
+}
+
+function isStatusLeak(xy, path) {
+  const normalized = path.replaceAll('\\', '/').replace(/^\.\//, '');
+  const watched = normalized === 'AGENTS.local.md' || normalized === 'CLAUDE.local.md'
+    || normalized === '.agents' || normalized.startsWith('.agents/')
+    || normalized === '.claude' || normalized.startsWith('.claude/')
+    || normalized === '.1agents/jobs' || normalized.startsWith('.1agents/jobs/')
+    || normalized === '.1agents/worktrees' || normalized.startsWith('.1agents/worktrees/')
+    || normalized === '.1agents/runtime' || normalized.startsWith('.1agents/runtime/')
+    || normalized === '.1agents/state' || normalized.startsWith('.1agents/state/');
+  if (!watched) return false;
+  if (xy === '??') return true;
+  const index = xy[0];
+  return index === 'A' || index === 'C' || index === 'R';
 }
 
 function validateSkillFrontmatter(text, expectedName) {
@@ -225,15 +245,19 @@ function validateSkillFrontmatter(text, expectedName) {
     if (LEGACY[key]) throw new Error(`Skill frontmatter rejects legacy key "${key}"; use "${LEGACY[key]}"`);
   }
   const name = data.name;
-  if (name === undefined) throw new Error('Skill frontmatter requires kebab-case name');
-  if (!SKILL_NAME.test(name)) throw new Error(`Skill frontmatter name "${name}" is not kebab-case`);
-  if (name !== expectedName) throw new Error(`Skill frontmatter name "${name}" does not match ${expectedName}`);
-  if (data.description === undefined || data.description.trim() === '') throw new Error('Skill frontmatter requires a non-empty description');
+  if (!name) throw new Error('Skill frontmatter requires kebab-case name');
+  if (name.kind !== 'string') throw new Error('Skill frontmatter name must be a string');
+  if (!SKILL_NAME.test(name.value)) throw new Error(`Skill frontmatter name "${name.value}" is not kebab-case`);
+  if (name.value !== expectedName) throw new Error(`Skill frontmatter name "${name.value}" does not match ${expectedName}`);
+  const description = data.description;
+  if (!description) throw new Error('Skill frontmatter requires a non-empty description');
+  if (description.kind !== 'string') throw new Error('Skill frontmatter description must be a string');
+  if (description.value.trim() === '') throw new Error('Skill frontmatter requires a non-empty description');
 }
 
 function parseFrontmatter(text) {
-  const normalized = text.replace(/^\uFEFF/, '');
-  const fence = /^(---)\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(normalized);
+  if (text.charCodeAt(0) === 0xfeff) throw new Error('Skill frontmatter rejects a UTF-8 BOM');
+  const fence = /^(---)\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
   if (!fence) throw new Error('Skill frontmatter requires an opening --- fence');
   const data = {};
   for (const rawLine of fence[2].split(/\r?\n/)) {
@@ -243,17 +267,21 @@ function parseFrontmatter(text) {
     if (!match) throw new Error(`Skill frontmatter has an unreadable line: ${line.slice(0, 80)}`);
     const key = match[1] ?? match[2] ?? match[3];
     if (Object.hasOwn(data, key)) throw new Error(`Skill frontmatter has duplicate key "${key}"`);
-    data[key] = unquote(match[4] ?? '');
+    data[key] = parseScalar(match[4] ?? '');
   }
   return data;
 }
 
-function unquote(value) {
-  const trimmed = value.trim();
+function parseScalar(raw) {
+  const trimmed = raw.trim();
   if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith('\'') && trimmed.endsWith('\''))) {
-    return trimmed.slice(1, -1);
+    return { kind: 'string', value: trimmed.slice(1, -1).trim() };
   }
-  return trimmed;
+  const comment = trimmed.indexOf(' #');
+  const bare = (comment === -1 ? trimmed : trimmed.slice(0, comment)).trim();
+  if (/^(?:true|false|null|~|yes|no|on|off)$/i.test(bare)) return { kind: 'other' };
+  if (/^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(bare)) return { kind: 'other' };
+  return { kind: 'string', value: bare };
 }
 
 function errorMessage(error) {

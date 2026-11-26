@@ -5,41 +5,28 @@
     { "id": "implement", "type": "executor_turn", "requireTicketSubmit": false },
     { "id": "l1_gate", "type": "program_check", "checks": ["l1_deterministic"], "dependsOn": ["implement"] },
     { "id": "draft_pr", "type": "executor_turn", "dependsOn": ["l1_gate"], "when": "checks_passed" },
-    { "id": "cross_model_cr", "type": "qa_session_review", "dependsOn": ["draft_pr"], "when": "checks_passed", "readOnly": true },
-    { "id": "rework_loop", "type": "executor_turn", "dependsOn": ["cross_model_cr"], "when": "verdict_revise" },
-    { "id": "ready_for_human", "type": "human_acceptance", "dependsOn": ["cross_model_cr"], "when": "three_green" }
+    { "id": "cross_model_cr", "type": "qa_session_review", "dependsOn": ["draft_pr"], "when": "checks_passed" },
+    { "id": "ready_for_human", "type": "ticket_apply_review", "dependsOn": ["cross_model_cr"] }
   ],
   "cycles": {
-    "rework": { "from": "rework_loop", "to": "l1_gate", "when": "rework_committed" }
-  },
-  "routing": {
-    "worker": {
-      "provider": "magpie-responses",
-      "model": "grok/grok-4.7@500k",
-      "deliveryMode": "workspace_git"
-    },
-    "reviewer": {
-      "provider": "magpie",
-      "model": "group/deepseek-v4.1",
-      "deliveryMode": "none",
-      "readOnly": true
-    }
+    "programBounce": { "from": "l1_gate", "to": "implement", "when": "block_failed" },
+    "qaRevise": { "from": "cross_model_cr", "to": "implement", "when": "verdict_revise" }
   },
   "policies": {
     "trial": {
-      "maxReworkLoops": 2,
-      "requireL1": true,
-      "requireCrossModelCr": true,
-      "requireCiGreen": false,
-      "humanAcceptance": "optional",
+      "maxProgramBounces": 1,
+      "maxQaRevisions": 2,
+      "enforceObserveAsBlock": false,
+      "requireQa": true,
+      "collectProposals": true,
       "allowExternalHandoff": false
     },
     "formal": {
-      "maxReworkLoops": 5,
-      "requireL1": true,
-      "requireCrossModelCr": true,
-      "requireCiGreen": true,
-      "humanAcceptance": "once",
+      "maxProgramBounces": 2,
+      "maxQaRevisions": 5,
+      "enforceObserveAsBlock": true,
+      "requireQa": true,
+      "collectProposals": false,
       "allowExternalHandoff": true
     }
   }

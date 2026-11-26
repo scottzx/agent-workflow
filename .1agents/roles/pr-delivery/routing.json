@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "worker": {
+    "provider": "magpie-responses",
+    "model": "grok/grok-4.7@500k",
+    "deliveryMode": "workspace_git"
+  },
+  "reviewer": {
+    "provider": "magpie",
+    "model": "group/deepseek-v4.1",
+    "deliveryMode": "none",
+    "readOnly": true
+  }
+}
