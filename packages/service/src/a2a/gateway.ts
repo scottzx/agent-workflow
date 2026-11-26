@@ -14,7 +14,8 @@ import { FileA2AStore } from './store.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
 import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
-import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, type RemoteAgentNotice } from './notices.js';
+import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary, type RemoteAgentNotice, type SubscriberNotice } from './notices.js';
+import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
@@ -113,6 +114,7 @@ const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: string.opt
   via: z.enum(['page', 'relay']).optional() }).strict();
 const taskFields = { ...originFields, remote: string, taskId: string };
 const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'Prompt must contain text');
+const notifySessionsSchema = z.array(notifySubscriptionInputSchema).max(32).optional();
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   cwd: string.refine(value => path.posix.isAbsolute(value), 'cwd must be an absolute remote path'),
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
@@ -120,6 +122,7 @@ const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
   clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
   provider: string.optional(), model: string.optional(), initiatedBy: actorSchema.optional(),
+  notifySessions: notifySessionsSchema,
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const modelCatalogQuerySchema = z.object({ ...originFields, remote: string }).strict();
@@ -133,7 +136,8 @@ const executionSubmitSchema = z.object({ ...originFields, targetId: string, inpu
   clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
   parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(), caseId: string.optional(),
   handoffId: string.optional(),
-  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional() }).strict();
+  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional(),
+  notifySessions: notifySessionsSchema }).strict();
 const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
 const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
 const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
@@ -160,7 +164,7 @@ const executionPendingApprovalsSchema = z.object({
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
-  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。', parameters: z.toJSONSchema(executionSubmitSchema) },
+  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。可选 notifySessions 登记该任务或所属 case 的只读订阅。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
   execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
@@ -174,7 +178,7 @@ const EXECUTION_METHODS = {
   execution_pending_approvals: { description: '跨任务汇总当前待审批的 A2A 过程请求（工具权限/计划/提问）、待裁决的任务单改进提议与活跃任务单；支持按 originSessionId 或 jobId 过滤。', parameters: z.toJSONSchema(executionPendingApprovalsSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
-  case_open: { description: '开一件事：写下目标，登记进账本。之后 handoff_space、handoff_offer 和带 caseId 的提交都只能引用已存在的一件事，不会隐式创建。', parameters: z.toJSONSchema(caseOpenSchema) },
+  case_open: { description: '开一件事：写下目标，登记进账本。之后 handoff_space、handoff_offer 和带 caseId 的提交都只能引用已存在的一件事，不会隐式创建。可选 notifySessions 登记 case 级订阅，之后该 case 的新任务与交接自动继承。', parameters: z.toJSONSchema(caseOpenSchema.extend({ notifySessions: notifySessionsSchema }).strict()) },
   case_get: { description: '读取一件事：目标、共享产物空间、其下的任务、交接、约定和待确认。不派单，不决定。', parameters: z.toJSONSchema(caseGetSchema) },
   ...TICKET_METHODS,
   ...HANDOFF_METHODS,
@@ -184,7 +188,7 @@ export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
   remote_agent_model_catalog: { description: '读取执行宿主 standard 预设当前可选的 provider 与 model，含默认路由和 routing group。不创建会话、不调用模型。填 remote_agent_spawn 或 remote_agent_message 时，provider 用 groups[].id，model 用其中的 models[].id。', parameters: z.toJSONSchema(modelCatalogQuerySchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。可选 notifySessions 为该任务登记只读订阅。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，任务上返回 resumed: true；historyReplayed 只说明宿主是否把历史重新推给了它的客户端，不影响接回本身。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
@@ -198,6 +202,9 @@ export const REMOTE_AGENT_METHODS = {
   session_delivery_get: { description: '查询本主会话的消息投递状态。unknown 必须先核实宿主是否已接收，不能盲目重发。', parameters: z.toJSONSchema(sessionMessageSchema) },
   session_delivery_resolve: { description: '核实 unknown 或处理 rejected 投递并记录依据。accepted=true 表示已确认入队；false 仅用于已证实未入队且已处理阻碍后释放重试。note 必填，不等于任务业务处理确认。', parameters: z.toJSONSchema(sessionResolveSchema) },
   session_binding_get: { description: '只读查询主会话是否已绑定宿主，以及该归属的投递计数和是否阻塞。不返回宿主凭据、hostFingerprint 或消息正文。unknown 或 rejected 大于 0 时 blocked 为 true。', parameters: z.toJSONSchema(sessionOriginSchema) },
+  notification_subscribe: { description: '为主归属登记一个任务级或 case 级只读订阅。省略 events 时按角色给默认事件：coordinator 含进度/终态/交接，downstream 含终态/交接，observer 仅终态；process_request 必须显式列入。默认 mode 为 queue。同一归属不可把 originSessionId 改成数组。', parameters: z.toJSONSchema(notificationSubscribeSchema) },
+  notification_unsubscribe: { description: '按 subscriptionId 取消本主归属的一条订阅。不影响主归属绑定，也不删除已经入队的通知。', parameters: z.toJSONSchema(notificationUnsubscribeSchema) },
+  notification_subscriptions: { description: '只读列出本主归属的订阅。可按 jobId 或 caseId 过滤。不返回宿主凭据或消息正文。', parameters: z.toJSONSchema(notificationListSchema) },
 };
 
 interface Job {
@@ -240,6 +247,8 @@ interface ExecutionCancellation { jobId: string; attemptId: string; originSessio
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
 interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[];
+  /** Read-only subscribers. Absent on gateway files written before multi-session notifications. */
+  subscriptions?: NotificationSubscription[];
   /** A shared space or role directory the host refused for a job; the task ran without it. */
   artifactSpaceRefusals?: Record<string, { at: string; path: string; reason: string }> }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
@@ -348,6 +357,8 @@ export class RemoteAgentGateway {
       this.state.pptDeliveries ??= { version: 1, runs: {} };
       if (this.state.processRequests !== undefined && !Array.isArray(this.state.processRequests)) throw new Error('Invalid gateway state');
       this.state.processRequests = z.array(processRequestSchema).parse(this.state.processRequests ?? []);
+      if (this.state.subscriptions !== undefined && !Array.isArray(this.state.subscriptions)) throw new Error('Invalid gateway state');
+      this.state.subscriptions = z.array(notificationSubscriptionSchema).parse(this.state.subscriptions ?? []);
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         const attempt = this.ledger.getAttempt(run.attemptId);
         if (attempt.submissionStatus === 'prepared') this.ledger.markDispatching(attempt.attemptId);
@@ -439,6 +450,100 @@ export class RemoteAgentGateway {
     if (local && createHash('sha256').update(local).digest('hex') === artifact.sha256) return local;
     return (await this.workbenchArtifact(jobId, artifact.sha256)).content;
   }
+  /** Explicit host targets are checked immediately. An origin target may be bound later and is resolved at fan-out. */
+  private assertSubscriberTarget(target: NotificationSubscription['target']): void {
+    if (target.originSessionId) return;
+    this.sessions.resolveTarget(target);
+  }
+  private attachSubscriptions(originSessionId: string, inputs: NotifySubscriptionInput[] | undefined, defaults: { scope: 'job' | 'case'; jobId?: string; caseId?: string }): void {
+    if (!inputs?.length) return;
+    const stored = this.state.subscriptions ??= [];
+    let changed = false;
+    for (const input of inputs) {
+      const next = materializeSubscription(originSessionId, input, defaults);
+      this.assertSubscriberTarget(next.target);
+      if (next.scope === 'job' && next.jobId) this.ledger.get(originSessionId, next.jobId);
+      if (next.scope === 'case' && next.caseId) requireCase(this.ledger, originSessionId, next.caseId);
+      if (stored.some(item => item.subscriptionId === next.subscriptionId)) continue;
+      stored.push(next);
+      changed = true;
+    }
+    if (changed) this.save();
+  }
+  private noteHandoffTaken(originSessionId: string, handoffId: string, childJobId: string): void {
+    const taken = this.ledger.markHandoffTaken(originSessionId, handoffId, childJobId);
+    this.fanoutSubscribers({
+      originSessionId, jobId: taken.fromJobId, caseId: taken.caseId, purpose: taken.purpose, targetId: taken.toTargetId,
+      event: 'handoff', eventKey: `handoff:taken:${taken.handoffId}`, status: 'taken', summary: taken.reason,
+      handoff: { handoffId: taken.handoffId, status: 'taken', purpose: taken.purpose, toTargetId: taken.toTargetId, childJobId },
+    });
+  }
+  /** Merge job and case subscriptions, skip the owner session, and isolate each target queue. */
+  private fanoutSubscribers(input: {
+    originSessionId: string; jobId?: string; caseId?: string; purpose?: string; targetId?: string;
+    event: SubscriberNotice['event']; eventKey: string; status: string; title?: string; summary?: string;
+    artifacts?: SubscriberNotice['artifacts']; handoff?: SubscriberNotice['handoff']; processRequest?: SubscriberNotice['processRequest'];
+  }): void {
+    if (!this.sessions.healthy) return;
+    const matches = (this.state.subscriptions ?? []).filter(sub => {
+      if (sub.originSessionId !== input.originSessionId || !sub.events.includes(input.event)) return false;
+      const jobMatch = Boolean(input.jobId && sub.scope === 'job' && sub.jobId === input.jobId);
+      const caseMatch = Boolean(input.caseId && sub.scope === 'case' && sub.caseId === input.caseId);
+      if (!jobMatch && !caseMatch) return false;
+      if (sub.filter?.purpose && sub.filter.purpose !== input.purpose) return false;
+      if (sub.filter?.targetId && sub.filter.targetId !== input.targetId) return false;
+      return true;
+    });
+    if (!matches.length) return;
+    let owner: { host: string; sessionId: string } | undefined;
+    try {
+      const status = this.sessions.getBindingStatus(input.originSessionId);
+      if (status.binding) owner = { host: status.binding.host, sessionId: status.binding.sessionId };
+    } catch { return; }
+    const seen = new Set<string>();
+    for (const sub of matches) {
+      try {
+        const resolved = this.sessions.resolveTarget(sub.target);
+        const key = `${resolved.host}\0${resolved.sessionId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (owner && owner.host === resolved.host && owner.sessionId === resolved.sessionId) continue;
+        const notice: SubscriberNotice = {
+          role: sub.role, event: input.event, originSessionId: input.originSessionId, status: input.status,
+          ...(input.caseId ? { caseId: input.caseId } : {}), ...(input.jobId ? { jobId: input.jobId } : {}),
+          ...(input.title ? { title: input.title } : {}), ...(input.summary ? { summary: input.summary } : {}),
+          ...(input.artifacts?.length ? { artifacts: input.artifacts } : {}),
+          ...(input.handoff ? { handoff: input.handoff } : {}),
+          ...(input.processRequest ? { processRequest: input.processRequest } : {}),
+        };
+        this.sessions.enqueueTarget({
+          targetKey: subscriberTargetKey(resolved.host, resolved.sessionId),
+          host: resolved.host, sessionId: resolved.sessionId,
+          messageId: subscriberMessageId(input.eventKey, resolved.host, resolved.sessionId),
+          mode: sub.mode, notice: { form: 'notice', summary: formatSubscriberNoticeSummary(notice) },
+          text: formatSubscriberNotice(notice),
+        });
+      } catch { /* One subscriber must not block the owner or any other subscriber. */ }
+    }
+    void this.sessions.reconcile().catch(() => {});
+  }
+  private notifyTaskSubscribers(job: Job, task: Task): void {
+    if (!job.ledgerJobId) return;
+    let view: { caseId?: string; purpose?: string; targetId: string; title?: string };
+    try { view = this.ledger.get(job.originSessionId, job.ledgerJobId); }
+    catch { return; }
+    const state = taskState(job);
+    const status = this.standardState(state);
+    const attemptId = job.attemptId ?? job.taskId;
+    const base = {
+      originSessionId: job.originSessionId, jobId: job.ledgerJobId, caseId: view.caseId, purpose: view.purpose, targetId: view.targetId,
+      title: job.title ?? view.title, summary: resultText(task).slice(0, 500),
+      artifacts: artifactLinks(task).map(link => ({ name: link.name, url: link.url })),
+    };
+    if (state === 'TASK_STATE_SUBMITTED') this.fanoutSubscribers({ ...base, event: 'progress', eventKey: `progress:submitted:${attemptId}`, status: 'submitted' });
+    if (state === 'TASK_STATE_WORKING') this.fanoutSubscribers({ ...base, event: 'progress', eventKey: `progress:working:${attemptId}`, status: 'working' });
+    if (actionable.has(state)) this.fanoutSubscribers({ ...base, event: 'terminal', eventKey: `terminal:${attemptId}:${status}`, status });
+  }
   private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; deliveryRecoveryInput?: PptDeliveryRecoveryInput; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
     if (input.handoffId) {
       const handoff = this.ledger.findHandoff(input.originSessionId, input.handoffId);
@@ -448,7 +553,10 @@ export class RemoteAgentGateway {
       if (input.caseId && input.caseId !== handoff.caseId) throw new Error('Handoff case does not match');
       // The accepted version is the one the handoff names. Another version needs a new proposal.
       if (input.resultRevision && input.resultRevision !== handoff.artifactRevision) throw new Error('Handoff version does not match; propose the new version instead');
-      if (handoff.status === 'taken' && handoff.childJobId) return this.ledgerView(input.originSessionId, handoff.childJobId);
+      if (handoff.status === 'taken' && handoff.childJobId) {
+        this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: handoff.childJobId, caseId: handoff.caseId });
+        return this.ledgerView(input.originSessionId, handoff.childJobId);
+      }
       const frozen = handoff.snapshots ?? [];
       const snapshot = { caseId: handoff.caseId, handoffId: handoff.handoffId, revision: handoff.artifactRevision, digest: handoff.artifactDigest,
         files: frozen.map(item => ({ digest: item.digest, name: item.name, size: item.size,
@@ -460,7 +568,10 @@ export class RemoteAgentGateway {
     // A task may only join a thing that exists; it never creates one by naming it.
     if (input.caseId) requireCase(this.ledger, input.originSessionId, input.caseId);
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
-    if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+    if (replay) {
+      this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: replay.job.jobId, caseId: replay.job.caseId ?? input.caseId });
+      return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+    }
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
     const resolved = this.targets.resolve(input.targetId, input.input);
     if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
@@ -473,11 +584,13 @@ export class RemoteAgentGateway {
     const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(development ? { development } : {}), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
     if (prepared.idempotent) {
-      if (input.handoffId) this.ledger.markHandoffTaken(input.originSessionId, input.handoffId, prepared.job.jobId);
+      this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: prepared.job.jobId, caseId: prepared.job.caseId ?? input.caseId });
+      if (input.handoffId) this.noteHandoffTaken(input.originSessionId, input.handoffId, prepared.job.jobId);
       return this.ledgerView(input.originSessionId, prepared.job.jobId);
     }
     const { job, attempt } = prepared;
-    if (input.handoffId) this.ledger.markHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
+    this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: job.jobId, caseId: job.caseId ?? input.caseId });
+    if (input.handoffId) this.noteHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
     let sent = false;
     try {
       if (reportRequest !== undefined) {
@@ -1264,6 +1377,7 @@ export class RemoteAgentGateway {
       else this.ledger.observe(job.attemptId, observed);
     } else this.save();
     if (oneShotShouldClose(job.lifecycle, state, this.taskAcknowledged(job, state))) this.releaseOneShot(job);
+    try { this.notifyTaskSubscribers(job, task); } catch { /* subscriber fan-out must not block the owner */ }
   }
   private async refresh(job: Job): Promise<void> {
     const key = `${job.remote}:${job.taskId}`;
@@ -1398,10 +1512,15 @@ export class RemoteAgentGateway {
     }
     if (method === 'execution_submit') return this.submitExecution(executionSubmitSchema.parse(params));
     if (method === 'case_open') {
-      const input = caseOpenSchema.parse(params);
+      const { notifySessions, ...input } = caseOpenSchema.extend({ notifySessions: notifySessionsSchema }).strict().parse(params);
       // This channel is an agent's. It may not write that a person opened the case.
       if (input.createdBy?.kind === 'person') throw new Error('A person opens a case on the workbench page, not through this channel');
-      return openCase(this.ledger, input);
+      for (const item of notifySessions ?? []) {
+        if ((item.scope ?? 'case') === 'job' && !item.jobId) throw new Error('Job subscription requires jobId');
+      }
+      const opened = openCase(this.ledger, input);
+      this.attachSubscriptions(opened.originSessionId, notifySessions, { scope: 'case', caseId: opened.caseId });
+      return opened;
     }
     if (method === 'case_get') {
       const input = caseGetSchema.parse(params);
@@ -1486,7 +1605,16 @@ export class RemoteAgentGateway {
       const result = invokeHandoff(this.ledger, method, params);
       // The bytes a handoff talks about are frozen once, so a later round of the source job cannot change them.
       if ((method === 'handoff_propose' || method === 'handoff_decide') && result && typeof result === 'object' && 'handoffId' in result) {
-        await this.freezeHandoff(result as Handoff);
+        const handoff = result as Handoff;
+        await this.freezeHandoff(handoff);
+        const origin = this.ledger.originOf(handoff.fromJobId);
+        if (origin) this.fanoutSubscribers({
+          originSessionId: origin, jobId: handoff.fromJobId, caseId: handoff.caseId, purpose: handoff.purpose, targetId: handoff.toTargetId,
+          event: 'handoff',
+          eventKey: method === 'handoff_propose' ? `handoff:propose:${handoff.handoffId}` : `handoff:decide:${handoff.handoffId}:${handoff.status}`,
+          status: handoff.status, summary: handoff.reason,
+          handoff: { handoffId: handoff.handoffId, status: handoff.status, purpose: handoff.purpose, toTargetId: handoff.toTargetId, ...(handoff.childJobId ? { childJobId: handoff.childJobId } : {}) },
+        });
       }
       return result;
     }
@@ -1556,11 +1684,34 @@ export class RemoteAgentGateway {
       return result;
     }
     if (method === 'session_binding_get') return this.sessions.getBindingStatus(sessionOriginSchema.parse(params).originSessionId);
+    if (method === 'notification_subscribe') {
+      const input = notificationSubscribeSchema.parse(params);
+      this.attachSubscriptions(input.originSessionId, [input], { scope: input.scope, jobId: input.jobId, caseId: input.caseId });
+      const subscriptionId = materializeSubscription(input.originSessionId, input, { scope: input.scope, jobId: input.jobId, caseId: input.caseId }).subscriptionId;
+      const subscription = (this.state.subscriptions ?? []).find(item => item.subscriptionId === subscriptionId);
+      if (!subscription) throw new Error('Subscription was not recorded');
+      return subscription;
+    }
+    if (method === 'notification_unsubscribe') {
+      const input = notificationUnsubscribeSchema.parse(params);
+      const list = this.state.subscriptions ?? [];
+      const index = list.findIndex(item => item.subscriptionId === input.subscriptionId && item.originSessionId === input.originSessionId);
+      if (index < 0) throw new Error('Subscription not found for this origin session');
+      list.splice(index, 1);
+      this.state.subscriptions = list;
+      this.save();
+      return { removed: true, subscriptionId: input.subscriptionId };
+    }
+    if (method === 'notification_subscriptions') {
+      const input = notificationListSchema.parse(params);
+      return { subscriptions: (this.state.subscriptions ?? []).filter(item => item.originSessionId === input.originSessionId
+        && (!input.jobId || item.jobId === input.jobId) && (!input.caseId || item.caseId === input.caseId)) };
+    }
     if (method === 'remote_agent_spawn') {
       const input = spawnSchema.parse(params);
       if (input.notificationTarget && !this.config.notificationTargets[input.notificationTarget]) throw new Error('Unknown notificationTarget');
-      const { originSessionId, remote, clientRequestId, title, initiatedBy, ...fields } = input;
-      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title, initiatedBy });
+      const { originSessionId, remote, clientRequestId, title, initiatedBy, notifySessions, ...fields } = input;
+      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title, initiatedBy, ...(notifySessions ? { notifySessions } : {}) });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
       if (!raw) throw new Error(`Task admission unresolved; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
@@ -2019,6 +2170,14 @@ export class RemoteAgentGateway {
           void this.sessions.reconcile().catch(() => {});
         } catch { /* Best-effort origin wakeup must not hide the durable workbench request. */ }
       }
+      try {
+        this.fanoutSubscribers({
+          originSessionId: scope.originSessionId, jobId: created.jobId, caseId: scope.caseId, purpose: scope.purpose, targetId: scope.targetId,
+          event: 'process_request', eventKey: `process:${created.requestId}`, status: created.kind, title: scope.title,
+          summary: created.kind === 'permission' ? created.toolTitle : created.kind,
+          processRequest: { requestId: created.requestId, kind: created.kind },
+        });
+      } catch { /* Subscriber copies are optional and must not hide the durable request. */ }
       return created;
     });
   }

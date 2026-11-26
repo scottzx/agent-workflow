@@ -9,7 +9,12 @@ import { HANDOFF_TOOLS } from './handoff-spec.js';
 import { TICKET_TOOLS } from './ticket-spec.js';
 
 const url = process.env.ONEAGENTS_REVIEW_URL, ticketUrl = process.env.ONEAGENTS_TICKET_URL, handoffUrl = process.env.ONEAGENTS_HANDOFF_URL, session = process.env.ONEAGENTS_REVIEW_SESSION, token = process.env.ONEAGENTS_REVIEW_TOKEN;
-const tools = [{ name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
+const defaultHost = process.env.ONEAGENTS_SESSION_HOST?.trim() || 'dsh-local';
+const origin = process.env.ONEAGENTS_DSH_ORIGIN ?? '';
+const identity = { sessionId: session ?? '', defaultHost, origin };
+const tools = [{ name: 'session_identity', description: '只读返回当前 ACP 会话身份：sessionId、默认宿主 defaultHost、以及 DSH origin。不返回任何凭据。',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
   inputSchema: { type: 'object', properties: { summary: { type: 'string', description: SUMMARY_DESCRIPTION } }, required: ['summary'], additionalProperties: false } },
   ...(ticketUrl ? TICKET_TOOLS.map(spec => ({ name: spec.name, description: spec.description,
     inputSchema: { type: 'object', properties: spec.parameters, required: Object.keys(spec.parameters), additionalProperties: false } })) : []),
@@ -19,6 +24,7 @@ const tools = [{ name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
 const write = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
 async function call(name: string, args: unknown): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+  if (name === 'session_identity') return { content: [{ type: 'text', text: JSON.stringify(identity) }] };
   const summary = (args as { summary?: unknown } | undefined)?.summary;
   if (name === SUBMIT_TOOL && (typeof summary !== 'string' || !summary.trim())) return { content: [{ type: 'text', text: 'summary is required' }], isError: true };
   const handoff = HANDOFF_TOOLS.some(spec => spec.name === name);

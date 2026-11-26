@@ -73,6 +73,8 @@ export class ReviewHandBack {
       { name: 'ONEAGENTS_HANDOFF_URL', value: new URL(HANDOFF_PATH, origin).href },
       { name: 'ONEAGENTS_REVIEW_SESSION', value: sessionId },
       { name: 'ONEAGENTS_REVIEW_TOKEN', value: this.token(sessionId) },
+      { name: 'ONEAGENTS_SESSION_HOST', value: process.env.ONEAGENTS_SESSION_HOST?.trim() || 'dsh-local' },
+      { name: 'ONEAGENTS_DSH_ORIGIN', value: origin },
     ] };
   }
 

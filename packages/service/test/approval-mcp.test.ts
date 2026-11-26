@@ -106,7 +106,7 @@ async function setupGateway(t: TestContext) {
   };
 }
 
-test('MCP handler lists 14 tools, dispatches/queries tasks, aggregates pending approvals, and executes coach-scoped approvals/tickets/reviews', async (t) => {
+test('MCP handler lists approval tools, dispatches/queries tasks, aggregates pending approvals, and executes coach-scoped approvals/tickets/reviews', async (t) => {
   const env = await setupGateway(t);
   const mcp = createA2AApprovalMcpHandler({ gatewayUrl: env.gatewayUrl, coachAgent: 'dsh-coach' });
 
@@ -118,7 +118,7 @@ test('MCP handler lists 14 tools, dispatches/queries tasks, aggregates pending a
   assert.deepEqual(ping?.result, {});
   const list = await mcp.handleJsonRpc({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
   const tools = (list?.result as { tools: typeof A2A_APPROVAL_MCP_TOOLS }).tools;
-  assert.equal(tools.length, 14);
+  assert.equal(tools.length, 19);
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object');
     assert.ok(tool.description.trim().length > 0);
@@ -279,7 +279,7 @@ test('acp-service mcp stdio subprocess speaks clean newline-delimited JSON-RPC o
   assert.equal((init.result as { serverInfo: { name: string } }).serverInfo.name, A2A_APPROVAL_MCP_SERVER_NAME);
 
   const list = await rpc(2, 'tools/list');
-  assert.equal((list.result as { tools: unknown[] }).tools.length, 14);
+  assert.equal((list.result as { tools: unknown[] }).tools.length, 19);
 
   const pending = await rpc(3, 'tools/call', { name: 'a2a_pending_approvals', arguments: {} });
   const result = pending.result as { isError?: boolean; structuredContent: { counts: { pendingProcessRequests: number } } };
@@ -352,4 +352,96 @@ test('a2a_task_dispatch, continue, cancel, bind and ack forward coach-stamped pa
   assert.ok(!ackRes.isError, ackRes.content[0]?.text);
   assert.equal(calls[5]?.method, 'remote_agent_ack');
   assert.equal(calls[6]?.method, 'execution_ack');
+});
+
+test('approval MCP fills the default origin, binds it idempotently, and lets an explicit id override it', async () => {
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const fakeFetch: typeof globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { method: string; params: Record<string, unknown> };
+    calls.push(body);
+    if (body.method === 'session_bind' && body.params.sessionId === 'already-taken') {
+      return new Response(JSON.stringify({ error: 'Origin session is already bound to a different host or session' }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ ok: true, echoedMethod: body.method }), { status: 200 });
+  };
+  const mcp = createA2AApprovalMcpHandler({
+    gatewayUrl: 'http://127.0.0.1:36814',
+    defaultOriginSessionId: 'origin-default',
+    defaultSessionHost: 'dsh-local',
+    defaultHostSessionId: 'host-sess',
+    autoBindDefaultSession: true,
+    fetch: fakeFetch,
+  });
+  const identity = await mcp.invokeTool('a2a_session_identity', {});
+  assert.equal(identity.isError, undefined);
+  assert.deepEqual(identity.structuredContent, {
+    configured: true, originSessionId: 'origin-default', host: 'dsh-local', sessionId: 'host-sess', autoBindDefaultSession: true,
+  });
+  assert.equal(JSON.stringify(identity).includes('token'), false);
+  assert.equal(calls.length, 0);
+
+  const dispatched = await mcp.invokeTool('a2a_task_dispatch', {
+    targetId: 'role-a', prompt: 'use the default origin',
+    notifySessions: [{ role: 'downstream', target: { host: 'dsh-local', sessionId: 'down-1' } }],
+  });
+  assert.equal(dispatched.isError, undefined, dispatched.content[0]?.text);
+  assert.equal(calls[0]?.method, 'session_bind');
+  assert.deepEqual(calls[0]?.params, { originSessionId: 'origin-default', host: 'dsh-local', sessionId: 'host-sess' });
+  assert.equal(calls[1]?.method, 'execution_submit');
+  assert.equal(calls[1]?.params.originSessionId, 'origin-default');
+  assert.deepEqual(calls[1]?.params.notifySessions, [{ role: 'downstream', target: { host: 'dsh-local', sessionId: 'down-1' } }]);
+
+  const explicit = await mcp.invokeTool('a2a_task_dispatch', { originSessionId: 'explicit-origin', targetId: 'role-a', prompt: 'override' });
+  assert.equal(explicit.isError, undefined, explicit.content[0]?.text);
+  assert.equal(calls[2]?.method, 'execution_submit');
+  assert.equal(calls[2]?.params.originSessionId, 'explicit-origin');
+
+  const overridden = await mcp.invokeTool('a2a_session_bind', { host: 'codex-local', sessionId: 'thread-1' });
+  assert.equal(overridden.isError, undefined, overridden.content[0]?.text);
+  assert.deepEqual(calls[3]?.params, { originSessionId: 'origin-default', host: 'codex-local', sessionId: 'thread-1' });
+
+  const binding = await mcp.invokeTool('a2a_session_binding_get', {});
+  assert.equal(binding.isError, undefined, binding.content[0]?.text);
+  assert.deepEqual(calls[4]?.params, { originSessionId: 'origin-default' });
+
+  const conflict = createA2AApprovalMcpHandler({
+    gatewayUrl: 'http://127.0.0.1:36814',
+    defaultOriginSessionId: 'origin-default',
+    defaultSessionHost: 'dsh-local',
+    defaultHostSessionId: 'already-taken',
+    fetch: fakeFetch,
+  });
+  const stillDispatched = await conflict.invokeTool('a2a_task_dispatch', { targetId: 'role-a', prompt: 'keep going' });
+  assert.equal(stillDispatched.isError, undefined, stillDispatched.content[0]?.text);
+  assert.equal(calls.at(-2)?.method, 'session_bind');
+  assert.equal(calls.at(-1)?.method, 'execution_submit');
+  assert.equal(calls.at(-1)?.params.originSessionId, 'origin-default');
+
+  const bare = createA2AApprovalMcpHandler({ gatewayUrl: 'http://127.0.0.1:36814', fetch: fakeFetch, autoBindDefaultSession: false });
+  const missing = await bare.invokeTool('a2a_task_get', { jobId: 'job-1' });
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0]?.text ?? '', /A2A_DEFAULT_ORIGIN_SESSION_ID/);
+
+  const fallback = createA2AApprovalMcpHandler({
+    gatewayUrl: 'http://127.0.0.1:36814', defaultOriginSessionId: 'origin-only', fetch: fakeFetch,
+  });
+  const fallbackIdentity = await fallback.invokeTool('a2a_session_identity', {});
+  assert.equal((fallbackIdentity.structuredContent as { sessionId?: string }).sessionId, 'origin-only');
+  assert.equal((fallbackIdentity.structuredContent as { configured: boolean }).configured, true);
+});
+
+test('mcp cli help documents the default origin session', async () => {
+  const { spawn } = await import('node:child_process');
+  const binPath = resolve(import.meta.dirname, '../bin/acp-service.ts');
+  const child = spawn(process.execPath, ['--import', 'tsx', binPath, 'mcp', '--help'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', chunk => { out += chunk; });
+  child.stderr.on('data', chunk => { out += chunk; });
+  const code = await new Promise<number | null>(resolve => child.once('exit', resolve));
+  assert.equal(code, 0, out);
+  assert.match(out, /A2A_DEFAULT_ORIGIN_SESSION_ID/);
+  assert.match(out, /--origin-session/);
+  assert.match(out, /--session-host/);
+  assert.match(out, /--host-session/);
+  assert.match(out, /--no-auto-bind/);
 });

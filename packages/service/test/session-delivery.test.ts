@@ -292,3 +292,77 @@ test('gateway session_binding_get and health expose binding stats without creden
   assert.equal(JSON.stringify(degraded).includes('gateway-status-secret'), false);
   assert.equal(JSON.stringify(degraded).includes('hostFingerprint'), false);
 });
+
+test('subscriber target queues stay isolated when one target is rejected or unknown', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'session-target-isolation-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const server = createServer(async (req, res) => {
+    let raw = ''; for await (const chunk of req) raw += chunk;
+    const request = JSON.parse(raw);
+    const sessionId = request.payload?.args?.request?.sessionId as string | undefined;
+    if (sessionId === 'bad-unknown') { req.socket.destroy(); return; }
+    if (sessionId === 'bad-rejected') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'server-response', rpcId: request.rpcId, result: { ok: false } }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'server-response', rpcId: request.rpcId, result: { ok: true, value: { accepted: true } } }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const hosts = {
+    dsh: sessionHostSchema.parse({ kind: 'dsh', url: `http://127.0.0.1:${address.port}`, headers: { Authorization: 'Bearer target-queue-secret' } }),
+    codex: sessionHostSchema.parse({ kind: 'codex', executable: 'codex' }),
+  };
+  const legacy = { version: 1, bindings: [], deliveries: [] };
+  await writeFile(join(root, 'session-delivery.json'), JSON.stringify(legacy));
+  const sessions = new SessionDelivery(root, hosts);
+  t.after(() => sessions.close());
+  const codexId = '11111111-1111-4111-8111-111111111111';
+  sessions.bind({ originSessionId: 'owner', host: 'dsh', sessionId: 'owner-session' });
+  assert.deepEqual(sessions.resolveTarget({ originSessionId: 'owner' }), { host: 'dsh', sessionId: 'owner-session' });
+  assert.throws(() => sessions.resolveTarget({ originSessionId: 'missing' }), /not bound/);
+  assert.throws(() => sessions.resolveTarget({ host: 'missing', sessionId: 'x' }), /Unknown session host/);
+  assert.throws(() => sessions.resolveTarget({ host: 'codex', sessionId: 'not-a-uuid' }), /UUID/);
+  assert.deepEqual(sessions.resolveTarget({ host: 'codex', sessionId: codexId }), { host: 'codex', sessionId: codexId });
+  sessions.enqueue({ originSessionId: 'owner', messageId: 'owner-1', text: 'owner body secret' });
+  const ownerKey = 'owner';
+  const rejectedKey = 'sub:dsh:bad-rejected';
+  const unknownKey = 'sub:dsh:bad-unknown';
+  const healthyKey = 'sub:dsh:healthy-session';
+  for (const [targetKey, sessionId, messageId] of [
+    [rejectedKey, 'bad-rejected', 'sub-1'],
+    [unknownKey, 'bad-unknown', 'sub-1'],
+    [healthyKey, 'healthy-session', 'sub-1'],
+  ] as const) {
+    sessions.enqueueTarget({ targetKey, host: 'dsh', sessionId, messageId, text: `body ${sessionId} secret`, mode: 'queue', notice: { form: 'notice', summary: '订阅' } });
+  }
+  await sessions.reconcile();
+  assert.equal(sessions.get({ originSessionId: ownerKey, messageId: 'owner-1' }).status, 'accepted');
+  assert.equal(sessions.getTarget({ targetKey: healthyKey, messageId: 'sub-1' }).status, 'accepted');
+  assert.equal(sessions.getTarget({ targetKey: rejectedKey, messageId: 'sub-1' }).status, 'rejected');
+  assert.equal(sessions.getTarget({ targetKey: unknownKey, messageId: 'sub-1' }).status, 'unknown');
+  sessions.enqueue({ originSessionId: 'owner', messageId: 'owner-2', text: 'owner second secret' });
+  sessions.enqueueTarget({ targetKey: healthyKey, host: 'dsh', sessionId: 'healthy-session', messageId: 'sub-2', text: 'healthy second secret' });
+  sessions.enqueueTarget({ targetKey: rejectedKey, host: 'dsh', sessionId: 'bad-rejected', messageId: 'sub-2', text: 'rejected second secret' });
+  sessions.enqueueTarget({ targetKey: unknownKey, host: 'dsh', sessionId: 'bad-unknown', messageId: 'sub-2', text: 'unknown second secret' });
+  await sessions.reconcile();
+  assert.equal(sessions.get({ originSessionId: 'owner', messageId: 'owner-2' }).status, 'accepted');
+  assert.equal(sessions.getTarget({ targetKey: healthyKey, messageId: 'sub-2' }).status, 'accepted');
+  assert.equal(sessions.getTarget({ targetKey: rejectedKey, messageId: 'sub-2' }).status, 'pending');
+  assert.equal(sessions.getTarget({ targetKey: rejectedKey, messageId: 'sub-2' }).attempts, 0);
+  assert.equal(sessions.getTarget({ targetKey: unknownKey, messageId: 'sub-2' }).status, 'pending');
+  const status = sessions.getBindingStatus('owner');
+  assert.equal(status.blocked, false);
+  assert.equal(status.deliveries.rejected, 0);
+  assert.equal(status.deliveries.unknown, 0);
+  const summary = sessions.summary();
+  assert.equal(summary.blockedOrigins, 0);
+  assert.equal(summary.deliveries.rejected, 0);
+  const leaked = JSON.stringify({ status, summary, owner: sessions.get({ originSessionId: 'owner', messageId: 'owner-1' }), healthy: sessions.getTarget({ targetKey: healthyKey, messageId: 'sub-1' }) });
+  assert.equal(leaked.includes('secret'), false);
+  assert.equal(leaked.includes('hostFingerprint'), false);
+  assert.equal(leaked.includes('target-queue-secret'), false);
+});
