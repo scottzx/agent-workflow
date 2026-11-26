@@ -167,3 +167,74 @@ export function formatProcessRequestNotice(notice: ProcessRequestNotice): string
     '</system-reminder>',
   ].join('\n');
 }
+
+export type SubscriberRole = 'coordinator' | 'downstream' | 'observer';
+export type SubscriberEventName = 'terminal' | 'handoff' | 'progress' | 'process_request';
+
+/** Read-only fan-out. It does not replace the owner's approval or the owner's ack. */
+export interface SubscriberNotice {
+  role: SubscriberRole;
+  event: SubscriberEventName;
+  originSessionId: string;
+  caseId?: string;
+  jobId?: string;
+  status: string;
+  title?: string;
+  summary?: string;
+  handoff?: { handoffId: string; status: string; purpose?: string; toTargetId?: string; childJobId?: string };
+  artifacts?: { name: string; url?: string }[];
+  processRequest?: { requestId: string; kind: string };
+}
+
+const roleLabels: Record<SubscriberRole, string> = {
+  coordinator: '总协调人 coordinator',
+  downstream: '下游 downstream',
+  observer: '观察者 observer',
+};
+const eventLabels: Record<SubscriberEventName, string> = {
+  terminal: '终态',
+  handoff: '交接',
+  progress: '进度',
+  process_request: '过程请求',
+};
+
+function oneLine(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** One-line collapsed subscriber notice for DSH's ContextFormed `form: 'notice'` row (<= 120 chars). */
+export function formatSubscriberNoticeSummary(notice: SubscriberNotice): string {
+  const where = notice.caseId ? `case ${notice.caseId}` : notice.jobId ? `job ${notice.jobId}` : notice.originSessionId;
+  const line = oneLine(`A2A订阅 · ${roleLabels[notice.role]} · ${eventLabels[notice.event]} · ${notice.status} · ${where}`);
+  return line.length <= 120 ? line : `${line.slice(0, 119)}…`;
+}
+
+/** Subscriber copy is explicitly read-only and names the role, case, job, status, and handoff or artifact summary. */
+export function formatSubscriberNotice(notice: SubscriberNotice): string {
+  const handoff = notice.handoff
+    ? [`交接 ${notice.handoff.handoffId}：${notice.handoff.status}`,
+      ...(notice.handoff.purpose ? [`用途：${notice.handoff.purpose}`] : []),
+      ...(notice.handoff.toTargetId ? [`下游目标：${notice.handoff.toTargetId}`] : []),
+      ...(notice.handoff.childJobId ? [`接力任务：${notice.handoff.childJobId}`] : [])]
+    : [];
+  const artifacts = (notice.artifacts ?? []).slice(0, 8).map(item => {
+    const name = oneLine(item.name).slice(0, 120) || '产物';
+    return item.url ? `- ${name} ${item.url}` : `- ${name}`;
+  });
+  const body = notice.summary ? boundedDetail(notice.summary, 4 * 1024) : '';
+  return [
+    `[A2A订阅通知] ${eventLabels[notice.event]} · ${roleLabels[notice.role]}`,
+    '这是只读订阅通知，不替代主归属会话的审批或主 ack。',
+    ...(notice.title ? [`任务：${oneLine(notice.title).slice(0, 200)}`] : []),
+    `状态：${oneLine(notice.status).slice(0, 80) || 'unknown'}`,
+    ...(notice.caseId ? [`caseId：${notice.caseId}`] : []),
+    ...(notice.jobId ? [`jobId：${notice.jobId}`] : []),
+    `主归属：${notice.originSessionId}`,
+    ...(notice.processRequest ? [`过程请求：${notice.processRequest.kind} ${notice.processRequest.requestId}（仅通知，请主归属处理）`] : []),
+    ...(handoff.length ? ['', ...handoff] : []),
+    ...(body ? ['', body] : []),
+    ...(artifacts.length ? ['', '产物摘要：', ...artifacts] : []),
+    '',
+    '请通过主归属会话查询任务或交接详情。订阅者确认本通知不会代替主归属的 remote_agent_ack、execution_ack 或审批。',
+  ].join('\n');
+}
