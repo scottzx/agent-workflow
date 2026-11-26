@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import test, { type TestContext } from 'node:test';
+import { promisify } from 'node:util';
 import {
   A2A_APPROVAL_MCP_SERVER_NAME,
   A2A_APPROVAL_MCP_TOOLS,
@@ -543,5 +544,68 @@ test('a2a_role_rules_get is listed, hot-loads from disk, and refuses a projectRo
   const second = await fromEnv.invokeTool('a2a_role_rules_get', { roleId: 'pr-delivery', phase: 'implement' });
   assert.match((second.structuredContent as { roleInstructions: string }).roleInstructions, /HOT-ROLE/);
   assert.notEqual((second.structuredContent as { digest: string }).digest, firstDigest);
+  assert.equal(fetched, 0);
+});
+
+test('a2a_role_rules_get rejects a forged .git and accepts a real worktree of the pinned repository', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'role-rules-forge-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const pinned = join(parent, 'repo');
+  const worktree = join(parent, 'wt');
+  const other = join(parent, 'wt-b');
+  await mkdir(join(pinned, '.1agents/roles/demo'), { recursive: true });
+  await writeFile(join(pinned, '.1agents/roles/demo/profile.json'), JSON.stringify({
+    id: 'demo', version: '1.0.0', skills: [{ key: 'only', name: 'only-skill' }],
+  }));
+  await writeFile(join(pinned, '.1agents/roles/demo/ROLE.md'), 'PINNED-ROLE\n');
+  await writeFile(join(pinned, 'README.md'), 'anchor\n');
+  const git = promisify(execFile);
+  const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 'role-rules', GIT_AUTHOR_EMAIL: 'role-rules@example.com', GIT_COMMITTER_NAME: 'role-rules', GIT_COMMITTER_EMAIL: 'role-rules@example.com' };
+  const runGit = (cwd: string, args: string[]) => git('git', args, { cwd, env: gitEnv });
+  await runGit(pinned, ['init', '-b', 'main']);
+  await runGit(pinned, ['add', 'README.md', '.1agents/roles/demo/profile.json', '.1agents/roles/demo/ROLE.md']);
+  await runGit(pinned, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await runGit(pinned, ['worktree', 'add', '-b', 'delivery', worktree]);
+  await runGit(pinned, ['worktree', 'add', '-b', 'delivery-b', other]);
+  const pinnedGit = await realpath(join(pinned, '.git'));
+  const wtGitdir = (await readFile(join(worktree, '.git'), 'utf8')).match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+  assert.ok(wtGitdir);
+  let fetched = 0;
+  const mcp = createA2AApprovalMcpHandler({
+    projectRoot: pinned,
+    fetch: async () => { fetched += 1; throw new Error('gateway should not be called'); },
+  });
+  const forged = [
+    ['link', async (dir: string) => { await symlink(pinnedGit, join(dir, '.git')); }],
+    ['main-gitdir', async (dir: string) => { await writeFile(join(dir, '.git'), `gitdir: ${pinnedGit}\n`); }],
+    ['worktree-gitdir', async (dir: string) => { await writeFile(join(dir, '.git'), `gitdir: ${wtGitdir}\n`); }],
+  ] as const;
+  for (const [name, plant] of forged) {
+    const dir = join(parent, `forged-${name}`);
+    await mkdir(join(dir, '.1agents/roles/demo'), { recursive: true });
+    await writeFile(join(dir, '.1agents/roles/demo/profile.json'), JSON.stringify({
+      id: 'demo', version: '9.9.9', skills: [{ key: 'only', name: 'only-skill' }],
+    }));
+    await writeFile(join(dir, '.1agents/roles/demo/ROLE.md'), 'FORGED-SECRET\n');
+    await plant(dir);
+    const rejected = await mcp.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: dir });
+    assert.equal(rejected.isError, true, name);
+    assert.match(rejected.content[0]?.text ?? '', /outside the allowed project/);
+    assert.equal((rejected.content[0]?.text ?? '').includes('FORGED-SECRET'), false, name);
+  }
+  const fromWorktree = await mcp.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: join(worktree, '.1agents') });
+  assert.equal(fromWorktree.isError, undefined, fromWorktree.content[0]?.text);
+  assert.match((fromWorktree.structuredContent as { roleInstructions?: string }).roleInstructions ?? '', /PINNED-ROLE/);
+  const pinnedOnWorktree = createA2AApprovalMcpHandler({
+    projectRoot: worktree,
+    fetch: async () => { fetched += 1; throw new Error('gateway should not be called'); },
+  });
+  const mainAgain = await pinnedOnWorktree.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: pinned });
+  assert.equal(mainAgain.isError, undefined, mainAgain.content[0]?.text);
+  const sibling = await pinnedOnWorktree.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: other });
+  assert.equal(sibling.isError, undefined, sibling.content[0]?.text);
+  await mkdir(join(other, 'nested'));
+  const nested = await pinnedOnWorktree.invokeTool('a2a_role_rules_get', { roleId: 'demo', projectRoot: join(other, 'nested') });
+  assert.equal(nested.isError, undefined, nested.content[0]?.text);
   assert.equal(fetched, 0);
 });

@@ -283,7 +283,7 @@ export const A2A_APPROVAL_MCP_TOOLS: readonly McpToolDefinition[] = [
   },
   {
     name: 'a2a_role_rules_get',
-    description: '只读热加载项目 `.1agents/roles/<roleId>/`（每次调用直接读盘并返回内容 digest，不访问 a2a-gateway）。phase 省略为 all；implement 不含审查提示词，review 不含实施提示词。显式 projectRoot 不得越出已固定的项目根或其同仓 worktree。',
+    description: '只读热加载项目 `.1agents/roles/<roleId>/`（每次调用直接读盘并返回内容 digest，不访问 a2a-gateway）。phase 省略为 all；implement 不含审查提示词，review 不含实施提示词。若服务通过 --project-root 或 A2A_PROJECT_ROOT 固定了项目根，显式 projectRoot 不得越出该根或其同仓真实 worktree；未固定时从显式 projectRoot 或当前工作目录解析。',
     inputSchema: z.toJSONSchema(roleRulesArgsSchema) as Record<string, unknown>,
   },
 ];

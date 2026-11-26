@@ -387,3 +387,28 @@ test('l1-gate rejects untracked or newly staged .1agents secrets but not a track
   assert.equal(added.status, 1);
   assert.match(added.body.checks.find(item => item.id === 'git-status')?.detail ?? '', /\.1agents\/cache\/lock\.json/);
 });
+
+test('l1-gate allows a config example and still rejects a forced local secret', async t => {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-example-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, 'repo');
+  await mkdir(join(root, '.1agents/config'), { recursive: true });
+  await git(root, ['init', '-b', 'main']);
+  await writeFile(join(root, 'README.md'), 'anchor\n');
+  await git(root, ['add', 'README.md']);
+  await git(root, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await writeFile(join(root, '.1agents/config/new.example.json'), '{}\n');
+  const untracked = await runGate(root);
+  assert.equal(untracked.status, 0, JSON.stringify(untracked.body));
+  assert.equal(untracked.body.checks.find(item => item.id === 'git-status')?.ok, true);
+  await git(root, ['add', '.1agents/config/new.example.json']);
+  const added = await runGate(root);
+  assert.equal(added.status, 0, JSON.stringify(added.body));
+  assert.equal(added.body.checks.find(item => item.id === 'git-status')?.ok, true);
+  await writeFile(join(root, '.1agents/config/host.local.json'), '{"token":"secret"}\n');
+  await git(root, ['add', '-f', '.1agents/config/host.local.json']);
+  const secret = await runGate(root);
+  assert.equal(secret.status, 1);
+  assert.equal(secret.body.ok, false);
+  assert.match(secret.body.checks.find(item => item.id === 'git-status')?.detail ?? '', /host\.local\.json/);
+});

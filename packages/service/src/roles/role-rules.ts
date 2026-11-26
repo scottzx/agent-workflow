@@ -83,54 +83,125 @@ function sameOrInside(root: string, candidate: string): boolean {
   return root === candidate || !escapes(root, candidate);
 }
 
+function isMissingPath(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 async function directoryOf(realPath: string): Promise<string> {
   const info = await stat(realPath);
   return info.isDirectory() ? realPath : dirname(realPath);
 }
 
-/** Common git directory of `start`, if any. Worktree `gitdir` files collapse to the main `.git`. */
-async function gitCommonDir(start: string): Promise<string | undefined> {
-  let current = await directoryOf(start);
-  for (;;) {
-    const gitPath = join(current, '.git');
-    let info;
-    try {
-      info = await lstat(gitPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      const parent = dirname(current);
-      if (parent === current) return undefined;
-      current = parent;
-      continue;
-    }
-    if (info.isSymbolicLink()) {
-      const followed = await stat(gitPath).catch(() => undefined);
-      if (followed?.isDirectory()) return realpath(gitPath);
-    }
-    if (info.isDirectory()) return realpath(gitPath);
-    const text = await readFile(gitPath, 'utf8');
-    const match = /^gitdir:\s*(.+)$/m.exec(text);
-    if (!match?.[1]) return undefined;
-    const gitdir = await realpath(resolve(dirname(gitPath), match[1].trim()));
-    if (basename(dirname(gitdir)) === 'worktrees') return dirname(dirname(gitdir));
-    return gitdir;
+async function lstatOrUndefined(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (isMissingPath(error)) return undefined;
+    throw error;
   }
 }
 
+type GitAnchor =
+  | { kind: 'symlink' }
+  | { kind: 'dir' | 'file'; root: string; gitPath: string };
+
+/** First `.git` at or above `startReal`. A symlink is not a repository anchor and stops the walk. */
+async function findGitAnchor(startReal: string): Promise<GitAnchor | undefined> {
+  let current = await directoryOf(startReal);
+  for (;;) {
+    const gitPath = join(current, '.git');
+    const info = await lstatOrUndefined(gitPath);
+    if (info) {
+      if (info.isSymbolicLink()) return { kind: 'symlink' };
+      if (info.isDirectory()) return { kind: 'dir', root: current, gitPath };
+      if (info.isFile()) return { kind: 'file', root: current, gitPath };
+      return { kind: 'symlink' };
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+/** Walk `rootReal/parts` without following a symlink. */
+async function containedRealDir(rootReal: string, parts: string[]): Promise<string | undefined> {
+  let current = rootReal;
+  for (const part of parts) {
+    if (part === '' || part === '.' || part === '..') return undefined;
+    current = join(current, part);
+    const info = await lstatOrUndefined(current);
+    if (!info || info.isSymbolicLink() || !info.isDirectory()) return undefined;
+    const real = await realpath(current).catch(() => undefined);
+    if (!real || !sameOrInside(rootReal, real)) return undefined;
+    current = real;
+  }
+  return current;
+}
+
 /**
- * `explicit` must be the allowed root, a path inside it, or a worktree of the same repository.
- * Returns the real path of `explicit`.
+ * A worktree counts only when `<commonGitDir>/worktrees/<entry>/gitdir` points back at this `.git` file.
+ * A handwritten `gitdir:` line, including one aimed at a real worktree admin directory, fails that check.
+ */
+async function verifiedWorktree(candRoot: string, gitFile: string): Promise<{ commonGitDir: string } | undefined> {
+  const info = await lstatOrUndefined(gitFile);
+  if (!info || info.isSymbolicLink() || !info.isFile()) return undefined;
+  const match = /^gitdir:\s*(.*\S)\s*$/m.exec(await readFile(gitFile, 'utf8'));
+  if (!match?.[1]) return undefined;
+  const declared = await realpath(resolve(dirname(gitFile), match[1].trim())).catch(() => undefined);
+  if (!declared) return undefined;
+  const entry = basename(declared);
+  if (basename(dirname(declared)) !== 'worktrees') return undefined;
+  const commonGitDir = dirname(dirname(declared));
+  const located = await containedRealDir(commonGitDir, ['worktrees', entry]);
+  if (!located || located !== declared) return undefined;
+  const backInfo = await lstatOrUndefined(join(located, 'gitdir'));
+  if (!backInfo || backInfo.isSymbolicLink() || !backInfo.isFile()) return undefined;
+  const back = (await readFile(join(located, 'gitdir'), 'utf8')).split(/\r?\n/, 1)[0]?.trim();
+  if (!back) return undefined;
+  const backReal = await realpath(resolve(located, back)).catch(() => undefined);
+  const gitFileReal = await realpath(gitFile);
+  const rootReal = await realpath(candRoot);
+  if (!backReal || backReal !== gitFileReal || dirname(gitFileReal) !== rootReal) return undefined;
+  return { commonGitDir: await realpath(commonGitDir) };
+}
+
+/** Real common git directory of `startReal`, after the same back-pointer check used for candidates. */
+async function trustedCommonGitDir(startReal: string): Promise<string | undefined> {
+  const anchor = await findGitAnchor(startReal);
+  if (!anchor || anchor.kind === 'symlink') return undefined;
+  if (anchor.kind === 'dir') {
+    const gitReal = await realpath(anchor.gitPath);
+    const rootReal = await realpath(anchor.root);
+    return rootReal === dirname(gitReal) ? gitReal : undefined;
+  }
+  return (await verifiedWorktree(anchor.root, anchor.gitPath))?.commonGitDir;
+}
+
+/**
+ * `explicit` must be the allowed root, a path inside it, or a registered worktree of that same repository.
+ * A `.git` symlink or a handwritten `gitdir:` file is not evidence. Returns the real path of `explicit`.
  */
 export async function assertAllowedRoleProjectPath(explicit: string, allowedRoot: string): Promise<string> {
   const explicitReal = await realpath(explicit).catch(error => {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`projectRoot does not exist: ${explicit}`);
+    if (isMissingPath(error)) throw new Error(`projectRoot does not exist: ${explicit}`);
     throw error;
   });
   const allowedReal = await realpath(allowedRoot);
   if (sameOrInside(allowedReal, explicitReal)) return explicitReal;
-  const [explicitGit, allowedGit] = await Promise.all([gitCommonDir(explicitReal), gitCommonDir(allowedReal)]);
-  if (explicitGit && allowedGit && explicitGit === allowedGit) return explicitReal;
-  throw new Error(`projectRoot is outside the allowed project: ${explicit}`);
+  const allowedCommon = await trustedCommonGitDir(allowedReal);
+  const anchor = await findGitAnchor(explicitReal);
+  const outside = new Error(`projectRoot is outside the allowed project: ${explicit}`);
+  if (!allowedCommon || !anchor || anchor.kind === 'symlink') throw outside;
+  if (anchor.kind === 'dir') {
+    const gitReal = await realpath(anchor.gitPath);
+    const rootReal = await realpath(anchor.root);
+    if (gitReal === allowedCommon && rootReal === dirname(allowedCommon)) return explicitReal;
+    throw outside;
+  }
+  const worktree = await verifiedWorktree(anchor.root, anchor.gitPath);
+  if (worktree?.commonGitDir === allowedCommon) return explicitReal;
+  throw outside;
 }
 
 /**
@@ -144,7 +215,7 @@ export async function resolveProjectRootFromCwd(cwd: string): Promise<string | u
   try {
     current = await realpath(cwd);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    if (isMissingPath(error)) return undefined;
     throw error;
   }
   current = await directoryOf(current);
@@ -162,7 +233,7 @@ async function exists(path: string): Promise<boolean> {
     await lstat(path);
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if (isMissingPath(error)) return false;
     throw error;
   }
 }
@@ -171,7 +242,7 @@ async function isDirectory(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isDirectory();
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if (isMissingPath(error)) return false;
     throw error;
   }
 }
@@ -184,7 +255,7 @@ async function resolveRolesRoot(projectRootReal: string): Promise<string> {
     try {
       info = await lstat(next);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`No .1agents/roles directory under ${projectRootReal}`);
+      if (isMissingPath(error)) throw new Error(`No .1agents/roles directory under ${projectRootReal}`);
       throw error;
     }
     if (!info.isDirectory() && !info.isSymbolicLink()) throw new Error(`${next} is not a directory`);
@@ -251,11 +322,6 @@ function parseJson(text: string, file: string): unknown {
   }
 }
 
-function checklistForPhase(checklist: NormalizedChecklist, phase: RoleRulesPhase): NormalizedChecklist {
-  if (phase !== 'implement') return checklist;
-  return { ...checklist, items: checklist.items.filter(item => item.locked || item.kind === 'program') };
-}
-
 function digestOf(files: { path: string; bytes: Buffer }[]): string {
   const hash = createHash('sha256');
   for (const file of files) {
@@ -273,13 +339,15 @@ export async function readRoleRules(options: { projectRoot: string; roleId: stri
   const phase = parsed.phase ?? 'all';
   assertSafeRoleId(parsed.roleId);
   const projectRootReal = await realpath(parsed.projectRoot).catch(error => {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`projectRoot does not exist: ${parsed.projectRoot}`);
+    if (isMissingPath(error)) throw new Error(`projectRoot does not exist: ${parsed.projectRoot}`);
     throw error;
   });
   const rolesRootReal = await resolveRolesRoot(projectRootReal);
   const roleReal = await resolveRoleDir(rolesRootReal, parsed.roleId);
+  const wanted = new Set<RoleFileName>(PHASE_FILES[phase]);
   const present = new Map<RoleFileName, RoleFile>();
   for (const name of ROLE_FILES) {
+    if (!wanted.has(name)) continue;
     const file = await readRoleFile(rolesRootReal, roleReal, name);
     if (file) present.set(name, file);
   }
@@ -288,16 +356,15 @@ export async function readRoleRules(options: { projectRoot: string; roleId: stri
   const profile = roleSkillProfileSchema.parse(parseJson(profileFile.text, 'profile.json'));
   if (profile.id !== parsed.roleId) throw new Error(`profile.json id "${profile.id}" does not match role directory "${parsed.roleId}"`);
 
-  const workflow = present.has('workflow.json') ? await loadWorkflow(roleReal) : undefined;
-  const loadedChecklist = present.has('checklist.json') ? await loadChecklist(roleReal) : undefined;
-  const routing = present.has('routing.json') ? roleRoutingSchema.parse(parseJson(present.get('routing.json')!.text, 'routing.json')) : undefined;
+  const workflow = wanted.has('workflow.json') && present.has('workflow.json') ? await loadWorkflow(roleReal) : undefined;
+  const checklist = wanted.has('checklist.json') && present.has('checklist.json') ? await loadChecklist(roleReal) : undefined;
+  const routing = wanted.has('routing.json') && present.has('routing.json')
+    ? roleRoutingSchema.parse(parseJson(present.get('routing.json')!.text, 'routing.json'))
+    : undefined;
 
-  const wanted = new Set(PHASE_FILES[phase]);
   const included = [...present.entries()]
-    .filter(([name]) => wanted.has(name))
     .map(([path, file]) => ({ path, bytes: file.bytes }))
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  const checklist = loadedChecklist && wanted.has('checklist.json') ? checklistForPhase(loadedChecklist, phase) : undefined;
   const roleInstructions = wanted.has('ROLE.md') ? present.get('ROLE.md')?.text : undefined;
   const qaInstructions = wanted.has('QA.md') ? present.get('QA.md')?.text : undefined;
   const agentsLocalTemplate = wanted.has('AGENTS.local.template.md') ? present.get('AGENTS.local.template.md')?.text : undefined;

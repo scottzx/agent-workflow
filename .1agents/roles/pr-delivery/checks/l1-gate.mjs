@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const HEADER = '<!-- AUTO-GENERATED FROM .1agents/roles/pr-delivery — DO NOT EDIT -->';
+const CONFIG_EXAMPLE = /^\.1agents\/config\/[^/]+\.example\.(?:json|yml)$/;
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const LEGACY = {
   disableModelInvocation: 'disable-model-invocation',
@@ -252,6 +253,7 @@ function porcelainLeaks(stdout) {
 
 function isStatusLeak(xy, path) {
   const normalized = path.replaceAll('\\', '/').replace(/^\.\//, '');
+  if (CONFIG_EXAMPLE.test(normalized)) return false;
   const watched = normalized === 'AGENTS.local.md' || normalized === 'CLAUDE.local.md'
     || normalized === '.agents' || normalized.startsWith('.agents/')
     || normalized === '.claude' || normalized.startsWith('.claude/')
