@@ -712,3 +712,19 @@ test('continue and message inherit deliveryMode unless the caller sets a new one
   assert.doesNotMatch(f.backend.runs[4]!.prompt, /\[空间\]/);
   f.backend.runs[4]!.finish({ outcome: 'completed', text: 'ok' });
 });
+
+test('execution_continue can switch workspace_git back to artifacts', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, prompt: 'edit code', deliveryMode: 'workspace_git', clientRequestId: 'switch-git' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  assert.match(f.backend.runs[0]!.prompt, /\[代码交付约定\]/);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'ok' });
+  await until(() => gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: first.taskId }) as Promise<any>, item => item.state === 'TASK_STATE_COMPLETED');
+  const switched = await gateway.invoke('execution_continue', { originSessionId: 'root', jobId: first.jobId, input: { prompt: 'write the report' },
+    deliveryMode: 'artifacts', clientRequestId: 'switch-artifacts' }) as any;
+  assert.equal(switched.error, undefined);
+  await until(async () => f.backend.runs.length, count => count === 2);
+  assert.match(f.backend.runs[1]!.prompt, /\[产物约定\]/);
+  assert.doesNotMatch(f.backend.runs[1]!.prompt, /\[代码交付约定\]/);
+  f.backend.runs[1]!.finish({ outcome: 'completed', text: 'ok' });
+});

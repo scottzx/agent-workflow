@@ -159,6 +159,47 @@ test('workspace_files verifies files in cwd and still rejects symlinks, director
     await writeFile(manifest, JSON.stringify({ artifacts: [{ path: secretPath }] }));
     await assert.rejects(check('workspace_files'), /artifact-sensitive-path/, secretPath);
   }
+  await writeFile(join(cwd, '.env.example'), 'TOKEN=\n');
+  await writeFile(manifest, JSON.stringify({ artifacts: [{ path: join(cwd, '.env.example') }] }));
+  const example = await check('workspace_files');
+  assert.equal(example.validation.status, 'passed');
+  assert.equal(example.artifacts.length, 1);
+});
+
+test('workspace_files inside a worktree admits project files and still rejects secrets under that cwd', async () => {
+  const repo = await project();
+  const cwd = join(repo, '.1agents', 'worktrees', 'wt');
+  const job = join(cwd, 'declared');
+  await mkdir(join(cwd, 'docs'), { recursive: true });
+  await mkdir(job);
+  const preflight = await runA2APreflight({ cwd, jobDirectory: job });
+  assert.equal(preflight.ok, true, preflight.checks.filter(check => !check.ok).map(check => check.detail).join('; '));
+  const manifest = join(job, 'manifest.json');
+  const guide = join(cwd, 'docs', 'guide.md');
+  await writeFile(guide, 'guide\n');
+  const target = { sessionId: 's', cwd, preflight } as any;
+  const read = async (path: string) => {
+    await writeFile(manifest, JSON.stringify({ artifacts: [{ path }] }));
+    return createA2AResultMetadata({ ...identity, outcome: 'completed', target,
+      contract: { jobId: 'j', artifactManifestPath: manifest, deliveryMode: 'workspace_files' } });
+  };
+  const admitted = await read(guide);
+  assert.equal(admitted.validation.status, 'passed');
+  assert.equal(admitted.artifacts.length, 1);
+  assert.equal(admitted.artifacts[0]?.path, await realpath(guide));
+
+  await mkdir(join(cwd, '.git'), { recursive: true });
+  await mkdir(join(cwd, '.1agents'), { recursive: true });
+  await writeFile(join(cwd, '.git', 'config'), '[core]\n');
+  await writeFile(join(cwd, '.1agents', 'secret.txt'), 'nope\n');
+  await writeFile(join(cwd, '.env'), 'TOKEN=1\n');
+  await writeFile(join(cwd, '.env.example'), 'TOKEN=\n');
+  for (const secretPath of [join(cwd, '.1agents', 'secret.txt'), join(cwd, '.git', 'config'), join(cwd, '.env')]) {
+    await assert.rejects(read(secretPath), /artifact-sensitive-path/, secretPath);
+  }
+  const template = await read(join(cwd, '.env.example'));
+  assert.equal(template.validation.status, 'passed');
+  assert.equal(template.artifacts.length, 1);
 });
 
 test('workspace_git samples the checkout and ignores a directory that is not a git repo', async () => {

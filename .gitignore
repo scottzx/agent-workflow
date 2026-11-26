@@ -19,8 +19,8 @@ packages/service/vendor/
 .1agents/skills/
 .1agents/runtime/
 .1agents/state/
-.1agents/jobs/
-.1agents/worktrees/
+**/.1agents/jobs/
+**/.1agents/worktrees/
 .1agents/config/*
 !.1agents/config/*.example.json
 !.1agents/config/*.example.yml

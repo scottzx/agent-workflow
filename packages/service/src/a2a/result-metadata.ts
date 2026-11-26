@@ -151,11 +151,15 @@ async function sampleGitDelivery(cwd: string): Promise<A2AGitDelivery | undefine
   }
 }
 
-/** workspace_files may register project files, but not credentials or host-internal trees. */
-function isSensitiveWorkspaceFile(file: string): boolean {
+const ENV_FILE_TEMPLATES = new Set(['.env.example', '.env.sample', '.env.template']);
+
+/** Judge secrets relative to cwd. An absolute path would treat a worktree under `.1agents/worktrees` as internal. */
+function isSensitiveWorkspaceFile(cwdRoot: string, file: string): boolean {
   const name = basename(file);
-  if (name === '.env' || name.startsWith('.env.')) return true;
-  const parts = file.split(sep);
+  if (name === '.env' || (name.startsWith('.env.') && !ENV_FILE_TEMPLATES.has(name))) return true;
+  const tail = relative(cwdRoot, file);
+  if (tail === '' || tail === '..' || tail.startsWith(`..${sep}`) || isAbsolute(tail)) return false;
+  const parts = tail.split(sep);
   return parts.includes('.git') || parts.includes('.1agents');
 }
 
@@ -180,7 +184,7 @@ async function verifiedArtifacts(root: string, extraRoots: string[], manifestPat
   for (const item of parsed.data.artifacts) {
     const path = await scopedFile(fileRoots, item.path);
     const authorized = [root, ...extraRoots].some(candidate => within(candidate, path));
-    if (cwdRoot && !authorized && isSensitiveWorkspaceFile(path)) throw new A2AResultValidationError('artifact-sensitive-path');
+    if (cwdRoot && !authorized && isSensitiveWorkspaceFile(cwdRoot, path)) throw new A2AResultValidationError('artifact-sensitive-path');
     if (seen.has(path)) throw new A2AResultValidationError('duplicate-artifact');
     seen.add(path);
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
