@@ -20,7 +20,8 @@ const CHUNK = /^chunk-[A-Za-z0-9_-]+\.js$/;
 /** Only hashed chunks are immutable. The shell and the API stay uncached so a rebuild shows up immediately. */
 const IMMUTABLE_CHUNK = { 'Cache-Control': 'public, max-age=31536000, immutable' };
 const SECURITY_HEADERS = {
-  'Content-Security-Policy': "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  // The inline SVG favicon is the one data: image the page needs; everything else stays same-origin.
+  'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
   'Cache-Control': 'no-store',

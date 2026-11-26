@@ -17,7 +17,14 @@
   --warning-bg: #fdf3e2;
   --danger: #c2410c;
   --danger-bg: #fdecea;
+  /* One radius scale: surfaces 10px, controls 7px, badges only stay pills. */
   --radius: 10px;
+  --radius-control: 7px;
+  --radius-small: 6px;
+  --divider: #eef0f3;
+  /* The only elevation in the page: a hairline shadow for panels, controls and the primary action. */
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-2: 0 1px 3px rgba(16, 24, 40, 0.07), 0 1px 2px rgba(16, 24, 40, 0.04);
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   /* One 4px spacing scale for the detail panel; space comes from these steps, never from stretched rows or UA margins. */
   --space-1: 4px;
@@ -45,6 +52,10 @@
     --warning-bg: #3a2c10;
     --danger: #fb923c;
     --danger-bg: #3d1d12;
+    --divider: #242932;
+    /* Dark mode leans on borders and surface steps, not on shadows. */
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-2: 0 1px 3px rgba(0, 0, 0, 0.4);
   }
 }
 
@@ -81,17 +92,20 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .acp-muted { color: var(--text-muted); }
 .acp-boot { padding: 32px; }
 .acp-button {
-  padding: 5px 14px;
+  padding: 6px 13px;
   border: 1px solid var(--border-color);
-  border-radius: 999px;
+  border-radius: var(--radius-control);
   background: var(--bg-card);
   color: var(--text-main);
   font: inherit;
+  font-size: 13px;
+  box-shadow: var(--shadow-1);
   cursor: pointer;
 }
-.acp-button:hover:not(:disabled) { border-color: var(--text-main); }
-.acp-button:disabled { opacity: 0.5; cursor: default; }
+.acp-button:hover:not(:disabled) { border-color: var(--text-muted); }
+.acp-button:disabled { opacity: 0.5; cursor: default; box-shadow: none; }
 .acp-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.acp-primary:hover:not(:disabled) { border-color: var(--accent); filter: brightness(1.05); }
 .acp-danger { color: var(--danger); }
 .acp-link {
   padding: 0;
@@ -115,28 +129,82 @@ dd { margin: 0; overflow-wrap: anywhere; }
   border-radius: var(--radius);
 }
 
-.acp-workbench { padding: 20px 24px; }
-.acp-workbench-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
-.acp-workbench-title { display: flex; align-items: center; gap: 16px; }
-.acp-workbench-title h1 { margin: 0; }
-.acp-header-actions { display: flex; gap: 8px; }
-.acp-workbench-source { margin: 6px 0 12px; color: var(--text-muted); font-size: 12px; }
-.acp-module-switch, .acp-workbench-views { display: flex; gap: 6px; flex-wrap: wrap; }
-.acp-workbench-views { margin-bottom: 12px; }
-.acp-module-switch button, .acp-workbench-views button {
-  padding: 4px 12px;
-  border: 1px solid transparent;
-  border-radius: 999px;
+.acp-workbench { padding: 0 24px 24px; }
+/* The top bar spans the page on a white surface; content below keeps the page's gutter. */
+.acp-workbench-header {
+  min-height: 56px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 0 -24px 20px;
+  padding: 0 24px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border-color);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
+}
+.acp-workbench-title { display: flex; align-items: center; gap: 26px; min-width: 0; }
+.acp-workbench-title h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; }
+.acp-header-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; flex-wrap: wrap; }
+.acp-header-actions .acp-button { padding: 5px 12px; font-size: 13px; }
+/* A link names one destination: it never breaks into a vertical stack beside a title. */
+.acp-header-actions .acp-link { white-space: nowrap; }
+/* The ledger provenance moves out of the title block: one quiet status dot with its source in the tooltip. */
+.acp-source { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+.acp-source-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px var(--success-bg); }
+
+/* Primary tabs are text on the bar, not chips. */
+.acp-module-switch { display: flex; gap: 2px; flex-wrap: wrap; }
+.acp-module-switch button {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-small);
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.acp-module-switch button:hover { background: var(--bg-panel); color: var(--text-main); }
+.acp-module-switch button[aria-pressed='true'] { background: var(--bg-panel); color: var(--text-main); font-weight: 600; }
+
+/* Secondary filters are one segmented control: a grey track with a white selected card. */
+.acp-workbench-views {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 3px;
+  margin-bottom: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  background: var(--bg-panel);
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+.acp-workbench-views button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 5px 11px;
+  border: 0;
+  border-radius: var(--radius-small);
   background: none;
   color: var(--text-secondary);
   font: inherit;
+  font-size: 13px;
   cursor: pointer;
 }
-.acp-module-switch button[aria-pressed='true'], .acp-workbench-views button[aria-pressed='true'] {
-  background: var(--accent-bg);
-  color: var(--accent);
+.acp-workbench-views button:hover { color: var(--text-main); }
+.acp-workbench-views button[aria-pressed='true'] {
+  background: var(--bg-card);
+  color: var(--text-main);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
 }
-.acp-workbench-views span { margin-left: 6px; color: var(--text-muted); }
+.acp-workbench-views span { margin-left: 6px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 
 .acp-workbench-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .has-detail .acp-workbench-body { grid-template-columns: minmax(0, 1fr) minmax(360px, 46%); }
@@ -147,19 +215,40 @@ dd { margin: 0; overflow-wrap: anywhere; }
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
 }
 table { width: 100%; border-collapse: collapse; }
-th, td { padding: 9px 12px; border-bottom: 1px solid var(--border-color); text-align: left; vertical-align: top; }
-th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size: 12px; }
+th, td { padding: 8px 14px; border-bottom: 1px solid var(--divider); text-align: left; vertical-align: middle; }
+th {
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  font-weight: 600;
+  white-space: nowrap;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+tbody tr:last-child td { border-bottom: 0; }
+.acp-task-row:hover td { background: color-mix(in srgb, var(--bg-panel) 55%, transparent); }
 .acp-task-row.is-selected td { background: var(--accent-bg); }
-.acp-name-link { display: grid; }
-.acp-name-link small, .acp-cell-note, .acp-execution-role small, .acp-execution-service small { display: block; color: var(--text-muted); font-size: 12px; }
-.acp-title-text { color: var(--text-main); font-weight: 500; }
+.acp-name-link { display: grid; gap: 1px; }
+.acp-name-link small, .acp-cell-note, .acp-execution-role small, .acp-execution-service small { display: block; color: var(--text-muted); font-size: 11.5px; }
+/* Role and service share one line; the alias lives in the service title so the row stays short. */
+.acp-execution-cell { display: flex; flex-wrap: nowrap; align-items: baseline; gap: 8px; max-width: 230px; }
+.acp-execution-role { min-width: 0; max-width: 42%; font-size: 12.5px; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.acp-execution-service { display: block; min-width: 0; flex: 1; font-size: 12px; color: var(--text-secondary); }
+.acp-execution-service > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acp-workbench-table .acp-execution-service small { display: none; }
+/* The status word is the only colour in a row; auxiliary counts stay grey unless they flag a problem. */
+.acp-workbench-table .acp-ticket-lights { margin: 0 0 0 8px; vertical-align: middle; }
+.acp-ticket-lights .is-ok { color: var(--text-muted); }
+.acp-title-text { color: var(--text-main); font-weight: 500; font-size: 13.5px; }
+/* Auxiliary labels are plain text; a 999px chip is reserved for the real status badge. */
 .acp-mode-label {
-  display: inline-block;
-  padding: 0 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 999px;
+  display: inline;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: var(--text-secondary);
   font-size: 12px;
   white-space: nowrap;
 }
@@ -179,6 +268,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
   /* A column whose content grows, so the preview drawer docks at the bottom even when the content is short. */
   display: flex;
   flex-direction: column;
@@ -224,7 +314,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 }
 .acp-detail-tabs button[aria-selected='true'] { color: var(--accent); border-bottom-color: var(--accent); }
 /* Rows pack at the top: the content grows to dock the preview drawer, and that extra height must stay below the last row. */
-.acp-detail-content { padding: var(--space-4); display: grid; gap: var(--space-5); align-content: start; }
+.acp-detail-content { padding: 18px 20px; display: grid; gap: var(--space-5); align-content: start; max-width: 720px; }
 .acp-detail-section { display: grid; gap: var(--space-2); align-content: start; }
 .acp-detail-section > h3 { margin: 0; }
 .acp-stage-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
@@ -282,33 +372,48 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 
 .acp-agent-note { margin: 0 0 12px; color: var(--text-secondary); }
 .acp-agent-layout { display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); gap: 16px; margin-top: 12px; }
-.acp-agent-list { display: grid; gap: 8px; align-content: start; }
+.acp-agent-list {
+  display: grid;
+  gap: 0;
+  align-content: start;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+  overflow: hidden;
+}
+.acp-agent-list > .acp-button { margin: 8px 8px 0; }
+.acp-agent-list > .acp-button:last-of-type { margin-bottom: 8px; }
 .acp-agent-row {
   display: grid;
   gap: 2px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius);
-  background: var(--bg-card);
+  padding: 11px 14px;
+  border: 0;
+  border-radius: 0;
+  background: none;
   color: var(--text-main);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.acp-agent-row:hover { border-color: var(--text-main); }
-.acp-agent-row.is-selected { border-color: var(--accent); }
+.acp-agent-row + .acp-agent-row { border-top: 1px solid var(--divider); }
+.acp-agent-row:hover { background: var(--bg-panel); }
+.acp-agent-row.is-selected { background: var(--accent-bg); box-shadow: inset 3px 0 0 var(--accent); }
 .acp-agent-row small { color: var(--text-muted); }
 .acp-agent-detail {
   min-width: 0;
-  padding: 14px 16px;
+  padding: 18px 20px;
   display: grid;
   gap: 10px;
   align-content: start;
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
 }
 .acp-agent-detail:empty { display: none; }
+/* Panel copy uses the grid rhythm, never the browser's paragraph margins. */
+.acp-agent-detail > p { margin: 0; }
 .acp-agent-form { display: grid; gap: 10px; }
 .acp-agent-facts { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
 .acp-agent-facts div { display: grid; }
@@ -346,7 +451,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 /* A thing is the first screen of the workbench: its list on the left, its detail on the right. */
 .acp-case-create { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); }
 .acp-case-create label { display: grid; gap: 4px; font-size: 12px; color: var(--text-muted); flex: 1 1 240px; }
-.acp-case-create input, .acp-case-create select { padding: 6px 8px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-panel); color: var(--text-main); }
+.acp-case-create input, .acp-case-create select { padding: 6px 8px; border: 1px solid var(--border-color); border-radius: var(--radius-control); background: var(--bg-panel); color: var(--text-main); }
 .acp-case-panel { min-height: 0; display: flex; }
 .acp-case-panel .acp-detail { flex: 1; }
 /* With a case open, its list and its detail sit side by side and scroll on their own. */
@@ -363,23 +468,110 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-case-edge.is-focused { outline: 2px solid var(--accent); border-radius: 8px; }
 
 .acp-tab-count { margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--danger); color: #fff; font-size: 11px; }
-.acp-ticket-lights { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-.acp-ticket-lights span { padding: 0 6px; border-radius: 999px; background: var(--bg-panel); font-size: 11px; }
-.acp-ticket-lights .is-ok { color: var(--success); }
+.acp-ticket-lights { display: inline-flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+.acp-ticket-lights span { padding: 0; border-radius: 0; background: none; color: var(--text-muted); font-size: 11px; }
 .acp-ticket-lights .is-wait, .acp-ticket-lights .is-warn { color: var(--warning); }
+.acp-ticket-lights .is-unknown { color: var(--text-muted); }
 .acp-ticket-lights .is-bad, .acp-mode-label.is-locked { color: var(--danger); }
 
-.acp-approvals-split { display: grid; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr); gap: 16px; min-height: 420px; }
-.acp-approval-queue { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; align-content: start; }
-.acp-approval-row { display: flex; gap: 8px; width: 100%; text-align: left; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-card); color: inherit; cursor: pointer; }
-.acp-approval-row.is-selected { border-color: var(--accent); background: var(--accent-bg); }
-.acp-approval-row.is-urgent { border-color: var(--danger); }
-.acp-approval-row small { display: block; color: var(--text-muted); }
-.acp-unread-dot { width: 8px; height: 8px; margin-top: 6px; border-radius: 50%; background: var(--accent); flex: none; }
-.acp-approval-detail { border: 1px solid var(--border-color); border-radius: var(--radius); padding: 16px; background: var(--bg-card); }
-.acp-approval-detail-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
-.acp-approval-preview { white-space: pre-wrap; max-height: 220px; overflow: auto; background: var(--bg-panel); padding: 8px; }
-.acp-filter-gap { width: 12px; }
+.acp-approvals-split { display: grid; grid-template-columns: minmax(260px, 330px) minmax(0, 1fr); gap: 20px; min-height: 420px; align-items: start; }
+/* One surface holds the queue; rows are separated by hairlines, not by their own cards. */
+.acp-approval-queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  align-content: start;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+  overflow: hidden;
+}
+.acp-approval-queue > li + li { border-top: 1px solid var(--divider); }
+.acp-approval-queue > li > .acp-button { display: block; margin: 10px; }
+.acp-approval-row {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 11px 14px 11px 11px;
+  border: 0;
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.acp-approval-row:hover { background: var(--bg-panel); }
+.acp-approval-row.is-selected { background: var(--accent-bg); border-left-color: var(--accent); }
+.acp-approval-row.is-urgent { border-left-color: var(--danger); }
+.acp-approval-row.is-selected.is-urgent { border-left-color: var(--accent); }
+.acp-approval-row-main { display: grid; gap: 2px; min-width: 0; }
+.acp-approval-title { display: block; font-size: 13.5px; font-weight: 500; line-height: 1.45; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.acp-approval-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.5; }
+/* Small type tags (check / locked line, approval kind) stay quiet rectangles, never pills. */
+.acp-kind-tag { padding: 0 5px; border-radius: 4px; background: var(--bg-panel); color: var(--text-secondary); font-size: 10.5px; }
+.acp-approval-row.is-selected .acp-kind-tag { background: color-mix(in srgb, var(--bg-card) 70%, transparent); }
+.acp-unread-dot { width: 6px; height: 6px; margin-top: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.acp-approval-detail {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 20px 22px 24px;
+  background: var(--bg-card);
+  box-shadow: var(--shadow-1);
+}
+/* The reading column stops at 720px even when the panel is wider. */
+.acp-approval-detail > :not(.acp-backbar) { max-width: 720px; }
+.acp-approval-detail-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-start;
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--divider);
+}
+.acp-approval-detail-head > :first-child { min-width: 0; }
+.acp-approval-heading { display: grid; gap: 6px; }
+.acp-approval-detail-head h2 { margin: 0; font-size: 17px; line-height: 1.35; letter-spacing: -0.01em; }
+.acp-approval-summary { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+.acp-approval-body { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.65; }
+.acp-approval-detail-head .acp-header-actions { align-items: center; }
+/* Secondary destination links read as quiet buttons in the header, still one line. */
+.acp-approval-detail-head .acp-link {
+  padding: 5px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-small);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-1);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+.acp-approval-detail-head .acp-link:hover { border-color: var(--text-muted); text-decoration: none; color: var(--text-main); }
+.acp-approval-preview { white-space: pre-wrap; max-height: 220px; overflow: auto; background: var(--bg-panel); border-radius: var(--radius-small); padding: 10px 12px; }
+
+/* The reason field and its buttons sit together on one soft decision surface. */
+.acp-decision-box {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+}
+.acp-decision-box textarea { background: var(--bg-card); }
+.acp-decision-box .acp-sticky-actions {
+  position: static;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  backdrop-filter: none;
+}
+.acp-decision-box .acp-primary { box-shadow: var(--shadow-1); }
+.acp-decision-box .acp-button:not(.acp-primary) { background: var(--bg-card); }
+.acp-filter-gap { width: 1px; height: 18px; margin: 0 4px; background: var(--border-color); flex: none; }
 @media (max-width: 768px) { .acp-approvals-split { grid-template-columns: minmax(0, 1fr); } }
 
 .acp-ticket-card { border: 1px solid var(--border-color); border-radius: var(--radius); padding: 10px 12px; margin: 8px 0; }
@@ -399,9 +591,32 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-dag-hit { stroke: transparent; stroke-width: 12; cursor: pointer; }
 .acp-dag-label, .acp-dag-sub { fill: var(--text-main); font-size: 11px; }
 .acp-dag-sub { fill: var(--text-muted); font-size: 10px; }
+/* The handoff digest sits on the edge line: a panel-coloured halo keeps it readable on a 360px screen. */
+.acp-dag-edge-label {
+  fill: var(--text-secondary);
+  paint-order: stroke;
+  stroke: var(--bg-panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
 .acp-dag-click { cursor: pointer; }
 .acp-rsi-policies { width: 100%; margin-top: 8px; }
 .acp-gate-card { margin-top: 8px; padding: 10px 12px; border-radius: var(--radius); background: var(--warning-bg); }
+/* A role without an RSI directory is a normal state: it reads as a quiet hint with a way to retry. */
+.acp-rsi-notice {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  padding: 12px;
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+}
+.acp-rsi-notice strong { color: var(--text-main); }
+.acp-rsi-notice p { margin: 0; }
+/* The task heading takes programmatic focus so a screen reader announces it; that focus stays visually quiet. */
+.acp-detail-heading:focus { outline: none; }
+.acp-detail-heading:focus-visible { outline: 2px solid var(--accent-bg); outline-offset: 4px; border-radius: 6px; }
 .acp-gate-card.is-ready { background: var(--success-bg); }
 
 /* Counts, clocks and revisions stay aligned when digits change width. */
@@ -441,12 +656,10 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-load-sentinel { height: 1px; }
 .acp-backbar { display: none; }
 
-.acp-approval-row,
 .acp-ticket-card,
 .acp-mobile-card {
   border-left: 3px solid var(--border-color);
 }
-.acp-approval-row.is-urgent { border-left-color: var(--danger); }
 .acp-ticket-card.is-l1 { border-left: 4px solid var(--danger); }
 .acp-ticket-card.is-l2 { border-left: 4px solid var(--warning); }
 .acp-ticket-card.is-pass { border-left: 4px solid var(--success); }
@@ -508,9 +721,18 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 .acp-dag-swatch.is-cached { width: 14px; height: 14px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent-bg); }
 
 @media (max-width: 768px) {
-  .acp-workbench { padding: 12px 12px calc(72px + env(safe-area-inset-bottom)); }
-  .acp-workbench-header { align-items: center; }
-  .acp-workbench-source { display: none; }
+  .acp-workbench { padding: 0 12px calc(72px + env(safe-area-inset-bottom)); }
+  .acp-workbench-header {
+    min-height: 52px;
+    margin: 0 -12px 14px;
+    padding: 0 12px;
+    align-items: center;
+    gap: 10px;
+  }
+  .acp-workbench-title { gap: 12px; }
+  .acp-workbench-title h1 { font-size: 16px; }
+  .acp-source-label { display: none; }
+  .acp-workbench-views { width: 100%; margin-bottom: 12px; }
   .acp-module-switch {
     position: fixed;
     left: 0;
@@ -535,7 +757,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
     gap: 2px;
     min-height: 48px;
     padding: 4px 2px 6px;
-    border-radius: 10px;
+    border-radius: 8px;
     font-size: 11px;
     touch-action: manipulation;
   }
@@ -550,11 +772,16 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   .acp-workbench-views button,
   .acp-detail-tabs button,
   .acp-button,
+  .acp-link,
   .acp-approval-row,
   .acp-agent-row {
     min-height: 40px;
     touch-action: manipulation;
   }
+  .acp-link { display: inline-flex; align-items: center; }
+  /* A checkbox keeps its 20px box and its label grows into the rest of the 40px row. */
+  label:has(> input[type='checkbox']), label:has(> input[type='radio']) { min-height: 40px; align-content: center; }
+  input[type='checkbox'], input[type='radio'] { width: 20px; height: 20px; margin: 0 8px 0 0; accent-color: var(--accent); }
   input, textarea, select { font-size: 16px; }
   .acp-workbench-views, .acp-detail-tabs {
     flex-wrap: nowrap;
@@ -578,6 +805,12 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
   .has-case-detail .acp-workbench-table { display: none; }
   .acp-approvals-split:not(.is-showing-detail) .acp-approval-detail { display: none; }
   .acp-approvals-split.is-showing-detail .acp-approval-queue { display: none; }
+  /* The title and its two links stack on a phone; the links keep their labels on one line. */
+  .acp-approval-detail { padding: 8px 12px 16px; }
+  .acp-approval-detail .acp-backbar { margin: 0 -12px 4px; padding: 6px 12px; }
+  .acp-approval-detail-head { flex-direction: column; align-items: stretch; gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
+  .acp-approval-detail-head .acp-header-actions { gap: 8px; }
+  .acp-approval-detail-head h2 { font-size: 16px; }
   .acp-agent-layout:not(.is-showing-detail) .acp-agent-detail { display: none; }
   .acp-agent-layout.is-showing-detail .acp-agent-list { display: none; }
   .acp-sticky-actions { bottom: calc(64px + env(safe-area-inset-bottom)); }
@@ -587,6 +820,7 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; font-size:
 
 @media (prefers-color-scheme: dark) {
   .acp-module-switch { box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.45); }
+  .acp-workbench-views button[aria-pressed='true'] { box-shadow: inset 0 0 0 1px var(--border-color); }
   .acp-skeleton-bar {
     background: linear-gradient(90deg, var(--bg-panel) 25%, #3a4150 37%, var(--bg-panel) 63%);
     background-size: 400% 100%;

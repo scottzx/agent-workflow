@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'preact/hooks';
 import { acpTaskService, AcpTaskApiError } from './api';
+import { roleRsiNotice } from './rsi-notice';
 import type { AcpAgentCatalog, AcpAgentOption, AcpAgentRow, AcpRoleRsi, AcpTaskSummary } from './types';
-import { EmptyState, ErrorState, text } from './ui';
+import { EmptyState, ErrorState, language, text } from './ui';
 
 const emptyCatalog: AcpAgentCatalog = { developing: [], published: [] };
 
@@ -433,23 +434,40 @@ export function AgentModule({ refreshKey, onOpenTask }: { refreshKey: number; on
 
 function RoleRsi({ roleId, showPublishHint }: { roleId: string; showPublishHint: boolean }) {
     const [rsi, setRsi] = useState<AcpRoleRsi | null>(null);
-    const [error, setError] = useState('');
+    const [failure, setFailure] = useState<{ status?: number; code?: string } | null>(null);
+    const [attempt, setAttempt] = useState(0);
     const [view, setView] = useState<'checklist' | 'workflow'>('checklist');
     useEffect(() => {
         let alive = true;
         setRsi(null);
-        setError('');
-        acpTaskService.roleRsi(roleId).then(next => { if (alive) setRsi(next); }).catch(err => { if (alive) setError(err instanceof Error ? err.message : String(err)); });
+        setFailure(null);
+        acpTaskService
+            .roleRsi(roleId)
+            .then(next => { if (alive) setRsi(next); })
+            // A published agent may name a role the project never registered: that is an empty state, not an error.
+            .catch((err: unknown) => {
+                if (!alive) return;
+                setFailure(err instanceof AcpTaskApiError ? { status: err.status, code: err.code } : {});
+            });
         return () => { alive = false; };
-    }, [roleId]);
+    }, [roleId, attempt]);
+    const notice = failure ? roleRsiNotice(failure.status, failure.code, roleId, language) : null;
     const checklist = rsi?.checklist as { items?: { id: string; kind?: string; locked?: boolean; severity?: string; rule?: string }[] } | null;
     const workflow = rsi?.workflow as { nodes?: { id: string; type?: string; dependsOn?: string[] }[]; policies?: { trial?: Record<string, unknown>; formal?: Record<string, unknown> }; cycles?: { programBounce?: { from: string; to: string }; qaRevise?: { from: string; to: string } } } | null;
     const ready = rsi?.gate?.ready === true && !rsi.gate.error;
     return (
         <section class="acp-detail-section acp-rsi">
             <h4>{text('RSI 标准与门禁', 'RSI standard and gate')}</h4>
-            {error && <p class="acp-decision-error">{error}</p>}
-            {!rsi && !error && <p class="acp-muted">{text('正在读取角色标准…', 'Loading the role standard…')}</p>}
+            {notice && (
+                <div class={`acp-rsi-notice is-${notice.kind}`} role="status">
+                    <strong>{notice.title}</strong>
+                    <p>{notice.description}</p>
+                    <button type="button" class="acp-button" onClick={() => setAttempt(value => value + 1)}>
+                        {text('重试', 'Retry')}
+                    </button>
+                </div>
+            )}
+            {!rsi && !notice && <p class="acp-muted">{text('正在读取角色标准…', 'Loading the role standard…')}</p>}
             {rsi && (
                 <>
                     <p class={rsi.version.dirty ? 'acp-decision-error' : 'acp-muted'}>

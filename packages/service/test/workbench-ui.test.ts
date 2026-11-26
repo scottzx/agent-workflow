@@ -27,8 +27,14 @@ test('the gateway serves its own workbench page with a hardened document', async
   const page = await fetch(`${base}/workbench/ui/`);
   assert.equal(page.status, 200);
   assert.match(page.headers.get('content-type') ?? '', /text\/html/);
-  assert.match(page.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
-  assert.match(await page.text(), /\/workbench\/ui\/app\.js/);
+  const csp = page.headers.get('content-security-policy') ?? '';
+  assert.match(csp, /frame-ancestors 'none'/);
+  // The page carries its own inline SVG icon, so the browser never asks for /favicon.ico; data: images stay allowed.
+  assert.match(csp, /img-src 'self' data:/);
+  const html = await page.text();
+  assert.match(html, /\/workbench\/ui\/app\.js/);
+  assert.match(html, /<link rel="icon"[^>]*data:image\/svg\+xml/i);
+  assert.doesNotMatch(html, /favicon\.ico/);
   assert.equal((await fetch(`${base}/workbench/ui/app.js`)).status, 200);
   assert.equal((await fetch(`${base}/workbench/ui/build.mjs`)).status, 404);
   // Only generated renderer chunks are served besides the entry files; names that merely look similar are not.
@@ -99,6 +105,11 @@ test('the workbench entry is code-split and only hashed chunks are immutable', a
   const css = await fetch(`${base}/workbench/ui/app.css`);
   assert.equal(css.status, 200);
   assert.equal(css.headers.get('cache-control'), 'no-store');
+  // Mobile filter chips keep their label on one line and let the bar scroll instead of stacking glyphs.
+  const cssText = await readFile(join(uiDir, 'app.css'), 'utf8');
+  assert.match(cssText, /\.acp-workbench-views button[^}]*flex: 0 0 auto/);
+  assert.match(cssText, /\.acp-workbench-views button[^}]*white-space: nowrap/);
+  assert.match(cssText, /\.acp-header-actions[^}]*flex: 0 0 auto/);
   const session = await fetch(`${base}/workbench/ui/api/session`);
   assert.equal(session.headers.get('cache-control'), 'no-store');
 

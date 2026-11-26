@@ -5,6 +5,7 @@ import { countUnread, postApprovalsState } from './approvals-sync';
 import { LazyView, preloadProps, Skeleton } from './LazyView';
 import { executionLabels, navigateCase, taskDepth } from './model';
 import { useChunkedList, useLoadMoreSentinel } from './paging';
+import { hashForModule, moduleFromHash, type AcpModule } from './routing';
 import { TicketLights } from './TicketLights';
 import type { AcpApprovals, AcpTaskFilter, AcpTaskSummary } from './types';
 import {
@@ -87,10 +88,10 @@ function Login({ onDone }: { onDone: () => void }) {
 /** The table and detail read one ACP projection; neither writes task states. */
 function Workbench({ onLogout }: { onLogout?: () => void }) {
     const route = useRoute();
-    const explicitModule = /^#acp\/(approvals|cases|tasks|agents)\b/.test(location.hash);
-    const landed = useRef(explicitModule);
+    const explicitModule = moduleFromHash(location.hash);
+    const landed = useRef(explicitModule !== undefined);
     // Approvals lead when something is waiting and the page was opened without a hash.
-    const [module, setModule] = useState<'approvals' | 'cases' | 'tasks' | 'agents'>(explicitModule && location.hash.startsWith('#acp/tasks') ? 'tasks' : explicitModule && location.hash.startsWith('#acp/agents') ? 'agents' : explicitModule && location.hash.startsWith('#acp/approvals') ? 'approvals' : 'cases');
+    const [module, setModule] = useState<AcpModule>(explicitModule ?? 'cases');
     const [approvals, setApprovals] = useState<AcpApprovals | null>(null);
     const [seenTick, setSeenTick] = useState(0);
     const [filter, setFilter] = useState<AcpTaskFilter>('all');
@@ -112,6 +113,26 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
         },
     });
     const sentinel = useLoadMoreSentinel(module === 'tasks' && list.items.length < list.total, list.items.length, list.loadMore);
+
+    /** A top-level tab is a hash route: clicking it writes the hash, and the hash is what the tab follows. */
+    const openModule = useCallback((next: AcpModule) => {
+        landed.current = true;
+        setModule(next);
+        if (moduleFromHash(location.hash) !== next) location.hash = hashForModule(next);
+    }, []);
+
+    // The browser's back/forward buttons and external deep links both arrive here; a detail hash keeps its module.
+    useEffect(() => {
+        const sync = () => {
+            const next = moduleFromHash(location.hash);
+            if (next) {
+                landed.current = true;
+                setModule(next);
+            }
+        };
+        window.addEventListener('hashchange', sync);
+        return () => window.removeEventListener('hashchange', sync);
+    }, []);
 
     // A task link opened while another module is showing still lands on that task.
     useEffect(() => {
@@ -176,16 +197,16 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                 <div class="acp-workbench-title">
                     <h1>{text('任务工作台', 'Task workbench')}</h1>
                     <nav class="acp-module-switch" aria-label={text('工作台模块', 'Workbench modules')}>
-                        <button type="button" aria-pressed={module === 'approvals'} {...preloadProps('module:approvals', loadApprovals)} onClick={() => { landed.current = true; setModule('approvals'); }}>
+                        <button type="button" aria-pressed={module === 'approvals'} {...preloadProps('module:approvals', loadApprovals)} onClick={() => openModule('approvals')}>
                             <TabIcon name="approvals" />
                             <span>{text('待审批', 'Approvals')}</span>
                             {!!approvals?.totalPending && <span class="acp-tab-count">{approvals.totalPending}</span>}
                         </button>
-                        <button type="button" aria-pressed={module === 'cases'} {...preloadProps('module:cases', loadCases)} onClick={() => { landed.current = true; setModule('cases'); }}>
+                        <button type="button" aria-pressed={module === 'cases'} {...preloadProps('module:cases', loadCases)} onClick={() => openModule('cases')}>
                             <TabIcon name="cases" />
                             <span>{text('事情', 'Cases')}</span>
                         </button>
-                        <button type="button" aria-pressed={module === 'tasks'} {...preloadProps('module:task-detail', loadTaskDetail)} onClick={() => setModule('tasks')}>
+                        <button type="button" aria-pressed={module === 'tasks'} {...preloadProps('module:task-detail', loadTaskDetail)} onClick={() => openModule('tasks')}>
                             <TabIcon name="tasks" />
                             <span>{text('任务', 'Tasks')}</span>
                         </button>
@@ -193,10 +214,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                             type="button"
                             aria-pressed={module === 'agents'}
                             {...preloadProps('module:agents', loadAgents)}
-                            onClick={() => {
-                                setModule('agents');
-                                if (route.jobId) navigateAcpTask({ full: false });
-                            }}
+                            onClick={() => openModule('agents')}
                         >
                             <TabIcon name="agents" />
                             <span>{text('智能体', 'Agents')}</span>
@@ -204,6 +222,14 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                     </nav>
                 </div>
                 <div class="acp-header-actions">
+                    <span
+                        class="acp-source"
+                        title={text('数据来源：本机 A2A 网关账本。', 'Source: this A2A gateway ledger.')}
+                        aria-label={text('数据来源：本机 A2A 网关账本。', 'Source: this A2A gateway ledger.')}
+                    >
+                        <span class="acp-source-dot" aria-hidden="true" />
+                        <span class="acp-source-label">{text('本机账本', 'Local ledger')}</span>
+                    </span>
                     <button type="button" class="acp-button" onClick={() => setRefreshKey(key => key + 1)} disabled={loading}>
                         {text('刷新', 'Refresh')}
                     </button>
@@ -214,9 +240,6 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                     )}
                 </div>
             </header>
-            <p class="acp-workbench-source">
-                {text('数据来源：本机 A2A 网关账本。', 'Source: this A2A gateway ledger.')}
-            </p>
             {module === 'approvals' ? (
                 <LazyView cacheKey="module:approvals" load={loadApprovals} lines={8}>
                     {mod => (
@@ -293,11 +316,10 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                 <thead>
                                     <tr>
                                         <th>{text('任务名称', 'Task')}</th>
-                                        <th>{text('任务性质', 'Task kind')}</th>
+                                        <th>{text('任务性质', 'Kind')}</th>
                                         <th>{text('执行状态', 'Status')}</th>
-                                        <th>{text('任务方式', 'Task mode')}</th>
-                                        <th>{text('角色或预设', 'Role / preset')}</th>
-                                        <th>{text('执行服务', 'Execution service')}</th>
+                                        <th>{text('任务方式', 'Mode')}</th>
+                                        <th>{text('执行角色与服务', 'Role and service')}</th>
                                         <th>{text('当前阶段', 'Phase')}</th>
                                         <th>{text('待办与卡点', 'Action / blocker')}</th>
                                         <th>{text('最近进展', 'Last updated')}</th>
@@ -306,7 +328,7 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                 <tbody>
                                     {list.settled && !rows.length && (
                                         <tr>
-                                            <td colSpan={9} class="acp-muted">
+                                            <td colSpan={8} class="acp-muted">
                                                 {filter === 'all'
                                                     ? text('当前没有 ACP 执行任务', 'No ACP execution tasks yet')
                                                     : text('当前视图没有匹配的任务', 'No tasks in this view')}
@@ -347,10 +369,10 @@ function Workbench({ onLogout }: { onLogout?: () => void }) {
                                                 <span class="acp-mode-label">{executionLabels(task.execution, language).mode}</span>
                                             </td>
                                             <td>
-                                                <ExecutionRole execution={task.execution} />
-                                            </td>
-                                            <td>
-                                                <ExecutionService execution={task.execution} />
+                                                <span class="acp-execution-cell">
+                                                    <ExecutionRole execution={task.execution} />
+                                                    <ExecutionService execution={task.execution} />
+                                                </span>
                                             </td>
                                             <td>{phaseLabel(task.phase || '') || '—'}</td>
                                             <td>

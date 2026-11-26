@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { acpCaseService } from './api';
 import { navigateCase, parseAcpCaseHash, snapshotUrl } from './model';
-import type { AcpCaseDetail, AcpCaseEdge, AcpInboxItem, AcpTaskSummary } from './types';
+import type { AcpCaseDetail, AcpCaseEdge, AcpCaseSummary, AcpInboxItem, AcpTaskSummary } from './types';
 import { Skeleton } from './LazyView';
 import { LazyArtifactDrawer, LazyArtifactItem } from './lazy-panels';
 import { useChunkedList, useLoadMoreSentinel } from './paging';
@@ -201,7 +201,7 @@ function CaseDag({
                                         <title>{edge.reason}</title>
                                     </line>
                                 )}
-                                <text x={(from.x + nodeW + x2) / 2} y={(from.y + nodeH / 2 + y2) / 2 - 4} class="acp-dag-sub">
+                                <text x={(from.x + nodeW + x2) / 2} y={(from.y + nodeH / 2 + y2) / 2 - 4} class="acp-dag-sub acp-dag-edge-label">
                                     <title>{edge.artifactDigest}</title>
                                     {label}
                                 </text>
@@ -495,7 +495,7 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
     const [detailError, setDetailError] = useState('');
     const originRef = useRef('');
     originRef.current = origin;
-    const list = useChunkedList({
+    const list = useChunkedList<AcpCaseSummary>({
         active: true,
         refreshKey,
         resetKey: 'cases',

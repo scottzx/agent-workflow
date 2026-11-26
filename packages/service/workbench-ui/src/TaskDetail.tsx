@@ -419,7 +419,7 @@ export function AcpTaskDetailPanel({
                     ))}
                     <span>{jobId}</span>
                 </div>
-                <h2 ref={heading} tabIndex={-1}>
+                <h2 ref={heading} class="acp-detail-heading" tabIndex={-1}>
                     {detail ? title(detail) : text('正在读取任务…', 'Loading task…')}
                 </h2>
                 {detail && (
