@@ -11,10 +11,10 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 
 const execFileAsync = promisify(execFile);
-const SHA = /^[0-9a-f]{7,40}$/i;
+const SHA = /^[0-9a-f]{7,40}$/;
 const VERDICT_LINE = /^\s*(?:[-*]\s*)?(?:\*\*|__)?VERDICT(?:\*\*|__)?\s*[:：]\s*(.+)$/i;
 const SOLO_VERDICT = /^\s*(?:\*\*|__)?(CHANGES_REQUESTED|PASS)(?:\*\*|__)?\s*$/;
-const EMPTY_MUST_LINE = /^(?:[-*+]\s+)?(?:无|无。|无\.|none\.?|n\/a)$/i;
+const EMPTY_MUST_PHRASES = new Set(['无', '无阻塞项', '无阻塞缺陷', '无必须项', 'none', 'n/a', 'na', 'nil', '0', 'no must issues', 'no must', 'no issues']);
 const DIGEST_FILES = ['QA.md', 'checklist.json', 'evals/manifest.json', 'routing.json'] as const;
 const REQUIRED_DIGEST_FILES = ['QA.md', 'checklist.json', 'evals/manifest.json'] as const;
 
@@ -132,16 +132,19 @@ interface SpecialSection {
   bodyLine: number;
 }
 
-/** Walk up to the nearest directory that contains a `.git` file or directory. */
+/** Walk up to the nearest real `.git` file or directory. A symlink `.git` is not an anchor. */
 export async function findRepoRoot(start: string): Promise<string> {
   let current = resolve(start);
   for (;;) {
-    try {
-      const info = await lstat(join(current, '.git'));
-      if (info.isFile() || info.isDirectory() || info.isSymbolicLink()) return current;
-    } catch (error) {
+    const gitPath = join(current, '.git');
+    let info;
+    try { info = await lstat(gitPath); }
+    catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      info = undefined;
     }
+    if (info?.isSymbolicLink()) throw new Error(`Refusing ${gitPath}: symlink is not a repository anchor`);
+    if (info && (info.isFile() || info.isDirectory())) return current;
     const parent = dirname(current);
     if (parent === current) throw new Error(`No .git repository found above ${start}`);
     current = parent;
@@ -209,26 +212,17 @@ export async function verifyCrEvalCommits(manifest: CrEvalManifest, repoRoot: st
 }
 
 /**
- * Parse a Markdown CR report. Verdict tokens are read only from a VERDICT section,
- * a `VERDICT:` line, or a preamble line that is only PASS / CHANGES_REQUESTED.
+ * Parse a Markdown CR report. A VERDICT heading uses the heading line, otherwise only its first
+ * non-empty line. Later explanation cannot add a second verdict. Fenced code is not a heading.
  * MUST/SHOULD prose cannot supply or override the verdict.
  */
 export function parseMarkdownCrReport(caseId: string, markdown: string): CrReviewResult {
   if (!caseId.trim()) throw new Error('caseId is required');
   const { preamble, sections } = splitSpecial(markdown);
-  const verdicts = new Set<string>();
   const verdictSections = sections.filter(section => section.kind === 'verdict');
-  const regions = [
-    ...verdictSections.map(section => `${section.title}\n${section.body}`),
-    ...declarationBlobs(preamble, sections.filter(section => section.kind !== 'verdict')),
-  ];
-  for (const region of regions) {
-    for (const match of region.matchAll(/\b(CHANGES_REQUESTED|PASS)\b/g)) verdicts.add(match[1]);
-  }
-  if (verdicts.size !== 1) {
-    throw new Error(`CR report for ${caseId} has no unique VERDICT (found ${[...verdicts].join(', ') || 'none'})`);
-  }
-  const verdict = [...verdicts][0] as 'CHANGES_REQUESTED' | 'PASS';
+  const verdict = verdictSections.length
+    ? oneVerdict(verdictSections.flatMap(section => verdictTokens(section)), caseId)
+    : oneVerdict(declarationTokens(preamble, sections), caseId);
   const must = sections.filter(section => section.kind === 'must').flatMap(section => parseFindings(section.body, section.bodyLine));
   const should = sections.filter(section => section.kind === 'should').flatMap(section => parseFindings(section.body, section.bodyLine));
   return crReviewResultSchema.parse({
@@ -310,12 +304,10 @@ function scoreCase(item: CrEvalCase, review: CrReviewResult): CrEvalCaseResult {
       passed: clean, matchedDefects: [], missedDefects: [], falsePositive: !clean,
     };
   }
-  const matchedDefects: string[] = [];
-  const missedDefects: string[] = [];
-  for (const defect of item.requiredDefects ?? []) {
-    if (review.must.some(finding => defectHit(defect, finding))) matchedDefects.push(defect.id);
-    else missedDefects.push(defect.id);
-  }
+  const defects = item.requiredDefects ?? [];
+  const assigned = assignDefects(defects, review.must);
+  const matchedDefects = defects.filter((_, index) => assigned[index] >= 0).map(defect => defect.id);
+  const missedDefects = defects.filter((_, index) => assigned[index] < 0).map(defect => defect.id);
   const passed = review.verdict === 'CHANGES_REQUESTED' && missedDefects.length === 0;
   return {
     caseId: item.id, kind: item.kind, expectedVerdict: item.expectedVerdict, actualVerdict: review.verdict,
@@ -330,6 +322,26 @@ function defectHit(defect: CrEvalDefect, finding: CrReviewFinding): boolean {
   return fileHit && textHit;
 }
 
+/** One finding may pay for only one defect. Kuhn matching so an earlier overlap cannot hide a later exclusive finding. */
+function assignDefects(defects: CrEvalDefect[], findings: CrReviewFinding[]): number[] {
+  const assigned = defects.map(() => -1);
+  const edges = findings.map(finding => defects.map(defect => defectHit(defect, finding)));
+  const visit = (finding: number, seen: boolean[]): boolean => {
+    for (let defect = 0; defect < defects.length; defect += 1) {
+      if (!edges[finding]?.[defect] || seen[defect]) continue;
+      seen[defect] = true;
+      const owner = assigned[defect];
+      if (owner < 0 || visit(owner, seen)) {
+        assigned[defect] = finding;
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let finding = 0; finding < findings.length; finding += 1) visit(finding, defects.map(() => false));
+  return assigned;
+}
+
 function ratio(part: number, whole: number): number {
   return whole === 0 ? 0 : part / whole;
 }
@@ -339,16 +351,27 @@ function splitSpecial(markdown: string): { preamble: string; sections: SpecialSe
   const preamble: string[] = [];
   const sections: SpecialSection[] = [];
   let current: { kind: SpecialSection['kind']; level: number; title: string; lines: string[]; bodyLine: number } | undefined;
+  let fence: { char: '`' | '~'; len: number } | undefined;
   const flush = () => {
     if (!current) return;
     sections.push({ kind: current.kind, title: current.title, body: current.lines.join('\n'), bodyLine: current.bodyLine });
     current = undefined;
   };
+  const push = (line: string) => {
+    if (current) current.lines.push(line);
+    else preamble.push(line);
+  };
   lines.forEach((line, index) => {
+    const marker = fenceMarker(line);
+    if (marker && (!fence || (marker.char === fence.char && marker.len >= fence.len))) {
+      fence = fence ? undefined : marker;
+      push(line);
+      return;
+    }
+    if (fence) { push(line); return; }
     const heading = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
     if (!heading) {
-      if (current) current.lines.push(line);
-      else preamble.push(line);
+      push(line);
       return;
     }
     const level = heading[1].length;
@@ -374,32 +397,41 @@ function classifyHeading(title: string): SpecialSection['kind'] | undefined {
   return undefined;
 }
 
-function declarationBlobs(preamble: string, sections: SpecialSection[]): string[] {
-  const chunks = [preamble, ...sections.filter(section => section.kind !== 'must' && section.kind !== 'should').map(section => `${section.title}\n${section.body}`)];
-  const blobs: string[] = [];
-  for (const chunk of chunks) {
-    const lines = chunk.split(/\r?\n/).filter(line => VERDICT_LINE.test(line) || SOLO_VERDICT.test(line));
-    if (lines.length) blobs.push(lines.join('\n'));
-  }
-  return blobs;
+function verdictTokens(section: SpecialSection): string[] {
+  const titleTokens = verdictWords(section.title);
+  if (titleTokens.length) return titleTokens;
+  const visible = stripFences(section.body);
+  const first = visible.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? '';
+  return verdictWords(first);
+}
+
+function declarationTokens(preamble: string, sections: SpecialSection[]): string[] {
+  const chunks = [preamble, ...sections.filter(section => section.kind !== 'must' && section.kind !== 'should').map(section => `${section.title}\n${stripFences(section.body)}`)];
+  const lines = chunks.flatMap(chunk => chunk.split(/\r?\n/).filter(line => VERDICT_LINE.test(line) || SOLO_VERDICT.test(line)));
+  return lines.flatMap(verdictWords);
+}
+
+function verdictWords(text: string): string[] {
+  return [...text.matchAll(/\b(CHANGES_REQUESTED|PASS)\b/g)].map(match => match[1]);
+}
+
+function oneVerdict(tokens: string[], caseId: string): 'CHANGES_REQUESTED' | 'PASS' {
+  const found = new Set(tokens);
+  if (found.size !== 1) throw new Error(`CR report for ${caseId} has no unique VERDICT (found ${[...found].join(', ') || 'none'})`);
+  return [...found][0] as 'CHANGES_REQUESTED' | 'PASS';
 }
 
 function parseFindings(body: string, originLine: number): CrReviewFinding[] {
-  if (isEmptyMust(body)) return [];
-  const lines = body.split(/\r?\n/);
-  const starts: { index: number; id?: string }[] = [];
-  lines.forEach((line, index) => {
-    const mark = itemStart(line);
-    if (mark) starts.push({ index, ...mark });
-  });
-  const slices = starts.length
-    ? starts.map((start, index) => ({
-      id: start.id,
-      line: originLine + start.index,
-      text: lines.slice(start.index, index + 1 < starts.length ? starts[index + 1].index : lines.length).join('\n').trim(),
-    }))
-    : [{ id: undefined, line: originLine, text: body.trim() }];
-  return slices.filter(slice => slice.text && !isEmptyMust(slice.text)).map(slice => {
+  const visible = stripFences(body);
+  if (isEmptyMust(visible)) return [];
+  const lines = visible.split(/\r?\n/);
+  const starts = numberedStarts(lines);
+  const ranges = starts.length ? starts : unnumberedStarts(lines);
+  return ranges.map((start, index) => ({
+    id: start.id,
+    line: originLine + start.index,
+    text: lines.slice(start.index, index + 1 < ranges.length ? ranges[index + 1].index : lines.length).join('\n').trim(),
+  })).filter(slice => slice.text && !isEmptyMust(slice.text)).map(slice => {
     const file = extractFileClue(slice.text);
     return {
       ...(slice.id ? { id: slice.id } : {}),
@@ -410,18 +442,78 @@ function parseFindings(body: string, originLine: number): CrReviewFinding[] {
   });
 }
 
-function itemStart(line: string): { id?: string } | undefined {
-  const heading = /^#{2,6}\s+(?:\d+\.\s*)?(?:\[(M\d+)\]|(M\d+))\b/.exec(line);
-  if (heading) return { id: heading[1] || heading[2] };
-  const bullet = /^[-*]\s+\*\*\[(M\d+)\]\*\*/.exec(line);
-  if (bullet) return { id: bullet[1] };
-  if (/^#{3,6}\s+\S/.test(line)) return {};
-  return undefined;
+function numberedStarts(lines: string[]): { index: number; id?: string }[] {
+  const starts: { index: number; id?: string }[] = [];
+  lines.forEach((line, index) => {
+    const heading = /^#{2,6}\s+(?:\d+\.\s*)?(?:\[(M\d+)\]|(M\d+))\b/.exec(line);
+    if (heading) { starts.push({ index, id: heading[1] || heading[2] }); return; }
+    const bullet = /^[-*]\s+\*\*\[(M\d+)\]\*\*/.exec(line);
+    if (bullet) starts.push({ index, id: bullet[1] });
+  });
+  return starts;
+}
+
+/** Without M1/M2 markers, each top-level list item or blank-line paragraph is its own finding. */
+function unnumberedStarts(lines: string[]): { index: number; id?: string }[] {
+  const listAt = lines.flatMap((line, index) => /^(?:[-*]|\d+\.)\s+\S/.test(line) ? [index] : []);
+  if (listAt.length) {
+    const starts: { index: number; id?: string }[] = [];
+    if (lines.slice(0, listAt[0]).some(line => line.trim())) starts.push({ index: 0 });
+    for (const index of listAt) starts.push({ index });
+    return starts;
+  }
+  const starts: { index: number; id?: string }[] = [];
+  let open = false;
+  lines.forEach((line, index) => {
+    if (!line.trim()) { open = false; return; }
+    if (!open) { starts.push({ index }); open = true; }
+  });
+  return starts;
 }
 
 function isEmptyMust(text: string): boolean {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  return lines.length === 0 || lines.every(line => EMPTY_MUST_LINE.test(line));
+  return lines.every(line => isEmptyPhrase(normalizeMustLine(line)));
+}
+
+function normalizeMustLine(line: string): string {
+  let text = line.trim().replace(/^(?:(?:[-+>]|•)\s+|\*\s+)+/, '').trim();
+  let wrapped = true;
+  while (wrapped) {
+    wrapped = false;
+    for (const mark of ['**', '__', '`', '*', '_']) {
+      if (text.startsWith(mark) && text.endsWith(mark) && text.length > mark.length * 2) {
+        const inner = text.slice(mark.length, -mark.length).trim();
+        if (inner) { text = inner; wrapped = true; break; }
+      }
+    }
+  }
+  return text.replace(/[\s。．.!?！？,，;；:：、]+$/g, '').trim().toLowerCase();
+}
+
+function isEmptyPhrase(value: string): boolean {
+  if (!value || EMPTY_MUST_PHRASES.has(value)) return true;
+  return /^无（[^）]*）$/.test(value) || /^无\([^)]*\)$/.test(value);
+}
+
+function fenceMarker(line: string): { char: '`' | '~'; len: number } | undefined {
+  const match = /^(?: {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match || (match[1][0] === '`' && match[2].includes('`'))) return undefined;
+  return { char: match[1][0] as '`' | '~', len: match[1].length };
+}
+
+function stripFences(text: string): string {
+  const kept: string[] = [];
+  let fence: { char: '`' | '~'; len: number } | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const marker = fenceMarker(line);
+    if (marker && (!fence || (marker.char === fence.char && marker.len >= fence.len))) {
+      fence = fence ? undefined : marker;
+      continue;
+    }
+    if (!fence) kept.push(line);
+  }
+  return kept.join('\n');
 }
 
 function extractFileClue(text: string): string | undefined {

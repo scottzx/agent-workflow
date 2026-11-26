@@ -185,9 +185,16 @@ async function runEvalCr(argv: string[]): Promise<void> {
     if (!verification.ok) process.exitCode = 1;
     return;
   }
+  const resultsPath = resolve(values.results);
+  let text: string;
+  try { text = await readFile(resultsPath, 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`results file does not exist: ${values.results}`);
+    throw error;
+  }
   let raw: unknown;
-  try { raw = JSON.parse((await readFile(resolve(values.results), 'utf8')).replace(/^\uFEFF/, '')); }
-  catch { throw new Error(`results file is not JSON: ${values.results}`); }
+  try { raw = JSON.parse(text.replace(/^\uFEFF/, '')); }
+  catch { throw new Error(`results file is not valid JSON: ${values.results}`); }
   const score = scoreCrEvalSuite(manifest, coerceCrEvalResults(raw));
   const ready = verification.ok && score.promotionReady;
   const report = {

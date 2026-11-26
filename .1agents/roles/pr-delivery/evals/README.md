@@ -18,11 +18,11 @@
 | `pr14-neg-forged-git-and-config` | 14 | 负 | `23bb0d37` → `e648d09b` | `CHANGES_REQUESTED` |
 | `pr14-pos-verified-worktree-fix` | 14 | 正 | `e648d09b` → `9bda36fe` | `PASS` |
 
-负样本的 `requiredDefects` 每条有 `anyFilePatterns` 和 `anyTextPatterns`。二者都是大小写不敏感的字面量子串，不是正则。一条 MUST 要同时命中至少一个文件子串和至少一个文本子串，才算命中该缺陷。文件名写在 `file`、正文或 `evidence` 里都可以。
+负样本的 `requiredDefects` 每条有 `anyFilePatterns` 和 `anyTextPatterns`。二者都是大小写不敏感的字面量子串，不是正则，并且写成缺陷机制而不是单独的函数名。一条 MUST 要同时命中至少一个文件子串和至少一个文本子串，才算能对上该缺陷。文件名写在 `file`、正文或 `evidence` 里都可以。一条 finding 最多核销一条缺陷：同一 case 有 2 条或 3 条缺陷时，报告里也要有同样多条各自命中的 MUST。
 
 ## 口径
 
-- 负样本通过：结论是 `CHANGES_REQUESTED`，且该样本每一条 `requiredDefects` 都被至少一条 MUST 命中。
+- 负样本通过：结论是 `CHANGES_REQUESTED`，且该样本每一条 `requiredDefects` 都被一条尚未核销过的 MUST 命中。
 - 正样本通过：结论是 `PASS`，且 MUST 为空。`SHOULD` 不计误报。
 - `negativeRecall` = 通过的负样本 / 负样本数。`defectRecall` = 命中的缺陷 / 缺陷总数。
 - `falsePositiveRate` = 未通过的正样本 / 正样本数。正样本给出 `CHANGES_REQUESTED`，或给出 `PASS` 但 MUST 非空，都算 1 条误报。
@@ -36,10 +36,10 @@
 
 ## 命令
 
-在仓库根执行。`--repo` 可省略，此时从 `--role` 向上找最近的 `.git`。
+在仓库根执行。相对路径按当前目录解析，不随子进程的 `packages/service` 工作目录漂移。`--repo` 可省略，此时从 `--role` 向上找最近的真实 `.git`（符号链接 `.git` 不算仓库根）。
 
 ```sh
-node --import tsx packages/service/bin/acp-service.ts rsi eval-cr \
+packages/service/node_modules/.bin/tsx packages/service/bin/acp-service.ts rsi eval-cr \
   --role .1agents/roles/pr-delivery --repo . --json
 
 node .1agents/roles/pr-delivery/checks/run-l3-eval.mjs \

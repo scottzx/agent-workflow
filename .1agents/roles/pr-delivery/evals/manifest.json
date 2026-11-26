@@ -21,8 +21,8 @@
           "anyTextPatterns": [
             "ledger.prepare",
             "半持久化",
-            "attachSubscriptions",
-            "重放漏订"
+            "重放漏订",
+            "落盘之后"
           ]
         }
       ]
@@ -67,9 +67,11 @@
             "packages/service/src/a2a/gateway.ts"
           ],
           "anyTextPatterns": [
-            "execution_continue",
+            "不继承上一轮",
+            "不继承 deliveryMode",
+            "inherit deliveryMode",
             "requestedDeliveryMode",
-            "不继承上一轮"
+            "deliveryMode 回落"
           ]
         }
       ]
@@ -90,10 +92,10 @@
             "packages/service/src/a2a/result-metadata.ts"
           ],
           "anyTextPatterns": [
-            "isSensitiveWorkspaceFile",
-            ".1agents/worktrees",
             "绝对路径",
-            "artifact-sensitive-path"
+            ".1agents/worktrees",
+            "artifact-sensitive-path",
+            "误判为敏感"
           ]
         }
       ]

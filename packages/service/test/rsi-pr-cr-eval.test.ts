@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import {
@@ -105,8 +105,61 @@ test('markdown verdict forms fail closed unless exactly one legal verdict is pre
   assert.equal(ignored.verdict, 'CHANGES_REQUESTED');
   assert.equal(ignored.must.length, 1);
   assert.throws(() => parseMarkdownCrReport('x', '## MUST\n\n### M1\n\ngateway.ts broke\n'), /no unique VERDICT/);
-  assert.throws(() => parseMarkdownCrReport('x', '## VERDICT\n\nPASS\nCHANGES_REQUESTED\n'), /no unique VERDICT/);
+  assert.throws(() => parseMarkdownCrReport('x', '## VERDICT: PASS CHANGES_REQUESTED\n\n说明\n'), /no unique VERDICT/);
   assert.throws(() => parseMarkdownCrReport('x', '## VERDICT\n\n看起来可以\n'), /no unique VERDICT/);
+  const later = parseMarkdownCrReport('pr14-pos-verified-worktree-fix', [
+    '## 1. VERDICT: `PASS`', '', '正文里的 L1 gate: PASS 不是结论，也不要把 CHANGES_REQUESTED 当成这次的 verdict。', '',
+    '## 2. MUST（阻塞缺陷）', '', '**无。**',
+  ].join('\n'));
+  assert.equal(later.verdict, 'PASS');
+  assert.deepEqual(later.must, []);
+  const firstLine = parseMarkdownCrReport('pos', '## VERDICT\n\nPASS\n\n后文提到 CHANGES_REQUESTED 也不改结论。\n\n## MUST\n\n- 无阻塞项\n');
+  assert.equal(firstLine.verdict, 'PASS');
+  assert.deepEqual(firstLine.must, []);
+});
+
+test('bold empty MUST and fenced sample headings do not create findings', () => {
+  const pass = parseMarkdownCrReport('pr14-pos-verified-worktree-fix', [
+    '## 1. VERDICT: `PASS`', '', '## 2. MUST（阻塞缺陷）', '', '**无。**', '',
+    '```md', '## MUST', '### M1 phantom', '`gateway.ts` ledger.prepare 半持久化', '```',
+  ].join('\n'));
+  assert.equal(pass.verdict, 'PASS');
+  assert.equal(pass.must.length, 0);
+  for (const body of ['**无。**', '- 无阻塞项', '> 无阻塞缺陷', '`none`', '无（已关闭）', '0', 'no must issues']) {
+    const parsed = parseMarkdownCrReport('pos', `## VERDICT\n\n**PASS**\n\n## MUST\n\n${body}\n`);
+    assert.deepEqual(parsed.must, [], body);
+  }
+});
+
+test('one vague MUST cannot pay for every defect, but an overlapping pair still matches', async () => {
+  const manifest = await loadCrEvalManifest(roleDir);
+  const vague = parseMarkdownCrReport('pr12-neg-sandbox-and-inherit', [
+    '## VERDICT', '', '**CHANGES_REQUESTED**', '', '## MUST', '',
+    '`packages/service/src/a2a/gateway.ts` worktreeRepoRoot 挪到 runtime/jobs 越出 cwd 和沙箱；另外不继承上一轮 deliveryMode，execution_continue 的语义也值得再看。',
+  ].join('\n'));
+  assert.equal(vague.must.length, 1);
+  const blurred = scoreCrEvalSuite(manifest, replace(manifest, 'pr12-neg-sandbox-and-inherit', vague));
+  assert.equal(blurred.passed, false);
+  assert.equal(blurred.promotionReady, false);
+  assert.equal(blurred.caseResults.find(item => item.caseId === 'pr12-neg-sandbox-and-inherit')?.matchedDefects.length, 1);
+  const packed = parseMarkdownCrReport('pr13-neg-schema-symlink-ignore', [
+    '## VERDICT', '', '**CHANGES_REQUESTED**', '', '## MUST', '',
+    '`checklist.json` schemaVersion 不兼容，`worktree-projection.ts` 的 symlink 会半写，`.gitignore` 的 `**/.agents/` 遮蔽了已跟踪的 autoreview。',
+  ].join('\n'));
+  const packedScore = scoreCrEvalSuite(manifest, replace(manifest, 'pr13-neg-schema-symlink-ignore', packed));
+  assert.equal(packed.must.length, 1);
+  assert.equal(packedScore.promotionReady, false);
+  const ordered = scoreCrEvalSuite(manifest, replace(manifest, 'pr12-neg-sandbox-and-inherit', {
+    caseId: 'pr12-neg-sandbox-and-inherit', verdict: 'CHANGES_REQUESTED',
+    must: [
+      { file: 'packages/service/src/a2a/gateway.ts', summary: 'runtime/jobs 越出 cwd，并且不继承上一轮 deliveryMode' },
+      { file: 'packages/service/src/a2a/job-directory.ts', summary: 'runtime/jobs 越出 cwd' },
+    ],
+  }));
+  const both = ordered.caseResults.find(item => item.caseId === 'pr12-neg-sandbox-and-inherit');
+  assert.deepEqual(both?.missedDefects, []);
+  assert.deepEqual(both?.matchedDefects, ['job-dir-outside-cwd', 'continue-misses-delivery-mode']);
+  assert.equal(ordered.promotionReady, true);
 });
 
 test('missing one required defect or citing the wrong file blocks promotion', async () => {
@@ -172,6 +225,9 @@ test('case schema rejects a positive defect list and a negative PASS', () => {
   assert.throws(() => crEvalCaseSchema.parse({
     id: 'neg', pr: 1, kind: 'negative', baseCommit: '69c136b5', headCommit: 'cc1b0ac3', expectedVerdict: 'PASS', summary: 'bad', requiredDefects: [defect],
   }));
+  assert.throws(() => crEvalCaseSchema.parse({
+    id: 'upper', pr: 1, kind: 'positive', baseCommit: '69C136B5', headCommit: 'cc1b0ac3', expectedVerdict: 'PASS', summary: 'sha',
+  }));
   assert.throws(() => crEvalManifestSchema.parse({
     schemaVersion: 1, roleId: 'pr-delivery',
     cases: [
@@ -196,6 +252,15 @@ test('a manifest symlink that leaves the role directory is refused', async t => 
   await assert.rejects(computeCrEvalDigest(role), /symlink escapes/);
 });
 
+test('findRepoRoot rejects a symlinked .git instead of walking into the parent repository', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'cr-eval-gitlink-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const nested = join(root, 'nested');
+  await mkdir(nested);
+  await symlink(join(repoRoot, '.git'), join(nested, '.git'));
+  await assert.rejects(findRepoRoot(nested), /symlink is not a repository anchor/);
+});
+
 test('commit verification fails closed when the SHAs are not in that repository', async t => {
   const root = await mkdtemp(join(tmpdir(), 'cr-eval-empty-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -207,9 +272,9 @@ test('commit verification fails closed when the SHAs are not in that repository'
   assert.ok(verification.errors.length >= 9);
 });
 
-async function spawn(args: string[]): Promise<{ status: number; stdout: string; stderr: string }> {
+async function spawn(args: string[], cwd = serviceDir): Promise<{ status: number; stdout: string; stderr: string }> {
   try {
-    const result = await exec(process.execPath, args, { cwd: serviceDir, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 90_000 });
+    const result = await exec(process.execPath, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 90_000 });
     return { status: 0, stdout: result.stdout, stderr: result.stderr ?? '' };
   } catch (error) {
     const failed = error as { code?: number; stdout?: string; stderr?: string };
@@ -261,4 +326,30 @@ test('eval-cr CLI and run-l3-eval.mjs agree on verify-only, pass, and fail', { t
       } else assert.equal(body.falsePositives, 1, check.label);
     }
   }
+  const missing = await spawn(['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--results', join(dir, 'missing.json')]);
+  assert.equal(missing.status, 1);
+  assert.match(`${missing.stderr}\n${missing.stdout}`, /does not exist/);
+  assert.doesNotMatch(`${missing.stderr}\n${missing.stdout}`, /not valid JSON/);
+  await writeFile(join(dir, 'bad.json'), '{');
+  const invalid = await spawn(['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--results', join(dir, 'bad.json')]);
+  assert.equal(invalid.status, 1);
+  assert.match(`${invalid.stderr}\n${invalid.stdout}`, /not valid JSON/);
+  assert.doesNotMatch(`${invalid.stderr}\n${invalid.stdout}`, /does not exist/);
+});
+
+test('run-l3-eval resolves relative role, repo and results from the caller cwd', { timeout: 60_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-eval-rel-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const manifest = await loadCrEvalManifest(roleDir);
+  const passFile = join(dir, 'pass.json');
+  await writeFile(passFile, JSON.stringify(manifest.cases.map(item => ({ caseId: item.id, markdown: deepSeek(item) }))));
+  const result = await spawn([
+    script, '--role-dir=.1agents/roles/pr-delivery', '--repo=.', '--results', relative(repoRoot, passFile), '--json',
+  ], repoRoot);
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const body = JSON.parse(result.stdout) as { mode: string; repoRoot: string; promotionReady: boolean; ok: boolean };
+  assert.equal(body.mode, 'score');
+  assert.equal(body.repoRoot, repoRoot);
+  assert.equal(body.promotionReady, true);
+  assert.equal(body.ok, true);
 });
