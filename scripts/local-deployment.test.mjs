@@ -325,4 +325,87 @@ test('CLI sync-desktop updates desktop profile and passes live CSS verification 
   assert.equal(output.desktopProfile.version, '1.1.1');
   assert.equal(output.liveCssCheck.matched, true);
   assert.equal(output.liveCssCheck.byteLength, Buffer.byteLength(css));
+  assert.equal(output.liveCssCheck.sha256, sha256(Buffer.from(css)));
+});
+
+test('syncDesktopProfile fails closed on symlinked package slot or bundled node_modules without mutating external dirs', t => {
+  const { root, version, profileDir } = desktopRepoFixture(t, '1.1.1');
+  buildTarballFixture(root, version, { marker: 'fresh-1.1.1' });
+
+  // External target directory that a symlinked node_modules/@1agents/acp-service points to.
+  const external = join(root, 'external-installation');
+  save(join(external, 'package.json'), JSON.stringify({ name: '@1agents/acp-service', version: '1.0.0' }));
+  save(join(external, 'node_modules/preserved-dep/index.js'), 'external-dep\n');
+  mkdirSync(join(profileDir, 'node_modules/@1agents'), { recursive: true });
+  symlinkSync(external, join(profileDir, 'node_modules/@1agents/acp-service'), 'dir');
+
+  assert.throws(() => syncDesktopProfile({ root, desktopProfileDir: profileDir }), /Refusing to sync over symlinked package slot/);
+  assert.equal(readFileSync(join(external, 'node_modules/preserved-dep/index.js'), 'utf8'), 'external-dep\n', 'external nested node_modules must stay untouched');
+
+  // Fresh profile with a tarball that illegally bundles node_modules must also be rejected.
+  const freshProfile = join(root, 'fresh-profile');
+  buildTarballFixture(root, version, { marker: 'bad-nested', bundleNestedNodeModules: true });
+  assert.throws(() => syncDesktopProfile({ root, desktopProfileDir: freshProfile }), /must not bundle nested node_modules/);
+
+  // Fresh install mid-swap failure leaves no installed tarball or package dir.
+  buildTarballFixture(root, version, { marker: 'clean-1.1.1' });
+  assert.throws(
+    () => syncDesktopProfile({
+      root,
+      desktopProfileDir: freshProfile,
+      hooks: { beforePackageSwap: () => { throw new Error('fresh swap fail'); } },
+    }),
+    /fresh swap fail/,
+  );
+  assert.equal(existsSync(join(freshProfile, 'local/packages/1agents-acp-service-1.1.1.tgz')), false);
+  assert.equal(existsSync(join(freshProfile, 'node_modules/@1agents/acp-service')), false);
+});
+
+test('resolveReleaseTarball validates service-manifest.json commit/checksum provenance when present', t => {
+  const { root, version } = desktopRepoFixture(t, '1.1.1');
+  execFileSync('git', ['init', '--quiet'], { cwd: root });
+  execFileSync('git', ['add', '.'], { cwd: root });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'commit-a'], { cwd: root });
+  const commitA = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  const tgz = buildTarballFixture(root, version, { marker: 'commit-a' });
+  saveJSON(join(root, 'release/service-manifest.json'), {
+    sha: commitA,
+    filename: `1agents-acp-service-${version}.tgz`,
+    sha256: sha256(readFileSync(tgz)),
+  });
+  assert.equal(resolveReleaseTarball(root).version, version);
+
+  // New commit without re-running pack must fail provenance check.
+  save(join(root, 'changed.txt'), 'commit-b\n');
+  execFileSync('git', ['add', 'changed.txt'], { cwd: root });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'commit-b'], { cwd: root });
+  assert.throws(() => resolveReleaseTarball(root), /belongs to commit.*re-run pnpm run pack/);
+
+  // Explicit archivePath + expectedSha256 (used by deployEnvironment) installs that exact captured tarball instead of stale release/.
+  const capturedDir = join(root, 'captured');
+  const freshTgz = buildTarballFixture(capturedDir, version, { marker: 'captured-from-deploy' });
+  const freshSha = sha256(readFileSync(freshTgz));
+  const profileDir = join(root, 'deploy-profile');
+  assert.throws(() => syncDesktopProfile({ root, desktopProfileDir: profileDir, archivePath: freshTgz, expectedSha256: '0'.repeat(64) }), /checksum mismatch/);
+  const synced = syncDesktopProfile({ root, desktopProfileDir: profileDir, archivePath: freshTgz, expectedSha256: freshSha });
+  assert.equal(synced.archiveSha256, freshSha);
+  assert.equal(readFileSync(join(profileDir, 'node_modules/@1agents/acp-service/dist/src/a2a/index.js'), 'utf8'), 'captured-from-deploy\n');
+});
+
+test('verifyLiveCssSync wraps body-phase timeout with endpoint identity and parseCliArgs rejects unknown or empty flags', async t => {
+  const listen = handler => new Promise(resolve => {
+    const server = http.createServer(handler);
+    server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
+  });
+  const fast = await listen((_req, res) => { res.writeHead(200); res.end('body{}'); });
+  const stalled = await listen((_req, res) => { res.writeHead(200); res.flushHeaders(); /* intentionally hang body */ });
+  t.after(() => { fast.server.close(); stalled.server.close(); });
+
+  await assert.rejects(
+    () => verifyLiveCssSync({ gatewayUrl: fast.url, desktopUrl: stalled.url, timeoutMs: 150 }),
+    /Failed to fetch desktop CSS at http:\/\/127\.0\.0\.1:\d+\/workbench\/ui\/app\.css/,
+  );
+
+  assert.throws(() => parseCliArgs(['deploy', '--env', 'test', '--root', '.', '--gateway-urll', 'http://x']), /Unknown option --gateway-urll/);
+  assert.throws(() => parseCliArgs(['deploy', '--env', 'test', '--root', '']), /Expected --root value/);
 });
