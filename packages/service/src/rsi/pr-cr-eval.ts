@@ -2,6 +2,8 @@
  * Offline golden-set scorer for pr-delivery cross-model CR.
  * Patterns are case-insensitive literals, never regular expressions.
  * A missing or ambiguous VERDICT fails closed and is never treated as PASS.
+ * A standalone MUST label without a leading `#` is still a MUST section.
+ * PASS with a real blocker marker and no MUST heading fails closed, not as zero findings.
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -215,6 +217,8 @@ export async function verifyCrEvalCommits(manifest: CrEvalManifest, repoRoot: st
  * Parse a Markdown CR report. A VERDICT heading uses the heading line, otherwise only its first
  * non-empty line. Later explanation cannot add a second verdict. Fenced code is not a heading.
  * MUST/SHOULD prose cannot supply or override the verdict.
+ * Bold or bare label lines (`**MUST**`, `MUST:`) open the same sections as `#` headings.
+ * With no MUST section at all, a top-level blocker marker still becomes a MUST finding.
  */
 export function parseMarkdownCrReport(caseId: string, markdown: string): CrReviewResult {
   if (!caseId.trim()) throw new Error('caseId is required');
@@ -223,7 +227,10 @@ export function parseMarkdownCrReport(caseId: string, markdown: string): CrRevie
   const verdict = verdictSections.length
     ? oneVerdict(verdictSections.flatMap(section => verdictTokens(section)), caseId)
     : oneVerdict(declarationTokens(preamble, sections), caseId);
-  const must = sections.filter(section => section.kind === 'must').flatMap(section => parseFindings(section.body, section.bodyLine));
+  const headed = sections.some(section => section.kind === 'must');
+  const must = headed
+    ? sections.filter(section => section.kind === 'must').flatMap(section => parseFindings(section.body, section.bodyLine))
+    : extractLooseBlockers(preamble, sections);
   const should = sections.filter(section => section.kind === 'should').flatMap(section => parseFindings(section.body, section.bodyLine));
   return crReviewResultSchema.parse({
     caseId, verdict, must, ...(should.length ? { should } : {}), rawText: markdown,
@@ -361,6 +368,20 @@ function splitSpecial(markdown: string): { preamble: string; sections: SpecialSe
     if (current) current.lines.push(line);
     else preamble.push(line);
   };
+  const openLabel = (label: LabelHit, index: number) => {
+    flush();
+    if (label.kind === 'other') {
+      if (label.inline) push(label.inline);
+      return;
+    }
+    current = {
+      kind: label.kind,
+      level: 2,
+      title: label.title,
+      lines: label.inline ? [label.inline] : [],
+      bodyLine: index + (label.inline ? 1 : 2),
+    };
+  };
   lines.forEach((line, index) => {
     const marker = fenceMarker(line);
     if (marker && (!fence || (marker.char === fence.char && marker.len >= fence.len))) {
@@ -370,31 +391,127 @@ function splitSpecial(markdown: string): { preamble: string; sections: SpecialSe
     }
     if (fence) { push(line); return; }
     const heading = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
-    if (!heading) {
-      push(line);
+    if (heading) {
+      const level = heading[1].length;
+      const title = heading[2].trim();
+      const kind = classifyHeading(title);
+      const terminator = classifyLabelCore(splitLabel(title).core) === 'other';
+      if (current && (level <= current.level || terminator)) flush();
+      if (kind && !current) {
+        current = { kind, level, title, lines: [], bodyLine: index + 2 };
+        return;
+      }
+      if (current) current.lines.push(line);
+      else preamble.push(line);
       return;
     }
-    const level = heading[1].length;
-    const title = heading[2].trim();
-    const kind = classifyHeading(title);
-    if (current && level <= current.level) flush();
-    if (kind && !current) {
-      current = { kind, level, title, lines: [], bodyLine: index + 2 };
+    const label = matchStandaloneLabel(line);
+    if (label) {
+      openLabel(label, index);
       return;
     }
-    if (current) current.lines.push(line);
-    else preamble.push(line);
+    push(line);
   });
   flush();
   return { preamble: preamble.join('\n'), sections };
 }
 
+type LabelKind = SpecialSection['kind'] | 'other';
+
+interface LabelHit {
+  kind: LabelKind;
+  title: string;
+  inline?: string;
+}
+
 function classifyHeading(title: string): SpecialSection['kind'] | undefined {
-  const stripped = title.replace(/^\d+\.\s*/, '').trim();
-  if (/^VERDICT\b/i.test(stripped)) return 'verdict';
-  if (/^MUST\b/i.test(stripped)) return 'must';
-  if (/^SHOULD\b/i.test(stripped)) return 'should';
+  const stripped = unwrapEmphasis(title).replace(/^\d+\.\s*/, '').trim();
+  const core = unwrapEmphasis(stripped);
+  if (/^VERDICT\b/i.test(core)) return 'verdict';
+  if (/^MUST\b/i.test(core)) return 'must';
+  if (/^SHOULD\b/i.test(core)) return 'should';
   return undefined;
+}
+
+/** A whole line that is only a section label, not a sentence that mentions one. Fences never reach here. */
+function matchStandaloneLabel(line: string): LabelHit | undefined {
+  const trimmed = line.trim();
+  if (!trimmed || /^[-+>|]/.test(trimmed) || /^\*(?!\*)/.test(trimmed)) return undefined;
+  const wrapped = matchWrappedLabel(trimmed);
+  const parts = wrapped ?? matchBareLabel(trimmed);
+  if (!parts) return undefined;
+  const kind = classifyLabelCore(parts.core);
+  if (!kind) return undefined;
+  const title = parts.rest ? `${parts.core}: ${parts.rest}` : parts.core;
+  return { kind, title, ...(parts.rest ? { inline: parts.rest } : {}) };
+}
+
+function matchWrappedLabel(trimmed: string): { core: string; rest?: string } | undefined {
+  const mark = trimmed.startsWith('**') ? '**' : trimmed.startsWith('__') ? '__' : undefined;
+  if (!mark) return undefined;
+  const close = trimmed.indexOf(mark, mark.length);
+  if (close <= mark.length) return undefined;
+  const inner = trimmed.slice(mark.length, close).trim();
+  if (!inner) return undefined;
+  const after = trimmed.slice(close + mark.length).trim();
+  const split = splitLabel(inner);
+  if (!classifyLabelCore(split.core)) return undefined;
+  if (!after) return { core: split.core, ...(split.rest ? { rest: split.rest } : {}) };
+  if (after.startsWith(':') || after.startsWith('：')) {
+    const rest = after.slice(1).trim();
+    return { core: split.core, ...(rest ? { rest } : {}) };
+  }
+  if (/[:：]\s*$/.test(inner)) return { core: split.core, rest: after };
+  return undefined;
+}
+
+function matchBareLabel(trimmed: string): { core: string; rest?: string } | undefined {
+  if (trimmed.startsWith('#') || trimmed.startsWith('**') || trimmed.startsWith('__') || /^[-*+>|]/.test(trimmed)) return undefined;
+  const body = trimmed.replace(/^\d+\.\s+/, '');
+  const split = splitLabel(body);
+  if (!classifyLabelCore(split.core)) return undefined;
+  const colon = body.search(/[:：]/);
+  const head = (colon >= 0 ? body.slice(0, colon) : body).trim();
+  const withoutParen = head.replace(/\s*[（(][^）)]*[）)]\s*$/g, '').trim();
+  if (withoutParen !== split.core) return undefined;
+  const suffix = head.slice(split.core.length).trim();
+  if (suffix && !/^[（(][^）)]*[）)]$/.test(suffix)) return undefined;
+  return split;
+}
+
+function splitLabel(raw: string): { core: string; rest?: string } {
+  let text = unwrapEmphasis(raw.trim()).replace(/^(?:\d+\.|[一二三四五六七八九十]+[、.．])\s*/, '').trim();
+  text = unwrapEmphasis(text);
+  const colon = text.search(/[:：]/);
+  let core = text;
+  let rest: string | undefined;
+  if (colon >= 0) {
+    core = text.slice(0, colon).trim();
+    rest = text.slice(colon + 1).trim() || undefined;
+  }
+  core = core.replace(/\s*[（(][^）)]*[）)]\s*$/g, '').trim();
+  return { core, ...(rest ? { rest } : {}) };
+}
+
+function classifyLabelCore(core: string): LabelKind | undefined {
+  if (/^VERDICT$/i.test(core)) return 'verdict';
+  if (/^MUST$/i.test(core)) return 'must';
+  if (/^SHOULD$/i.test(core)) return 'should';
+  if (/^VERIFIED_CHECKS$/i.test(core)) return 'other';
+  if (core === '总结' || core === '结论') return 'other';
+  if (/^(?:总结|结论)(?:与|和|及)[\u4e00-\u9fffA-Za-z0-9]{1,16}$/.test(core)) return 'other';
+  return undefined;
+}
+
+function unwrapEmphasis(text: string): string {
+  let value = text.trim();
+  for (;;) {
+    const wrapped = /^(\*\*|__)([\s\S]+)\1$/.exec(value);
+    if (!wrapped) return value;
+    const inner = wrapped[2].trim();
+    if (!inner) return value;
+    value = inner;
+  }
 }
 
 function verdictTokens(section: SpecialSection): string[] {
@@ -427,6 +544,31 @@ function parseFindings(body: string, originLine: number): CrReviewFinding[] {
   const lines = visible.split(/\r?\n/);
   const starts = numberedStarts(lines);
   const ranges = starts.length ? starts : unnumberedStarts(lines);
+  return materializeFindings(lines, ranges, originLine);
+}
+
+/**
+ * No MUST heading at all. Marker lines in the preamble or a non-SHOULD section are still blockers.
+ * Prose such as "无 MUST" / "0 MUST" has no marker and stays empty. Fenced samples are already stripped.
+ */
+function extractLooseBlockers(preamble: string, sections: SpecialSection[]): CrReviewFinding[] {
+  const findings: CrReviewFinding[] = [];
+  const take = (text: string, originLine: number) => {
+    const visible = stripFences(text);
+    const lines = visible.split(/\r?\n/);
+    const starts = numberedStarts(lines);
+    if (!starts.length) return;
+    findings.push(...materializeFindings(lines, starts, originLine));
+  };
+  take(preamble, 1);
+  for (const section of sections) {
+    if (section.kind === 'should' || section.kind === 'must') continue;
+    take(section.body, section.bodyLine);
+  }
+  return findings;
+}
+
+function materializeFindings(lines: string[], ranges: { index: number; id?: string }[], originLine: number): CrReviewFinding[] {
   return ranges.map((start, index) => ({
     id: start.id,
     line: originLine + start.index,
@@ -445,10 +587,12 @@ function parseFindings(body: string, originLine: number): CrReviewFinding[] {
 function numberedStarts(lines: string[]): { index: number; id?: string }[] {
   const starts: { index: number; id?: string }[] = [];
   lines.forEach((line, index) => {
-    const heading = /^#{2,6}\s+(?:\d+\.\s*)?(?:\[(M\d+)\]|(M\d+))\b/.exec(line);
+    const heading = /^#{1,6}\s+(?:\d+\.\s*)?(?:\[(M\d+)\]|(M\d+))\b/.exec(line);
     if (heading) { starts.push({ index, id: heading[1] || heading[2] }); return; }
     const bullet = /^[-*]\s+\*\*\[(M\d+)\]\*\*/.exec(line);
-    if (bullet) starts.push({ index, id: bullet[1] });
+    if (bullet) { starts.push({ index, id: bullet[1] }); return; }
+    const bold = /^\*\*\[(M\d+)\]\*\*/.exec(line);
+    if (bold) starts.push({ index, id: bold[1] });
   });
   return starts;
 }
