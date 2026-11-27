@@ -11,14 +11,62 @@ import { lstat, readFile, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
+import { cohenKappa } from './rubric.js';
 
 const execFileAsync = promisify(execFile);
 const SHA = /^[0-9a-f]{7,40}$/;
 const VERDICT_LINE = /^\s*(?:[-*]\s*)?(?:\*\*|__)?VERDICT(?:\*\*|__)?\s*[:：]\s*(.+)$/i;
 const SOLO_VERDICT = /^\s*(?:\*\*|__)?(CHANGES_REQUESTED|PASS)(?:\*\*|__)?\s*$/;
 const EMPTY_MUST_PHRASES = new Set(['无', '无阻塞项', '无阻塞缺陷', '无必须项', 'none', 'n/a', 'na', 'nil', '0', 'no must issues', 'no must', 'no issues']);
-const DIGEST_FILES = ['QA.md', 'checklist.json', 'evals/manifest.json', 'routing.json'] as const;
+const DIGEST_FILES = ['QA.md', 'checklist.json', 'evals/manifest.json', 'evals/human-calibration.json', 'routing.json'] as const;
 const REQUIRED_DIGEST_FILES = ['QA.md', 'checklist.json', 'evals/manifest.json'] as const;
+
+export const POLICY_MIN_CR_JUDGE_KAPPA = 0.8;
+export const CR_FAILURE_TAXONOMIES = ['system_design', 'agent_misalignment', 'task_verification'] as const;
+export type CrFailureTaxonomy = (typeof CR_FAILURE_TAXONOMIES)[number];
+
+const TAXONOMY_LABEL_ZH: Record<CrFailureTaxonomy, string> = {
+  system_design: '系统设计',
+  agent_misalignment: '代理错位',
+  task_verification: '任务验证',
+};
+
+export const crHumanCalibrationSampleSchema = z.object({
+  caseId: z.string().min(1),
+  humanVerdict: z.enum(['CHANGES_REQUESTED', 'PASS']),
+  reviewer: z.string().min(1),
+  reviewedAt: z.string().min(1),
+  note: z.string().min(1).max(2000).optional(),
+}).strict();
+export type CrHumanCalibrationSample = z.infer<typeof crHumanCalibrationSampleSchema>;
+
+export const crHumanCalibrationFileSchema = z.object({
+  schemaVersion: z.literal(1),
+  roleId: z.string().min(1),
+  minKappa: z.number().min(0).max(1).default(POLICY_MIN_CR_JUDGE_KAPPA),
+  samples: z.array(crHumanCalibrationSampleSchema).min(1),
+}).strict().superRefine((doc, ctx) => {
+  if (doc.minKappa < POLICY_MIN_CR_JUDGE_KAPPA) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['minKappa'],
+      message: `minKappa (${doc.minKappa}) is below policy floor (${POLICY_MIN_CR_JUDGE_KAPPA})`,
+    });
+  }
+  const seen = new Set<string>();
+  doc.samples.forEach((sample, index) => {
+    const key = `${sample.caseId}\0${sample.reviewer}`;
+    if (seen.has(key)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['samples', index],
+        message: `duplicate human calibration sample for (${sample.caseId}, ${sample.reviewer})`,
+      });
+    }
+    seen.add(key);
+  });
+});
+export type CrHumanCalibrationFile = z.infer<typeof crHumanCalibrationFileSchema>;
 
 export const crEvalDefectSchema = z.object({
   id: z.string().min(1).max(80),
@@ -108,6 +156,36 @@ export interface CrEvalCaseResult {
   falsePositive: boolean;
 }
 
+export interface CrJudgeCalibrationResult {
+  minKappa: number;
+  overlapCases: number;
+  tiedHumanCases: number;
+  agreement: number | null;
+  kappa: number | null;
+  passed: boolean;
+  disagreements: { caseId: string; humanVerdict: 'CHANGES_REQUESTED' | 'PASS'; judgeVerdict: 'CHANGES_REQUESTED' | 'PASS' }[];
+  reason?: string;
+}
+
+export interface CrMissClassification {
+  caseId: string;
+  pr: number;
+  kind: 'negative' | 'positive';
+  taxonomy: CrFailureTaxonomy;
+  taxonomyLabelZh: string;
+  missedDefects: string[];
+  reason: string;
+  suggestedLayer: 'check' | 'qa' | 'eval_change';
+}
+
+export interface CrEvalGeneratedProposal {
+  kind: 'check' | 'qa' | 'eval_change';
+  taxonomy: CrFailureTaxonomy;
+  caseId: string;
+  text: string;
+  evidence: string;
+}
+
 export interface CrEvalScore {
   totalCases: number;
   negativeCases: number;
@@ -126,6 +204,9 @@ export interface CrEvalScore {
   passed: boolean;
   promotionReady: boolean;
   caseResults: CrEvalCaseResult[];
+  judgeCalibration?: CrJudgeCalibrationResult;
+  missClassifications: CrMissClassification[];
+  generatedProposals: CrEvalGeneratedProposal[];
 }
 
 interface SpecialSection {
@@ -540,11 +621,239 @@ export function coerceCrEvalResults(input: unknown): CrReviewResult[] {
   });
 }
 
+export async function loadCrHumanCalibrationFile(filePath: string, expectedRoleId?: string): Promise<CrHumanCalibrationFile> {
+  const text = await readFile(resolve(filePath), 'utf8');
+  let raw: unknown;
+  try { raw = JSON.parse(text.replace(/^\uFEFF/, '')); }
+  catch { throw new Error(`human calibration file is not valid JSON: ${filePath}`); }
+  const parsed = crHumanCalibrationFileSchema.parse(raw);
+  if (expectedRoleId && parsed.roleId !== expectedRoleId) {
+    throw new Error(`human calibration roleId "${parsed.roleId}" does not match expected "${expectedRoleId}"`);
+  }
+  return parsed;
+}
+
+/** Load optional `<roleDir>/evals/human-calibration.json` safely inside the role directory. */
+export async function loadRoleHumanCalibration(roleDirectory: string, expectedRoleId?: string): Promise<CrHumanCalibrationFile | undefined> {
+  const kind = await containedKind(roleDirectory, 'evals/human-calibration.json');
+  if (kind === 'missing') return undefined;
+  const file = await readContained(roleDirectory, 'evals/human-calibration.json');
+  let raw: unknown;
+  try { raw = JSON.parse(file.text.replace(/^\uFEFF/, '')); }
+  catch { throw new Error('evals/human-calibration.json is not valid JSON'); }
+  const parsed = crHumanCalibrationFileSchema.parse(raw);
+  if (expectedRoleId && parsed.roleId !== expectedRoleId) {
+    throw new Error(`evals/human-calibration.json roleId "${parsed.roleId}" does not match "${expectedRoleId}"`);
+  }
+  return parsed;
+}
+
+/**
+ * Compute Cohen's kappa between sampled human ground-truth verdicts and CR judge verdicts.
+ * When `kappa === null` or `kappa < minKappa` (policy floor >= 0.8), `passed` is forced `false`.
+ */
+export function scoreCrJudgeAgreement(
+  results: readonly CrReviewResult[],
+  samples: readonly CrHumanCalibrationSample[],
+  options?: { minKappa?: number; minOverlap?: number },
+): CrJudgeCalibrationResult {
+  const minKappa = options?.minKappa ?? POLICY_MIN_CR_JUDGE_KAPPA;
+  if (minKappa < POLICY_MIN_CR_JUDGE_KAPPA) {
+    throw new Error(`minKappa (${minKappa}) is below policy floor (${POLICY_MIN_CR_JUDGE_KAPPA})`);
+  }
+  const minOverlap = options?.minOverlap ?? 2;
+  const parsedSamples = samples.map(s => crHumanCalibrationSampleSchema.parse(s));
+
+  // Group human verdicts per caseId and take strict majority (excluding 1:1 ties without bias).
+  const humanByCase = new Map<string, ('CHANGES_REQUESTED' | 'PASS')[]>();
+  const seenPairs = new Set<string>();
+  for (const s of parsedSamples) {
+    const key = `${s.caseId}\0${s.reviewer}`;
+    if (seenPairs.has(key)) throw new Error(`duplicate human calibration sample for (${s.caseId}, ${s.reviewer})`);
+    seenPairs.add(key);
+    const list = humanByCase.get(s.caseId) ?? [];
+    list.push(s.humanVerdict);
+    humanByCase.set(s.caseId, list);
+  }
+
+  const judgeByCase = new Map<string, CrReviewResult>();
+  for (const review of results) {
+    judgeByCase.set(review.caseId, crReviewResultSchema.parse(review));
+  }
+
+  const humanVec: number[] = [];
+  const judgeVec: number[] = [];
+  const disagreements: CrJudgeCalibrationResult['disagreements'] = [];
+  let tiedHumanCases = 0;
+
+  for (const [caseId, verdicts] of [...humanByCase.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const judge = judgeByCase.get(caseId);
+    if (!judge) continue;
+    const reqCount = verdicts.filter(v => v === 'CHANGES_REQUESTED').length;
+    const passCount = verdicts.length - reqCount;
+    if (reqCount === passCount) {
+      tiedHumanCases += 1;
+      continue;
+    }
+    const humanVerdict: 'CHANGES_REQUESTED' | 'PASS' = reqCount > passCount ? 'CHANGES_REQUESTED' : 'PASS';
+    // Treat a PASS with non-empty MUST findings as effective CHANGES_REQUESTED? No — compare raw verdict so inconsistent PASS+MUST is caught by both positive scorer and human calibration.
+    const judgeVerdict = judge.verdict;
+    humanVec.push(humanVerdict === 'CHANGES_REQUESTED' ? 1 : 0);
+    judgeVec.push(judgeVerdict === 'CHANGES_REQUESTED' ? 1 : 0);
+    if (humanVerdict !== judgeVerdict) {
+      disagreements.push({ caseId, humanVerdict, judgeVerdict });
+    }
+  }
+
+  const overlapCases = humanVec.length;
+  if (overlapCases < minOverlap) {
+    return {
+      minKappa,
+      overlapCases,
+      tiedHumanCases,
+      agreement: overlapCases === 0 ? null : Math.round(((overlapCases - disagreements.length) / overlapCases) * 1000) / 1000,
+      kappa: null,
+      passed: false,
+      disagreements,
+      reason: `人工校准重叠样本不足（overlap=${overlapCases} < ${minOverlap}），无法证明评委一致性`,
+    };
+  }
+
+  const rawKappa = cohenKappa(humanVec, judgeVec);
+  const kappa = rawKappa === null ? null : Math.round(rawKappa * 1000) / 1000;
+  const agreement = Math.round(((overlapCases - disagreements.length) / overlapCases) * 1000) / 1000;
+  const passed = rawKappa !== null && rawKappa >= minKappa;
+  return {
+    minKappa,
+    overlapCases,
+    tiedHumanCases,
+    agreement,
+    kappa,
+    passed,
+    disagreements,
+    ...(!passed ? { reason: `评委与人工抽样标注一致率 Cohen's κ=${kappa ?? 'null'} < ${minKappa}（分歧 ${disagreements.length}/${overlapCases}），强制禁止晋升` } : {}),
+  };
+}
+
+/**
+ * Classify a missed or false-positive CR case into the 3-way failure taxonomy:
+ * - `system_design` (系统设计): multi-defect negative case partially caught — structural coverage / L1 check gap.
+ * - `agent_misalignment` (代理错位): negative case passed or missed defect files — reviewer did not follow QA red lines.
+ * - `task_verification` (任务验证): false positive on a clean positive case, or negative case flagged on the right file without verifying the exact defect mechanism.
+ */
+export function classifyCrMiss(
+  caseResult: CrEvalCaseResult,
+  manifestCase: CrEvalCase,
+  review?: CrReviewResult,
+): CrMissClassification | undefined {
+  if (caseResult.passed) return undefined;
+
+  if (caseResult.kind === 'positive' || caseResult.falsePositive) {
+    return {
+      caseId: caseResult.caseId,
+      pr: manifestCase.pr,
+      kind: caseResult.kind,
+      taxonomy: 'task_verification',
+      taxonomyLabelZh: TAXONOMY_LABEL_ZH.task_verification,
+      missedDefects: [],
+      reason: `正样本（PR #${manifestCase.pr}）发生误报（actual=${caseResult.actualVerdict}，MUST=${review?.must.length ?? 0}），属于任务验证/核验边界误判`,
+      suggestedLayer: 'eval_change',
+    };
+  }
+
+  const totalDefects = manifestCase.requiredDefects?.length ?? 0;
+  if (totalDefects >= 2 && caseResult.matchedDefects.length > 0 && caseResult.missedDefects.length > 0) {
+    return {
+      caseId: caseResult.caseId,
+      pr: manifestCase.pr,
+      kind: 'negative',
+      taxonomy: 'system_design',
+      taxonomyLabelZh: TAXONOMY_LABEL_ZH.system_design,
+      missedDefects: [...caseResult.missedDefects],
+      reason: `PR #${manifestCase.pr} 多缺陷负样本仅命中 ${caseResult.matchedDefects.length}/${totalDefects} 条，漏检 ${caseResult.missedDefects.join('、')}，应按最便宜耐久阶梯补确定性检查或拆分节点`,
+      suggestedLayer: 'check',
+    };
+  }
+
+  if (caseResult.actualVerdict === 'CHANGES_REQUESTED' && review && review.must.length > 0) {
+    const missedDefs = (manifestCase.requiredDefects ?? []).filter(d => caseResult.missedDefects.includes(d.id));
+    const haystack = review.must.map(m => [m.file, m.summary, m.evidence].filter(Boolean).join('\n')).join('\n').toLowerCase();
+    const touchedRightFile = missedDefs.some(d => d.anyFilePatterns.some(p => haystack.includes(p.toLowerCase())));
+    if (touchedRightFile) {
+      return {
+        caseId: caseResult.caseId,
+        pr: manifestCase.pr,
+        kind: 'negative',
+        taxonomy: 'task_verification',
+        taxonomyLabelZh: TAXONOMY_LABEL_ZH.task_verification,
+        missedDefects: [...caseResult.missedDefects],
+        reason: `PR #${manifestCase.pr} 审到了目标文件但未验证核心缺陷机制（漏检 ${caseResult.missedDefects.join('、')}），属于任务验证不充分`,
+        suggestedLayer: 'check',
+      };
+    }
+  }
+
+  return {
+    caseId: caseResult.caseId,
+    pr: manifestCase.pr,
+    kind: 'negative',
+    taxonomy: 'agent_misalignment',
+    taxonomyLabelZh: TAXONOMY_LABEL_ZH.agent_misalignment,
+    missedDefects: [...caseResult.missedDefects],
+    reason: `PR #${manifestCase.pr} 负样本未按 QA 红线拦截（actual=${caseResult.actualVerdict}，漏检 ${caseResult.missedDefects.join('、')}），属于代理错位`,
+    suggestedLayer: 'qa',
+  };
+}
+
+/** Convert classified CR misses into structured actionable proposals following the cheapest durable ladder. */
+export function generateProposalsFromCrMisses(classifications: readonly CrMissClassification[]): CrEvalGeneratedProposal[] {
+  return classifications.map(item => {
+    const evidence = `case=${item.caseId} (PR #${item.pr}, taxonomy=${item.taxonomy}${item.missedDefects.length ? `, missed=${item.missedDefects.join(',')}` : ''})`;
+    if (item.taxonomy === 'system_design') {
+      return {
+        kind: 'check',
+        taxonomy: item.taxonomy,
+        caseId: item.caseId,
+        text: `[${item.taxonomyLabelZh}] 为 PR #${item.pr} 漏检缺陷（${item.missedDefects.join('、')}）补充确定性 L1 检查或在 workflow 中拆分独立核验节点`,
+        evidence,
+      };
+    }
+    if (item.taxonomy === 'task_verification') {
+      return {
+        kind: item.kind === 'positive' ? 'eval_change' : 'check',
+        taxonomy: item.taxonomy,
+        caseId: item.caseId,
+        text: item.kind === 'positive'
+          ? `[${item.taxonomyLabelZh}] 核查 PR #${item.pr} 正样本误报（${item.caseId}），明确 QA 放行边界或由人复核考卷表述`
+          : `[${item.taxonomyLabelZh}] 强化 PR #${item.pr} 目标文件的机制级复现验证，补齐 ${item.missedDefects.join('、')} 的确定性断言`,
+        evidence,
+      };
+    }
+    return {
+      kind: 'qa',
+      taxonomy: item.taxonomy,
+      caseId: item.caseId,
+      text: `[${item.taxonomyLabelZh}] 收紧 QA.md 红线与证据核查清单，防止漏放 PR #${item.pr}（${item.missedDefects.join('、')}）`,
+      evidence,
+    };
+  });
+}
+
 /**
  * Score one report per manifest case. Duplicate and unknown case ids throw.
  * A returned report therefore always has `unknownCases: []`; missing cases stay in the report and fail it.
+ * When `options.humanCalibration` is provided, computes Cohen's kappa and forces `promotionReady = false`
+ * whenever `kappa < 0.8` (or insufficient overlap).
  */
-export function scoreCrEvalSuite(manifest: CrEvalManifest, results: CrReviewResult[]): CrEvalScore {
+export function scoreCrEvalSuite(
+  manifest: CrEvalManifest,
+  results: CrReviewResult[],
+  options?: {
+    humanCalibration?: CrHumanCalibrationFile | readonly CrHumanCalibrationSample[];
+    minKappa?: number;
+    minOverlap?: number;
+  },
+): CrEvalScore {
   const parsed = crEvalManifestSchema.parse(manifest);
   const reviews = results.map(result => crReviewResultSchema.parse(result));
   const known = new Set(parsed.cases.map(item => item.id));
@@ -558,14 +867,33 @@ export function scoreCrEvalSuite(manifest: CrEvalManifest, results: CrReviewResu
   if (unknown.length) throw new Error(`unknown CR result caseId: ${unknown.join(', ')}`);
   const caseResults: CrEvalCaseResult[] = [];
   const missingCases: string[] = [];
+  const missClassifications: CrMissClassification[] = [];
   for (const item of parsed.cases) {
     const review = byId.get(item.id);
     if (!review) {
       missingCases.push(item.id);
       continue;
     }
-    caseResults.push(scoreCase(item, review));
+    const result = scoreCase(item, review);
+    caseResults.push(result);
+    const classified = classifyCrMiss(result, item, review);
+    if (classified) missClassifications.push(classified);
   }
+
+  let judgeCalibration: CrJudgeCalibrationResult | undefined;
+  if (options?.humanCalibration) {
+    const samples = Array.isArray(options.humanCalibration)
+      ? options.humanCalibration
+      : (options.humanCalibration as CrHumanCalibrationFile).samples;
+    const declaredMin = Array.isArray(options.humanCalibration)
+      ? undefined
+      : (options.humanCalibration as CrHumanCalibrationFile).minKappa;
+    judgeCalibration = scoreCrJudgeAgreement(reviews, samples, {
+      minKappa: options.minKappa ?? declaredMin ?? POLICY_MIN_CR_JUDGE_KAPPA,
+      ...(options.minOverlap !== undefined ? { minOverlap: options.minOverlap } : {}),
+    });
+  }
+
   const negativeCases = parsed.cases.filter(item => item.kind === 'negative').length;
   const positiveCases = parsed.cases.filter(item => item.kind === 'positive').length;
   const negativeCaught = caseResults.filter(item => item.kind === 'negative' && item.passed).length;
@@ -575,6 +903,9 @@ export function scoreCrEvalSuite(manifest: CrEvalManifest, results: CrReviewResu
   const totalDefects = parsed.cases.reduce((sum, item) => sum + (item.requiredDefects?.length ?? 0), 0);
   const matchedDefects = caseResults.reduce((sum, item) => sum + item.matchedDefects.length, 0);
   const passed = missingCases.length === 0 && negativeMissed === 0 && falsePositives === 0 && caseResults.every(item => item.passed);
+  const calibrationOk = judgeCalibration ? judgeCalibration.passed : true;
+  const generatedProposals = generateProposalsFromCrMisses(missClassifications);
+
   return {
     totalCases: parsed.cases.length,
     negativeCases, positiveCases, negativeCaught, negativeMissed, positivePassed, falsePositives,
@@ -583,8 +914,11 @@ export function scoreCrEvalSuite(manifest: CrEvalManifest, results: CrReviewResu
     defectRecall: ratio(matchedDefects, totalDefects),
     falsePositiveRate: ratio(falsePositives, positiveCases),
     passed,
-    promotionReady: passed && negativeCases > 0 && positiveCases > 0,
+    promotionReady: passed && calibrationOk && negativeCases > 0 && positiveCases > 0,
     caseResults,
+    ...(judgeCalibration ? { judgeCalibration } : {}),
+    missClassifications,
+    generatedProposals,
   };
 }
 

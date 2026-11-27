@@ -28,6 +28,7 @@ import {
   crReviewResultSchema,
   findRepoRoot,
   loadCrEvalManifest,
+  loadRoleHumanCalibration,
   scoreCrEvalSuite,
   verifyCrEvalCommits,
   type CrEvalScore,
@@ -353,10 +354,11 @@ async function evalCrGate(input: {
     };
   }
 
-  // Re-score the stored CR review results in-process against the live manifest — never trust a stored boolean!
+  // Re-score the stored CR review results in-process against the live manifest (and role human-calibration.json when present) — never trust a stored boolean!
   let rescored: CrEvalScore;
   try {
-    rescored = scoreCrEvalSuite(manifest, coerceCrEvalResults(saved.results));
+    const humanCalibration = await loadRoleHumanCalibration(input.roleDirectory, input.roleId);
+    rescored = scoreCrEvalSuite(manifest, coerceCrEvalResults(saved.results), humanCalibration ? { humanCalibration } : undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     reasons.push(`CR 黄金回放进程内重算打分失败：${message}`);
@@ -367,7 +369,10 @@ async function evalCrGate(input: {
   }
 
   if (!rescored.promotionReady) {
-    reasons.push(`CR 黄金回放未达到晋升门槛（负样本召回 ${rescored.negativeRecall}，缺陷召回 ${rescored.defectRecall}，误报 ${rescored.falsePositives}，缺样本 ${rescored.missingCases.length}）`);
+    const kappaNote = rescored.judgeCalibration && !rescored.judgeCalibration.passed
+      ? `，人工校准 κ=${rescored.judgeCalibration.kappa ?? 'null'} < ${rescored.judgeCalibration.minKappa}`
+      : '';
+    reasons.push(`CR 黄金回放未达到晋升门槛（负样本召回 ${rescored.negativeRecall}，缺陷召回 ${rescored.defectRecall}，误报 ${rescored.falsePositives}，缺样本 ${rescored.missingCases.length}${kappaNote}）`);
     return {
       summary: { present: true, evalDigest, roleDigest: input.roleDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
       reasons,

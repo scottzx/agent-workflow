@@ -28,6 +28,7 @@ Exit code is the scorer's exit code.`);
 let roleDir;
 let repo;
 let results;
+let humanCalibration;
 let workspace;
 let lint = false;
 let json = false;
@@ -39,6 +40,7 @@ for (let index = 0; index < args.length; index += 1) {
   if (taken.name === '--role-dir' || taken.name === '--role') roleDir = taken.value;
   else if (taken.name === '--repo') repo = taken.value;
   else if (taken.name === '--results') results = taken.value;
+  else if (taken.name === '--human-calibration') humanCalibration = taken.value;
   else if (taken.name === '--workspace') workspace = taken.value;
   else {
     console.error(`unknown argument ${arg}`);
@@ -54,6 +56,7 @@ if (!roleDir) {
 const forwarded = ['rsi', 'eval-cr', '--role', absolute(roleDir)];
 if (repo) forwarded.push('--repo', absolute(repo));
 if (results) forwarded.push('--results', absolute(results));
+if (humanCalibration) forwarded.push('--human-calibration', absolute(humanCalibration));
 if (workspace) forwarded.push('--workspace', absolute(workspace));
 if (lint) forwarded.push('--lint');
 if (json) forwarded.push('--json');
@@ -63,7 +66,7 @@ const distRsi = join(serviceDir, 'dist/bin/rsi.js');
 const distEval = join(serviceDir, 'dist/src/rsi/pr-cr-eval.js');
 const compiled = existsSync(distCli) && existsSync(distRsi) && existsSync(distEval)
   && readFileSync(distRsi, 'utf8').includes('eval-cr')
-  && readFileSync(distEval, 'utf8').includes('lintCrEvalManifest');
+  && readFileSync(distEval, 'utf8').includes('scoreCrJudgeAgreement');
 const nodeArgs = compiled
   ? [distCli, ...forwarded]
   : ['--import', 'tsx', join(serviceDir, 'bin/acp-service.ts'), ...forwarded];
