@@ -34,6 +34,7 @@ import {
   type CrReviewResult,
 } from './pr-cr-eval.js';
 import { computeRubricDigest, readRubricCalibration } from './rubric.js';
+import { readPairwiseRegression } from './pairwise.js';
 
 const execFileAsync = promisify(execFile);
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
@@ -99,6 +100,14 @@ export interface GateReport {
     rubricDigest?: string;
     blockedBy?: string[];
   };
+  /** A/B position-swapped dual-judge pairwise regression status when `rubric.json` is present. */
+  pairwiseRegression?: {
+    present: boolean;
+    status: 'passed' | 'failed' | 'stale' | 'missing' | 'not_required';
+    rubricDigest?: string;
+    winRate?: number;
+    minWinRate?: number;
+  };
 }
 
 export function crEvalReportPath(workspace: string, roleId: string): string {
@@ -152,6 +161,8 @@ export async function checkGate(options: {
   required?: number;
   /** Block until `acp-service rsi calibrate` has a clean report for this version, even with no older run to compare. */
   requireCalibration?: boolean;
+  /** Block until `acp-service rsi pairwise` has a passing A/B swapped dual-judge regression report bound to `rubricDigest`. */
+  requirePairwise?: boolean;
   /** Optional git repository root for `evals/manifest.json` commit ancestry checks (defaults to nearest `.git` above roleDirectory). */
   repoRoot?: string;
   /** The gateway, for the proposals' current state; without it every proposal in the ledger counts as open. */
@@ -248,6 +259,13 @@ export async function checkGate(options: {
   if (calibration.reason) reasons.push(calibration.reason);
   const rubricCal = await rubricCalibrationGate({ roleDirectory, workspace: options.workspace, roleId });
   if (rubricCal.reason) reasons.push(rubricCal.reason);
+  const pairwiseReg = await pairwiseRegressionGate({
+    roleDirectory,
+    workspace: options.workspace,
+    roleId,
+    requirePairwise: options.requirePairwise === true,
+  });
+  if (pairwiseReg.reason) reasons.push(pairwiseReg.reason);
   return {
     roleId,
     role,
@@ -261,6 +279,7 @@ export async function checkGate(options: {
     calibration: calibration.report,
     ...(crEvalResult.summary.present ? { crEval: crEvalResult.summary } : {}),
     ...(rubricCal.report ? { rubricCalibration: rubricCal.report } : {}),
+    ...(pairwiseReg.report ? { pairwiseRegression: pairwiseReg.report } : {}),
   };
 }
 
@@ -421,6 +440,58 @@ async function rubricCalibrationGate(input: {
     };
   }
   return { report: { present: true, status: 'passed', rubricDigest, blockedBy: [] } };
+}
+
+async function pairwiseRegressionGate(input: {
+  roleDirectory: string;
+  workspace: string;
+  roleId: string;
+  requirePairwise: boolean;
+}): Promise<{ report?: GateReport['pairwiseRegression']; reason?: string }> {
+  const hasRubric = await stat(path.join(input.roleDirectory, 'rubric.json')).then(s => s.isFile(), () => false);
+  if (!hasRubric) return {};
+  let rubricDigest: string;
+  try {
+    rubricDigest = await computeRubricDigest(input.roleDirectory);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return {
+      report: { present: true, status: 'failed' },
+      reason: `无法计算 rubric 摘要以核验 Pairwise 回归（${msg}）`,
+    };
+  }
+  const loaded = await readPairwiseRegression(input.workspace, input.roleId);
+  if (loaded.state === 'missing') {
+    if (input.requirePairwise) {
+      return {
+        report: { present: true, status: 'missing', rubricDigest },
+        reason: '缺少绑定当前 rubricDigest 的 Pairwise A/B 换位双评回归报告，请运行 acp-service rsi pairwise',
+      };
+    }
+    return { report: { present: true, status: 'not_required', rubricDigest } };
+  }
+  if (loaded.state === 'invalid') {
+    return {
+      report: { present: true, status: 'failed', rubricDigest },
+      reason: `Pairwise 回归报告损坏或格式无效（${loaded.error}），请重新运行 acp-service rsi pairwise`,
+    };
+  }
+  const saved = loaded.report;
+  if (saved.rubricDigest !== rubricDigest) {
+    return {
+      report: { present: true, status: 'stale', rubricDigest, winRate: saved.winRate, minWinRate: saved.config.minWinRate },
+      reason: 'Pairwise 回归报告已过期（rubric.json 或 checks 摘要已变更），请重新运行 acp-service rsi pairwise',
+    };
+  }
+  if (!saved.passed || !saved.promotionReady) {
+    return {
+      report: { present: true, status: 'failed', rubricDigest, winRate: saved.winRate, minWinRate: saved.config.minWinRate },
+      reason: `Pairwise A/B 换位双评回归未通过（winRate=${saved.winRate} < ${saved.config.minWinRate} 或存在未完成样本：${saved.failureReasons.join('；')}）`,
+    };
+  }
+  return {
+    report: { present: true, status: 'passed', rubricDigest, winRate: saved.winRate, minWinRate: saved.config.minWinRate },
+  };
 }
 
 /**

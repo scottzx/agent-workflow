@@ -39,10 +39,12 @@ const rubricCriterionSchema = z.object({
   polarity: z.enum(['positive', 'negative']).optional(),
   weight: z.number().optional(),
   severity: z.enum(['must', 'should']).optional(),
+  replaces: z.array(z.string().min(1)).optional(),
   scale: z.object({
     type: z.enum(['binary', 'ordinal']),
     min: z.number().optional(),
     max: z.number().optional(),
+    levels: z.array(z.object({ value: z.number() }).passthrough()).optional(),
   }).passthrough(),
   gate: z.object({
     mode: z.enum(['observe', 'advise', 'block']).optional(),
@@ -59,6 +61,15 @@ const rubricFileSchema = z.object({
     mustAllPass: z.array(z.string()).optional(),
     mustNotTrigger: z.array(z.string()).optional(),
     passScore: z.number().optional(),
+  }).passthrough().optional(),
+  pairwise: z.object({
+    enabled: z.boolean().optional(),
+    purpose: z.string().optional(),
+    swapPositions: z.boolean().optional(),
+    tieOnDisagreement: z.boolean().optional(),
+    judges: z.array(z.string().min(1)).optional(),
+    minWinRate: z.number().min(0).max(1).optional(),
+    abstainOn: z.array(z.string().min(1)).optional(),
   }).passthrough().optional(),
   calibration: z.object({
     bands: z.object({
@@ -655,9 +666,167 @@ export async function readRubricCalibration(workspace: string, roleId: string): 
   } catch (error) {
     const summary = error instanceof z.ZodError
       ? error.issues.map(issue => `${issue.path.join('.') || '(root)'}: ${issue.message}`).slice(0, 3).join('; ')
-      : (error instanceof Error ? error.message.split(/\r?\n/, 1)[0] ?? 'invalid report' : String(error));
+      : (error instanceof Error ? error.message.split(/\r?\n/, 1)[0] || 'invalid report' : String(error));
     return { state: 'invalid', error: summary };
   }
+}
+
+export const rubricEvaluationItemSchema = z.object({
+  id: z.string().min(1),
+  met: z.boolean().optional(),
+  score: z.number().finite().optional(),
+  cannotAssess: z.boolean().optional(),
+  evidence: z.string().optional(),
+}).passthrough();
+export type RubricEvaluationItem = z.infer<typeof rubricEvaluationItemSchema>;
+
+export interface RubricEvaluationSummary {
+  roleId: string;
+  positiveWeightSum: number;
+  earnedPositiveWeight: number;
+  negativeDeduction: number;
+  rawNormalizedScore: number;
+  normalizedScore: number;
+  passScore: number;
+  mustAllPassFailed: string[];
+  mustNotTriggerFired: string[];
+  passed: boolean;
+  /** Derived integer 1..5 scores per legacy dimension, compatible with `qualityReviewSchema`. */
+  legacyScores: Record<string, number>;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Derive a backward-compatible integer 1..5 score for `qualityReviewSchema` from a normalized
+ * rubric score in [0, 1]: `Math.round(clamp(1 + 4 * normalizedScore, 1, 5))`.
+ * Boundary values: 0 -> 1, 0.5 -> 3, 1 -> 5.
+ */
+export function normalizedScoreToLegacyScore(normalizedScore: number): number {
+  if (!Number.isFinite(normalizedScore)) {
+    throw new Error(`normalizedScore must be finite, got ${String(normalizedScore)}`);
+  }
+  return Math.round(clamp(1 + 4 * clamp(normalizedScore, 0, 1), 1, 5));
+}
+
+function criterionMaxLevel(criterion: RubricDefinition['criteria'][number]): number {
+  if (criterion.scale.type === 'binary') return 1;
+  if (typeof criterion.scale.max === 'number' && criterion.scale.max > 0) return criterion.scale.max;
+  const levels = criterion.scale.levels ?? [];
+  const maxVal = levels.reduce((acc, lvl) => Math.max(acc, lvl.value), 0);
+  return maxVal > 0 ? maxVal : 1;
+}
+
+function criterionNormalizedRatio(criterion: RubricDefinition['criteria'][number], item: RubricEvaluationItem | undefined): number {
+  if (!item || item.cannotAssess) return 0;
+  if (criterion.scale.type === 'binary') {
+    if (typeof item.met === 'boolean') return item.met ? 1 : 0;
+    if (typeof item.score === 'number') return item.score > 0 ? 1 : 0;
+    return 0;
+  }
+  const maxLevel = criterionMaxLevel(criterion);
+  if (typeof item.score === 'number') return clamp(item.score / maxLevel, 0, 1);
+  if (typeof item.met === 'boolean') return item.met ? 1 : 0;
+  return 0;
+}
+
+/**
+ * Score a Rubric-driven QA review under `normalized_positive_sum` and derive backward-compatible
+ * integer 1..5 `legacyScores` per replaced dimension (or `overall` fallback).
+ */
+export function scoreRubricEvaluation(
+  rubric: RubricDefinition,
+  items: readonly RubricEvaluationItem[],
+): RubricEvaluationSummary {
+  const byId = new Map<string, RubricEvaluationItem>();
+  for (const raw of items) {
+    const parsed = rubricEvaluationItemSchema.parse(raw);
+    if (byId.has(parsed.id)) throw new Error(`Duplicate rubric evaluation item: ${parsed.id}`);
+    byId.set(parsed.id, parsed);
+  }
+
+  let positiveWeightSum = 0;
+  let earnedPositiveWeight = 0;
+  let negativeDeduction = 0;
+
+  const mustAllPass = new Set(rubric.aggregation?.mustAllPass ?? []);
+  const mustNotTrigger = new Set(rubric.aggregation?.mustNotTrigger ?? []);
+  const mustAllPassFailed: string[] = [];
+  const mustNotTriggerFired: string[] = [];
+
+  const dimAccum = new Map<string, { posWeight: number; earned: number; negDeduct: number }>();
+  const addToDim = (dim: string, posWeight: number, earned: number, negDeduct: number) => {
+    const prev = dimAccum.get(dim) ?? { posWeight: 0, earned: 0, negDeduct: 0 };
+    prev.posWeight += posWeight;
+    prev.earned += earned;
+    prev.negDeduct += negDeduct;
+    dimAccum.set(dim, prev);
+  };
+
+  for (const criterion of rubric.criteria) {
+    const weight = criterion.weight ?? 1;
+    const isNegative = criterion.polarity === 'negative' || weight < 0;
+    const absWeight = Math.abs(weight);
+    const item = byId.get(criterion.id);
+    const ratio = criterionNormalizedRatio(criterion, item);
+    const dims = criterion.replaces?.length ? criterion.replaces : [];
+
+    if (isNegative) {
+      const triggered = ratio > 0;
+      const deduct = triggered ? absWeight : 0;
+      negativeDeduction += deduct;
+      if (mustNotTrigger.has(criterion.id) && triggered) {
+        mustNotTriggerFired.push(criterion.id);
+      }
+      for (const dim of dims) addToDim(dim, 0, 0, deduct);
+    } else {
+      positiveWeightSum += absWeight;
+      const earned = absWeight * ratio;
+      earnedPositiveWeight += earned;
+      if (mustAllPass.has(criterion.id) && ratio < 1) {
+        mustAllPassFailed.push(criterion.id);
+      }
+      for (const dim of dims) addToDim(dim, absWeight, earned, 0);
+    }
+  }
+
+  const rawNormalizedScore = positiveWeightSum > 0
+    ? (earnedPositiveWeight - negativeDeduction) / positiveWeightSum
+    : 0;
+  const normalizedScore = clamp(rawNormalizedScore, 0, 1);
+  const passScore = rubric.aggregation?.passScore ?? 0.8;
+
+  const legacyScores: Record<string, number> = {};
+  if (dimAccum.size > 0) {
+    for (const [dim, acc] of dimAccum.entries()) {
+      const dimNorm = acc.posWeight > 0
+        ? clamp((acc.earned - acc.negDeduct) / acc.posWeight, 0, 1)
+        : (acc.negDeduct > 0 ? 0 : 1);
+      legacyScores[dim] = normalizedScoreToLegacyScore(dimNorm);
+    }
+  } else {
+    legacyScores.overall = normalizedScoreToLegacyScore(normalizedScore);
+  }
+
+  const passed = normalizedScore >= passScore
+    && mustAllPassFailed.length === 0
+    && mustNotTriggerFired.length === 0;
+
+  return {
+    roleId: rubric.roleId,
+    positiveWeightSum,
+    earnedPositiveWeight: Math.round(earnedPositiveWeight * 1000) / 1000,
+    negativeDeduction: Math.round(negativeDeduction * 1000) / 1000,
+    rawNormalizedScore: Math.round(rawNormalizedScore * 1000) / 1000,
+    normalizedScore: Math.round(normalizedScore * 1000) / 1000,
+    passScore,
+    mustAllPassFailed,
+    mustNotTriggerFired,
+    passed,
+    legacyScores,
+  };
 }
 
 export async function loadRubricCalibration(workspace: string, roleId: string): Promise<RubricCalibrationReport | undefined> {
