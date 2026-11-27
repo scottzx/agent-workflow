@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import test from 'node:test';
-import { execFileSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { activateStage, fileInventory, inventoryHash, rollbackActivation, sha256, sourceFiles, stageRelease, verifyDependencies, verifyInstalledPackage, verifyRelease, verifyStage, versionSatisfies } from './local-deployment.mjs';
+import { fileURLToPath } from 'node:url';
+import { activateStage, fileInventory, inventoryHash, parseCliArgs, resolveReleaseTarball, rollbackActivation, sha256, sourceFiles, stageRelease, syncDesktopProfile, verifyDependencies, verifyInstalledPackage, verifyLiveCssSync, verifyRelease, verifyStage, versionSatisfies } from './local-deployment.mjs';
 const sourceManifest = JSON.parse(readFileSync(new URL('../packages/service/package.json', import.meta.url), 'utf8'));
 const save = (path, value) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, value); };
 const saveJSON = (path, value) => save(path, JSON.stringify(value));
@@ -121,4 +125,204 @@ test('copy rollback refuses a modified installation without removing the active 
   assert.throws(()=>rollbackActivation(receiptPath),/contents changed/);
   assert.equal(readFileSync(join(target,'dist/src/a2a/index.js'),'utf8'),'changed after activation');
   assert.equal(readFileSync(join(activation.previous,'old.txt'),'utf8'),'old installation');
+});
+
+function buildTarballFixture(root, version, { packedVersion = version, marker = `version-${version}`, bundleNestedNodeModules = false } = {}) {
+  const pkgRoot = join(root, `packed-${version}-${packedVersion}-${Math.random().toString(16).slice(2, 8)}`);
+  const packageDirectory = join(pkgRoot, 'package');
+  const manifest = { ...sourceManifest, version: packedVersion, dependencies: { sample: '^1.2.3' } };
+  const targets = [
+    ...Object.values(manifest.exports).flatMap(value => typeof value === 'string' ? [value] : Object.values(value)),
+    ...Object.values(manifest.bin),
+    'vendor/runtime/package.json',
+    'vendor/dsh/service-worker.js',
+    'vendor/dsh-a2a/index.js',
+  ];
+  for (const target of targets) save(join(packageDirectory, target), `${marker}\n`);
+  saveJSON(join(packageDirectory, 'package.json'), manifest);
+  save(join(packageDirectory, manifest.dsh.bundle.patch), `- name: '${manifest.name}'\n- name: '${manifest.name}/dsh-a2a'\n`);
+  save(join(packageDirectory, manifest.exports['./client']), `load({id:"${manifest.name}"});\n`);
+  if (bundleNestedNodeModules) save(join(packageDirectory, 'node_modules/unexpected/index.js'), 'bad\n');
+  const tgzPath = join(root, 'release', `1agents-acp-service-${version}.tgz`);
+  mkdirSync(dirname(tgzPath), { recursive: true });
+  execFileSync('tar', ['-czf', tgzPath, '-C', pkgRoot, 'package']);
+  return tgzPath;
+}
+
+function desktopRepoFixture(t, version = '1.2.3') {
+  const root = mkdtempSync(join(tmpdir(), '1acp-desktop-profile-test-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  saveJSON(join(root, 'packages/service/package.json'), { ...sourceManifest, version });
+  return { root, version, profileDir: join(root, 'desktop-profile') };
+}
+
+test('resolveReleaseTarball picks exact packages/service/package.json version and ignores older tarballs', t => {
+  const { root, version } = desktopRepoFixture(t, '1.1.1');
+  // Older tarball sorts lexicographically before 1.1.1; exact lookup must ignore it.
+  buildTarballFixture(root, '0.10.5', { marker: 'stale-0.10.5' });
+  assert.throws(() => resolveReleaseTarball(root), /Missing exact release tarball.*1\.1\.1/);
+
+  const exactPath = buildTarballFixture(root, version, { marker: 'fresh-1.1.1' });
+  const resolved = resolveReleaseTarball(root);
+  assert.equal(resolved.version, '1.1.1');
+  assert.equal(resolved.filename, '1agents-acp-service-1.1.1.tgz');
+  assert.equal(resolved.archivePath, exactPath);
+  assert.equal(resolved.sha256, sha256(readFileSync(exactPath)));
+});
+
+test('syncDesktopProfile atomically updates tarball & package dir while preserving nested node_modules', t => {
+  const { root, version, profileDir } = desktopRepoFixture(t, '1.1.1');
+  buildTarballFixture(root, '0.10.5', { marker: 'stale-0.10.5' });
+  const exactTgz = buildTarballFixture(root, version, { marker: 'fresh-1.1.1' });
+
+  const existingPkg = join(profileDir, 'node_modules/@1agents/acp-service');
+  const existingTarball = join(profileDir, 'local/packages/1agents-acp-service-1.1.1.tgz');
+  save(existingTarball, 'old-tgz-bytes');
+  save(join(existingPkg, 'package.json'), JSON.stringify({ name: '@1agents/acp-service', version: '1.0.0' }));
+  save(join(existingPkg, 'dist/src/a2a/index.js'), 'old-build\n');
+  save(join(existingPkg, 'node_modules/preserved-dep/index.js'), 'nested-dep-ok\n');
+  save(join(profileDir, 'settings.json'), '{"keep":true}\n');
+
+  const receipt = syncDesktopProfile({ root, desktopProfileDir: profileDir });
+  assert.equal(receipt.version, '1.1.1');
+  assert.equal(receipt.preservedNestedNodeModules, true);
+  assert.equal(sha256(readFileSync(existingTarball)), sha256(readFileSync(exactTgz)));
+  assert.equal(JSON.parse(readFileSync(join(existingPkg, 'package.json'), 'utf8')).version, '1.1.1');
+  assert.equal(readFileSync(join(existingPkg, 'dist/src/a2a/index.js'), 'utf8'), 'fresh-1.1.1\n');
+  assert.equal(readFileSync(join(existingPkg, 'node_modules/preserved-dep/index.js'), 'utf8'), 'nested-dep-ok\n');
+  assert.equal(readFileSync(join(profileDir, 'settings.json'), 'utf8'), '{"keep":true}\n');
+
+  // Verify no stray staging or backup artifacts remain.
+  assert.deepEqual(readdirSync(join(profileDir, 'local/packages')), ['1agents-acp-service-1.1.1.tgz']);
+  assert.deepEqual(readdirSync(join(profileDir, 'node_modules/@1agents')), ['acp-service']);
+});
+
+test('syncDesktopProfile fails closed and rolls back on missing tarball, version mismatch, corrupt archive, or mid-swap failure', t => {
+  const { root, version, profileDir } = desktopRepoFixture(t, '1.1.1');
+  const existingPkg = join(profileDir, 'node_modules/@1agents/acp-service');
+  const existingTarball = join(profileDir, 'local/packages/1agents-acp-service-1.1.1.tgz');
+  const seedExisting = () => {
+    rmSync(profileDir, { recursive: true, force: true });
+    save(existingTarball, 'original-tgz-bytes');
+    save(join(existingPkg, 'package.json'), JSON.stringify({ name: '@1agents/acp-service', version: '1.0.0' }));
+    save(join(existingPkg, 'dist/src/a2a/index.js'), 'original-code\n');
+    save(join(existingPkg, 'node_modules/preserved-dep/index.js'), 'original-nested\n');
+  };
+  const assertUntouched = () => {
+    assert.equal(readFileSync(existingTarball, 'utf8'), 'original-tgz-bytes');
+    assert.equal(JSON.parse(readFileSync(join(existingPkg, 'package.json'), 'utf8')).version, '1.0.0');
+    assert.equal(readFileSync(join(existingPkg, 'dist/src/a2a/index.js'), 'utf8'), 'original-code\n');
+    assert.equal(readFileSync(join(existingPkg, 'node_modules/preserved-dep/index.js'), 'utf8'), 'original-nested\n');
+    assert.deepEqual(readdirSync(join(profileDir, 'local/packages')), ['1agents-acp-service-1.1.1.tgz']);
+    assert.deepEqual(readdirSync(join(profileDir, 'node_modules/@1agents')), ['acp-service']);
+  };
+
+  // 1) Missing exact tarball
+  seedExisting();
+  assert.throws(() => syncDesktopProfile({ root, desktopProfileDir: profileDir }), /Missing exact release tarball/);
+  assertUntouched();
+
+  // 2) Tarball filename matches 1.1.1 but internal package.json version is 0.9.0
+  seedExisting();
+  buildTarballFixture(root, version, { packedVersion: '0.9.0', marker: 'wrong-version' });
+  assert.throws(() => syncDesktopProfile({ root, desktopProfileDir: profileDir }), /does not match expected 1\.1\.1/);
+  assertUntouched();
+
+  // 3) Corrupt tarball bytes
+  seedExisting();
+  save(join(root, 'release', `1agents-acp-service-${version}.tgz`), 'not-a-valid-gzip-tarball');
+  assert.throws(() => syncDesktopProfile({ root, desktopProfileDir: profileDir }));
+  assertUntouched();
+
+  // 4) Valid tarball, simulated mid-swap crash after tarball swap and nested node_modules move
+  seedExisting();
+  buildTarballFixture(root, version, { marker: 'valid-new' });
+  assert.throws(
+    () => syncDesktopProfile({
+      root,
+      desktopProfileDir: profileDir,
+      hooks: { beforePackageSwap: () => { throw new Error('simulated swap crash'); } },
+    }),
+    /simulated swap crash/,
+  );
+  assertUntouched();
+});
+
+test('verifyLiveCssSync verifies byte-for-byte equality and reports mismatches or HTTP errors', async t => {
+  let gatewayCss = 'body { height: 100dvh; }\n';
+  let desktopCss = 'body { height: 100dvh; }\n';
+  let desktopStatus = 200;
+
+  const listen = handler => new Promise(resolve => {
+    const server = http.createServer(handler);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      resolve({ server, url: `http://127.0.0.1:${addr.port}` });
+    });
+  });
+
+  const gw = await listen((req, res) => {
+    if (req.url === '/workbench/ui/app.css') { res.writeHead(200, { 'Content-Type': 'text/css' }); res.end(gatewayCss); }
+    else { res.writeHead(404); res.end('not found'); }
+  });
+  const dt = await listen((req, res) => {
+    if (req.url === '/workbench/ui/app.css') { res.writeHead(desktopStatus, { 'Content-Type': 'text/css' }); res.end(desktopCss); }
+    else { res.writeHead(404); res.end('not found'); }
+  });
+  t.after(() => { gw.server.close(); dt.server.close(); });
+
+  const ok = await verifyLiveCssSync({ gatewayUrl: gw.url, desktopUrl: dt.url });
+  assert.equal(ok.matched, true);
+  assert.equal(ok.byteLength, Buffer.byteLength(gatewayCss));
+  assert.equal(ok.gateway.sha256, ok.desktop.sha256);
+
+  desktopCss = 'body { height: auto; }\n';
+  await assert.rejects(() => verifyLiveCssSync({ gatewayUrl: gw.url, desktopUrl: dt.url }), /Live CSS byte mismatch/);
+
+  desktopStatus = 503;
+  await assert.rejects(() => verifyLiveCssSync({ gatewayUrl: gw.url, desktopUrl: dt.url }), /Unexpected HTTP status.*503/);
+});
+
+test('parseCliArgs supports boolean --desktop-profile / --skip-live-check alongside key-value flags', () => {
+  const parsed = parseCliArgs([
+    'deploy', '--env', 'test', '--root', '.', '--desktop-profile',
+    '--desktop-profile-dir', '/tmp/desktop', '--gateway-url', 'http://127.0.0.1:36814',
+    '--desktop-url', 'http://127.0.0.1:3466', '--skip-live-check',
+  ]);
+  assert.equal(parsed.command, 'deploy');
+  assert.deepEqual(parsed.options, {
+    env: 'test',
+    root: '.',
+    desktopProfile: true,
+    desktopProfileDir: '/tmp/desktop',
+    gatewayUrl: 'http://127.0.0.1:36814',
+    desktopUrl: 'http://127.0.0.1:3466',
+    skipLiveCheck: true,
+  });
+});
+
+test('CLI sync-desktop updates desktop profile and passes live CSS verification end-to-end', async t => {
+  const { root, version, profileDir } = desktopRepoFixture(t, '1.1.1');
+  buildTarballFixture(root, version, { marker: 'cli-e2e-1.1.1' });
+  const css = '.acp-workbench { height: 100dvh; }\n';
+  const listen = () => new Promise(resolve => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/workbench/ui/app.css') { res.writeHead(200); res.end(css); }
+      else { res.writeHead(404); res.end(); }
+    });
+    server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
+  });
+  const gw = await listen();
+  const dt = await listen();
+  t.after(() => { gw.server.close(); dt.server.close(); });
+
+  const scriptPath = fileURLToPath(new URL('./local-deployment.mjs', import.meta.url));
+  const { stdout } = await execFileAsync(process.execPath, [
+    scriptPath, 'sync-desktop', '--root', root, '--desktop-profile-dir', profileDir,
+    '--gateway-url', gw.url, '--desktop-url', dt.url,
+  ], { encoding: 'utf8' });
+  const output = JSON.parse(stdout);
+  assert.equal(output.desktopProfile.version, '1.1.1');
+  assert.equal(output.liveCssCheck.matched, true);
+  assert.equal(output.liveCssCheck.byteLength, Buffer.byteLength(css));
 });

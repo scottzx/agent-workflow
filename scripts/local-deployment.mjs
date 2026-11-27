@@ -1,4 +1,4 @@
-/** Local, immutable deployment receipts. Never publishes, restarts hosts or edits profile/config/state. */
+/** Local, immutable deployment receipts. Never publishes or restarts hosts; only touches desktop profile when explicitly requested via --desktop-profile / sync-desktop. */
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -298,9 +298,201 @@ export function deployEnvironment({ env, root, base = join(homedir(), '.local/sh
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 }
 
-function main() {
-  const [command, ...args] = process.argv.slice(2), options = {};
-  for (let i = 0; i < args.length; i += 2) { assert.ok(args[i].startsWith('--') && args[i + 1], 'Expected --key value'); options[args[i].slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = args[i + 1]; }
+export const DEFAULT_DESKTOP_PROFILE_DIR = join(homedir(), '.dsh/profiles/desktop');
+export const DEFAULT_GATEWAY_URL = 'http://127.0.0.1:36814';
+export const DEFAULT_DESKTOP_URL = 'http://127.0.0.1:3466';
+export const DEFAULT_LIVE_CSS_PATH = '/workbench/ui/app.css';
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const BOOLEAN_FLAGS = new Set(['desktopProfile', 'skipLiveCheck']);
+
+/** Locate the exact release tarball matching packages/service/package.json version. Never wildcard-scan release/. */
+export function resolveReleaseTarball(root) {
+  root = resolve(root);
+  const manifestPath = join(root, 'packages/service/package.json');
+  assert.ok(existsSync(manifestPath), `Missing service package manifest: ${manifestPath}`);
+  const sourceManifest = json(manifestPath);
+  assert.equal(sourceManifest.name, ownPackage, `Unexpected service package name: ${sourceManifest.name}`);
+  assert.ok(typeof sourceManifest.version === 'string' && SEMVER_RE.test(sourceManifest.version), `Invalid service package version: ${String(sourceManifest.version)}`);
+  const filename = `${sourceManifest.name.replace('@', '').replace('/', '-')}-${sourceManifest.version}.tgz`;
+  assert.equal(basename(filename), filename, `Unsafe tarball filename: ${filename}`);
+  const archivePath = join(root, 'release', filename);
+  assert.ok(existsSync(archivePath), `Missing exact release tarball for ${sourceManifest.name}@${sourceManifest.version}: ${archivePath}`);
+  const stat = lstatSync(archivePath);
+  assert.ok(stat.isFile() && !stat.isSymbolicLink(), `Release tarball must be a regular file: ${archivePath}`);
+  return { name: sourceManifest.name, version: sourceManifest.version, filename, archivePath, sha256: sha256(readFileSync(archivePath)) };
+}
+
+/**
+ * Atomically sync the exact-version release tarball and extracted package into a DSH Desktop profile,
+ * preserving any existing nested node_modules inside node_modules/@1agents/acp-service/node_modules.
+ * Fails closed and rolls back both local/packages/<tgz> and node_modules/@1agents/acp-service on any error.
+ */
+export function syncDesktopProfile({ root, desktopProfileDir = DEFAULT_DESKTOP_PROFILE_DIR, hooks = {} }) {
+  const releaseTarball = resolveReleaseTarball(root);
+  desktopProfileDir = resolve(desktopProfileDir);
+  const packagesDir = join(desktopProfileDir, 'local', 'packages');
+  const scopeDir = join(desktopProfileDir, 'node_modules', '@1agents');
+  mkdirSync(packagesDir, { recursive: true });
+  mkdirSync(scopeDir, { recursive: true });
+
+  const txId = randomUUID();
+  const stagedTarball = join(packagesDir, `.${releaseTarball.filename}.tmp-${txId}`);
+  const stageExtractDir = join(scopeDir, `.acp-service-stage-${txId}`);
+  const targetTarball = join(packagesDir, releaseTarball.filename);
+  const backupTarball = join(packagesDir, `.${releaseTarball.filename}.bak-${txId}`);
+  const targetPackageDir = join(scopeDir, 'acp-service');
+  const backupPackageDir = join(scopeDir, `.acp-service-bak-${txId}`);
+
+  // Phase 1: non-destructive staging and strict manifest/version/inventory validation.
+  let stagedPackageDir;
+  try {
+    cpSync(releaseTarball.archivePath, stagedTarball, { dereference: false });
+    assert.equal(sha256(readFileSync(stagedTarball)), releaseTarball.sha256, 'Staged release tarball checksum mismatch');
+    tarExtract(stagedTarball, stageExtractDir);
+    stagedPackageDir = join(stageExtractDir, 'package');
+    assert.ok(existsSync(stagedPackageDir) && lstatSync(stagedPackageDir).isDirectory() && !lstatSync(stagedPackageDir).isSymbolicLink(), 'Release tarball is missing package/ directory');
+    assert.ok(!existsSync(join(stagedPackageDir, 'node_modules')), 'Release tarball must not bundle nested node_modules');
+    const manifestPath = join(stagedPackageDir, 'package.json');
+    assert.ok(existsSync(manifestPath) && lstatSync(manifestPath).isFile() && !lstatSync(manifestPath).isSymbolicLink(), 'Release tarball is missing regular package/package.json');
+    fileInventory(stagedPackageDir); // Reject external symlinks or unsupported filesystem entries.
+    const packedManifest = verifyInstalledPackage(stagedPackageDir);
+    assert.equal(packedManifest.version, releaseTarball.version, `Tarball package.json version ${packedManifest.version} does not match expected ${releaseTarball.version}`);
+    hooks.afterStage?.({ stagedTarball, stagedPackageDir, releaseTarball });
+  } catch (error) {
+    rmSync(stagedTarball, { force: true });
+    rmSync(stageExtractDir, { recursive: true, force: true });
+    throw error;
+  }
+
+  // Phase 2: atomic swap with reverse-order rollback on any error.
+  const hasEntry = path => {
+    try { lstatSync(path); return true; } catch { return false; }
+  };
+  let tarballBackedUp = false, tarballSwapped = false;
+  let packageBackedUp = false, nestedModulesMoved = false, packageSwapped = false;
+  try {
+    if (hasEntry(targetTarball)) { renameSync(targetTarball, backupTarball); tarballBackedUp = true; }
+    renameSync(stagedTarball, targetTarball);
+    tarballSwapped = true;
+
+    if (hasEntry(targetPackageDir)) { renameSync(targetPackageDir, backupPackageDir); packageBackedUp = true; }
+    const backupNestedModules = join(backupPackageDir, 'node_modules');
+    const stagedNestedModules = join(stagedPackageDir, 'node_modules');
+    if (packageBackedUp && hasEntry(backupNestedModules)) {
+      renameSync(backupNestedModules, stagedNestedModules);
+      nestedModulesMoved = true;
+    }
+    hooks.beforePackageSwap?.({ targetTarball, stagedPackageDir, targetPackageDir, backupPackageDir });
+    renameSync(stagedPackageDir, targetPackageDir);
+    packageSwapped = true;
+  } catch (error) {
+    const safe = fn => { try { fn(); } catch { /* best-effort rollback step */ } };
+    const stagedNestedModules = join(stagedPackageDir, 'node_modules');
+    const backupNestedModules = join(backupPackageDir, 'node_modules');
+    if (packageSwapped) {
+      if (nestedModulesMoved && hasEntry(join(targetPackageDir, 'node_modules')) && packageBackedUp) {
+        safe(() => renameSync(join(targetPackageDir, 'node_modules'), backupNestedModules));
+        nestedModulesMoved = false;
+      }
+      safe(() => rmSync(targetPackageDir, { recursive: true, force: true }));
+    }
+    if (nestedModulesMoved && hasEntry(stagedNestedModules) && packageBackedUp) {
+      safe(() => renameSync(stagedNestedModules, backupNestedModules));
+    }
+    if (packageBackedUp && hasEntry(backupPackageDir)) {
+      safe(() => rmSync(targetPackageDir, { recursive: true, force: true }));
+      safe(() => renameSync(backupPackageDir, targetPackageDir));
+    }
+    if (tarballSwapped) safe(() => rmSync(targetTarball, { force: true }));
+    if (tarballBackedUp && hasEntry(backupTarball)) safe(() => renameSync(backupTarball, targetTarball));
+    safe(() => rmSync(stagedTarball, { force: true }));
+    safe(() => rmSync(stageExtractDir, { recursive: true, force: true }));
+    throw error;
+  }
+
+  // Phase 3: cleanup backup and staging directories after both swaps succeeded.
+  rmSync(stageExtractDir, { recursive: true, force: true });
+  if (packageBackedUp) rmSync(backupPackageDir, { recursive: true, force: true });
+  if (tarballBackedUp) rmSync(backupTarball, { force: true });
+
+  return {
+    name: releaseTarball.name,
+    version: releaseTarball.version,
+    filename: releaseTarball.filename,
+    archiveSha256: releaseTarball.sha256,
+    desktopProfileDir,
+    tarballPath: targetTarball,
+    packageDirectory: targetPackageDir,
+    preservedNestedNodeModules: nestedModulesMoved,
+  };
+}
+
+/** Verify byte-for-byte equality of /workbench/ui/app.css between a2a-gateway (36814) and DSH Desktop (3466). */
+export async function verifyLiveCssSync({
+  gatewayUrl = DEFAULT_GATEWAY_URL,
+  desktopUrl = DEFAULT_DESKTOP_URL,
+  cssPath = DEFAULT_LIVE_CSS_PATH,
+  timeoutMs = 5000,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  assert.equal(typeof fetchImpl, 'function', 'fetch implementation is required');
+  const fetchAsset = async (label, baseUrl) => {
+    const url = new URL(cssPath, baseUrl).href;
+    let response;
+    try {
+      response = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      throw new Error(`Failed to fetch ${label} CSS at ${url}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (response.status !== 200) throw new Error(`Unexpected HTTP status from ${label} CSS at ${url}: ${response.status}`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    assert.ok(bytes.length > 0, `Empty CSS response from ${label} at ${url}`);
+    return { url, status: response.status, bytes, byteLength: bytes.length, sha256: sha256(bytes) };
+  };
+
+  const [gatewayResult, desktopResult] = await Promise.allSettled([
+    fetchAsset('gateway', gatewayUrl),
+    fetchAsset('desktop', desktopUrl),
+  ]);
+  const failures = [gatewayResult, desktopResult].filter(item => item.status === 'rejected').map(item => item.reason instanceof Error ? item.reason.message : String(item.reason));
+  if (failures.length) throw new Error(`Live CSS sync verification failed: ${failures.join('; ')}`);
+
+  const gateway = gatewayResult.value, desktop = desktopResult.value;
+  if (Buffer.compare(gateway.bytes, desktop.bytes) !== 0) {
+    throw new Error(
+      `Live CSS byte mismatch for ${cssPath}: gateway (${gateway.url}) ${gateway.byteLength} bytes sha256=${gateway.sha256} !== desktop (${desktop.url}) ${desktop.byteLength} bytes sha256=${desktop.sha256}`,
+    );
+  }
+  return {
+    cssPath,
+    matched: true,
+    byteLength: gateway.byteLength,
+    sha256: gateway.sha256,
+    gateway: { url: gateway.url, status: gateway.status, byteLength: gateway.byteLength, sha256: gateway.sha256 },
+    desktop: { url: desktop.url, status: desktop.status, byteLength: desktop.byteLength, sha256: desktop.sha256 },
+  };
+}
+
+export function parseCliArgs(argv) {
+  const [command, ...args] = argv, options = {};
+  for (let i = 0; i < args.length; ) {
+    const token = args[i];
+    assert.ok(token.startsWith('--') && token.length > 2, `Expected --flag, got ${token}`);
+    const key = token.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    if (BOOLEAN_FLAGS.has(key)) {
+      options[key] = true;
+      i += 1;
+    } else {
+      assert.ok(i + 1 < args.length && !args[i + 1].startsWith('--'), `Expected --${token.slice(2)} value`);
+      options[key] = args[i + 1];
+      i += 2;
+    }
+  }
+  return { command, options };
+}
+
+async function main() {
+  const { command, options } = parseCliArgs(process.argv.slice(2));
   const required = names => { for (const name of names) assert.ok(options[name], `Missing --${name.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`); };
   let result;
   if (command === 'capture') { required(['root', 'output', 'dependencyRoot']); result = captureRelease(options); }
@@ -308,10 +500,36 @@ function main() {
   else if (command === 'verify') { required(['target']); result = verifyStage(options.target); }
   else if (command === 'verify-release') { required(['release']); result = { releaseId: verifyRelease(options.release).releaseId, verified: true }; }
   else if (command === 'activate') { required(['stage', 'target', 'receiptPath']); result = activateStage(options); }
-  else if (command === 'deploy') { required(['env', 'root']); result = deployEnvironment(options); }
+  else if (command === 'deploy') {
+    required(['env', 'root']);
+    result = deployEnvironment(options);
+    if (options.desktopProfile) {
+      const desktopProfile = syncDesktopProfile({ root: options.root, ...(options.desktopProfileDir ? { desktopProfileDir: options.desktopProfileDir } : {}) });
+      const liveCssCheck = options.skipLiveCheck
+        ? { skipped: true }
+        : await verifyLiveCssSync({ ...(options.gatewayUrl ? { gatewayUrl: options.gatewayUrl } : {}), ...(options.desktopUrl ? { desktopUrl: options.desktopUrl } : {}) });
+      result = { ...result, desktopProfile, liveCssCheck };
+    }
+  }
+  else if (command === 'sync-desktop') {
+    required(['root']);
+    const desktopProfile = syncDesktopProfile({ root: options.root, ...(options.desktopProfileDir ? { desktopProfileDir: options.desktopProfileDir } : {}) });
+    const liveCssCheck = options.skipLiveCheck
+      ? { skipped: true }
+      : await verifyLiveCssSync({ ...(options.gatewayUrl ? { gatewayUrl: options.gatewayUrl } : {}), ...(options.desktopUrl ? { desktopUrl: options.desktopUrl } : {}) });
+    result = { desktopProfile, liveCssCheck };
+  }
+  else if (command === 'verify-live-css') {
+    result = await verifyLiveCssSync({ ...(options.gatewayUrl ? { gatewayUrl: options.gatewayUrl } : {}), ...(options.desktopUrl ? { desktopUrl: options.desktopUrl } : {}) });
+  }
   else if (command === 'rollback') { required(['receiptPath']); result = rollbackActivation(options.receiptPath); }
-  else throw new Error('Use capture, stage, verify, verify-release, activate, deploy or rollback');
+  else throw new Error('Use capture, stage, verify, verify-release, activate, deploy, sync-desktop, verify-live-css or rollback');
   // Inventories can be large; the saved manifest is authoritative.
   console.log(JSON.stringify(command === 'capture' ? { releaseId: result.releaseId, output: resolve(options.output), packageSha256: result.package.sha256, sourceInventorySha256: result.source.inventorySha256, dirty: result.source.dirty } : result, null, 2));
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch(error => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
