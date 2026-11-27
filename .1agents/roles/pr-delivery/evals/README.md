@@ -1,8 +1,10 @@
 # pr-delivery L3 黄金 CR 基准
 
-用本仓已经合并的 PR #11–#14 衡量一次 CR 提示词或模型路由改动的召回和误报。负样本是异模型 CR 当时拦住的提交，正样本是修复后签字通过的下一提交。打分读的是审查报告，不重新实现缺陷检测。
+用本仓已经合并的 PR #11–#23（共 23 个提交对，13 负 / 10 正 ≈ 3:2，覆盖 PR #18 租约泄漏与严格类型、PR #19 失败分类/信任边界、PR #20 CI 路径过滤、PR #22 日志/配置降级、PR #23 空列表塌缩）衡量一次 CR 提示词或模型路由改动的召回和误报。负样本是异模型 CR 当时拦住的提交，正样本是修复后签字通过的下一提交。打分读的是审查报告，不重新实现缺陷检测。
 
-`manifest.json` 的 `schemaVersion` 固定为 1，`roleId` 必须等于同目录 `profile.json` 的 `id`。提交写 7–40 位十六进制 SHA。`baseCommit` 必须是 `headCommit` 的祖先。
+> **考卷权限说明**：`evals/` 属于受保护考卷资产，新增样本或更新 `snapshotDigest` 须由人审核合入，总管与执行者不得静默篡改既有考卷。
+
+`manifest.json` 的 `schemaVersion` 固定为 1，`roleId` 必须等于同目录 `profile.json` 的 `id`，且须携带 `snapshotDigest`（对 `schemaVersion/roleId/cases` 规范化 JSON 的 SHA-256 冻结摘要；`loadCrEvalManifest` 发现摘要不匹配时 fail-closed 拒绝）。提交写 7–40 位十六进制 SHA，`baseCommit` 必须是 `headCommit` 的祖先。
 
 ## 样本
 
@@ -43,9 +45,13 @@ packages/service/node_modules/.bin/tsx packages/service/bin/acp-service.ts rsi e
   --role .1agents/roles/pr-delivery --repo . --json
 
 node .1agents/roles/pr-delivery/checks/run-l3-eval.mjs \
+  --role-dir .1agents/roles/pr-delivery --repo . --lint --json
+
+node .1agents/roles/pr-delivery/checks/run-l3-eval.mjs \
   --role-dir .1agents/roles/pr-delivery --repo . --json
 ```
 
-带 `--results` 时读取 JSON 数组，或 `{ "results": [...] }`。每项可以是结构化结果 `{ caseId, verdict, must }`，也可以是 `{ caseId, markdown }`。未通过时退出码为 1。
+- `--lint` 校验样本量下限（`>=20`）、类平衡（负样本占比 `0.45..0.75`）、提交对与缺陷去重、缺陷判别力（拒绝空泛模式并核验真实 `git diff` 命中）以及 `snapshotDigest` 冻结完整性；不可与 `--results` 混用。
+- 带 `--results` 时读取 JSON 数组或 `{ "results": [...] }`（每项可以是结构化结果或 `{ caseId, markdown }`），默认将评估报告落盘到 `<repoRoot>/.1agents/runtime/rsi/<roleId>/eval-cr.json`（可用 `--workspace <dir>` 覆盖，测试务必传入临时目录）。未通过时退出码为 1。
 
 `evalDigest` 是 `evals/manifest.json`、`QA.md`、`checklist.json` 以及存在的 `routing.json` 按路径排序后的 SHA-256。评估报告要带上它，避免拿旧清单的分数去放行新提示词。
