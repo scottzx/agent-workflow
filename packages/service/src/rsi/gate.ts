@@ -33,8 +33,14 @@ import {
   type CrEvalScore,
   type CrReviewResult,
 } from './pr-cr-eval.js';
-import { computeRubricDigest, readRubricCalibration } from './rubric.js';
-import { readPairwiseRegression } from './pairwise.js';
+import { computeRubricDigest, loadRubric, readRubricCalibration } from './rubric.js';
+import {
+  digestPairwiseVotes,
+  evaluatePairwiseRegression,
+  POLICY_MIN_PAIRWISE_JUDGES,
+  POLICY_MIN_PAIRWISE_WIN_RATE,
+  readPairwiseRegression,
+} from './pairwise.js';
 
 const execFileAsync = promisify(execFile);
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
@@ -483,14 +489,46 @@ async function pairwiseRegressionGate(input: {
       reason: 'Pairwise 回归报告已过期（rubric.json 或 checks 摘要已变更），请重新运行 acp-service rsi pairwise',
     };
   }
-  if (!saved.passed || !saved.promotionReady) {
+  // Never trust a self-attested boolean: enforce policy floors + invariant checks AND re-evaluate votes in-process.
+  if (
+    !saved.config.swapPositions
+    || !saved.config.tieOnDisagreement
+    || saved.config.minJudges < POLICY_MIN_PAIRWISE_JUDGES
+    || saved.config.minWinRate < POLICY_MIN_PAIRWISE_WIN_RATE
+    || !saved.votes?.length
+    || !saved.votesDigest
+    || saved.votesDigest !== digestPairwiseVotes(saved.votes)
+  ) {
     return {
       report: { present: true, status: 'failed', rubricDigest, winRate: saved.winRate, minWinRate: saved.config.minWinRate },
-      reason: `Pairwise A/B 换位双评回归未通过（winRate=${saved.winRate} < ${saved.config.minWinRate} 或存在未完成样本：${saved.failureReasons.join('；')}）`,
+      reason: 'Pairwise 回归报告策略不变量或投票摘要校验失败（不采信手写 passed 布尔值），请重新运行 acp-service rsi pairwise',
+    };
+  }
+  let reevaluated;
+  try {
+    const rubric = await loadRubric(input.roleDirectory);
+    reevaluated = evaluatePairwiseRegression({
+      rubric,
+      rubricDigest,
+      votes: saved.votes,
+      ...(saved.candidateVersion ? { candidateVersion: saved.candidateVersion } : {}),
+      ...(saved.baselineVersion ? { baselineVersion: saved.baselineVersion } : {}),
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return {
+      report: { present: true, status: 'failed', rubricDigest },
+      reason: `Pairwise 回归进程内重算失败（${msg}），请重新运行 acp-service rsi pairwise`,
+    };
+  }
+  if (!reevaluated.passed || !reevaluated.promotionReady || reevaluated.winRate < POLICY_MIN_PAIRWISE_WIN_RATE) {
+    return {
+      report: { present: true, status: 'failed', rubricDigest, winRate: reevaluated.winRate, minWinRate: reevaluated.config.minWinRate },
+      reason: `Pairwise A/B 换位双评回归未通过（winRate=${reevaluated.winRate} < ${reevaluated.config.minWinRate} 或存在未完成样本：${reevaluated.failureReasons.join('；')}）`,
     };
   }
   return {
-    report: { present: true, status: 'passed', rubricDigest, winRate: saved.winRate, minWinRate: saved.config.minWinRate },
+    report: { present: true, status: 'passed', rubricDigest, winRate: reevaluated.winRate, minWinRate: reevaluated.config.minWinRate },
   };
 }
 

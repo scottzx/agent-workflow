@@ -10,6 +10,7 @@
  *   cannot inflate the win rate.
  * - Criteria listed in `rubric.pairwise.abstainOn` (e.g. `R7`) are excluded from win/loss counts.
  */
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
@@ -82,6 +83,9 @@ export const pairwiseRegressionReportSchema = z.object({
   promotionReady: z.boolean(),
   failureReasons: z.array(z.string()),
   cases: z.array(pairwiseCaseOutcomeSchema),
+  /** Optional stored vote list + SHA-256 digest so `gate.ts` can verify integrity and re-evaluate in-process. */
+  votesDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  votes: z.array(pairwiseVoteSchema).optional(),
 }).strict();
 
 export type PairwiseJudgeOutcome = z.infer<typeof judgeCaseOutcomeSchema>;
@@ -110,20 +114,29 @@ export function translateDisplayWinner(order: 'AB' | 'BA', winner: PairwiseVote[
   return winner === 'A' ? 'baseline' : 'candidate';
 }
 
+export function digestPairwiseVotes(votes: readonly PairwiseVote[]): string {
+  return createHash('sha256').update(JSON.stringify(votes)).digest('hex');
+}
+
 export async function loadPairwiseVotes(filePath: string): Promise<PairwiseVote[]> {
   const text = await readFile(path.resolve(filePath), 'utf8');
   const trimmed = text.replace(/^\uFEFF/, '').trim();
   if (!trimmed) return [];
   if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    let parsed: unknown;
+    let jsonOk = false;
     try {
-      const parsed = JSON.parse(trimmed) as unknown;
+      parsed = JSON.parse(trimmed);
+      jsonOk = true;
+    } catch {
+      // Multi-line JSONL starts with `{` on line 1; fall through to line-by-line JSONL parser.
+    }
+    if (jsonOk) {
       if (Array.isArray(parsed)) return parsed.map(item => pairwiseVoteSchema.parse(item));
       if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { votes?: unknown }).votes)) {
         return (parsed as { votes: unknown[] }).votes.map(item => pairwiseVoteSchema.parse(item));
       }
-      // Single JSONL line falls through to line-by-line parser below.
-    } catch {
-      // Multi-line JSONL begins with `{` on line 1; parse line-by-line below.
+      return [pairwiseVoteSchema.parse(parsed)];
     }
   }
   const votes: PairwiseVote[] = [];
@@ -185,20 +198,27 @@ export function evaluatePairwiseRegression(options: {
     activeVotes.push(vote);
   }
 
-  // Group active votes by caseId -> judgeId -> order (aggregating multiple criteria if present).
-  const byCase = new Map<string, Map<string, { AB: LogicalWinner[]; BA: LogicalWinner[] }>>();
+  // Group active votes by caseId -> judgeId -> criterionKey ('' for holistic) -> { AB, BA }.
+  // Requiring AB and BA per criterionKey prevents cross-criterion splice (e.g. AB on R1 + BA on R2) from passing as swapped!
+  const byCase = new Map<string, Map<string, Map<string, { AB?: LogicalWinner; BA?: LogicalWinner }>>>();
   for (const vote of activeVotes) {
     let judgeMap = byCase.get(vote.caseId);
     if (!judgeMap) {
       judgeMap = new Map();
       byCase.set(vote.caseId, judgeMap);
     }
-    let pair = judgeMap.get(vote.judgeId);
-    if (!pair) {
-      pair = { AB: [], BA: [] };
-      judgeMap.set(vote.judgeId, pair);
+    let critMap = judgeMap.get(vote.judgeId);
+    if (!critMap) {
+      critMap = new Map();
+      judgeMap.set(vote.judgeId, critMap);
     }
-    pair[vote.order].push(translateDisplayWinner(vote.order, vote.winner));
+    const critKey = vote.criterionId ?? '';
+    let pair = critMap.get(critKey);
+    if (!pair) {
+      pair = {};
+      critMap.set(critKey, pair);
+    }
+    pair[vote.order] = translateDisplayWinner(vote.order, vote.winner);
   }
 
   const collapseDirection = (votes: LogicalWinner[]): LogicalWinner | null => {
@@ -226,33 +246,49 @@ export function evaluatePairwiseRegression(options: {
     let hasIncompleteJudge = false;
 
     for (const judgeId of [...judgeMap.keys()].sort()) {
-      const pair = judgeMap.get(judgeId)!;
-      const abWinner = collapseDirection(pair.AB);
-      const baWinner = collapseDirection(pair.BA);
-      if (abWinner === null || baWinner === null) {
+      const critMap = judgeMap.get(judgeId)!;
+      const abAll: LogicalWinner[] = [];
+      const baAll: LogicalWinner[] = [];
+      const critOutcomes: LogicalWinner[] = [];
+      let judgeIncomplete = false;
+      let judgeFlipped = false;
+
+      for (const [, pair] of [...critMap.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        if (pair.AB !== undefined) abAll.push(pair.AB);
+        if (pair.BA !== undefined) baAll.push(pair.BA);
+        if (pair.AB === undefined || pair.BA === undefined) {
+          judgeIncomplete = true;
+          continue;
+        }
+        if (pair.AB === 'abstain' && pair.BA === 'abstain') {
+          critOutcomes.push('abstain');
+          continue;
+        }
+        if (pair.AB !== pair.BA) {
+          judgeFlipped = true;
+          critOutcomes.push('tie');
+          continue;
+        }
+        critOutcomes.push(pair.AB);
+      }
+
+      const abWinner = collapseDirection(abAll);
+      const baWinner = collapseDirection(baAll);
+
+      if (judgeIncomplete) {
         hasIncompleteJudge = true;
         judges.push({
           judgeId,
           abWinner,
           baWinner,
-          positionInconsistent: false,
+          positionInconsistent: judgeFlipped,
           incomplete: true,
           outcome: 'incomplete',
         });
         continue;
       }
-      if (abWinner === 'abstain' && baWinner === 'abstain') {
-        judges.push({
-          judgeId,
-          abWinner,
-          baWinner,
-          positionInconsistent: false,
-          incomplete: false,
-          outcome: 'abstain',
-        });
-        continue;
-      }
-      if (abWinner !== baWinner) {
+
+      if (judgeFlipped) {
         casePositionFlips += 1;
         judges.push({
           judgeId,
@@ -264,13 +300,15 @@ export function evaluatePairwiseRegression(options: {
         });
         continue;
       }
+
+      const finalJudgeOutcome = collapseDirection(critOutcomes) ?? 'abstain';
       judges.push({
         judgeId,
         abWinner,
         baWinner,
         positionInconsistent: false,
         incomplete: false,
-        outcome: abWinner,
+        outcome: finalJudgeOutcome,
       });
     }
 
@@ -394,6 +432,8 @@ export function evaluatePairwiseRegression(options: {
     promotionReady: passed,
     failureReasons,
     cases,
+    votesDigest: digestPairwiseVotes(normalizedVotes),
+    votes: normalizedVotes,
   };
 }
 

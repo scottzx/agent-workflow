@@ -119,7 +119,13 @@ test('normalizedScoreToLegacyScore maps 0 / 0.5 / 1 boundaries and derived score
     { id: 'V9', met: true }, { id: 'V10', met: true }, { id: 'V11', met: false }, { id: 'V12', met: false },
   ]);
   assert.equal(pptEval.passed, true);
-  assert.equal(pptEval.legacyScores.overall, 5);
+  assert.deepEqual(pptEval.legacyScores, { program: 5, visual: 5, narrative: 5 });
+  assert.doesNotThrow(() => qualityReviewSchema.parse({
+    verdict: 'pass',
+    summary: 'ppt rubric passed',
+    scores: pptEval.legacyScores,
+    issues: [],
+  }));
 });
 
 function makeConsistentCase(caseId: string, winner: 'candidate' | 'baseline' | 'tie', judges = ['anthropic:claude', 'openai:gpt']): PairwiseVote[] {
@@ -182,7 +188,7 @@ test('evaluatePairwiseRegression enforces AB/BA swap, dual-judge tie on disagree
   assert.equal(biasedReport.ties, 2);
   assert.equal(biasedReport.winRate, 0.4);
 
-  // Single judge or missing BA direction fails closed via incompleteCases.
+  // Single judge, missing BA direction, or cross-criterion splice (AB on R1 + BA on R2 without matching pairs) all fail closed.
   const incompleteReport = evaluatePairwiseRegression({
     rubric,
     rubricDigest: digest,
@@ -190,10 +196,14 @@ test('evaluatePairwiseRegression enforces AB/BA swap, dual-judge tie on disagree
       ...makeConsistentCase('c-one-judge', 'candidate', ['anthropic:claude']),
       { caseId: 'c-missing-ba', judgeId: 'anthropic:claude', order: 'AB', winner: 'A' },
       { caseId: 'c-missing-ba', judgeId: 'openai:gpt', order: 'AB', winner: 'A' },
+      { caseId: 'c-cross-crit-splice', judgeId: 'anthropic:claude', order: 'AB', winner: 'A', criterionId: 'R1' },
+      { caseId: 'c-cross-crit-splice', judgeId: 'anthropic:claude', order: 'BA', winner: 'B', criterionId: 'R2' },
+      { caseId: 'c-cross-crit-splice', judgeId: 'openai:gpt', order: 'AB', winner: 'A', criterionId: 'R1' },
+      { caseId: 'c-cross-crit-splice', judgeId: 'openai:gpt', order: 'BA', winner: 'B', criterionId: 'R2' },
     ],
   });
   assert.equal(incompleteReport.passed, false);
-  assert.deepEqual(incompleteReport.incompleteCases.sort(), ['c-missing-ba', 'c-one-judge']);
+  assert.deepEqual(incompleteReport.incompleteCases.sort(), ['c-cross-crit-splice', 'c-missing-ba', 'c-one-judge']);
 
   // Duplicate vote throws; rubric trying to lower minWinRate below 0.6 throws.
   assert.throws(() => evaluatePairwiseRegression({
@@ -248,6 +258,26 @@ test('pairwise CLI, report persistence, and checkGate rubricDigest binding', asy
   const gateOk = await checkGate({ roleDirectory: roleCopy, workspace, requirePairwise: true });
   assert.equal(gateOk.pairwiseRegression?.status, 'passed');
   assert.equal(gateOk.pairwiseRegression?.winRate, 0.8);
+
+  // M2: tampering pairwise-regression.json invariants or self-attesting passed=true on losing votes MUST fail in checkGate.
+  const savedPath = pairwiseRegressionPath(workspace, 'product-intro-outline');
+  const savedOriginal = JSON.parse(await readFile(savedPath, 'utf8')) as Record<string, unknown>;
+  const tamperedInvariants = {
+    ...savedOriginal,
+    config: { swapPositions: false, tieOnDisagreement: false, minWinRate: 0.1, minJudges: 1, abstainOn: [] },
+    candidateWins: 1,
+    baselineWins: 9,
+    winRate: 0.1,
+    passed: true,
+    promotionReady: true,
+    failureReasons: [],
+  };
+  await writeFile(savedPath, JSON.stringify(tamperedInvariants, null, 2));
+  const gateTampered = await checkGate({ roleDirectory: roleCopy, workspace, requirePairwise: true });
+  assert.equal(gateTampered.pairwiseRegression?.status, 'failed');
+  assert.ok(gateTampered.reasons.some(r => r.includes('策略不变量或投票摘要校验失败')));
+  // Restore clean report before staleness test.
+  await writeFile(savedPath, JSON.stringify(savedOriginal, null, 2));
 
   // Modifying rubric.json invalidates pairwise-regression.json in checkGate.
   const rubricPath = join(roleCopy, 'rubric.json');

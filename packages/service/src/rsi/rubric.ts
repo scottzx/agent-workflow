@@ -39,6 +39,7 @@ const rubricCriterionSchema = z.object({
   polarity: z.enum(['positive', 'negative']).optional(),
   weight: z.number().optional(),
   severity: z.enum(['must', 'should']).optional(),
+  layer: z.string().min(1).optional(),
   replaces: z.array(z.string().min(1)).optional(),
   scale: z.object({
     type: z.enum(['binary', 'ordinal']),
@@ -765,13 +766,30 @@ export function scoreRubricEvaluation(
     dimAccum.set(dim, prev);
   };
 
+  const criterionById = new Map(rubric.criteria.map(c => [c.id, c]));
+  for (const id of mustAllPass) {
+    const c = criterionById.get(id);
+    if (!c) throw new Error(`aggregation.mustAllPass references unknown criterion "${id}"`);
+    if (c.polarity === 'negative' || (c.weight ?? 1) < 0) {
+      throw new Error(`aggregation.mustAllPass cannot contain negative criterion "${id}" (use mustNotTrigger)`);
+    }
+  }
+  for (const id of mustNotTrigger) {
+    const c = criterionById.get(id);
+    if (!c) throw new Error(`aggregation.mustNotTrigger references unknown criterion "${id}"`);
+    if (!(c.polarity === 'negative' || (c.weight ?? 1) < 0)) {
+      throw new Error(`aggregation.mustNotTrigger cannot contain positive criterion "${id}" (use mustAllPass)`);
+    }
+  }
+
+  const usesReplaces = rubric.criteria.some(c => Boolean(c.replaces?.length));
   for (const criterion of rubric.criteria) {
     const weight = criterion.weight ?? 1;
     const isNegative = criterion.polarity === 'negative' || weight < 0;
     const absWeight = Math.abs(weight);
     const item = byId.get(criterion.id);
     const ratio = criterionNormalizedRatio(criterion, item);
-    const dims = criterion.replaces?.length ? criterion.replaces : [];
+    const dims = usesReplaces ? (criterion.replaces ?? []) : (criterion.layer ? [criterion.layer] : []);
 
     if (isNegative) {
       const triggered = ratio > 0;

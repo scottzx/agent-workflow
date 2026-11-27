@@ -34,7 +34,7 @@
 
 - **Rubric 归一化分**：采用 `normalized_positive_sum`（正权重总和 `+25`），`passScore >= 0.80`。
 - **硬门槛**：`mustAllPass: ["V1", "V2", "V3"]` 全部通过，且 `mustNotTrigger: ["V11"]` 未触发，且无未关闭的 `severity: "must"` 问题。
-- **旧 `scores`（`int 1..5`）兼容派生**：按层（`程序几何`、`视觉层级`、`图表风格`、`叙事结构`）的归一化得分严格通过 `Math.round(clamp(1 + 4 * normalizedScore, 1, 5))` 派生整数 `1..5`，确保输出 JSON 100% 兼容 `qualityReviewSchema`。
+- **旧 `scores`（`int 1..5`）兼容派生**：直接按 `rubric.json` 各条目的 `layer` 字段（`program` 对应 `V1`–`V4`、`visual` 对应 `V5`–`V8` 及负向 `V11`–`V12`、`narrative` 对应 `V9`–`V10`）计算每层归一化得分，严格通过 `Math.round(clamp(1 + 4 * normalizedScore, 1, 5))` 派生整数 `1..5`（与 `scoreRubricEvaluation` 一致），确保输出 JSON 100% 兼容 `qualityReviewSchema`。`V7` 标注 `cannotAssess` 时按未得分（`0`）计入 `visual` 层与总分并由人工复核。
 - **版本晋升防通胀**：角色 `trial → formal` 晋升时，除双上限校准（`calibrate --rubric`）外，还须通过 `acp-service rsi pairwise` A/B 换位双评（双评委不一致判平、`V5`/`V6`/`V8` 按配置弃权或双评、严格胜率 `winRate >= 0.6`）。
 
 ## 输出契约
@@ -45,7 +45,7 @@
 {
   "verdict": "revise",
   "summary": "一两句话总评（给出 normalizedScore、阶段 1–3 结果与阻断项）",
-  "scores": { "程序几何": 5, "视觉层级": 3, "图表风格": 4, "叙事结构": 3 },
+  "scores": { "program": 5, "visual": 4, "narrative": 3 },
   "rubric": {
     "roleId": "ppt-beautifier",
     "normalizedScore": 0.76,
