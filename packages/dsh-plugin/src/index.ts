@@ -69,8 +69,13 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   let review: ReviewHandBack | undefined;
   let a2aHost: A2AHostRef | undefined;
   let closeA2A: (() => Promise<void>) | undefined;
-  let nativeSessions: NativeSessions | undefined;
-  let adapter: AcpAdapter | undefined;
+  /**
+   * Disposers captured from the objects the start creates. They are handles, not
+   * the objects themselves: a closure over the object would widen it to
+   * `| undefined` and make every use inside a callback a compile error.
+   */
+  let disposeNativeSessions: (() => Promise<void>) | undefined;
+  let disposeAdapter: (() => Promise<void>) | undefined;
   let torndown = false;
   /**
    * The one release chain for a failed start and for a normal unload. Every step is
@@ -88,8 +93,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     if (a2aHost) a2aHost.current = undefined;
     if (review) review.host = undefined;
     try { await closeA2A?.(); } catch (error) { errors.push(error); }
-    try { await nativeSessions?.dispose(); } catch (error) { errors.push(error); }
-    try { await adapter?.dispose(); } catch (error) { errors.push(error); }
+    try { await disposeNativeSessions?.(); } catch (error) { errors.push(error); }
+    try { await disposeAdapter?.(); } catch (error) { errors.push(error); }
     try { await diagnosticOwner.close(); } catch (error) { errors.push(error); }
     try { await releaseService(); } catch (error) { errors.push(error); }
     return errors;
@@ -99,7 +104,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     const a2aEnabled = Boolean(input.a2a && input.a2a.enabled !== false);
     const workbench = a2aEnabled ? await resolveA2AWorkbench(input.a2a?.workbench, input.a2a?.workbenchConfigFile) : undefined;
     const processRequests = workbench ? createWorkbenchProcessClient(workbench) : undefined;
-    adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
+    const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
+    disposeAdapter = async () => { await adapter.dispose(); };
     const track = (dispose: unknown) => { if (typeof dispose === 'function') stops.push(dispose as Stop); };
     track(ctx.llm.registerAdapter(['1agents-acp'], adapter));
     // Archiving a Session in DSH stops its work but never reaches the service daemon, where the
@@ -118,7 +124,8 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       stops.push(() => clearInterval(timer));
     }
     if (processRequests) track(registerNativeApprovals(ctx, processRequests));
-    nativeSessions = new NativeSessions(ctx, adapter, config);
+    const nativeSessions = new NativeSessions(ctx, adapter, config);
+    disposeNativeSessions = async () => { await nativeSessions.dispose(); };
     ctx.provide('oneagentsAcpSessions', nativeSessions);
     const sessionDeliverHandler = createSessionDeliverHandler(ctx);
     track(ctx.webServer.register({ kind: 'prefix', path: '/api/1agents-acp', handler: async (req, res) => {
@@ -179,8 +186,10 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
         name: SUBMIT_TOOL, description: SUBMIT_DESCRIPTION,
         parameters: { summary: { type: 'string', required: true, description: SUMMARY_DESCRIPTION } },
         output: { schema: { type: 'object', additionalProperties: false, properties: { message: { type: 'string', required: true } } },
-          render: (_args, value) => [{ type: 'text', text: value.message }] },
-        async execute(args, exec) {
+          // defineTool comes from the lazily loaded host module, so it carries no
+          // contextual type for these callbacks. Spell the parameters out.
+          render: (_args: unknown, value: { message: string }) => [{ type: 'text', text: value.message }] },
+        async execute(args: { summary: string }, exec: { agent?: { id: string } }) {
           if (!exec.agent) throw new Error(`${SUBMIT_TOOL} requires an owning agent session`);
           return { message: await review!.submit(exec.agent.id, args.summary) };
         },
