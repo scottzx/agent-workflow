@@ -5,8 +5,8 @@ import { isAbsolute, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId } from '@deepseek-ai/dsh-llm';
-import { LlmError } from '@deepseek-ai/dsh-llm';
+import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId, LlmError } from '@deepseek-ai/dsh-llm';
+import { loadDshLlm } from './host-runtime.js';
 import type { DiagnosticLog } from './diagnostics.js';
 import type {} from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-user-questions';
@@ -108,9 +108,18 @@ function emitAdapterTiming(stage: string, fields: Record<string, string | number
   console.log(`[acp-timing] ${stage} ${parts.join(' ')}`);
 }
 
+let LlmErrorCtor: new (...args: any[]) => LlmError;
+/** One host class for every `instanceof LlmError` check. Loaded before generate/delete entry points. */
+export async function ensureLlmError(): Promise<void> {
+  if (!LlmErrorCtor) LlmErrorCtor = (await loadDshLlm()).LlmError as new (...args: any[]) => LlmError;
+}
+function isLlmError(error: unknown): error is LlmError {
+  return !!LlmErrorCtor && error instanceof LlmErrorCtor;
+}
 /** The official host receives its normal error; complete facts live in the plugin domain. */
 function publicFailure(safe: ReturnType<typeof toSafeError>, _requestId: string): LlmError {
-  const error = Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED'), safe);
+  if (!LlmErrorCtor) throw new Error('LlmError is not loaded');
+  const error = Object.assign(new LlmErrorCtor(safe.message, safe.code ?? 'ACP_TURN_FAILED'), safe);
   ownedFailures.set(error, safe); return error;
 }
 
@@ -313,6 +322,7 @@ export class AcpAdapter implements LlmAdapter {
     return { optionsApplied, modeApplied: true };
   }
   private async connection(agent: Agent, capacityId?: string, callerSignal?: AbortSignal): Promise<Link> {
+    await ensureLlmError();
     const operation = (this.connections.get(agent.id) ?? Promise.resolve())
       .catch(() => undefined).then(() => this.openConnection(agent, capacityId, callerSignal));
     this.connections.set(agent.id, operation);
@@ -468,7 +478,7 @@ export class AcpAdapter implements LlmAdapter {
       } catch (error) {
         if (binding && isDeletedAcpSession(error)) {
           link.close();
-          const deleted = new LlmError('Session was deleted', 'SESSION_DELETED');
+          const deleted = new LlmErrorCtor('Session was deleted', 'SESSION_DELETED');
           // The stream catch replaces unowned errors with ACP_TURN_FAILED. Keep this code.
           ownedFailures.set(deleted, toSafeError(deleted, { origin: 'acp', outcomeUnknown: false }));
           throw deleted;
@@ -553,6 +563,7 @@ export class AcpAdapter implements LlmAdapter {
    * The DSH session and its history stay. A detached session gets a bare link, so no agent process starts.
    */
   async deleteSession(sessionId: string): Promise<{ processReleased: true | 'pending'; acp: boolean }> {
+    await ensureLlmError();
     const agent = this.ctx.agents.get(sessionId as never);
     if (!agent) {
       const error = new Error('Session not found') as Error & { code: string };
@@ -593,6 +604,7 @@ export class AcpAdapter implements LlmAdapter {
     return { attached: this.links.has(agent.id), activeTurn: this.controllers.has(agent.id) };
   }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    await ensureLlmError();
     const agent = options.sessionId ? this.ctx.agents.get(options.sessionId) : undefined;
     if (!agent || options.purpose) throw new Error('ACP requires a foreground DSH session; auxiliary model calls are unsupported');
     if (this.controllers.has(agent.id)) throw new Error('ACP session already has a running request');
@@ -849,7 +861,7 @@ export class AcpAdapter implements LlmAdapter {
           queue.push({ type: 'finish', reason: result.stopReason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } });
           return;
         } catch (error) {
-          if (error instanceof LlmError) throw error;
+          if (isLlmError(error)) throw error;
           if (isCancellationRejection(error, signal)) { endBlock(); throw cancelled(requestSent); }
           // An idle-reaped session can detach right before session/prompt arrives.
           // requireSession rejects with -32001 before touching the agent, so re-attach once via session/load.

@@ -13,7 +13,18 @@ pnpm dsh plugin --profile web add @1agents/acp-service
 
 已有旧 bundle 时先停止 DSH，移除旧 bundle，再安装统一包；保留自定义配置和绑定文件。使用 profile 的 `cordis.patch.yml` 配置插件，不修改 DSH 源码或默认 profile。
 
-默认 `serviceMode: auto`：插件复用健康的本地 ACP 服务，未运行时在 `127.0.0.1:36812` 启动内嵌服务。卸载/停止插件时，只关闭自己拥有的服务；远端 URL 或 `serviceMode: external` 不管理服务进程。
+默认 `serviceMode: auto`：插件复用健康的本地 ACP 服务，未运行时在 `127.0.0.1:36812` 启动内嵌服务。卸载/停止插件时，只关闭自己拥有的服务；远端 URL 或 `serviceMode: external` 不管理服务进程。`serviceMode: launchd` 只唤醒本机服务管理器，热重载和退出都不会杀掉那个常驻进程。
+
+## 本地插件零重启热更新（DSH HMR）
+
+`@1agents/acp-service` 的包根是静态 ESM：`vendor/dsh/package-entry.js` 再导出服务 API，并用静态 `import` 连接 `vendor/dsh/index.js`。DSH 已启用的 `@deepseek-ai/dsh-hmr` 沿这条静态图热替换插件模块，不必重启 Desktop。`@deepseek-ai/*` 宿主包只在 `apply()` 里按需加载，所以普通 Node 直接 `import('@1agents/acp-service')` 不会去找它们。
+
+本地改插件后任选一种让 Host 重新加载：
+
+- 开发时用 `link:` 把本仓库的包指到 profile 的 `node_modules/@1agents/acp-service`。保存后 HMR 替换静态图里变化的文件。
+- 或在 DSH Plugin Manager 里对当前 profile 执行 `reconcileProfile()`，让 Host 按已安装的包重新挂上 `oneagents-acp`。`cordis.patch.yml` 仍是 `id: oneagents-acp`、`name: '@1agents/acp-service'`，已有 profile 和浏览器 `dsh.client` 发现不用改。
+
+浏览器侧 UI 由 `@deepseek-ai/dsh-client-hmr` 跟着重载，不用刷新整页。独立 `launchd` 守护的 `acp-service` 不在这条图里：改的是常驻进程本身时，用 `launchctl kickstart -k gui/$UID/com.1agents.acp-service`（或该 profile 配置的 label）重启它，不要指望插件 HMR 杀掉或替换那个进程。
 
 ## 选择执行 Agent
 

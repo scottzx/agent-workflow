@@ -9,6 +9,18 @@ import { startA2AService } from '../src/server.js';
 
 async function fixture(t, mode = 'ok') {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-only-'));
+  // The A2A server admits work through the machine-global ACP capacity state.
+  // A test must not inherit the developer's live capacity leases: admission
+  // would then hit its own five-second deadline and report a generic failure
+  // instead of the validation this suite asserts.
+  const capacity = await mkdtemp(join(tmpdir(), 'dsh-capacity-'));
+  const previousCapacity = process.env.ACP_CAPACITY_DIRECTORY;
+  process.env.ACP_CAPACITY_DIRECTORY = capacity;
+  t.after(() => {
+    if (previousCapacity === undefined) delete process.env.ACP_CAPACITY_DIRECTORY;
+    else process.env.ACP_CAPACITY_DIRECTORY = previousCapacity;
+  });
+  t.after(() => rm(capacity, { recursive: true, force: true }));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const script = join(dir, 'runtime.mjs');
   await writeFile(script, `let text='';for await(const c of process.stdin)text+=c;const a=process.argv.slice(2);if(!a.includes('--json')||!a.includes('--approval-policy')||a.at(-1)!=='-')process.exit(2);const id=a.includes('--session-id')?a[a.indexOf('--session-id')+1]:'session-real';console.log(JSON.stringify({type:'session',sessionId:id}));${mode === 'missing' ? '' : "console.log(JSON.stringify({type:'final',sessionId:id,text,reason:{kind:'completed'}}));"}`);
@@ -86,45 +98,50 @@ test('standalone A2A rejects oneagents-acp-* preset and provider/model with clea
     port: 0, host: '127.0.0.1', publicUrl: 'http://127.0.0.1:3080', token: 'test',
     stateDirectory: join(f.dir, 'state-reject'), runtime: f.runtime,
   });
-  t.after(() => service.close());
-  const origin = `http://127.0.0.1:${service.server.address().port}`;
-  const rpc = async (method, params) => {
-    const res = await fetch(`${origin}/a2a`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer test', 'A2A-Version': '1.0', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: '1', method, params }),
+  // Close before the fixture removes the state directory: a task still in
+  // flight would otherwise write into a directory that no longer exists.
+  try {
+    const origin = `http://127.0.0.1:${service.server.address().port}`;
+    const rpc = async (method, params) => {
+      const res = await fetch(`${origin}/a2a`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer test', 'A2A-Version': '1.0', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: '1', method, params }),
+      });
+      assert.equal(res.status, 200);
+      return res.json();
+    };
+    const send = await rpc('SendMessage', {
+      message: { messageId: 'm-preset', role: 'ROLE_USER', parts: [{ text: 'hello', mediaType: 'text/plain' }] },
+      configuration: { returnImmediately: true },
+      metadata: { '1agents': { cwd: f.dir, agentPreset: 'oneagents-acp-grok-build' } },
     });
-    assert.equal(res.status, 200);
-    return res.json();
-  };
-  const send = await rpc('SendMessage', {
-    message: { messageId: 'm-preset', role: 'ROLE_USER', parts: [{ text: 'hello', mediaType: 'text/plain' }] },
-    configuration: { returnImmediately: true },
-    metadata: { '1agents': { cwd: f.dir, agentPreset: 'oneagents-acp-grok-build' } },
-  });
-  const taskId = send.result.task.id;
-  const submittedText = send.result.task.status?.message?.parts?.[0]?.text ?? '';
-  assert.doesNotMatch(submittedText, /waiting in FIFO order/);
-  let task;
-  for (let i = 0; i < 40; i++) {
-    const got = await rpc('GetTask', { id: taskId });
-    task = got.result;
-    if (task.status?.state === 'TASK_STATE_FAILED') break;
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
-  assert.equal(task.status?.state, 'TASK_STATE_FAILED');
-  assert.equal(task.metadata?.['1agents']?.result?.validation?.code, 'PRESET_UNSUPPORTED');
-  assert.equal(task.status?.message?.parts?.[0]?.text, 'Only the configured DSH headless composition is supported');
-  const historyTexts = (task.history ?? []).flatMap(item => (item.parts ?? []).map(p => p.text ?? ''));
-  assert.ok(!historyTexts.some(line => line.includes('waiting in FIFO order')));
+    const taskId = send.result.task.id;
+    const submittedText = send.result.task.status?.message?.parts?.[0]?.text ?? '';
+    assert.doesNotMatch(submittedText, /waiting in FIFO order/);
+    let task;
+    for (let i = 0; i < 40; i++) {
+      const got = await rpc('GetTask', { id: taskId });
+      task = got.result;
+      if (task.status?.state === 'TASK_STATE_FAILED') break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal(task.status?.state, 'TASK_STATE_FAILED');
+    assert.equal(task.metadata?.['1agents']?.result?.validation?.code, 'PRESET_UNSUPPORTED');
+    assert.equal(task.status?.message?.parts?.[0]?.text, 'Only the configured DSH headless composition is supported');
+    const historyTexts = (task.history ?? []).flatMap(item => (item.parts ?? []).map(p => p.text ?? ''));
+    assert.ok(!historyTexts.some(line => line.includes('waiting in FIFO order')));
 
-  const modelSend = await rpc('SendMessage', {
-    message: { messageId: 'm-model', role: 'ROLE_USER', parts: [{ text: 'hello', mediaType: 'text/plain' }] },
-    configuration: { returnImmediately: false },
-    metadata: { '1agents': { cwd: f.dir, agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' } },
-  });
-  const modelTask = modelSend.result.task;
-  assert.equal(modelTask.status?.state, 'TASK_STATE_FAILED');
-  assert.equal(modelTask.metadata?.['1agents']?.result?.validation?.code, 'MODEL_SELECTION_UNSUPPORTED');
-  assert.equal(modelTask.status?.message?.parts?.[0]?.text, 'Configure the model on the DSH headless profile');
+    const modelSend = await rpc('SendMessage', {
+      message: { messageId: 'm-model', role: 'ROLE_USER', parts: [{ text: 'hello', mediaType: 'text/plain' }] },
+      configuration: { returnImmediately: false },
+      metadata: { '1agents': { cwd: f.dir, agentPreset: 'standard', provider: 'deepseek', model: 'deepseek-v4' } },
+    });
+    const modelTask = modelSend.result.task;
+    assert.equal(modelTask.status?.state, 'TASK_STATE_FAILED');
+    assert.equal(modelTask.metadata?.['1agents']?.result?.validation?.code, 'MODEL_SELECTION_UNSUPPORTED');
+    assert.equal(modelTask.status?.message?.parts?.[0]?.text, 'Configure the model on the DSH headless profile');
+  } finally {
+    await service.close();
+  }
 });
