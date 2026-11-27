@@ -71,12 +71,12 @@ export async function resolveA2AWorkbench(
 
 /** Routes and in-flight turns are released with the owning Cordis plugin. */
 export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string, diagnostics?: DiagnosticLog, sessions?: SessionControl,
-  expose?: (host: A2AHostControls | undefined) => void): Promise<() => Promise<void>> {
+  expose?: (host: A2AHostControls | undefined) => void, bindEffect = true): Promise<() => Promise<void>> {
   if (options.enabled === false) return async () => {};
   const token = await resolveA2AToken(options);
   if (!token) throw new Error('Set DSH_A2A_TOKEN, a2a.token, or a2a.tokenFile before enabling DSH A2A');
   let close = async () => {};
-  await ctx.effect(async () => {
+  const start = async () => {
     const { workbench: _workbench, workbenchConfigFile: _workbenchConfigFile, tokenFile: _tokenFile, ...serverOptions } = options;
     const server = await createA2AServer({ ...serverOptions, token, backend: new DshA2ABackend(ctx, diagnostics, sessions),
       stateDirectory: options.stateDirectory ?? stateDirectory,
@@ -106,6 +106,11 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
       await server.close();
     })();
     return close;
-  });
+  };
+  if (!bindEffect) {
+    await start();
+    return close;
+  }
+  await ctx.effect(start);
   return close;
 }
