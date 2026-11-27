@@ -6,8 +6,9 @@
  * this session; it cannot tell this plugin from another local caller holding the same IDs (not defended in the MVP).
  */
 import { currentA2AExecution, runExecutorTicket, type ExecutorTicketArgs } from '@1agents/acp-service/a2a';
+import type { defineTool } from '@deepseek-ai/dsh-tools';
 import { TICKET_TOOLS, type TicketTool } from './ticket-spec.js';
-import { defineTool } from '@deepseek-ai/dsh-tools';
+import { loadDshToolsSync } from './host-runtime.js';
 
 export interface TicketGateway { invoke(method: string, params: Record<string, unknown>): Promise<unknown> }
 export type { TicketTool };
@@ -36,8 +37,8 @@ export async function runTicketTool(gateway: TicketGateway, sessionId: string, t
 const output = { schema: { type: 'object', additionalProperties: false, properties: { message: { type: 'string', required: true } } },
   render: (_args: unknown, value: { message: string }) => [{ type: 'text' as const, text: value.message }] } as const;
 
-export function ticketTools(gateway: TicketGateway) {
-  return TICKET_TOOLS.map(spec => defineTool({ name: spec.name, description: spec.description, output,
+export function ticketTools(gateway: TicketGateway, defineToolFn: typeof defineTool = loadDshToolsSync().defineTool) {
+  return TICKET_TOOLS.map(spec => defineToolFn({ name: spec.name, description: spec.description, output,
     // Every parameter is required in DSH's own schema form.
     parameters: Object.fromEntries(Object.entries(spec.parameters).map(([key, value]) => [key, { ...value, required: true }])),
     execute: (args: ExecutorTicketArgs, exec: { agent?: { id: string } }) => {

@@ -1,13 +1,9 @@
 /** Plugin-owned ACP diagnostics; official DSH session events remain unchanged. */
-import { Context } from '@deepseek-ai/cordis';
-import Storage from '@deepseek-ai/dsh-storage';
-import * as JsonStorage from '@deepseek-ai/dsh-storage-json';
-import * as StorageDomain from '@deepseek-ai/dsh-storage-domain';
 import { randomUUID } from 'node:crypto';
 import { z } from 'dsh-zod';
-import { defineDomain, domainTable, type Domain, type DomainFacility } from '@deepseek-ai/dsh-storage-domain';
 import { DirectoryLease, isStorageBusy } from '@1agents/acp-service/a2a';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
+import { loadDshStorage } from './host-runtime.js';
 
 const identitySchema = z.object({
   sessionId: z.string().min(1).max(256), turn: z.number().int().nonnegative(),
@@ -32,10 +28,28 @@ const recordSchema = z.object({
   phase: z.enum(['prepared', 'submitted', 'confirmed', 'settled']),
   error: errorSchema.optional(),
 }).strict().refine(value => value.phase === 'settled' || value.phase === 'confirmed' || value.error === undefined);
-const spec = defineDomain({ name: 'oneagents_acp_diagnostics', version: 1,
-  tables: { attempts: domainTable<string, z.infer<typeof recordSchema>>(recordSchema) } });
-export type DiagnosticIdentity = z.infer<typeof identitySchema>;
+/** Built on first open so importing this module does not touch @deepseek-ai/*. */
+let specPromise: Promise<unknown> | undefined;
+function diagnosticSpec(): Promise<unknown> {
+  return specPromise ??= loadDshStorage()
+    .then(({ defineDomain, domainTable }) => defineDomain({
+      name: 'oneagents_acp_diagnostics', version: 1,
+      tables: { attempts: domainTable(recordSchema) },
+    }))
+    // A failed build must not stay cached: the next mount has to be able to try again.
+    .catch((error: unknown) => { specPromise = undefined; throw error; });
+}
 type DiagnosticRecord = z.infer<typeof recordSchema>;
+interface AttemptTable {
+  entries(): Iterable<[string, DiagnosticRecord]>;
+  put(id: string, record: DiagnosticRecord): Promise<void>;
+  update(id: string, change: (record: DiagnosticRecord) => DiagnosticRecord): Promise<void>;
+}
+interface DiagnosticDomain {
+  table(name: 'attempts'): AttemptTable;
+  close(): Promise<void>;
+}
+export type DiagnosticIdentity = z.infer<typeof identitySchema>;
 /** Methods the adapter and A2A backend actually call. A follower may implement them in memory. */
 export interface DiagnosticLog {
   begin(identity: DiagnosticIdentity): Promise<string>;
@@ -51,7 +65,7 @@ export class Diagnostics {
   private serial = 0;
   private chain: Promise<unknown> = Promise.resolve();
   private closed = false;
-  private constructor(private readonly domain: Domain<typeof spec>) {
+  private constructor(private readonly domain: DiagnosticDomain) {
     const serials = new Set<number>();
     for (const [key, record] of domain.table('attempts').entries()) {
       if (record.id !== key || serials.has(record.serial)) throw new Error('Invalid ACP diagnostic identity');
@@ -59,8 +73,9 @@ export class Diagnostics {
     }
   }
   /** Open the plugin's schema-validated domain using the configured official storage facility. */
-  static async open(facility: DomainFacility): Promise<Diagnostics> {
-    let domain: Domain<typeof spec>;
+  static async open(facility: { open(spec: unknown): Promise<DiagnosticDomain> }): Promise<Diagnostics> {
+    const spec = await diagnosticSpec();
+    let domain: DiagnosticDomain;
     try { domain = await facility.open(spec); } catch { throw new Error('ACP diagnostic storage could not be opened; check its configuration and version.'); }
     try { return new Diagnostics(domain); }
     catch { await domain.close(); throw new Error('Invalid ACP diagnostic storage identity.'); }
@@ -199,19 +214,28 @@ export async function openDiagnostics(directory: string, options?: { onConflict?
   }
   // The host's shared facility can close concurrently during root teardown.
   // This private composition gives the consumer an explicit drain-before-close order.
-  const storage = new Context();
+  // Every step after the lease is taken runs inside this guard: a failure anywhere
+  // must release the lease, or the next hot reload silently degrades to read-only.
   try {
-    await storage.plugin(Storage);
-    await storage.plugin(JsonStorage, { root: directory });
-    const mounted = await storage.plugin(StorageDomain, { backend: 'json' });
-    await mounted.await();
-    const diagnostics = await Diagnostics.open(storage.storageDomain);
-    let closing: Promise<void> | undefined;
-    return { diagnostics, mode: 'read-write', close: () => closing ??= (async () => {
-      try { await diagnostics.close(); } finally { try { await storage.fiber.dispose(); } finally { lease.close(); } }
-    })() };
-  } catch {
-    try { await storage.fiber.dispose(); } finally { lease.close(); }
-    throw new Error('ACP diagnostic storage could not be opened; check its configuration and version.');
+    const { Context, Storage, JsonStorage, StorageDomain } = await loadDshStorage();
+    const storage = new Context();
+    try {
+      await storage.plugin(Storage);
+      await storage.plugin(JsonStorage, { root: directory });
+      const mounted = await storage.plugin(StorageDomain, { backend: 'json' });
+      await mounted.await();
+      const diagnostics = await Diagnostics.open(storage.storageDomain);
+      let closing: Promise<void> | undefined;
+      return { diagnostics, mode: 'read-write', close: () => closing ??= (async () => {
+        try { await diagnostics.close(); } finally { try { await storage.fiber.dispose(); } finally { lease.close(); } }
+      })() };
+    } catch {
+      try { await storage.fiber.dispose(); } finally { lease.close(); }
+      throw new Error('ACP diagnostic storage could not be opened; check its configuration and version.');
+    }
+  } catch (error) {
+    // DirectoryLease.close() is idempotent, so the inner guard may have closed it already.
+    lease.close();
+    throw error;
   }
 }
