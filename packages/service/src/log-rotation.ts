@@ -11,6 +11,7 @@ export interface DailyLogRotationOptions {
 export interface DailyLogRotationHandle {
   currentDate: () => string;
   rotateIfNeeded: () => void;
+  closeSync: () => void;
   close: () => Promise<void>;
 }
 
@@ -80,7 +81,9 @@ function archiveRegularFileIfExists(
   const mtimeDate = stat.mtimeMs > 0 ? new Date(stat.mtimeMs) : fallbackDate;
   const dateStr = formatLocalDate(mtimeDate);
   const targetPath = uniqueArchivePath(logDir, `${prefix}-${dateStr}`, ext);
-  fs.renameSync(fullPath, targetPath);
+  try {
+    fs.renameSync(fullPath, targetPath);
+  } catch {}
 }
 
 function updateSymlink(logDir: string, linkName: string, targetBasename: string): void {
@@ -133,26 +136,34 @@ export function pruneExpiredLogs(
   return removed;
 }
 
-function writeToStream(
-  getStream: () => fs.WriteStream | null,
-  chunk: string | Uint8Array,
-  encodingOrCallback?: BufferEncoding | ((err?: Error | null) => void),
-  callback?: (err?: Error | null) => void,
-): boolean {
-  const stream = getStream();
-  if (!stream) return true;
-  if (typeof encodingOrCallback === 'function') {
-    return stream.write(chunk, encodingOrCallback);
+function toBuffer(chunk: string | Uint8Array, encoding?: BufferEncoding): Buffer {
+  if (typeof chunk === 'string') return Buffer.from(chunk, encoding ?? 'utf8');
+  return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+}
+
+function closeFdQuietly(fd: number | null): void {
+  if (fd === null) return;
+  try {
+    fs.closeSync(fd);
+  } catch {}
+}
+
+function writeAllSync(fd: number, buffer: Buffer): void {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+    if (written <= 0) throw new Error('Short write to rotated log file');
+    offset += written;
   }
-  if (encodingOrCallback !== undefined) {
-    return stream.write(chunk, encodingOrCallback, callback);
-  }
-  return stream.write(chunk, callback);
 }
 
 /**
  * Redirect process.stdout and process.stderr into daily rotated files under logDir,
  * maintaining `<prefix>.log` / `<prefix>.err.log` symlinks and pruning files >= retainDays old.
+ *
+ * Writes go through synchronous append descriptors so short-lived processes never lose
+ * buffered output on `process.exit()`, and I/O failures degrade cleanly to the original
+ * stdout/stderr instead of crashing the daemon with an unhandled stream error.
  */
 export function installDailyLogRotation(options: DailyLogRotationOptions): DailyLogRotationHandle {
   const logDir = path.resolve(options.logDir);
@@ -163,34 +174,73 @@ export function installDailyLogRotation(options: DailyLogRotationOptions): Daily
       : DEFAULT_RETAIN_DAYS;
   const now = options.now ?? (() => new Date());
 
-  fs.mkdirSync(logDir, { recursive: true });
-  const initialDate = now();
-  archiveRegularFileIfExists(logDir, `${prefix}.log`, prefix, '.log', initialDate);
-  archiveRegularFileIfExists(logDir, `${prefix}.err.log`, prefix, '.err.log', initialDate);
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+  let lastWarning = '';
+  const warnFallback = (context: string, error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    const key = `${context}:${detail}`;
+    if (key === lastWarning) return;
+    lastWarning = key;
+    try {
+      originalStderrWrite(`[log-rotation] ${context} (${detail}); falling back to stdio\n`);
+    } catch {}
+  };
 
   let activeDate = '';
-  let outStream: fs.WriteStream | null = null;
-  let errStream: fs.WriteStream | null = null;
+  let outFd: number | null = null;
+  let errFd: number | null = null;
   let closed = false;
 
+  const openAppendFd = (filePath: string, label: string): number | null => {
+    try {
+      return fs.openSync(filePath, 'a');
+    } catch (error) {
+      warnFallback(`cannot open ${label} ${filePath}`, error);
+      return null;
+    }
+  };
+
   const openForDate = (dateStr: string) => {
-    const prevOut = outStream;
-    const prevErr = errStream;
+    const prevOut = outFd;
+    const prevErr = errFd;
+
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+    } catch (error) {
+      warnFallback(`cannot prepare logDir ${logDir}`, error);
+      activeDate = dateStr;
+      outFd = null;
+      errFd = null;
+      closeFdQuietly(prevOut);
+      closeFdQuietly(prevErr);
+      return;
+    }
 
     const outFile = `${prefix}-${dateStr}.log`;
     const errFile = `${prefix}-${dateStr}.err.log`;
-    outStream = fs.createWriteStream(path.join(logDir, outFile), { flags: 'a' });
-    errStream = fs.createWriteStream(path.join(logDir, errFile), { flags: 'a' });
+    outFd = openAppendFd(path.join(logDir, outFile), 'stdout log');
+    errFd = openAppendFd(path.join(logDir, errFile), 'stderr log');
     activeDate = dateStr;
 
-    updateSymlink(logDir, `${prefix}.log`, outFile);
-    updateSymlink(logDir, `${prefix}.err.log`, errFile);
+    if (outFd !== null) updateSymlink(logDir, `${prefix}.log`, outFile);
+    if (errFd !== null) updateSymlink(logDir, `${prefix}.err.log`, errFile);
 
-    prevOut?.end();
-    prevErr?.end();
+    closeFdQuietly(prevOut);
+    closeFdQuietly(prevErr);
 
     pruneExpiredLogs(logDir, prefix, retainDays, dateStr);
   };
+
+  const initialDate = now();
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+    archiveRegularFileIfExists(logDir, `${prefix}.log`, prefix, '.log', initialDate);
+    archiveRegularFileIfExists(logDir, `${prefix}.err.log`, prefix, '.err.log', initialDate);
+  } catch (error) {
+    warnFallback(`cannot initialize logDir ${logDir}`, error);
+  }
 
   const rotateIfNeeded = () => {
     if (closed) return;
@@ -202,8 +252,32 @@ export function installDailyLogRotation(options: DailyLogRotationOptions): Daily
 
   openForDate(formatLocalDate(initialDate));
 
-  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  const writeChannel = (
+    label: string,
+    getFd: () => number | null,
+    clearFd: () => void,
+    fallback: typeof originalStdoutWrite,
+    chunk: string | Uint8Array,
+    encodingOrCallback?: BufferEncoding | ((err?: Error | null) => void),
+    callback?: (err?: Error | null) => void,
+  ): boolean => {
+    const encoding = typeof encodingOrCallback === 'string' ? encodingOrCallback : undefined;
+    const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
+    const fd = getFd();
+    if (fd === null) {
+      return fallback(chunk, encodingOrCallback as never, callback as never);
+    }
+    try {
+      writeAllSync(fd, toBuffer(chunk, encoding));
+      cb?.(null);
+      return true;
+    } catch (error) {
+      closeFdQuietly(fd);
+      clearFd();
+      warnFallback(`write failed on ${label}`, error);
+      return fallback(chunk, encodingOrCallback as never, callback as never);
+    }
+  };
 
   process.stdout.write = ((
     chunk: string | Uint8Array,
@@ -214,7 +288,15 @@ export function installDailyLogRotation(options: DailyLogRotationOptions): Daily
       return originalStdoutWrite(chunk, encodingOrCallback as never, callback as never);
     }
     rotateIfNeeded();
-    return writeToStream(() => outStream, chunk, encodingOrCallback, callback);
+    return writeChannel(
+      'stdout log',
+      () => outFd,
+      () => { outFd = null; },
+      originalStdoutWrite,
+      chunk,
+      encodingOrCallback,
+      callback,
+    );
   }) as typeof process.stdout.write;
 
   process.stderr.write = ((
@@ -226,41 +308,39 @@ export function installDailyLogRotation(options: DailyLogRotationOptions): Daily
       return originalStderrWrite(chunk, encodingOrCallback as never, callback as never);
     }
     rotateIfNeeded();
-    return writeToStream(() => errStream, chunk, encodingOrCallback, callback);
+    return writeChannel(
+      'stderr log',
+      () => errFd,
+      () => { errFd = null; },
+      originalStderrWrite,
+      chunk,
+      encodingOrCallback,
+      callback,
+    );
   }) as typeof process.stderr.write;
 
-  const closeStream = (stream: fs.WriteStream | null): Promise<void> =>
-    new Promise((resolve) => {
-      if (!stream) {
-        resolve();
-        return;
-      }
-      let settled = false;
-      const done = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      stream.once('close', done);
-      stream.once('error', done);
-      stream.end();
-    });
-
-  const close = (): Promise<void> => {
-    if (closed) return Promise.resolve();
+  const closeSync = (): void => {
+    if (closed) return;
     closed = true;
     process.stdout.write = originalStdoutWrite;
     process.stderr.write = originalStderrWrite;
-    const prevOut = outStream;
-    const prevErr = errStream;
-    outStream = null;
-    errStream = null;
-    return Promise.all([closeStream(prevOut), closeStream(prevErr)]).then(() => undefined);
+    const prevOut = outFd;
+    const prevErr = errFd;
+    outFd = null;
+    errFd = null;
+    closeFdQuietly(prevOut);
+    closeFdQuietly(prevErr);
+  };
+
+  const close = (): Promise<void> => {
+    closeSync();
+    return Promise.resolve();
   };
 
   return {
     currentDate: () => activeDate,
     rotateIfNeeded,
+    closeSync,
     close,
   };
 }

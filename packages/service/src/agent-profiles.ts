@@ -76,7 +76,7 @@ export function defaultAgentProfilesFile(env: NodeJS.ProcessEnv = process.env): 
 function expandHome(value: string, home: string): string {
   if (value === '~') return home;
   if (value.startsWith('~/')) return join(home, value.slice(2));
-  return resolvePath(value);
+  return value;
 }
 
 function fail(file: string, message: string): never {
@@ -116,8 +116,9 @@ function parseProfile(
   let home: string | undefined;
   if (entry.home !== undefined) {
     if (typeof entry.home !== 'string' || !entry.home.trim()) fail(file, `profiles.${id}.home must be a non-empty string`);
-    home = expandHome(entry.home.trim(), options.home);
-    if (!isAbsolute(home)) fail(file, `profiles.${id}.home must be absolute`);
+    const expanded = expandHome(entry.home.trim(), options.home);
+    if (!isAbsolute(expanded)) fail(file, `profiles.${id}.home must be absolute`);
+    home = resolvePath(expanded);
   }
 
   const env: Record<string, string> = {};
@@ -131,13 +132,20 @@ function parseProfile(
       if (!ENV_ALLOW.some(pattern => pattern.test(name))) {
         fail(file, `profiles.${id}.env.${name} is not an allowed variable (credential/home variables only)`);
       }
-      if (name === 'HOME' && home && expandHome(value, options.home) !== home) {
-        fail(file, `profiles.${id} sets both home and env.HOME with different values`);
+      if (name === 'HOME') {
+        const expandedEnvHome = expandHome(value.trim(), options.home);
+        if (!isAbsolute(expandedEnvHome)) fail(file, `profiles.${id}.env.HOME must be absolute`);
+        const normalizedEnvHome = resolvePath(expandedEnvHome);
+        if (home && normalizedEnvHome !== home) {
+          fail(file, `profiles.${id} sets both home and env.HOME with different values`);
+        }
+        env[name] = normalizedEnvHome;
+      } else {
+        env[name] = value.startsWith('~/') ? join(options.home, value.slice(2)) : value;
       }
-      env[name] = value.startsWith('~/') ? join(options.home, value.slice(2)) : value;
     }
   }
-  if (!home && env.HOME) home = expandHome(env.HOME, options.home);
+  if (!home && env.HOME) home = env.HOME;
 
   return Object.freeze({
     id,
@@ -183,6 +191,25 @@ export function loadAgentProfiles(options: AgentProfileOptions = {}): AgentProfi
     .map(([id, raw]) => parseProfile(file, id, raw, { home, agents }))
     .sort((left, right) => left.id.localeCompare(right.id));
   return { file, profiles, byId: new Map(profiles.map(profile => [profile.id, profile])) };
+}
+
+/**
+ * Runtime-safe profile loader for live server paths (`/agents`, `/manifest`, session launch/history):
+ * a broken `profiles.json` logs a warning and degrades to an empty set so built-in Agents keep working.
+ */
+export function loadAgentProfilesSafe(
+  options: AgentProfileOptions = {},
+  onError: (error: unknown) => void = error =>
+    console.warn(`[acp-service] agent profiles ignored: ${error instanceof Error ? error.message : error}`),
+): AgentProfileSet {
+  const env = options.env ?? process.env;
+  const file = options.file ? resolvePath(options.file) : defaultAgentProfilesFile(env);
+  try {
+    return loadAgentProfiles({ ...options, file });
+  } catch (error) {
+    onError(error);
+    return { file, profiles: [], byId: new Map() };
+  }
 }
 
 /** Child-only environment overlay for one profile. `HOME` is the account boundary. */
@@ -236,4 +263,35 @@ export function resolveAgentProfile(id: string, options: AgentProfileOptions = {
     cache = { file, ...stamp, set: loadAgentProfiles({ ...options, file }) };
   }
   return cache.set.byId.get(id);
+}
+
+/** Runtime-safe cached lookup: degrades to `undefined` on malformed profiles.json instead of crashing built-in Agents. */
+export function resolveAgentProfileSafe(
+  id: string,
+  options: AgentProfileOptions = {},
+  onError: (error: unknown) => void = error =>
+    console.warn(`[acp-service] agent profiles ignored: ${error instanceof Error ? error.message : error}`),
+): AgentProfile | undefined {
+  try {
+    return resolveAgentProfile(id, options);
+  } catch (error) {
+    onError(error);
+    return undefined;
+  }
+}
+
+/** Runtime-safe launch resolver: a broken profiles.json never blocks built-in Agent sessions. */
+export function resolveAgentLaunchSafe(
+  id: string,
+  sessionEnv?: Record<string, string>,
+  options: AgentProfileOptions & { ensureHome?: boolean } = {},
+  onError: (error: unknown) => void = error =>
+    console.warn(`[acp-service] agent profiles ignored: ${error instanceof Error ? error.message : error}`),
+): { agent: string; env?: Record<string, string> } {
+  const profile = resolveAgentProfileSafe(id, options, onError);
+  if (!profile) return { agent: id };
+  if (options.ensureHome && profile.home) mkdirSync(profile.home, { recursive: true, mode: 0o700 });
+  const overlay = profileEnvironment(profile);
+  if (Object.keys(overlay).length === 0) return { agent: profile.agent, ...(sessionEnv ? { env: sessionEnv } : {}) };
+  return { agent: profile.agent, env: { ...(sessionEnv ?? {}), ...overlay } };
 }

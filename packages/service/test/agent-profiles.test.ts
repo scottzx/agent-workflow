@@ -7,10 +7,14 @@ import { discoverAgents } from '../src/catalog.js';
 import {
   defaultAgentProfilesFile,
   loadAgentProfiles,
+  loadAgentProfilesSafe,
   profileEnvironment,
   resolveAgentLaunch,
+  resolveAgentLaunchSafe,
   resolveAgentProfile,
+  resolveAgentProfileSafe,
 } from '../src/agent-profiles.js';
+import { createAcpServer } from '../src/server.js';
 
 const AGENTS = ['antigravity', 'codex'];
 
@@ -70,6 +74,8 @@ test('invalid profiles fail loudly instead of silently degrading', t => {
     ['shadowing', { profiles: { antigravity: { agent: 'antigravity' } } }, /would shadow/],
     ['unknown field', { profiles: { agy2: { agent: 'antigravity', argv: ['agy'] } } }, /not a supported field/],
     ['path override', { profiles: { agy2: { agent: 'antigravity', env: { PATH: '/tmp' } } } }, /not an allowed variable/],
+    ['relative home', { profiles: { agy2: { agent: 'antigravity', home: 'relative/dir' } } }, /home must be absolute/],
+    ['relative env.HOME', { profiles: { agy2: { agent: 'antigravity', env: { HOME: 'relative/dir' } } } }, /env\.HOME must be absolute/],
     ['home conflict', { profiles: { agy2: { agent: 'antigravity', home: '/a', env: { HOME: '/b' } } } }, /different values/],
     ['bad root', { profiles: [] }, /"profiles" must be an object/],
     ['unknown top level', { agents: {} }, /not a supported top-level field/],
@@ -147,4 +153,35 @@ test('the default location lives in the DSH plugin state directory', () => {
     join('/home/user', '.dsh', 'plugins', '1agents-acp', 'profiles.json'),
   );
   assert.equal(defaultAgentProfilesFile({ ACP_PROFILES_FILE: '/tmp/p.json', HOME: '/home/user' }), '/tmp/p.json');
+});
+
+test('malformed profiles.json degrades safely on live /agents, launch, and profile lookup paths', async t => {
+  const f = workspace(t);
+  writeFileSync(f.file, '{not valid json');
+  const warnings: unknown[] = [];
+  const onError = (err: unknown) => warnings.push(err);
+  const safeSet = loadAgentProfilesSafe({ file: f.file, env: { HOME: f.home }, agents: AGENTS }, onError);
+  assert.deepEqual(safeSet.profiles, []);
+  assert.equal(resolveAgentProfileSafe('antigravity', { file: f.file, env: { HOME: f.home }, agents: AGENTS }, onError), undefined);
+  assert.deepEqual(
+    resolveAgentLaunchSafe('antigravity', { CUSTOM: '1' }, { file: f.file, env: { HOME: f.home }, agents: AGENTS }, onError),
+    { agent: 'antigravity' },
+  );
+  assert.ok(warnings.length >= 3);
+
+  const prev = process.env.ACP_PROFILES_FILE;
+  process.env.ACP_PROFILES_FILE = f.file;
+  const { server } = createAcpServer();
+  t.after(async () => {
+    if (prev === undefined) delete process.env.ACP_PROFILES_FILE;
+    else process.env.ACP_PROFILES_FILE = prev;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const res = await fetch(`http://127.0.0.1:${address.port}/agents`);
+  assert.equal(res.status, 200);
+  const body = await res.json() as { agents: Array<{ id: string }> };
+  assert.ok(Array.isArray(body.agents) && body.agents.length > 0);
 });

@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { installDailyLogRotation, pruneExpiredLogs } from '../src/log-rotation.js';
 
 function makeTmpDir() {
@@ -85,6 +87,59 @@ test('pruneExpiredLogs removes files older than retainDays', () => {
     const removed = pruneExpiredLogs(dir, 'acp-service', 30, '2026-11-26');
     assert.deepEqual(removed, ['acp-service-2026-10-01.log']);
     assert.equal(fs.existsSync(path.join(dir, 'acp-service-2026-11-25.log')), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('installDailyLogRotation falls back to stdio instead of crashing when logDir is not writable', () => {
+  const dir = makeTmpDir();
+  const blockerFile = path.join(dir, 'not-a-directory');
+  fs.writeFileSync(blockerFile, 'file');
+  const blockedLogDir = path.join(blockerFile, 'logs');
+  try {
+    const moduleUrl = pathToFileURL(path.resolve(import.meta.dirname, '../dist/src/log-rotation.js')).href;
+    const output = execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { installDailyLogRotation } from ${JSON.stringify(moduleUrl)};
+         const h = installDailyLogRotation({ logDir: ${JSON.stringify(blockedLogDir)} });
+         console.log('fallback-stdout-line');
+         console.error('fallback-stderr-line');
+         h.closeSync();`,
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    assert.match(output, /fallback-stdout-line/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('installDailyLogRotation flushes all lines synchronously before abrupt process.exit', () => {
+  const dir = makeTmpDir();
+  try {
+    const moduleUrl = pathToFileURL(path.resolve(import.meta.dirname, '../dist/src/log-rotation.js')).href;
+    execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { installDailyLogRotation } from ${JSON.stringify(moduleUrl)};
+         const h = installDailyLogRotation({ logDir: ${JSON.stringify(dir)}, now: () => new Date(2026, 10, 27, 12, 0, 0) });
+         process.once('exit', () => h.closeSync());
+         for (let i = 0; i < 5000; i++) console.log('line-' + i);
+         process.exit(0);`,
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const content = fs.readFileSync(path.join(dir, 'acp-service-2026-11-27.log'), 'utf8');
+    const lines = content.trim().split('\n');
+    assert.equal(lines.length, 5000);
+    assert.equal(lines[0], 'line-0');
+    assert.equal(lines[4999], 'line-4999');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

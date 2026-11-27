@@ -5,7 +5,7 @@
  * 保证整台机器上的所有服务共享同一个 node_id 与 name。
  */
 import { createAgentRegistry } from '@1agents/acp-service/runtime';
-import { loadAgentProfiles } from './agent-profiles.js';
+import { loadAgentProfilesSafe } from './agent-profiles.js';
 import { nodeIdentity, type NodeIdentity } from '@1agents/dreammate-node';
 import {
   PROTOCOL_VERSION,
@@ -20,12 +20,7 @@ export type { AccessDescriptor, NetworkService, NodeIdentity, NodeManifest, Reac
 
 /** Profile ids are real Agent endpoints; a broken profile file must not break discovery. */
 function agentProfileIds(): string[] {
-  try {
-    return loadAgentProfiles().profiles.map(profile => profile.id);
-  } catch (error) {
-    console.warn(`[acp-service] agent profiles ignored in manifest: ${error instanceof Error ? error.message : error}`);
-    return [];
-  }
+  return loadAgentProfilesSafe().profiles.map(profile => profile.id);
 }
 
 /**

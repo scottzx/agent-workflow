@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { WebSocketServer } from "ws";
 import { attachAcpConnection } from "./acp-connection.js";
 import { createServiceAgentRegistry } from "./catalog.js";
-import { resolveAgentLaunch, resolveAgentProfile } from "./agent-profiles.js";
+import { resolveAgentLaunchSafe, resolveAgentProfileSafe } from "./agent-profiles.js";
 import { CapacityQueue } from "./capacity-queue.js";
 import { createCapacityLifecycle } from "./capacity-lifecycle.js";
 import {
@@ -1204,7 +1204,7 @@ async function loadSessionHistory(sessionId, payload = {}) {
   const agentType = payload.agentType || session?.agentType || session?.handle?.agent;
   // A profile session reports the profile id; its native history lives with the
   // underlying CLI, so adapters and identity checks use the launch Agent instead.
-  const historyAgent = resolveAgentProfile(agentType)?.agent || agentType;
+  const historyAgent = resolveAgentProfileSafe(agentType)?.agent || agentType;
   const acpSessionId =
     session?.handle?.agentSessionId || session?.handle?.backendSessionId || payload.acpSessionId;
   const workspacePath = session?.handle?.cwd || payload.workspacePath;
@@ -1737,7 +1737,7 @@ export async function dispatchCommand(ws, payload) {
           // The session keeps the profile id as its identity; only the spawn target and
           // the child environment switch. Server-side profile entries win over client
           // entries: a session may add tokens, but it may not move another account's HOME.
-          const launchPlan = resolveAgentLaunch(agentType, sessionOptions.env, { ensureHome: true });
+          const launchPlan = resolveAgentLaunchSafe(agentType, sessionOptions.env, { ensureHome: true });
           const agentLaunch = launchPlan.agent;
           if (launchPlan.env) sessionOptions.env = launchPlan.env;
 

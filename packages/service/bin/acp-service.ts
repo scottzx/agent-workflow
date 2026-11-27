@@ -157,12 +157,12 @@ async function runServer(options: {
   const envRetain = envRetainRaw ? Number.parseInt(envRetainRaw, 10) : undefined;
   const retainDays = options.logRetainDays ?? (Number.isFinite(envRetain) ? envRetain : undefined);
 
-  let logRotation: { close: () => Promise<void> } | undefined;
+  let logRotation: { closeSync: () => void; close: () => Promise<void> } | undefined;
   if (logDir) {
     const { installDailyLogRotation } = await import('../src/log-rotation.js');
     logRotation = installDailyLogRotation({ logDir, retainDays });
     process.once('exit', () => {
-      void logRotation?.close();
+      logRotation?.closeSync();
     });
   }
 
