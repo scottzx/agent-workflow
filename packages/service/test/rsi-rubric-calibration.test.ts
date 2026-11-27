@@ -14,6 +14,8 @@ import {
   computeRubricDigest,
   evaluateRubricJudgments,
   krippendorffAlpha,
+  loadRubric,
+  rubricCalibrationPath,
   spearmanRho,
   type RubricDefinition,
   type RubricJudgment,
@@ -45,21 +47,63 @@ function makeBinaryJudgments(
   return out;
 }
 
-test('statistical primitives: cohenKappa, krippendorffAlpha (nominal & ordinal), spearmanRho', () => {
+test('statistical primitives: cohenKappa, canonical Krippendorff ordinal alpha, and spearmanRho', () => {
   assert.equal(cohenKappa([1, 0, 1, 0, 1, 0], [1, 0, 1, 0, 1, 0]), 1);
   const kPartial = cohenKappa([1, 1, 1, 0, 0, 0], [1, 1, 0, 0, 0, 0]);
   assert.ok(kPartial !== null && Math.abs(kPartial - 0.6667) < 0.01);
 
   assert.equal(krippendorffAlpha([[1, 1], [0, 0], [1, 1], [0, 0]], false), 1);
-  const ordHigh = krippendorffAlpha([[0, 0], [1, 1], [2, 2], [3, 3], [2, 3]], true);
-  assert.ok(ordHigh !== null && ordHigh > 0.85, `expected high ordinal alpha, got ${ordHigh}`);
+
+  // M3 canonical Krippendorff ordinal alpha exact regression vectors (marginal-frequency weighted delta^2_ord):
+  const vec7 = [[0, 0], [0, 0], [2, 0, 1], [0, 0], [2, 1], [2, 1, 1], [0, 0, 0]];
+  const alpha7 = krippendorffAlpha(vec7, true);
+  assert.ok(alpha7 !== null && Math.abs(alpha7 - 0.6742) < 0.001, `expected canonical ~0.6742, got ${alpha7}`);
+
+  const vec40: number[][] = [
+    ...Array.from({ length: 26 }, () => [0, 0]),
+    [0, 0, 0],
+    [1, 0],
+    ...Array.from({ length: 3 }, () => [1, 1]),
+    [1, 0, 1],
+    ...Array.from({ length: 4 }, () => [0, 0, 1]),
+    [0, 1, 1],
+    ...Array.from({ length: 3 }, () => [2, 2, 2]),
+  ];
+  const alpha40 = krippendorffAlpha(vec40, true);
+  assert.ok(alpha40 !== null && Math.abs(alpha40 - 0.6885) < 0.001, `expected canonical ~0.6885 (advise, not auto), got ${alpha40}`);
 
   const rhoPerfect = spearmanRho([0, 1, 2, 3], [0, 1, 2, 3]);
   assert.ok(rhoPerfect !== null && Math.abs(rhoPerfect - 1) < 1e-9);
   assert.equal(spearmanRho([1, 2], [1, 2]), null);
 });
 
-test('dual-ceiling 3-band classification enforces auto/advise/split and only auto must criteria can auto-block', () => {
+test('M1: loadRubric and CLI calibrate --rubric parse both real repository rubric.json files', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'rsi-real-rubric-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+
+  const outlineDir = join(repoRoot, '.1agents/roles/product-intro-outline');
+  const pptDir = join(repoRoot, '.1agents/roles/ppt-beautifier');
+  const outlineRubric = await loadRubric(outlineDir);
+  const pptRubric = await loadRubric(pptDir);
+  assert.equal(outlineRubric.roleId, 'product-intro-outline');
+  assert.equal(pptRubric.roleId, 'ppt-beautifier');
+  assert.ok(outlineRubric.criteria.some(c => c.gate?.mode === 'advise'));
+  assert.ok(pptRubric.criteria.some(c => c.gate?.mode === 'advise'));
+
+  // Run real calibrateRubric on product-intro-outline with 40 clean judgments for every criterion.
+  const allJudgments: RubricJudgment[] = [];
+  for (const c of outlineRubric.criteria) {
+    allJudgments.push(...makeBinaryJudgments(c.id, 40));
+  }
+  const jPath = join(workspace, 'outline-gold.jsonl');
+  await writeFile(jPath, `${allJudgments.map(j => JSON.stringify(j)).join('\n')}\n`);
+  const rep = await calibrateRubric({ roleDirectory: outlineDir, judgmentsPath: jPath, workspace });
+  assert.equal(rep.passed, true);
+  assert.ok(rep.autoBlockAllowed.includes('R1'));
+  assert.ok(rep.autoBlockAllowed.includes('R7'));
+});
+
+test('M2, M4, M5 & S1/S5/S9: pair-count n, minAlpha consistency, policy floors, tie handling, and duplicate rejection', () => {
   const bands = { auto: 0.8, advise: 0.67, minAutoSamples: 40 };
   assert.equal(classifyBand(0.9, 40, bands), 'auto');
   assert.equal(classifyBand(0.9, 39, bands), 'advise', 'n < 40 cannot enter auto band');
@@ -67,63 +111,99 @@ test('dual-ceiling 3-band classification enforces auto/advise/split and only aut
   assert.equal(classifyBand(0.66, 50, bands), 'split');
   assert.equal(classifyBand(null, 0, bands), 'split');
 
-  const rubric: RubricDefinition = {
+  // M2: 40 human-only units + judge on only 1 or 2 units must NOT enter auto!
+  const sparseRubric: RubricDefinition = {
     schemaVersion: 1,
-    roleId: 'demo-rubric',
-    criteria: [
-      { id: 'R_AUTO', scale: { type: 'binary' }, gate: { mode: 'block' } },
-      { id: 'R_SMALL_N', scale: { type: 'binary' }, gate: { mode: 'observe' } },
-      { id: 'R_LOW_CEILING', scale: { type: 'binary' }, gate: { mode: 'block' } },
-      { id: 'R_ADVISORY_ONLY', scale: { type: 'binary' }, gate: { mode: 'observe' } },
-    ],
-    pass_rule: { mustAllPass: ['R_AUTO', 'R_SMALL_N', 'R_LOW_CEILING'] },
-    calibration: { bands: { auto: 0.8, advise: 0.67 }, minAutoSamples: 40 },
+    roleId: 'sparse-role',
+    criteria: [{ id: 'R1', severity: 'must', scale: { type: 'binary' }, gate: { mode: 'block' } }],
+    aggregation: { mustAllPass: ['R1'] },
+    calibration: { bands: { auto: 0.8, advise: 0.67 } },
   };
+  const sparse1: RubricJudgment[] = [];
+  for (let i = 0; i < 40; i += 1) {
+    sparse1.push({ unit: `u${i}`, criterion: 'R1', rater: 'human:a', value: i % 2 });
+    if (i === 0) sparse1.push({ unit: `u${i}`, criterion: 'R1', rater: 'judge:llm', value: i % 2 });
+  }
+  const sparse1Rep = evaluateRubricJudgments({ rubric: sparseRubric, judgments: sparse1, rubricDigest: 'a'.repeat(64) });
+  assert.equal(sparse1Rep.perCriterion.R1?.n, 1);
+  assert.equal(sparse1Rep.perCriterion.R1?.n_gold, 40);
+  assert.equal(sparse1Rep.perCriterion.R1?.band, 'split');
+  assert.equal(sparse1Rep.perCriterion.R1?.canAutoBlock, false);
+  assert.equal(sparse1Rep.passed, false);
 
-  // R_AUTO: n=40, perfect human & judge agreement -> band=auto, canAutoBlock=true
-  // R_SMALL_N: n=20, perfect agreement -> band=advise (n < 40), canAutoBlock=false
-  // R_LOW_CEILING: n=40, judge matches human majority 100%, BUT human:b disagrees on 18/40 -> alpha_human_ceiling < 0.67 -> band=split!
-  // R_ADVISORY_ONLY: n=40, perfect agreement, NOT must and observe -> band=auto, canAutoBlock=false
-  const judgments: RubricJudgment[] = [
-    ...makeBinaryJudgments('R_AUTO', 40),
-    ...makeBinaryJudgments('R_SMALL_N', 20),
-    ...makeBinaryJudgments('R_LOW_CEILING', 40, {
-      humanDisagreeIndices: new Set(Array.from({ length: 18 }, (_, i) => i)),
-    }),
-    ...makeBinaryJudgments('R_ADVISORY_ONLY', 40),
-  ];
+  // M2 with 2 judge pairs out of 40 human units -> n=2 -> advise, NOT auto!
+  const sparse2 = [...sparse1, { unit: 'u1', criterion: 'R1', rater: 'judge:llm', value: 1 }];
+  const sparse2Rep = evaluateRubricJudgments({ rubric: sparseRubric, judgments: sparse2, rubricDigest: 'a'.repeat(64) });
+  assert.equal(sparse2Rep.perCriterion.R1?.n, 2);
+  assert.equal(sparse2Rep.perCriterion.R1?.band, 'advise');
+  assert.equal(sparse2Rep.perCriterion.R1?.canAutoBlock, false);
 
-  const report = evaluateRubricJudgments({
-    rubric,
-    judgments,
-    rubricDigest: 'a'.repeat(64),
-    now: () => new Date('2026-11-27T00:00:00.000Z'),
+  // M4: gate.minAlpha: 0.9 at alpha ~0.85 -> canAutoBlock MUST be false (no contradiction with passed: false).
+  const strictMinAlphaRubric: RubricDefinition = {
+    schemaVersion: 1,
+    roleId: 'strict-min-alpha',
+    criteria: [{ id: 'V1', severity: 'must', scale: { type: 'binary' }, gate: { mode: 'block', minAlpha: 0.9 } }],
+    aggregation: { mustAllPass: ['V1'] },
+  };
+  const minAlphaJudgments = makeBinaryJudgments('V1', 40, { judgeDisagreeIndices: new Set([0, 1, 2]) });
+  const minAlphaRep = evaluateRubricJudgments({ rubric: strictMinAlphaRubric, judgments: minAlphaJudgments, rubricDigest: 'b'.repeat(64) });
+  assert.equal(minAlphaRep.perCriterion.V1?.band, 'auto');
+  assert.equal(minAlphaRep.perCriterion.V1?.canAutoBlock, false, 'minAlpha 0.9 not met at alpha ~0.85');
+  assert.equal(minAlphaRep.perCriterion.V1?.effectiveEnforcement, 'observe');
+  assert.deepEqual(minAlphaRep.autoBlockAllowed, []);
+  assert.deepEqual(minAlphaRep.blockedBy, ['V1']);
+  assert.equal(minAlphaRep.passed, false);
+
+  // M5: Rubric lowering bands.auto below policy floor 0.80 MUST be rejected!
+  assert.throws(() => evaluateRubricJudgments({
+    rubric: {
+      schemaVersion: 1,
+      roleId: 'cheating-rubric',
+      criteria: [{ id: 'R1', scale: { type: 'binary' }, gate: { mode: 'block' } }],
+      calibration: { bands: { auto: 0.5, advise: 0.4 } },
+    },
+    judgments: makeBinaryJudgments('R1', 40),
+    rubricDigest: 'c'.repeat(64),
+  }), /below policy floor 0.8/);
+
+  // S9: Duplicate (unit, criterion, rater) throws instead of silently overwriting.
+  assert.throws(() => evaluateRubricJudgments({
+    rubric: sparseRubric,
+    judgments: [
+      { unit: 'u1', criterion: 'R1', rater: 'human:a', value: 1 },
+      { unit: 'u1', criterion: 'R1', rater: 'human:a', value: 0 },
+    ],
+    rubricDigest: 'd'.repeat(64),
+  }), /Duplicate judgment/);
+
+  // Dual-ceiling low human-human alpha forces split even if judge agrees 100% with human majority.
+  const dualRubric: RubricDefinition = {
+    schemaVersion: 1,
+    roleId: 'dual-test',
+    criteria: [
+      { id: 'R_AUTO', severity: 'must', scale: { type: 'binary' }, gate: { mode: 'block' } },
+      { id: 'R_LOW_CEILING', severity: 'must', scale: { type: 'binary' }, gate: { mode: 'block' } },
+      { id: 'R_ADVISORY', severity: 'should', scale: { type: 'binary' }, gate: { mode: 'advise' } },
+    ],
+    aggregation: { mustAllPass: ['R_AUTO', 'R_LOW_CEILING'] },
+  };
+  const dualRep = evaluateRubricJudgments({
+    rubric: dualRubric,
+    judgments: [
+      ...makeBinaryJudgments('R_AUTO', 40),
+      ...makeBinaryJudgments('R_LOW_CEILING', 40, { humanDisagreeIndices: new Set(Array.from({ length: 18 }, (_, i) => i)) }),
+      ...makeBinaryJudgments('R_ADVISORY', 40),
+    ],
+    rubricDigest: 'e'.repeat(64),
   });
-
-  assert.equal(report.perCriterion.R_AUTO?.band, 'auto');
-  assert.equal(report.perCriterion.R_AUTO?.canAutoBlock, true);
-  assert.equal(report.perCriterion.R_AUTO?.effectiveEnforcement, 'block');
-
-  assert.equal(report.perCriterion.R_SMALL_N?.band, 'advise');
-  assert.equal(report.perCriterion.R_SMALL_N?.canAutoBlock, false);
-  assert.equal(report.perCriterion.R_SMALL_N?.effectiveEnforcement, 'observe');
-
-  assert.equal(report.perCriterion.R_LOW_CEILING?.alpha_gold_vs_judge, 1);
-  assert.equal(report.perCriterion.R_LOW_CEILING?.ceilingLow, true);
-  assert.equal(report.perCriterion.R_LOW_CEILING?.band, 'split');
-  assert.equal(report.perCriterion.R_LOW_CEILING?.canAutoBlock, false);
-  assert.equal(report.perCriterion.R_LOW_CEILING?.action, 'split_or_rewrite');
-
-  assert.equal(report.perCriterion.R_ADVISORY_ONLY?.band, 'auto');
-  assert.equal(report.perCriterion.R_ADVISORY_ONLY?.canAutoBlock, false, 'non-must observe criterion does not auto-block');
-
-  assert.deepEqual(report.autoBlockAllowed, ['R_AUTO']);
-  assert.deepEqual(report.splitRequired, ['R_LOW_CEILING']);
-  assert.deepEqual(report.blockedBy, ['R_LOW_CEILING']);
-  assert.equal(report.passed, false);
+  assert.equal(dualRep.perCriterion.R_AUTO?.canAutoBlock, true);
+  assert.equal(dualRep.perCriterion.R_LOW_CEILING?.ceilingLow, true);
+  assert.equal(dualRep.perCriterion.R_LOW_CEILING?.band, 'split');
+  assert.equal(dualRep.perCriterion.R_LOW_CEILING?.action, 'split_or_rewrite');
+  assert.equal(dualRep.perCriterion.R_ADVISORY?.canAutoBlock, false);
 });
 
-test('rubric.json is included in computeChecksDigest, invalidates gate on edit, and CLI calibrate --rubric works', async t => {
+test('rubric.json digest binding, corrupt report handling in checkGate, and CLI calibrate --rubric', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rsi-rubric-cli-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const roleDir = join(dir, 'role');
@@ -139,9 +219,12 @@ test('rubric.json is included in computeChecksDigest, invalidates gate on edit, 
   const rubricObj = {
     schemaVersion: 1,
     roleId: 'rubric-role',
-    criteria: [{ id: 'R1', scale: { type: 'binary' }, gate: { mode: 'block' } }],
-    pass_rule: { mustAllPass: ['R1'] },
-    calibration: { bands: { auto: 0.8, advise: 0.67 }, minAutoSamples: 40 },
+    criteria: [
+      { id: 'R1', severity: 'must', scale: { type: 'binary' }, gate: { mode: 'block' } },
+      { id: 'R2', severity: 'should', scale: { type: 'binary' }, gate: { mode: 'advise' } },
+    ],
+    aggregation: { mustAllPass: ['R1'] },
+    calibration: { bands: { auto: 0.8, advise: 0.67 } },
   };
   await writeFile(rubricPath, JSON.stringify(rubricObj, null, 2));
 
@@ -154,7 +237,10 @@ test('rubric.json is included in computeChecksDigest, invalidates gate on edit, 
   const rubricDigest1 = await computeRubricDigest(roleDir);
 
   const judgmentsPath = join(dir, 'gold.jsonl');
-  await writeFile(judgmentsPath, `${makeBinaryJudgments('R1', 40).map(j => JSON.stringify(j)).join('\n')}\n`);
+  await writeFile(
+    judgmentsPath,
+    `${[...makeBinaryJudgments('R1', 40), ...makeBinaryJudgments('R2', 40)].map(j => JSON.stringify(j)).join('\n')}\n`,
+  );
 
   const cli = join(repoRoot, 'packages/service/bin/acp-service.ts');
   const { stdout } = await exec(
@@ -168,18 +254,25 @@ test('rubric.json is included in computeChecksDigest, invalidates gate on edit, 
   assert.equal(parsed.perCriterion.R1.band, 'auto');
   assert.equal(parsed.perCriterion.R1.canAutoBlock, true);
 
-  // Editing rubric.json changes computeChecksDigest AND marks saved rubric calibration stale in checkGate.
+  // S8: combining --rubric with --only must fail cleanly.
+  await assert.rejects(
+    exec(process.execPath, ['--import', 'tsx', cli, 'rsi', 'calibrate', '--rubric', '--only', 'R1', '--role', roleDir, '--judgments', judgmentsPath]),
+  );
+
+  // S4: corrupt rubric-calibration.json does not crash checkGate (fails cleanly).
+  await writeFile(rubricCalibrationPath(workspace, 'rubric-role'), JSON.stringify({ schemaVersion: 1, rubricDigest: rubricDigest1, passed: false }));
+  const corruptGate = await checkGate({ roleDirectory: roleDir, workspace });
+  assert.equal(corruptGate.rubricCalibration?.status, 'failed');
+  assert.equal(corruptGate.ready, false);
+
+  // Restore valid calibration, then edit rubric.json -> computeChecksDigest changes and checkGate marks stale.
+  await calibrateRubric({ roleDirectory: roleDir, judgmentsPath, workspace });
   await writeFile(rubricPath, JSON.stringify({ ...rubricObj, version: '1.1' }, null, 2));
   const digest2 = await computeChecksDigest(roleDir);
   assert.notEqual(digest2, digest1, 'editing rubric.json must change computeChecksDigest');
 
-  const gate = await checkGate({ roleDirectory: roleDir, workspace });
-  assert.equal(gate.rubricCalibration?.status, 'stale');
-  assert.equal(gate.ready, false);
-  assert.match(gate.reasons.join('\n'), /Rubric 校准报告已过期/);
-
-  // Re-running calibrateRubric updates the bound report.
-  const refreshed = await calibrateRubric({ roleDirectory: roleDir, judgmentsPath, workspace });
-  assert.equal(refreshed.passed, true);
-  assert.notEqual(refreshed.rubricDigest, rubricDigest1);
+  const staleGate = await checkGate({ roleDirectory: roleDir, workspace });
+  assert.equal(staleGate.rubricCalibration?.status, 'stale');
+  assert.equal(staleGate.ready, false);
+  assert.match(staleGate.reasons.join('\n'), /Rubric 校准报告已过期/);
 });

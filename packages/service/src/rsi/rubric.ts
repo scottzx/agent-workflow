@@ -2,16 +2,21 @@
  * Dual-ceiling Rubric calibration (Cohen's kappa, Krippendorff's alpha, Spearman's rho)
  * and digest binding for role `rubric.json`.
  *
+ * Policy floors (cannot be lowered by the rubric being calibrated):
+ * - POLICY_AUTO_ALPHA = 0.80
+ * - POLICY_ADVISE_ALPHA = 0.67
+ * - POLICY_MIN_AUTO_SAMPLES = 40 (counted over usable judge-vs-gold paired units)
+ *
  * Dual-ceiling 3-band rule:
- * - `effectiveAlpha = min(alpha_human_ceiling, alpha_gold_vs_judge)` (falls back to whichever exists, then kappa)
- * - `auto`:   effectiveAlpha >= bands.auto (default 0.80) AND n >= minAutoSamples (default 40)
- * - `advise`: effectiveAlpha >= bands.advise (default 0.67) AND (effectiveAlpha < bands.auto OR n < minAutoSamples)
- * - `split`:  effectiveAlpha < bands.advise (or n === 0 / missing human gold)
+ * - `effectiveAlpha` requires a real `alpha_gold_vs_judge` (at least 2 usable judge-gold pairs);
+ *   when `alpha_human_ceiling` is also available, `effectiveAlpha = min(alpha_human_ceiling, alpha_gold_vs_judge)`.
+ * - `auto`:   effectiveAlpha >= bands.auto (>= 0.80) AND n >= 40
+ * - `advise`: effectiveAlpha >= bands.advise (>= 0.67) AND (effectiveAlpha < bands.auto OR n < 40)
+ * - `split`:  effectiveAlpha === null OR effectiveAlpha < bands.advise
  *
  * Enforcement invariant:
- * - ONLY `band === 'auto'` `must` criteria (in `pass_rule.mustAllPass` / `mustNotTrigger` or `gate.mode === 'block'`)
- *   are permitted to auto-block.
- * - `advise` is strictly advisory-only (`canAutoBlock = false`).
+ * - ONLY `band === 'auto'` `must` criteria meeting their optional `gate.minAlpha` may auto-block (`canAutoBlock = true`).
+ * - `advise` is advisory-only (`canAutoBlock = false`).
  * - `split` emits a mandatory split/rewrite warning (`action = 'split_or_rewrite'`, `canAutoBlock = false`).
  */
 import { createHash } from 'node:crypto';
@@ -21,19 +26,28 @@ import { z } from 'zod';
 
 export type RubricBand = 'auto' | 'advise' | 'split';
 
+export const POLICY_AUTO_ALPHA = 0.8;
+export const POLICY_ADVISE_ALPHA = 0.67;
+export const POLICY_MIN_AUTO_SAMPLES = 40;
+
+const SAFE_ROLE_ID = /^[A-Za-z0-9._-]+$/;
+
 const rubricCriterionSchema = z.object({
   id: z.string().min(1),
+  title: z.string().min(1).optional(),
   name: z.string().min(1).optional(),
   polarity: z.enum(['positive', 'negative']).optional(),
   weight: z.number().optional(),
+  severity: z.enum(['must', 'should']).optional(),
   scale: z.object({
     type: z.enum(['binary', 'ordinal']),
     min: z.number().optional(),
     max: z.number().optional(),
   }).passthrough(),
   gate: z.object({
-    mode: z.enum(['observe', 'block', 'skip']).optional(),
+    mode: z.enum(['observe', 'advise', 'block']).optional(),
     minAlpha: z.number().min(0).max(1).optional(),
+    onLowAgreement: z.enum(['split', 'advise', 'observe']).optional(),
   }).passthrough().optional(),
 }).passthrough();
 
@@ -41,17 +55,18 @@ const rubricFileSchema = z.object({
   schemaVersion: z.number().int().positive(),
   roleId: z.string().min(1),
   criteria: z.array(rubricCriterionSchema).min(1),
-  pass_rule: z.object({
+  aggregation: z.object({
     mustAllPass: z.array(z.string()).optional(),
     mustNotTrigger: z.array(z.string()).optional(),
-    minNormalizedScore: z.number().optional(),
+    passScore: z.number().optional(),
   }).passthrough().optional(),
   calibration: z.object({
     bands: z.object({
-      auto: z.number().min(0).max(1).default(0.8),
-      advise: z.number().min(0).max(1).default(0.67),
+      auto: z.number().min(0).max(1).optional(),
+      advise: z.number().min(0).max(1).optional(),
+      split: z.number().min(0).max(1).optional(),
     }).passthrough().optional(),
-    minAutoSamples: z.number().int().positive().optional(),
+    minSamples: z.number().int().positive().optional(),
   }).passthrough().optional(),
 }).passthrough();
 
@@ -62,45 +77,60 @@ const judgmentLineSchema = z.object({
   value: z.number().finite(),
 }).passthrough();
 
+const criterionCalibrationResultSchema = z.object({
+  criterionId: z.string().min(1),
+  n: z.number().int().nonnegative(),
+  n_gold: z.number().int().nonnegative(),
+  raters: z.number().int().nonnegative(),
+  isMust: z.boolean(),
+  declaredGateMode: z.enum(['observe', 'advise', 'block']),
+  agreement: z.number().nullable(),
+  kappa_gold_vs_judge: z.number().nullable(),
+  alpha_human_ceiling: z.number().nullable(),
+  alpha_gold_vs_judge: z.number().nullable(),
+  effectiveAlpha: z.number().nullable(),
+  rho: z.number().nullable(),
+  ceilingLow: z.boolean(),
+  band: z.enum(['auto', 'advise', 'split']),
+  canAutoBlock: z.boolean(),
+  effectiveEnforcement: z.enum(['block', 'observe']),
+  action: z.enum(['allow_auto_block', 'advise_only', 'split_or_rewrite']),
+  note: z.string().optional(),
+}).strict();
+
+export const rubricCalibrationReportSchema = z.object({
+  schemaVersion: z.literal(1),
+  roleId: z.string().min(1),
+  rubricDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  calibratedAt: z.string().min(1),
+  bands: z.object({
+    auto: z.number().min(0).max(1),
+    advise: z.number().min(0).max(1),
+    minAutoSamples: z.number().int().positive(),
+  }).strict(),
+  perCriterion: z.record(z.string(), criterionCalibrationResultSchema),
+  autoBlockAllowed: z.array(z.string()),
+  advisoryOnly: z.array(z.string()),
+  splitRequired: z.array(z.string()),
+  blockedBy: z.array(z.string()),
+  passed: z.boolean(),
+}).strict();
+
 export type RubricDefinition = z.infer<typeof rubricFileSchema>;
 export type RubricJudgment = z.infer<typeof judgmentLineSchema>;
+export type CriterionCalibrationResult = z.infer<typeof criterionCalibrationResultSchema>;
+export type RubricCalibrationReport = z.infer<typeof rubricCalibrationReportSchema>;
 
-export interface CriterionCalibrationResult {
-  criterionId: string;
-  n: number;
-  raters: number;
-  isMust: boolean;
-  declaredGateMode: 'observe' | 'block' | 'skip';
-  agreement: number | null;
-  kappa_gold_vs_judge: number | null;
-  alpha_human_ceiling: number | null;
-  alpha_gold_vs_judge: number | null;
-  effectiveAlpha: number | null;
-  rho: number | null;
-  ceilingLow: boolean;
-  band: RubricBand;
-  canAutoBlock: boolean;
-  effectiveEnforcement: 'block' | 'observe' | 'skip';
-  action: 'allow_auto_block' | 'advise_only' | 'split_or_rewrite';
-  note?: string;
+function assertSafeRoleId(roleId: string): void {
+  if (!SAFE_ROLE_ID.test(roleId) || roleId === '.' || roleId === '..' || roleId.includes('..')) {
+    throw new Error(`Unsafe roleId for rubric calibration path: ${roleId.slice(0, 64)}`);
+  }
 }
 
-export interface RubricCalibrationReport {
-  schemaVersion: 1;
-  roleId: string;
-  rubricDigest: string;
-  calibratedAt: string;
-  bands: { auto: number; advise: number; minAutoSamples: number };
-  perCriterion: Record<string, CriterionCalibrationResult>;
-  autoBlockAllowed: string[];
-  advisoryOnly: string[];
-  splitRequired: string[];
-  blockedBy: string[];
-  passed: boolean;
+export function rubricCalibrationPath(workspace: string, roleId: string): string {
+  assertSafeRoleId(roleId);
+  return path.join(path.resolve(workspace), roleId, 'rubric-calibration.json');
 }
-
-export const rubricCalibrationPath = (workspace: string, roleId: string) =>
-  path.join(path.resolve(workspace), roleId, 'rubric-calibration.json');
 
 function round3(value: number | null): number | null {
   return value === null || !Number.isFinite(value) ? null : Math.round(value * 1000) / 1000;
@@ -169,8 +199,11 @@ export function cohenKappa(a: readonly number[], b: readonly number[]): number |
 }
 
 /**
- * Krippendorff's alpha for nominal (binary/categorical) or ordinal scales.
- * Each unit is an array of rater values (>=2 raters contribute to the coincidence matrix).
+ * Canonical Krippendorff's alpha for nominal or ordinal scales.
+ *
+ * For ordinal scales, uses Krippendorff's marginal-frequency difference function:
+ *   delta^2_ord(c, k) = ( sum_{g=min(c,k)..max(c,k)} n_g - (n_c + n_k) / 2 )^2
+ * where n_g is the marginal coincidence frequency of category g.
  */
 export function krippendorffAlpha(units: readonly (readonly number[])[], ordinal: boolean): number | null {
   const coinc = new Map<string, { c: number; k: number; v: number }>();
@@ -202,11 +235,23 @@ export function krippendorffAlpha(units: readonly (readonly number[])[], ordinal
   if (keys.length <= 1) return 1.0;
 
   const idx = new Map<number, number>(keys.map((k, i) => [k, i]));
+  const freq = keys.map(k => nc.get(k)!);
+  // Precompute prefix sums for O(1) canonical ordinal delta^2 lookups.
+  const prefix = new Array<number>(keys.length + 1).fill(0);
+  for (let i = 0; i < keys.length; i += 1) {
+    prefix[i + 1] = prefix[i]! + freq[i]!;
+  }
+
   const d2 = (c: number, k: number): number => {
     if (c === k) return 0;
     if (ordinal && keys.length > 2) {
-      const diff = idx.get(c)! - idx.get(k)!;
-      return diff * diff;
+      const ic = idx.get(c)!;
+      const ik = idx.get(k)!;
+      const lo = Math.min(ic, ik);
+      const hi = Math.max(ic, ik);
+      const sumBetween = prefix[hi + 1]! - prefix[lo]!;
+      const delta = sumBetween - (freq[lo]! + freq[hi]!) / 2;
+      return delta * delta;
     }
     return 1;
   };
@@ -303,16 +348,21 @@ export async function loadRubricJudgments(judgmentsPath: string): Promise<Rubric
 
 export function classifyBand(
   effectiveAlpha: number | null,
-  n: number,
+  nPairs: number,
   bands: { auto: number; advise: number; minAutoSamples: number },
 ): RubricBand {
-  if (effectiveAlpha === null || n <= 0) return 'split';
-  if (effectiveAlpha >= bands.auto && n >= bands.minAutoSamples) return 'auto';
+  if (effectiveAlpha === null || nPairs <= 0) return 'split';
+  if (effectiveAlpha >= bands.auto && nPairs >= bands.minAutoSamples) return 'auto';
   if (effectiveAlpha >= bands.advise) return 'advise';
   return 'split';
 }
 
-function humanConsensus(values: readonly number[], ordinal: boolean): number | null {
+/**
+ * Unbiased consensus for both humans and judges:
+ * - Binary: strict majority; 50/50 tie returns null (excluded from pair).
+ * - Ordinal: exact median; half-integer tie (e.g. 1.5) returns null (excluded from pair, no upward rounding bias).
+ */
+function consensusValue(values: readonly number[], ordinal: boolean): number | null {
   if (!values.length) return null;
   if (!ordinal) {
     const ones = values.reduce((s, v) => s + (v >= 0.5 ? 1 : 0), 0);
@@ -322,34 +372,51 @@ function humanConsensus(values: readonly number[], ordinal: boolean): number | n
   }
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
-  const med = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
-  return Math.round(med);
+  if (sorted.length % 2 === 1) return sorted[mid]!;
+  const med = (sorted[mid - 1]! + sorted[mid]!) / 2;
+  return Number.isInteger(med) ? med : null;
+}
+
+function resolvePolicyBands(rubric: RubricDefinition): { auto: number; advise: number; minAutoSamples: number } {
+  const declaredAuto = rubric.calibration?.bands?.auto;
+  const declaredAdvise = rubric.calibration?.bands?.advise;
+  if (declaredAuto !== undefined && declaredAuto < POLICY_AUTO_ALPHA) {
+    throw new Error(`rubric calibration.bands.auto (${declaredAuto}) cannot be below policy floor ${POLICY_AUTO_ALPHA}`);
+  }
+  if (declaredAdvise !== undefined && declaredAdvise < POLICY_ADVISE_ALPHA) {
+    throw new Error(`rubric calibration.bands.advise (${declaredAdvise}) cannot be below policy floor ${POLICY_ADVISE_ALPHA}`);
+  }
+  const auto = declaredAuto ?? POLICY_AUTO_ALPHA;
+  const advise = declaredAdvise ?? POLICY_ADVISE_ALPHA;
+  if (advise > auto) {
+    throw new Error(`rubric calibration.bands.advise (${advise}) cannot exceed bands.auto (${auto})`);
+  }
+  return { auto, advise, minAutoSamples: POLICY_MIN_AUTO_SAMPLES };
 }
 
 export function evaluateRubricJudgments(options: {
   rubric: RubricDefinition;
   judgments: readonly RubricJudgment[];
   rubricDigest: string;
-  minAutoSamples?: number;
   now?: () => Date;
 }): RubricCalibrationReport {
-  const autoThreshold = options.rubric.calibration?.bands?.auto ?? 0.8;
-  const adviseThreshold = options.rubric.calibration?.bands?.advise ?? 0.67;
-  const minAutoSamples = options.minAutoSamples ?? options.rubric.calibration?.minAutoSamples ?? 40;
-  const bands = { auto: autoThreshold, advise: adviseThreshold, minAutoSamples };
+  const bands = resolvePolicyBands(options.rubric);
 
   const mustSet = new Set<string>([
-    ...(options.rubric.pass_rule?.mustAllPass ?? []),
-    ...(options.rubric.pass_rule?.mustNotTrigger ?? []),
+    ...(options.rubric.aggregation?.mustAllPass ?? []),
+    ...(options.rubric.aggregation?.mustNotTrigger ?? []),
   ]);
 
-  // criterion -> unit -> rater -> value
+  // criterion -> unit -> rater -> value (reject duplicate (unit, criterion, rater) records)
   const byCriterion = new Map<string, Map<string, Map<string, number>>>();
   for (const j of options.judgments) {
     let unitMap = byCriterion.get(j.criterion);
     if (!unitMap) { unitMap = new Map(); byCriterion.set(j.criterion, unitMap); }
     let raterMap = unitMap.get(j.unit);
     if (!raterMap) { raterMap = new Map(); unitMap.set(j.unit, raterMap); }
+    if (raterMap.has(j.rater)) {
+      throw new Error(`Duplicate judgment for unit="${j.unit}" criterion="${j.criterion}" rater="${j.rater}"`);
+    }
     raterMap.set(j.rater, j.value);
   }
 
@@ -362,7 +429,7 @@ export function evaluateRubricJudgments(options: {
   for (const criterion of options.rubric.criteria) {
     const cid = criterion.id;
     const declaredGateMode = criterion.gate?.mode ?? 'observe';
-    const isMust = mustSet.has(cid) || declaredGateMode === 'block';
+    const isMust = mustSet.has(cid) || criterion.severity === 'must' || declaredGateMode === 'block';
     const ordinal = criterion.scale.type === 'ordinal';
     const unitMap = byCriterion.get(cid);
 
@@ -379,6 +446,7 @@ export function evaluateRubricJudgments(options: {
       const res: CriterionCalibrationResult = {
         criterionId: cid,
         n: 0,
+        n_gold: 0,
         raters: 0,
         isMust,
         declaredGateMode,
@@ -391,7 +459,7 @@ export function evaluateRubricJudgments(options: {
         ceilingLow: false,
         band: 'split',
         canAutoBlock: false,
-        effectiveEnforcement: declaredGateMode === 'skip' ? 'skip' : 'observe',
+        effectiveEnforcement: 'observe',
         action: 'split_or_rewrite',
         note: '没有人工金标，未校准，禁止自动阻断，需补充金标或拆改条目',
       };
@@ -420,17 +488,16 @@ export function evaluateRubricJudgments(options: {
       }
       if (hv.length >= 2) humanMat.push(hv);
       if (hv.length > 0 && jv.length > 0) {
-        const hm = humanConsensus(hv, ordinal);
-        const jmMean = jv.reduce((s, v) => s + v, 0) / jv.length;
-        const jmRounded = Math.round(jmMean);
-        if (hm !== null) {
-          pairMat.push([hm, jmRounded]);
+        const hm = consensusValue(hv, ordinal);
+        const jm = consensusValue(jv, ordinal);
+        if (hm !== null && jm !== null) {
+          pairMat.push([hm, jm]);
           goldDiscrete.push(hm);
-          judgeDiscrete.push(jmRounded);
-          rawMatches.push(jmRounded === hm ? 1 : 0);
+          judgeDiscrete.push(jm);
+          rawMatches.push(jm === hm ? 1 : 0);
         }
         humanMeans.push(hv.reduce((s, v) => s + v, 0) / hv.length);
-        judgeMeans.push(jmMean);
+        judgeMeans.push(jv.reduce((s, v) => s + v, 0) / jv.length);
       }
     }
 
@@ -440,39 +507,57 @@ export function evaluateRubricJudgments(options: {
     const rho = humanMeans.length >= 3 ? spearmanRho(humanMeans, judgeMeans) : null;
     const agreement = rawMatches.length > 0 ? rawMatches.reduce((s, v) => s + v, 0) / rawMatches.length : null;
 
-    // Dual-ceiling effective score: bounded by BOTH judge-vs-gold AND human-human ceiling!
-    const candidates = [alphaGoldVsJudge, alphaHumanCeiling].filter((v): v is number => v !== null);
-    const effectiveAlpha = candidates.length > 0
-      ? Math.min(...candidates)
-      : kappaGoldVsJudge;
+    // Dual-ceiling effective score: requires a real alpha_gold_vs_judge (>= 2 judge-gold pairs).
+    // Never falls back to human-only ceiling or 1-sample kappa to enter auto/advise!
+    const effectiveAlpha = alphaGoldVsJudge === null
+      ? null
+      : alphaHumanCeiling !== null
+        ? Math.min(alphaGoldVsJudge, alphaHumanCeiling)
+        : alphaGoldVsJudge;
 
-    const n = goldUnits.length;
-    const band = classifyBand(effectiveAlpha, n, bands);
+    // n is strictly the count of usable judge-gold paired units!
+    const nPairs = pairMat.length;
+    const nGold = goldUnits.length;
+    const band = classifyBand(effectiveAlpha, nPairs, bands);
     const ceilingLow = alphaHumanCeiling !== null && alphaHumanCeiling < bands.advise;
-    const canAutoBlock = band === 'auto' && isMust && declaredGateMode !== 'skip';
-    const effectiveEnforcement: 'block' | 'observe' | 'skip' =
-      declaredGateMode === 'skip' ? 'skip' : (canAutoBlock ? 'block' : 'observe');
+    const minAlpha = criterion.gate?.minAlpha;
+    const meetsMinAlpha = minAlpha === undefined || (effectiveAlpha !== null && effectiveAlpha >= minAlpha);
+    const canAutoBlock = band === 'auto' && isMust && meetsMinAlpha;
+    const effectiveEnforcement: 'block' | 'observe' = canAutoBlock ? 'block' : 'observe';
     const action: CriterionCalibrationResult['action'] =
-      band === 'auto'
-        ? (canAutoBlock ? 'allow_auto_block' : 'advise_only')
-        : band === 'advise'
-          ? 'advise_only'
-          : 'split_or_rewrite';
+      canAutoBlock
+        ? 'allow_auto_block'
+        : band === 'split'
+          ? 'split_or_rewrite'
+          : 'advise_only';
 
     let note: string | undefined;
     if (band === 'split') {
-      note = ceilingLow
-        ? `人工互评上限过低（alpha_human_ceiling=${round3(alphaHumanCeiling)} < ${bands.advise}），必须拆改 Rubric 条目`
-        : `一致性过低（effectiveAlpha=${round3(effectiveAlpha)} < ${bands.advise}），强制提示拆改条目`;
+      if (alphaGoldVsJudge === null) {
+        note = `可用评委-金标配对不足（n=${nPairs} < 2），无法计算 alpha_gold_vs_judge，禁止自动阻断`;
+      } else if (ceilingLow) {
+        note = `人工互评上限过低（alpha_human_ceiling=${round3(alphaHumanCeiling)} < ${bands.advise}），必须拆改 Rubric 条目`;
+      } else {
+        note = `一致性过低（effectiveAlpha=${round3(effectiveAlpha)} < ${bands.advise}），强制提示拆改条目`;
+      }
+    } else if (!meetsMinAlpha && minAlpha !== undefined) {
+      note = `未达到该条目自声明 gate.minAlpha（effectiveAlpha=${round3(effectiveAlpha)} < ${minAlpha}），禁止自动阻断`;
     } else if (band === 'advise') {
-      note = n < bands.minAutoSamples && effectiveAlpha !== null && effectiveAlpha >= bands.auto
-        ? `样本量不足（n=${n} < ${bands.minAutoSamples}），降档为 advise 仅建议，禁止自动阻断`
-        : `处于 advise 区间（${bands.advise} <= alpha < ${bands.auto}），仅建议不阻断`;
+      if (declaredGateMode === 'block') {
+        note = nPairs < bands.minAutoSamples && effectiveAlpha !== null && effectiveAlpha >= bands.auto
+          ? `配对样本量不足（n=${nPairs} < ${bands.minAutoSamples}），该 block 条目暂落 advise 档，不能自动阻断并导致校准未通过`
+          : `该 block 条目处于 advise 区间（${bands.advise} <= alpha < ${bands.auto}），不能自动阻断并导致校准未通过`;
+      } else {
+        note = nPairs < bands.minAutoSamples && effectiveAlpha !== null && effectiveAlpha >= bands.auto
+          ? `配对样本量不足（n=${nPairs} < ${bands.minAutoSamples}），暂处 advise 档，仅建议不阻断`
+          : `处于 advise 区间（${bands.advise} <= alpha < ${bands.auto}），仅建议不阻断`;
+      }
     }
 
     perCriterion[cid] = {
       criterionId: cid,
-      n,
+      n: nPairs,
+      n_gold: nGold,
       raters: raterSet.size,
       isMust,
       declaredGateMode,
@@ -494,12 +579,8 @@ export function evaluateRubricJudgments(options: {
     else if (band === 'split') splitRequired.push(cid);
     else advisoryOnly.push(cid);
 
-    if (declaredGateMode === 'block') {
-      if (band !== 'auto') {
-        blockedBy.push(cid);
-      } else if (criterion.gate?.minAlpha !== undefined && effectiveAlpha !== null && effectiveAlpha < criterion.gate.minAlpha) {
-        blockedBy.push(cid);
-      }
+    if (declaredGateMode === 'block' && !canAutoBlock) {
+      blockedBy.push(cid);
     }
   }
 
@@ -523,20 +604,25 @@ export async function calibrateRubric(options: {
   judgmentsPath: string;
   rubricPath?: string;
   workspace?: string;
-  minAutoSamples?: number;
   now?: () => Date;
 }): Promise<RubricCalibrationReport> {
   const roleDirectory = path.resolve(options.roleDirectory);
-  const [rubric, judgments, rubricDigest] = await Promise.all([
+  const [rubric, judgments, rubricDigest, profileRaw] = await Promise.all([
     loadRubric(roleDirectory, options.rubricPath),
     loadRubricJudgments(options.judgmentsPath),
     computeRubricDigest(roleDirectory, options.rubricPath),
+    readFile(path.join(roleDirectory, 'profile.json'), 'utf8').catch(() => undefined),
   ]);
+  if (profileRaw !== undefined) {
+    const profileId = z.object({ id: z.string().min(1) }).passthrough().parse(JSON.parse(profileRaw)).id;
+    if (profileId !== rubric.roleId) {
+      throw new Error(`rubric.json roleId "${rubric.roleId}" does not match profile.json id "${profileId}"`);
+    }
+  }
   const report = evaluateRubricJudgments({
     rubric,
     judgments,
     rubricDigest,
-    ...(options.minAutoSamples !== undefined ? { minAutoSamples: options.minAutoSamples } : {}),
     ...(options.now ? { now: options.now } : {}),
   });
   if (options.workspace) {
@@ -547,16 +633,33 @@ export async function calibrateRubric(options: {
   return report;
 }
 
-export async function loadRubricCalibration(workspace: string, roleId: string): Promise<RubricCalibrationReport | undefined> {
+export type LoadedRubricCalibration =
+  | { state: 'missing' }
+  | { state: 'invalid'; error: string }
+  | { state: 'ok'; report: RubricCalibrationReport };
+
+export async function readRubricCalibration(workspace: string, roleId: string): Promise<LoadedRubricCalibration> {
+  let text: string;
   try {
-    const raw = JSON.parse(await readFile(rubricCalibrationPath(workspace, roleId), 'utf8')) as RubricCalibrationReport;
-    if (raw?.schemaVersion === 1 && typeof raw.rubricDigest === 'string' && typeof raw.passed === 'boolean') {
-      return raw;
-    }
-    return undefined;
-  } catch {
-    return undefined;
+    text = await readFile(rubricCalibrationPath(workspace, roleId), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'missing' };
+    return { state: 'invalid', error: error instanceof Error ? error.message : String(error) };
   }
+  try {
+    const report = rubricCalibrationReportSchema.parse(JSON.parse(text));
+    if (report.roleId !== roleId) {
+      return { state: 'invalid', error: `rubric-calibration.json roleId "${report.roleId}" does not match "${roleId}"` };
+    }
+    return { state: 'ok', report };
+  } catch (error) {
+    return { state: 'invalid', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export async function loadRubricCalibration(workspace: string, roleId: string): Promise<RubricCalibrationReport | undefined> {
+  const loaded = await readRubricCalibration(workspace, roleId);
+  return loaded.state === 'ok' ? loaded.report : undefined;
 }
 
 export function formatRubricCalibrationText(report: RubricCalibrationReport): string {
@@ -565,7 +668,7 @@ export function formatRubricCalibrationText(report: RubricCalibrationReport): st
   ];
   for (const row of Object.values(report.perCriterion)) {
     lines.push(
-      `  ${row.criterionId.padStart(4)} n=${String(row.n).padEnd(3)} kappa=${row.kappa_gold_vs_judge ?? 'null'} a_ceil=${row.alpha_human_ceiling ?? 'null'} a_gold=${row.alpha_gold_vs_judge ?? 'null'} rho=${row.rho ?? 'null'} band=${row.band} autoBlock=${row.canAutoBlock}${row.note ? ` — ${row.note}` : ''}`,
+      `  ${row.criterionId.padStart(4)} n=${String(row.n).padEnd(3)} (gold=${row.n_gold}) kappa=${row.kappa_gold_vs_judge ?? 'null'} a_ceil=${row.alpha_human_ceiling ?? 'null'} a_gold=${row.alpha_gold_vs_judge ?? 'null'} rho=${row.rho ?? 'null'} band=${row.band} autoBlock=${row.canAutoBlock}${row.note ? ` — ${row.note}` : ''}`,
     );
   }
   lines.push(`允许自动阻断：${report.autoBlockAllowed.join('、') || '无'} | 仅建议：${report.advisoryOnly.join('、') || '无'} | 强制拆改：${report.splitRequired.join('、') || '无'}`);

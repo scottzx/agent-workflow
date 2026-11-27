@@ -13,7 +13,7 @@ import { worktreeConfigSchema } from './worktree.js';
 
 const nodeSchema = z.object({
   id: z.string().min(1),
-  type: z.enum(['executor_turn', 'program_check', 'artifact_digest_check', 'ticket_apply_checks', 'qa_session_review', 'ticket_apply_review']),
+  type: z.enum(['executor_turn', 'program_check', 'artifact_digest_check', 'ticket_apply_checks', 'qa_session_review', 'ticket_apply_review', 'learnings_lookup']),
   dependsOn: z.array(z.string().min(1)).optional(),
   checks: z.array(z.string().min(1)).optional(),
   when: z.enum(['checks_passed', 'always']).optional(),
@@ -109,7 +109,7 @@ export interface RunRoundDagOptions {
   now?: () => Date;
 }
 
-const CHECK_NODE = new Set<WorkflowNode['type']>(['program_check', 'artifact_digest_check']);
+const CHECK_NODE = new Set<WorkflowNode['type']>(['program_check', 'artifact_digest_check', 'learnings_lookup']);
 
 export function defaultOutlineWorkflow(): Workflow {
   return workflowSchema.parse({

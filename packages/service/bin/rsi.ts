@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate } from '../src/rsi/gate.js';
+import { formatLearningsLookupText, lookupLearnings } from '../src/rsi/learnings-lookup.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
 import { calibrateRubric, formatRubricCalibrationText, rubricCalibrationPath } from '../src/rsi/rubric.js';
@@ -16,6 +17,7 @@ const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [o
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
        acp-service rsi calibrate --rubric --role DIR --judgments FILE [--workspace DIR] [--json]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
+       acp-service rsi lookup --paths FILE1,FILE2 [--repo DIR] [--limit N] [--json]
        acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
@@ -86,6 +88,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   if (argv[0] === 'gate') return runGate(argv.slice(1));
   if (argv[0] === 'calibrate') return runCalibrate(argv.slice(1));
   if (argv[0] === 'scorecard') return runScorecard(argv.slice(1));
+  if (argv[0] === 'lookup') return runLookup(argv.slice(1));
   if (argv[0] === 'eval-cr') return runEvalCr(argv.slice(1));
   if (argv[0] !== 'run') throw new Error('Unknown rsi command; use rsi --help');
   const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
@@ -137,6 +140,10 @@ async function runGate(argv: string[]): Promise<void> {
   console.log(`L1 对校分歧：${gate.l1Mismatches}`);
   const calibrationLabel = { passed: '已通过', failed: '未通过', missing: '缺少', stale: '已过期', not_required: '不要求' }[gate.calibration.status];
   console.log(`L3 回放校准：${calibrationLabel}${gate.calibration.falsePositives ? `，误报 ${gate.calibration.falsePositives}` : ''}`);
+  if (gate.rubricCalibration?.present) {
+    const rubricLabel = { passed: '已通过', failed: '未通过', stale: '已过期', not_required: '未校准（observe）' }[gate.rubricCalibration.status];
+    console.log(`Rubric 校准：${rubricLabel}${gate.rubricCalibration.blockedBy?.length ? `（未达标：${gate.rubricCalibration.blockedBy.join('、')}）` : ''}`);
+  }
   for (const kase of gate.testCases) console.log(`  测试 ${kase.caseId}（${kase.kind === 'original' ? '原题' : '变体题'}）：${{ passed: '通过', failed: '未通过', not_run: '未跑' }[kase.result]}`);
   if (!gate.ready) process.exitCode = 1;
 }
@@ -150,6 +157,8 @@ async function runCalibrate(argv: string[]): Promise<void> {
   if (!values.role) throw new Error('--role is required');
   if (values.rubric) {
     if (!values.judgments) throw new Error('--judgments <jsonl> is required with --rubric');
+    if (values.only) throw new Error('--only cannot be combined with --rubric');
+    if (values.python) throw new Error('--python cannot be combined with --rubric');
     const report = await calibrateRubric({
       roleDirectory: resolve(values.role),
       judgmentsPath: resolve(values.judgments),
@@ -193,6 +202,34 @@ async function runScorecard(argv: string[]): Promise<void> {
   });
   if (values.json) console.log(JSON.stringify(report, null, 2));
   else console.log(formatScorecardText(report));
+}
+
+async function runLookup(argv: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({ args: argv, strict: true, allowPositionals: true, options: {
+    paths: { type: 'string', multiple: true },
+    repo: { type: 'string' },
+    limit: { type: 'string' },
+    json: { type: 'boolean', default: false },
+  } });
+  const rawPaths = [
+    ...(values.paths ?? []).flatMap(entry => entry.split(',')),
+    ...positionals,
+  ].map(item => item.trim()).filter(Boolean);
+  if (!rawPaths.length) throw new Error('--paths <files> is required');
+  const repoRoot = values.repo ? resolve(values.repo) : await findRepoRoot(process.cwd()).catch(() => resolve('.'));
+  let limit: number | undefined;
+  if (values.limit !== undefined) {
+    const parsed = Number(values.limit);
+    if (!Number.isInteger(parsed) || parsed < 0) throw new Error('--limit must be a non-negative integer');
+    limit = parsed;
+  }
+  const report = await lookupLearnings({
+    repoRoot,
+    paths: rawPaths,
+    ...(limit !== undefined ? { limit } : {}),
+  });
+  if (values.json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatLearningsLookupText(report));
 }
 
 async function runEvalCr(argv: string[]): Promise<void> {

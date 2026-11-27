@@ -14,7 +14,7 @@ import { z } from 'zod';
 import type { Ticket } from '../execution/ticket.js';
 import { computeChecksDigest, loadCalibration } from './calibrate.js';
 import { type LedgerEntry, ledgerPath, roleVersion, type RoleVersion, type StopReason } from './outline-run.js';
-import { computeRubricDigest, loadRubricCalibration } from './rubric.js';
+import { computeRubricDigest, readRubricCalibration } from './rubric.js';
 
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 
@@ -112,10 +112,17 @@ async function rubricCalibrationGate(input: {
   const hasRubric = await stat(path.join(input.roleDirectory, 'rubric.json')).then(s => s.isFile(), () => false);
   if (!hasRubric) return {};
   const rubricDigest = await computeRubricDigest(input.roleDirectory);
-  const saved = await loadRubricCalibration(input.workspace, input.roleId);
-  if (!saved) {
+  const loaded = await readRubricCalibration(input.workspace, input.roleId);
+  if (loaded.state === 'missing') {
     return { report: { present: true, status: 'not_required', rubricDigest } };
   }
+  if (loaded.state === 'invalid') {
+    return {
+      report: { present: true, status: 'failed', rubricDigest },
+      reason: `Rubric 校准报告损坏或格式无效（${loaded.error}），请重新运行 acp-service rsi calibrate --rubric`,
+    };
+  }
+  const saved = loaded.report;
   if (saved.rubricDigest !== rubricDigest) {
     return {
       report: { present: true, status: 'stale', rubricDigest, blockedBy: saved.blockedBy },
