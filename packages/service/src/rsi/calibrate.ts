@@ -33,7 +33,7 @@ import { type LedgerEntry, ledgerPath, type RoleVersion, roleVersion, type StopR
 const execFileAsync = promisify(execFile);
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 const SAFE_ROLE_ID = /^[A-Za-z0-9._-]+$/;
-const ROLE_DIGEST_TOP_FILES = ['profile.json', 'ROLE.md', 'QA.md', 'checklist.json', 'workflow.json', 'routing.json'] as const;
+const ROLE_DIGEST_TOP_FILES = ['profile.json', 'ROLE.md', 'QA.md', 'checklist.json', 'rubric.json', 'workflow.json', 'routing.json'] as const;
 const ROLE_DIGEST_SUBDIRS = ['checks', 'skills', 'evals'] as const;
 
 export function assertSafeRoleWorkspaceId(roleId: string): void {
@@ -239,10 +239,11 @@ export function holdoutPath(workspace: string, roleId: string): string {
   return path.join(path.resolve(workspace), roleId, 'holdout.json');
 }
 
-/** Stable SHA-256 over `checklist.json` and every regular file in `checks/`. */
+/** Stable SHA-256 over `checklist.json`, optional `rubric.json`, and every regular file in `checks/`. */
 export async function computeChecksDigest(roleDirectory: string): Promise<string> {
   const root = path.resolve(roleDirectory);
   const files = ['checklist.json'];
+  if (await isFile(path.join(root, 'rubric.json'))) files.push('rubric.json');
   await collectFiles(path.join(root, 'checks'), root, files);
   files.sort();
   return digestFiles(root, files);

@@ -33,6 +33,7 @@ import {
   type CrEvalScore,
   type CrReviewResult,
 } from './pr-cr-eval.js';
+import { computeRubricDigest, readRubricCalibration } from './rubric.js';
 
 const execFileAsync = promisify(execFile);
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
@@ -91,6 +92,13 @@ export interface GateReport {
   };
   /** Eval-CR gate summary when the role contains `evals/manifest.json` (e.g. `pr-delivery`). */
   crEval?: CrEvalGateSummary;
+  /** Dual-ceiling rubric calibration status when `rubric.json` is present. */
+  rubricCalibration?: {
+    present: boolean;
+    status: 'passed' | 'failed' | 'stale' | 'not_required';
+    rubricDigest?: string;
+    blockedBy?: string[];
+  };
 }
 
 export function crEvalReportPath(workspace: string, roleId: string): string {
@@ -238,6 +246,8 @@ export async function checkGate(options: {
     requireCalibration: options.requireCalibration === true,
   });
   if (calibration.reason) reasons.push(calibration.reason);
+  const rubricCal = await rubricCalibrationGate({ roleDirectory, workspace: options.workspace, roleId });
+  if (rubricCal.reason) reasons.push(rubricCal.reason);
   return {
     roleId,
     role,
@@ -250,6 +260,7 @@ export async function checkGate(options: {
     l1Mismatches,
     calibration: calibration.report,
     ...(crEvalResult.summary.present ? { crEval: crEvalResult.summary } : {}),
+    ...(rubricCal.report ? { rubricCalibration: rubricCal.report } : {}),
   };
 }
 
@@ -376,6 +387,40 @@ async function evalCrGate(input: {
     },
     reasons,
   };
+}
+
+async function rubricCalibrationGate(input: {
+  roleDirectory: string;
+  workspace: string;
+  roleId: string;
+}): Promise<{ report?: GateReport['rubricCalibration']; reason?: string }> {
+  const hasRubric = await stat(path.join(input.roleDirectory, 'rubric.json')).then(s => s.isFile(), () => false);
+  if (!hasRubric) return {};
+  const rubricDigest = await computeRubricDigest(input.roleDirectory);
+  const loaded = await readRubricCalibration(input.workspace, input.roleId);
+  if (loaded.state === 'missing') {
+    return { report: { present: true, status: 'not_required', rubricDigest } };
+  }
+  if (loaded.state === 'invalid') {
+    return {
+      report: { present: true, status: 'failed', rubricDigest },
+      reason: `Rubric 校准报告损坏或格式无效（${loaded.error}），请重新运行 acp-service rsi calibrate --rubric`,
+    };
+  }
+  const saved = loaded.report;
+  if (saved.rubricDigest !== rubricDigest) {
+    return {
+      report: { present: true, status: 'stale', rubricDigest, blockedBy: saved.blockedBy },
+      reason: 'Rubric 校准报告已过期（rubric.json 或 checks 摘要已变更），请重新运行 acp-service rsi calibrate --rubric',
+    };
+  }
+  if (!saved.passed) {
+    return {
+      report: { present: true, status: 'failed', rubricDigest, blockedBy: saved.blockedBy },
+      reason: `Rubric 校准未通过（未达标阻断项：${saved.blockedBy.join('、')}），请调整或拆改条目后重跑 acp-service rsi calibrate --rubric`,
+    };
+  }
+  return { report: { present: true, status: 'passed', rubricDigest, blockedBy: [] } };
 }
 
 /**
