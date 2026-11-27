@@ -2,7 +2,7 @@
 
 > 日期：2026-11-27  
 > 关联文档：[5 层概念模型与四路调研综合研判](./compound-agent-architecture-synthesis-20261127.md) · [分阶段 PR 拆分与现有场景演练](./compound-agent-staged-pr-plan-20261127.md)  
-> **编号约定**：`A1–A5` 指 5 层系统架构层；`L1 / L2 / L3` 专指本仓既有的三层质检对校（`L1` 自检↔机检、`L2` 自检↔质检、`L3` 规则↔历史样本回放）；`G1–G8` 指 8 处缺口。
+> **编号约定**：`A1–A5` 指 5 层系统架构层（与个别既有清单条目 id 如 `product-intro-outline` 的 `A1`/`A2` 无关）；`L1 / L2 / L3` 专指本仓既有的三层质检对校（`L1` 自检↔机检、`L2` 自检↔质检、`L3` 规则↔历史样本回放）；`G1–G8` 指 8 处缺口。
 
 本文用 6 张可视化流程图 + 1 张落点对照表，完整展示 **AS-IS 现状与缺口（图 1）**、**5 层概念模型（图 2）**、**统一资产 `trial/formal` 生命周期与总管权限边界（图 3）**、**单次交付 × 持续复利双飞轮（图 4）**、**双钥匙治理时序（图 5）**，以及 **Checklist × Rubric × Pairwise 三层质量漏斗（图 6）**。
 
@@ -28,11 +28,11 @@ flowchart TD
         PR --> CR["异模型只读 CR: deepseek-v4.1"]
         CI -- "红" --> W
         CR -- "MUST 阻塞打回" --> W
-        CI -- "100% 绿" --> G0["三绿汇合: 质检 L1 + CI + CR PASS"]
-        CR -- "PASS" --> G0
+        CI -- "100% 绿" --> TriGreen["三绿汇合: 质检 L1 + CI + CR PASS"]
+        CR -- "PASS" --> TriGreen
     end
 
-    G0 --> M["人/总管: Ready & Merge 到 main"]
+    TriGreen --> M["人/总管: Ready & Merge 到 main"]
     M --> D["本机发布: a2a-gateway 自动 + DSH Desktop 手工"]
     D -. "G3 缺口: DSH 插件同步未进发布脚本" .-> END1["本次交付结束"]
 
@@ -230,7 +230,7 @@ flowchart TD
     subgraph Cal["校准门禁 calibrate_rubric (双上限: min 人-人 alpha, 评委-金标 alpha)"]
         direction LR
         Band1["alpha >= 0.8 且 n >= 40: auto 档 (可自动 block 门禁, 平替 QA)"]
-        Band2["0.67 <= alpha < 0.8: advise 档 (只做建议, 不阻断)"]
+        Band2["0.67 <= alpha < 0.8 或 n < 40 且 alpha >= 0.67: advise 档 (只做建议, 不阻断)"]
         Band3["alpha < 0.67: split 档 (标准含糊, 必须拆改条目)"]
     end
 

@@ -11,7 +11,7 @@
 3. **调研 3（评测驱动迭代、总管治理与本仓诊断，424 行）**：核实 OpenAI / Anthropic Eval 与 Auto Mode 实践、SWE-bench Verified、MAST 归因体系，并逐行只读核查 `.1agents/roles/pr-delivery/` 与 `packages/service/src/rsi/`。
 4. **调研 4（Rubric 评分 Eval 与 PPT 多维质量评测，654 行 + 7 个本机可运行原型）**：核实 HealthBench、Rubrics as Rewards、AutoRubric、PPTEval / PPTAgent、VLM-SlideEval、PPTBench、MT-Bench 换位双跑，并完成本机原型验证（`rubric.schema.json`、`check_pptx.py`、`calibrate_rubric.py` 计划随 `PR-R1` / `PR-R2` 正式入库）。
 
-> **编号约定**：本文档用 **`A1–A5`** 表示 5 层系统架构层，保留 **`L1 / L2 / L3`** 专指本仓既有的三层质检对校体系（`L1` 自检↔机检、`L2` 自检↔质检、`L3` 规则↔历史样本回放），避免两套编号冲突。
+> **编号约定**：本文档用 **`A1–A5`** 表示 5 层系统架构层，保留 **`L1 / L2 / L3`** 专指本仓既有的三层质检对校体系（`L1` 自检↔机检、`L2` 自检↔质检、`L3` 规则↔历史样本回放），避免两套编号冲突（个别既有角色清单条目 id 如 `product-intro-outline/checklist.json` 中的 `A1`/`A2` 仅作条目编号，与架构层 `A1–A5` 无关）。
 
 ---
 
@@ -39,7 +39,7 @@
 | --- | --- | --- | --- | --- |
 | **1. Preset 能力资产** | `ROLE.md`、`skills/*/SKILL.md`、DSH 工具白名单、`routing.json` | **总管充分自主修改**（自动记录 `skillDigest` 与变更依据） | **不可变锁定，总管只读**（只能 fork 新 `trial` 草稿迭代） | 具备 `NOT for:` 负向触发边界；路由变更须过 canary 黄金回放 |
 | **2. Micro 质检资产（A2a）** | 节点内自检项、`checks/` 本地程序检查 | **总管自主增改**（新检查默认以 `observe` 试跑） | **不可变锁定，总管只读** | 必填 `source` provenance；当前树 pass + 缺陷副本 fail；负样本零覆盖禁升 `block` |
-| **3. Macro 质检资产（A2b）** | `QA.md`、`rubric.json`、Pairwise 配置 | **总管自主调优**（拆模糊条目、补锚点与反例） | **不可变锁定，总管只读** | 双上限校准 `min(人-人 α, 评委-金标 α)` 分三档：`α ≥ 0.8` 且 `n ≥ 40` 进 `auto` 阻断；`0.67 ≤ α < 0.8` 归 `advise` 仅建议；`α < 0.67` 归 `split` 必须拆改模糊条目 |
+| **3. Macro 质检资产（A2b）** | `QA.md`、`rubric.json`、Pairwise 配置 | **总管自主调优**（拆模糊条目、补锚点与反例） | **不可变锁定，总管只读** | 双上限校准 `min(人-人 α, 评委-金标 α)` 分三档：`α ≥ 0.8` 且 `n ≥ 40` 进 `auto` 阻断；`0.67 ≤ α < 0.8`（或 `α ≥ 0.8` 但 `n < 40`）一律落 `advise` 仅建议；`α < 0.67` 归 `split` 必须拆改模糊条目 |
 | **4. DAG 工作流资产（A3）** | `workflow.json`、Artifact Contract、回边与人工关口 | **总管自主编排实验**（试新节点/并行/分支） | **不可变锁定，总管只读** | 原题 + 变体题跑通、质检 L1 `self_vs_program = 0`、闭环满足单向依赖 |
 | **5. 考卷资产（独立）** | `evals/manifest.json`、冻结 `holdout`、人工金标 `gold.jsonl` | **总管只读**（仅可提议新增样本，严禁改删旧考卷） | **永久只读（仅人可改）** | **独立防线**：确保总管在 `trial` 充分放权时不等于能篡改考题 |
 
