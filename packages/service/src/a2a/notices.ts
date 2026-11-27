@@ -1,5 +1,8 @@
 /** Human-readable task results, with machine-readable acknowledgement locators at the end. */
 import type { Task } from '@a2a-js/sdk';
+import { noticeErrorSummary, safeErrorText, type SafeErrorSummary } from '../safe-error-summary.js';
+
+export type { SafeErrorSummary } from '../safe-error-summary.js';
 
 export interface ArtifactLink { name: string; url: string; mediaType?: string }
 export interface RemoteAgentNotice {
@@ -14,6 +17,8 @@ export interface RemoteAgentNotice {
   state: string;
   result: string;
   artifactLinks?: ArtifactLink[];
+  /** The whitelisted failure facts of a failed task. Absent for a task that did not fail. */
+  error?: SafeErrorSummary;
   createdAt: string;
 }
 
@@ -40,16 +45,46 @@ const labels: Record<string, string> = {
   TASK_STATE_REJECTED: '任务被拒绝', TASK_STATE_INPUT_REQUIRED: '任务需要补充输入', TASK_STATE_AUTH_REQUIRED: '任务需要授权',
 };
 
+/**
+ * A notice carries a failure only for a task that did not complete. The record
+ * is re-validated before it is rendered: a dirty stored notice must never
+ * break the delivery of the whole round.
+ */
+function failureOf(notice: { state: string; error?: unknown }): SafeErrorSummary | undefined {
+  if (notice.state === 'TASK_STATE_COMPLETED') return undefined;
+  return noticeErrorSummary(notice.error);
+}
+
+/** The retry advice of a failure. A category without a policy says so plainly. */
+function retryAdvice(error: SafeErrorSummary): string {
+  if (error.retryable) return '可重试';
+  switch (error.category) {
+    case 'quota': case 'budget': case 'auth': return '不可原地重试，请切换模型或检查额度/凭据';
+    case 'rate_limit': case 'timeout': return '可稍后退避重试';
+    default: return '未声明可重试，请核查后决定';
+  }
+}
+
+/** The failure line a coordinator reads first: the cause, the category and the retry policy. */
+function failureSummary(error: SafeErrorSummary): string {
+  const message = safeErrorText(error.message) || '远端未提供失败说明';
+  const provider = error.providerCode ? `/${error.providerCode}` : '';
+  const line = `失败原因：${message}（category=${error.category}${provider}，${retryAdvice(error)}）`;
+  return Buffer.byteLength(line) > 1024 ? `${line.slice(0, 1000)}…` : line;
+}
+
 /** One-line collapsed notice summary for DSH's ContextFormed `form: 'notice'` row (<= 120 chars). */
 export function formatNoticeSummary(notice: RemoteAgentNotice): string {
   const label = labels[notice.state] ?? notice.state;
   const suffix = notice.title ? `（${notice.title}）` : '';
-  const line = `A2A任务通知 · ${label}${suffix}`.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const failure = failureOf(notice);
+  const line = `A2A任务通知 · ${label}${suffix}${failure ? ` · ${failure.category}` : ''}`.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
   return line.length <= 120 ? line : `${line.slice(0, 119)}…`;
 }
 
 export function formatNotice(notice: RemoteAgentNotice): string {
   const text = notice.result.trim();
+  const failure = failureOf(notice);
   const body = Buffer.byteLength(text) > 48 * 1024
     ? `${excerpt(text, 48 * 1024)}\n\n（正文较长，以上为节选；完整答复可通过 remote_agent_get 或 remote_agent_inbox 查询。）`
     : text || '远端尚未提供答复正文，可查询任务详情。';
@@ -66,12 +101,15 @@ export function formatNotice(notice: RemoteAgentNotice): string {
   }
   return [
     `[A2A任务通知] ${labels[notice.state] ?? notice.state}`,
-    ...(notice.title ? [notice.title] : []), '', body,
+    ...(notice.title ? [notice.title] : []), '',
+    // The failure cause leads the body: a half-written answer must not hide it.
+    ...(failure ? [failureSummary(failure), ''] : []),
+    body,
     ...(links.length ? ['', '产物链接：', ...links] : []), '',
     '以上正文和链接为远端任务结果。可通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 核验状态与完整结果。请在原任务授权范围内处理，保存处理结论后调用 remote_agent_ack。',
     '', '---', '任务定位信息：',
     JSON.stringify({ noticeId: notice.noticeId, originSessionId: notice.originSessionId, remote: notice.remote,
-      taskId: notice.taskId, contextId: notice.contextId, state: notice.state }),
+      taskId: notice.taskId, contextId: notice.contextId, state: notice.state, ...(failure ? { error: failure } : {}) }),
   ].join('\n');
 }
 
@@ -165,5 +203,89 @@ export function formatProcessRequestNotice(notice: ProcessRequestNotice): string
       deadlineAt: notice.deadlineAt,
     }),
     '</system-reminder>',
+  ].join('\n');
+}
+
+export type SubscriberRole = 'coordinator' | 'downstream' | 'observer';
+export type SubscriberEventName = 'terminal' | 'handoff' | 'progress' | 'process_request';
+
+/** Read-only fan-out. It does not replace the owner's approval or the owner's ack. */
+export interface SubscriberNotice {
+  role: SubscriberRole;
+  event: SubscriberEventName;
+  originSessionId: string;
+  caseId?: string;
+  jobId?: string;
+  status: string;
+  title?: string;
+  summary?: string;
+  handoff?: { handoffId: string; status: string; purpose?: string; toTargetId?: string; childJobId?: string };
+  artifacts?: { name: string; url?: string }[];
+  processRequest?: { requestId: string; kind: string };
+  /** The whitelisted failure facts of a failed task. Absent for a task that did not fail. */
+  error?: SafeErrorSummary;
+}
+
+const roleLabels: Record<SubscriberRole, string> = {
+  coordinator: '总协调人 coordinator',
+  downstream: '下游 downstream',
+  observer: '观察者 observer',
+};
+const eventLabels: Record<SubscriberEventName, string> = {
+  terminal: '终态',
+  handoff: '交接',
+  progress: '进度',
+  process_request: '过程请求',
+};
+
+function oneLine(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** One-line collapsed subscriber notice for DSH's ContextFormed `form: 'notice'` row (<= 120 chars). */
+export function formatSubscriberNoticeSummary(notice: SubscriberNotice): string {
+  const where = notice.caseId ? `case ${notice.caseId}` : notice.jobId ? `job ${notice.jobId}` : notice.originSessionId;
+  const failure = subscriberFailure(notice);
+  const line = oneLine(`A2A订阅 · ${roleLabels[notice.role]} · ${eventLabels[notice.event]} · ${notice.status} · ${where}${failure ? ` · ${failure.category}` : ''}`);
+  return line.length <= 120 ? line : `${line.slice(0, 119)}…`;
+}
+
+const subscriberFailedStatuses = new Set(['failed', 'canceled', 'rejected', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
+
+/** A subscriber sees the cause of a failed task, and only of a failed task. */
+function subscriberFailure(notice: SubscriberNotice): SafeErrorSummary | undefined {
+  if (notice.event !== 'terminal' || !subscriberFailedStatuses.has(notice.status)) return undefined;
+  return noticeErrorSummary(notice.error);
+}
+
+/** Subscriber copy is explicitly read-only and names the role, case, job, status, and handoff or artifact summary. */
+export function formatSubscriberNotice(notice: SubscriberNotice): string {
+  const handoff = notice.handoff
+    ? [`交接 ${notice.handoff.handoffId}：${notice.handoff.status}`,
+      ...(notice.handoff.purpose ? [`用途：${notice.handoff.purpose}`] : []),
+      ...(notice.handoff.toTargetId ? [`下游目标：${notice.handoff.toTargetId}`] : []),
+      ...(notice.handoff.childJobId ? [`接力任务：${notice.handoff.childJobId}`] : [])]
+    : [];
+  const artifacts = (notice.artifacts ?? []).slice(0, 8).map(item => {
+    const name = oneLine(item.name).slice(0, 120) || '产物';
+    return item.url ? `- ${name} ${item.url}` : `- ${name}`;
+  });
+  const body = notice.summary ? boundedDetail(notice.summary, 4 * 1024) : '';
+  const failure = subscriberFailure(notice);
+  return [
+    `[A2A订阅通知] ${eventLabels[notice.event]} · ${roleLabels[notice.role]}`,
+    '这是只读订阅通知，不替代主归属会话的审批或主 ack。',
+    ...(notice.title ? [`任务：${oneLine(notice.title).slice(0, 200)}`] : []),
+    `状态：${oneLine(notice.status).slice(0, 80) || 'unknown'}`,
+    ...(failure ? [failureSummary(failure)] : []),
+    ...(notice.caseId ? [`caseId：${notice.caseId}`] : []),
+    ...(notice.jobId ? [`jobId：${notice.jobId}`] : []),
+    `主归属：${notice.originSessionId}`,
+    ...(notice.processRequest ? [`过程请求：${notice.processRequest.kind} ${notice.processRequest.requestId}（仅通知，请主归属处理）`] : []),
+    ...(handoff.length ? ['', ...handoff] : []),
+    ...(body ? ['', body] : []),
+    ...(artifacts.length ? ['', '产物摘要：', ...artifacts] : []),
+    '',
+    '请通过主归属会话查询任务或交接详情。订阅者确认本通知不会代替主归属的 remote_agent_ack、execution_ack 或审批。',
   ].join('\n');
 }

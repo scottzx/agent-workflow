@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "entry": "implement",
+  "nodes": [
+    { "id": "implement", "type": "executor_turn", "requireTicketSubmit": false },
+    { "id": "l1_gate", "type": "program_check", "checks": ["l1_deterministic"], "dependsOn": ["implement"] },
+    { "id": "draft_pr", "type": "executor_turn", "dependsOn": ["l1_gate"], "when": "checks_passed" },
+    { "id": "cross_model_cr", "type": "qa_session_review", "dependsOn": ["draft_pr"], "when": "checks_passed" },
+    { "id": "ready_for_human", "type": "ticket_apply_review", "dependsOn": ["cross_model_cr"] }
+  ],
+  "cycles": {
+    "programBounce": { "from": "l1_gate", "to": "implement", "when": "block_failed" },
+    "qaRevise": { "from": "cross_model_cr", "to": "implement", "when": "verdict_revise" }
+  },
+  "policies": {
+    "trial": {
+      "maxProgramBounces": 1,
+      "maxQaRevisions": 2,
+      "enforceObserveAsBlock": false,
+      "requireQa": true,
+      "collectProposals": true,
+      "allowExternalHandoff": false
+    },
+    "formal": {
+      "maxProgramBounces": 2,
+      "maxQaRevisions": 5,
+      "enforceObserveAsBlock": true,
+      "requireQa": true,
+      "collectProposals": false,
+      "allowExternalHandoff": true
+    }
+  }
+}

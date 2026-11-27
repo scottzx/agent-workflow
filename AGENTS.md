@@ -23,6 +23,19 @@
 - Git 只跟踪角色声明、说明和示例配置；缓存、技能包、任务/会话数据、产物、状态与本机私密配置不提交。本机配置使用 `.1agents/config/*.local.*`，示例使用 `*.example.json` 或 `*.example.yml`。
 - 宿主安装包、登录凭据、全局模型设置与原生会话库仍由共享宿主管理；项目配置指向上述目录。系统启动日志使用操作系统允许的日志目录，项目任务文件仍写入 `.1agents/`。历史路径迁移须保留原任务锁、版本字节及兼容入口，不直接重写旧回执或冻结合同。
 
+## PR 交付流程（热更新模板）
+
+承接本仓开发 PR 时，先用 `session_identity` 绑定总会话，再实时读取 `.1agents/roles/pr-delivery/` 的当前声明（`profile.json`、`workflow.json`、`ROLE.md`、`QA.md`、`checklist.json`、`routing.json`、`skills/`）。
+不要凭记忆复述旧流程，也不要依赖 `~/.dsh/.agent-presets/` 或 `.agents/hooks/`。
+DSH `standard` 以最近的 `.git` 为项目根，每个 step 热加载该根的指令和 `.agents/skills`；改角色包后重新投影即生效。
+开发只在隔离 worktree 中进行。真源单向投影到该 worktree 的 `.agents/skills/`、`.claude/skills` 软链和 `AGENTS.local.md`。
+这些投影已写入 `.gitignore`，不得进入提交，也不要手改 `AGENTS.md` 来抄一份。
+路径固定为：Worktree 开发 → L1 机检（`checks/l1-gate.mjs`）→ Draft PR → 异模型独立 CR（`magpie` / `group/deepseek-v4.1`，只读）。
+CR 未过则回到实现节点修到三绿，再进入 Ready for review。人只做最后一次验收。
+Worker 不 push、不开 PR、不改授权范围外的文件；门禁与红线以角色包最新声明为准。
+L1 以 `checks/l1-gate.mjs` 的退出码和 JSON 摘要为准，不用口头说明代替。
+没有 `.git` 的裸目录不能当技能根；DSH 会向上找到父仓库。
+
 <!-- aoci:begin -->
 ## AOCI 仓库认知
 

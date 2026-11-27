@@ -120,6 +120,16 @@ export function acpCaseHash(route: AcpCaseRoute): string {
     return `#acp/cases/${encodeURIComponent(route.caseId)}${params.size ? `?${params}` : ''}`;
 }
 
+/** Opens a case, or the case list when no id is given. Kept here so the shell does not import the case chunk. */
+export function navigateCase(caseId?: string, originSessionId?: string) {
+    location.hash = acpCaseHash({ caseId, originSessionId });
+}
+
+/** The frozen bytes of an accepted handoff. The gateway re-checks the digest on every read. */
+export function snapshotUrl(caseId: string, handoffId: string, digest: string): string {
+    return new URL(`/workbench/ui/api/cases/${encodeURIComponent(caseId)}/handoffs/${encodeURIComponent(handoffId)}/artifacts/${digest}`, location.origin).href;
+}
+
 export function latestReview(reviews: AcpReview[]): AcpReview | undefined {
     return [...reviews].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 }

@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import type { McpServerStdio } from '@agentclientprotocol/sdk';
 import type { A2AHostControls } from './a2a.js';
 import { HANDOFF_PATH, HANDOFF_TOOLS, type HandoffTool } from './handoff-spec.js';
+import { ROLE_RULES_PATH, ROLE_RULES_TOOL, roleRulesArguments, type RoleRulesPhaseName } from './role-rules-spec.js';
 import { TICKET_PATH, TICKET_TOOLS, type TicketTool } from './ticket-spec.js';
 
 export const SUBMIT_TOOL = 'submit_to_review';
@@ -71,8 +72,11 @@ export class ReviewHandBack {
       { name: 'ONEAGENTS_REVIEW_URL', value: new URL(REVIEW_SUBMIT_PATH, origin).href },
       { name: 'ONEAGENTS_TICKET_URL', value: new URL(TICKET_PATH, origin).href },
       { name: 'ONEAGENTS_HANDOFF_URL', value: new URL(HANDOFF_PATH, origin).href },
+      { name: 'ONEAGENTS_ROLE_RULES_URL', value: new URL(ROLE_RULES_PATH, origin).href },
       { name: 'ONEAGENTS_REVIEW_SESSION', value: sessionId },
       { name: 'ONEAGENTS_REVIEW_TOKEN', value: this.token(sessionId) },
+      { name: 'ONEAGENTS_SESSION_HOST', value: process.env.ONEAGENTS_SESSION_HOST?.trim() || 'dsh-local' },
+      { name: 'ONEAGENTS_DSH_ORIGIN', value: origin },
     ] };
   }
 
@@ -114,6 +118,19 @@ export class ReviewHandBack {
       const tool = TICKET_TOOLS.find(spec => spec.name === call.body.tool)?.name, args = call.body.arguments ?? {};
       if (!tool || typeof args !== 'object' || Array.isArray(args)) return reply(400, { error: 'Unknown ticket tool or invalid arguments' });
       try { reply(200, { text: await run(call.sessionId, tool, args as Record<string, unknown>) }); }
+      catch (error) { reply(409, { error: error instanceof Error ? error.message : String(error) }); }
+    };
+  }
+
+  /** Read-only role rules for this session. `run` loads them from the session workspace, never from a caller-supplied root. */
+  roleRulesHandler(run: (sessionId: string, args: { roleId: string; phase?: RoleRulesPhaseName }) => Promise<string>) {
+    return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const reply = replier(res), call = await this.authorized(req, reply);
+      if (!call) return;
+      if (call.body.tool !== ROLE_RULES_TOOL.name) return reply(400, { error: 'Unknown role rules tool or invalid arguments' });
+      const parsed = roleRulesArguments(call.body.arguments ?? {});
+      if ('error' in parsed) return reply(400, { error: parsed.error });
+      try { reply(200, { text: await run(call.sessionId, parsed.value) }); }
       catch (error) { reply(409, { error: error instanceof Error ? error.message : String(error) }); }
     };
   }

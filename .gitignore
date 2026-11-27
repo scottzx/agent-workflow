@@ -19,6 +19,8 @@ packages/service/vendor/
 .1agents/skills/
 .1agents/runtime/
 .1agents/state/
+**/.1agents/jobs/
+**/.1agents/worktrees/
 .1agents/config/*
 !.1agents/config/*.example.json
 !.1agents/config/*.example.yml
@@ -27,3 +29,10 @@ dsh-image-gen/
 /skills/
 .tmp/
 packages/*/.tmp/
+
+# Worktree projections only. Do not ignore the tracked .agents/skills/autoreview tree or packages/runtime/.agents.
+/.agents/skills/*
+!/.agents/skills/autoreview/
+/.claude/
+**/AGENTS.local.md
+**/CLAUDE.local.md

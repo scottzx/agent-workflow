@@ -149,7 +149,7 @@ test('ledger state written before tickets existed loads and takes tickets', () =
 });
 
 test('every ticket method is described for discovery', () => {
-  assert.deepEqual(Object.keys(TICKET_METHODS), ['ticket_get', 'ticket_open', 'ticket_checks', 'ticket_review', 'ticket_revise', 'ticket_show', 'ticket_mark', 'ticket_submit', 'ticket_proposal', 'ticket_close', 'ticket_reopen']);
+  assert.deepEqual(Object.keys(TICKET_METHODS), ['ticket_get', 'ticket_open', 'ticket_checks', 'ticket_review', 'ticket_revise', 'ticket_show', 'ticket_mark', 'ticket_self_check', 'ticket_submit', 'ticket_proposal', 'ticket_close', 'ticket_reopen']);
   for (const method of Object.values(TICKET_METHODS)) assert.equal((method.parameters as { type?: string }).type, 'object');
 });
 
@@ -207,4 +207,140 @@ test('a stopped ticket reopens where it stood, a continue sends it back to the e
   assert.equal(f.call('ticket_get').status, 'closed');
   const bare = new JobLedger(undefined, () => {}), job = bare.prepare({ originSessionId: origin, targetSnapshot: target, input: {} }).job.jobId;
   reopenForContinue(bare, origin, job);
+});
+
+const selfCheck = (id: string, over: Record<string, unknown> = {}) => ({ id, kind: 'self', severity: 'must', rule: `${id} 的规则`, ...over });
+
+test('required self-checks block the first submit until each one is marked, from every executor channel', async () => {
+  const f = fixture();
+  assert.throws(() => f.call('ticket_open', { roleId: 'role', caseId: 'demo', selfChecks: [{ ...selfCheck('A1'), state: 'pass' }] }), /Unrecognized key/,
+    'a caller cannot open a self-check already marked');
+  const opened = f.call('ticket_open', { roleId: 'role', caseId: 'demo', artifacts: ['outline.json'], selfChecks: [
+    selfCheck('A1', { evidenceHint: '引用标题' }), selfCheck('S1', { kind: 'self_and_qa' }), selfCheck('P5', { kind: 'program', severity: 'should', recheckOnRevision: false })] });
+  assert.equal(opened.status, 'drafting');
+  assert.equal(opened.outline, 'outline.json');
+  assert.deepEqual(opened.artifacts, ['outline.json']);
+  assert.deepEqual(opened.selfChecks?.map(check => [check.id, check.kind, check.state, check.recheckOnRevision, check.evidenceHint]), [
+    ['A1', 'self', 'pending', true, '引用标题'], ['S1', 'self_and_qa', 'pending', true, undefined], ['P5', 'program', 'pending', false, undefined]]);
+  assert.throws(() => f.executor('ticket_submit'), /还有 2 条必填自检未打卡：A1、S1/);
+  assert.throws(() => f.executor('ticket_self_check', { checkId: 'S1', status: 'pass', note: '  ' }), /说明不能为空/);
+  assert.throws(() => f.executor('ticket_self_check', { checkId: 'S1', status: 'done', note: 'x' }), /Invalid option/);
+  assert.throws(() => f.executor('ticket_self_check', { checkId: 'Z9', status: 'pass', note: '没有这项' }), /没有自检项 Z9/);
+  assert.throws(() => f.executor('ticket_self_check', { sessionId: 'other-session', checkId: 'A1', status: 'pass', note: '标题含受众' }), /不是执行这一轮的会话/);
+  const invoke = async (method: string, params: Record<string, unknown>) => invokeTicket(f.ledger, method, params);
+  const shown = await runExecutorTicket(invoke, { jobId: f.jobId }, 'cli', 'ticket_show');
+  assert.match(shown.text, /预置自检清单（待打卡 3 条 \/ 已完成 0 条）[\s\S]*A1 \[必填\] pending：A1 的规则[\s\S]*待处理修改意见（共 0 条）[\s\S]*待处理 0 条，任务单状态 drafting，第 1 轮/);
+  assert.deepEqual(await runExecutorTicket(invoke, { jobId: f.jobId }, 'cli', 'ticket_self_check', { id: 'A1', status: 'pass', note: '标题含受众' }),
+    { text: 'A1 已自检为 pass，还剩 1 条必填自检待完成。' });
+  await runExecutorTicket(invoke, { jobId: f.jobId, attemptId: f.attempt(), sessionId: 'session' }, 'mcp', 'ticket_self_check', { id: 'S1', status: 'na', note: '本题没有场景字段' });
+  const checked = f.events().filter(event => event.type === 'ticket.self_checked');
+  assert.deepEqual(checked.map(event => [event.type, (event.data as any).via, (event.data as any).checkId, (event.data as any).status, (event.data as any).note, (event.data as any).sessionId, (event.data as any).callerUnverified]), [
+    ['ticket.self_checked', 'cli', 'A1', 'pass', '标题含受众', undefined, true],
+    ['ticket.self_checked', 'mcp', 'S1', 'na', '本题没有场景字段', 'session', undefined]]);
+  assert.equal((checked[0]!.data as any).actor, 'executor');
+  assert.equal((checked[0]!.data as any).round, 1);
+  assert.equal(checked[0]!.attemptId, f.attempt());
+  const submitted = f.executor('ticket_submit') as Ticket;
+  assert.equal(submitted.status, 'ready_for_review');
+  assert.deepEqual(submitted.selfChecks?.map(check => [check.id, check.state, check.checkedInRound]), [['A1', 'pass', 1], ['S1', 'na', 1], ['P5', 'pending', undefined]]);
+  assert.equal(f.events().at(-1)!.type, 'ticket.submitted');
+  assert.throws(() => f.executor('ticket_self_check', { checkId: 'P5', status: 'pass', note: '交稿后不能再改' }), /ready_for_review/);
+});
+
+test('a self-check marked pass is cross-checked when the same program check fails, including when that item is reopened', () => {
+  const f = fixture();
+  f.call('ticket_open', { roleId: 'role', caseId: 'demo', selfChecks: [
+    selfCheck('P5', { kind: 'program', rule: '字体符合规范', recheckOnRevision: false }),
+    selfCheck('P9', { kind: 'program', rule: '另一项', recheckOnRevision: false })] });
+  f.executor('ticket_self_check', { checkId: 'P5', status: 'pass', note: '已核对字体' });
+  f.executor('ticket_self_check', { checkId: 'P9', status: 'na', note: '本题不涉及' });
+  f.executor('ticket_submit');
+  const checked = f.call('ticket_checks', { results: [
+    { itemId: 'P5', pass: false, evidence: [{ path: 'style/font' }] }, { itemId: 'P9', pass: false, evidence: [] }, { itemId: 'P2', pass: true, evidence: [] }] });
+  const failed = checked.items.find(item => item.id === 'P1-P5');
+  assert.deepEqual(failed?.crossCheck, { kind: 'self_vs_program', checkId: 'P5', claimedState: 'pass', claimedNote: '已核对字体', actualVerdict: 'fail' });
+  assert.equal(checked.items.find(item => item.id === 'P1-P9')?.crossCheck, undefined, 'na is not a claim that the program check passed');
+  assert.deepEqual(f.events().filter(event => event.type === 'ticket.crosscheck_mismatch').map(event => event.data), [
+    { actor: 'host', round: 1, itemId: 'P1-P5', kind: 'self_vs_program', checkId: 'P5', claimedState: 'pass', claimedNote: '已核对字体', actualVerdict: 'fail' }]);
+  f.revise();
+  f.executor('ticket_mark', { itemId: 'P1-P5', state: 'done', note: '字体改了' });
+  f.executor('ticket_mark', { itemId: 'P1-P9', state: 'done', note: '不适用已说明' });
+  f.executor('ticket_submit');
+  const again = f.call('ticket_checks', { results: [{ itemId: 'P5', pass: false, evidence: [{ path: 'style/font' }] }, { itemId: 'P9', pass: true, evidence: [] }] });
+  assert.equal(again.items.find(item => item.id === 'P1-P5')?.state, 'reopened');
+  assert.equal(again.items.find(item => item.id === 'P1-P5')?.crossCheck?.kind, 'self_vs_program');
+  assert.equal(again.items.find(item => item.id === 'P1-P9')?.state, 'verified');
+  assert.equal(f.events().filter(event => event.type === 'ticket.crosscheck_mismatch').length, 2);
+});
+
+test('a revision resets self-checks that must be rechecked, and submit then requires both opinions and those checks', () => {
+  const f = fixture();
+  f.call('ticket_open', { roleId: 'role', caseId: 'demo', selfChecks: [selfCheck('A1'), selfCheck('B1', { recheckOnRevision: false, rule: '不必重核' })] });
+  f.executor('ticket_self_check', { checkId: 'A1', status: 'pass', note: '第一轮核对过' });
+  f.executor('ticket_self_check', { checkId: 'B1', status: 'pass', note: '这项保持有效' });
+  f.executor('ticket_submit');
+  f.call('ticket_checks', { results: [{ itemId: 'P2', pass: false, evidence: [] }] });
+  f.revise();
+  const revised = f.call('ticket_get');
+  const a1 = revised.selfChecks?.find(check => check.id === 'A1'), b1 = revised.selfChecks?.find(check => check.id === 'B1');
+  assert.equal(revised.status, 'in_revision');
+  assert.equal(revised.round, 2);
+  assert.deepEqual([a1?.state, a1?.note, a1?.checkedInRound, a1?.log.map(entry => entry.note)], ['pending', undefined, undefined, ['第一轮核对过']]);
+  assert.deepEqual([b1?.state, b1?.note, b1?.checkedInRound], ['pass', '这项保持有效', 1]);
+  assert.throws(() => f.executor('ticket_submit'), (error: Error) => {
+    assert.match(error.message, /还有 1 条没处理：P1-P2/);
+    assert.match(error.message, /还有 1 条必填自检未打卡：A1/);
+    assert.doesNotMatch(error.message, /B1/);
+    return true;
+  });
+  f.executor('ticket_mark', { itemId: 'P1-P2', state: 'done', note: '改了' });
+  assert.throws(() => f.executor('ticket_submit'), /还有 1 条必填自检未打卡：A1/);
+  f.executor('ticket_self_check', { checkId: 'A1', status: 'pass', note: '修改后再次核对' });
+  const submitted = f.executor('ticket_submit') as Ticket;
+  assert.equal(submitted.status, 'ready_for_review');
+  assert.deepEqual(submitted.selfChecks?.find(check => check.id === 'A1')?.log.map(entry => [entry.round, entry.note]), [[1, '第一轮核对过'], [2, '修改后再次核对']]);
+});
+
+test('QA self-check audit records agreement and turns a disagreement into an X item', () => {
+  const f = fixture();
+  f.call('ticket_open', { roleId: 'role', caseId: 'demo', selfChecks: [selfCheck('A1', { kind: 'self_and_qa' }), selfCheck('S1', { kind: 'self_and_qa', rule: '场景要具体' })] });
+  f.executor('ticket_self_check', { checkId: 'A1', status: 'pass', note: '标题含受众' });
+  f.executor('ticket_self_check', { checkId: 'S1', status: 'pass', note: '写了会议室' });
+  f.executor('ticket_submit');
+  f.call('ticket_checks', { results: [{ itemId: 'P1', pass: true, evidence: [] }] });
+  assert.throws(() => f.call('ticket_review', { review: review({ issues: [], selfCheckAudit: [{ id: 'A1', verdict: 'agree' }] }) }), /at least one issue/);
+  const reviewed = f.call('ticket_review', { qaJobId: 'qa-job', review: review({ issues: [], summary: '自检对不上', selfCheckAudit: [
+    { id: 'A1', verdict: 'agree', note: '依据成立' }, { id: 'S1', verdict: 'disagree', note: '场景仍是空话' }] }) });
+  const a1 = reviewed.selfChecks?.find(check => check.id === 'A1'), s1 = reviewed.selfChecks?.find(check => check.id === 'S1');
+  assert.deepEqual(a1?.log.at(-1), { round: 1, by: 'qa', action: 'agree', note: '依据成立' });
+  assert.deepEqual(s1?.log.at(-1), { round: 1, by: 'qa', action: 'disagree', note: '场景仍是空话' });
+  const item = reviewed.items.find(entry => entry.id === 'X1-S1');
+  assert.equal(item?.source, 'qa');
+  assert.equal(item?.severity, 'must');
+  assert.deepEqual(item?.crossCheck, { kind: 'self_vs_qa', checkId: 'S1', claimedState: 'pass', claimedNote: '写了会议室', actualVerdict: 'disagree', actualNote: '场景仍是空话' });
+  assert.match(item?.problem ?? '', /写了会议室/);
+  assert.match(item?.problem ?? '', /场景仍是空话/);
+  const auditEvents = f.events().filter(event => event.type === 'ticket.self_check_verified' || event.type === 'ticket.item_raised' || event.type === 'ticket.crosscheck_mismatch');
+  assert.deepEqual(auditEvents.map(event => [event.type, (event.data as any).checkId ?? (event.data as any).itemId, (event.data as any).actor]), [
+    ['ticket.self_check_verified', 'A1', 'qa'], ['ticket.item_raised', 'X1-S1', 'qa'], ['ticket.crosscheck_mismatch', 'S1', 'qa']]);
+  assert.equal((auditEvents[0]!.data as any).qaJobId, 'qa-job');
+  assert.equal((auditEvents[2]!.data as any).kind, 'self_vs_qa');
+  assert.equal((auditEvents[2]!.data as any).actualVerdict, 'disagree');
+});
+
+test('a ticket opened without self-checks keeps the old check, revision and submit path', () => {
+  const f = fixture();
+  const opened = f.call('ticket_open', { roleId: 'role', caseId: 'demo' });
+  assert.equal(opened.outline, 'outline.json');
+  assert.equal(opened.selfChecks, undefined);
+  assert.equal(opened.artifacts, undefined);
+  assert.throws(() => f.executor('ticket_self_check', { checkId: 'A1', status: 'pass', note: '没有这项' }), /没有自检项 A1/);
+  const checked = f.call('ticket_checks', { results: [{ itemId: 'P2', pass: false, evidence: [{ path: 'style/font' }] }] });
+  assert.equal(checked.status, 'drafting', 'the first round can still enter checks without ticket_submit');
+  assert.equal(checked.items[0]?.id, 'P1-P2');
+  assert.equal(checked.items[0]?.crossCheck, undefined);
+  f.revise();
+  f.executor('ticket_mark', { itemId: 'P1-P2', state: 'done', note: '改了' });
+  assert.equal((f.executor('ticket_submit') as Ticket).status, 'ready_for_review');
+  assert.equal(f.events().some(event => event.type === 'ticket.self_checked' || event.type === 'ticket.crosscheck_mismatch'), false);
 });

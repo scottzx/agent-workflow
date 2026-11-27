@@ -9,7 +9,109 @@ concurrency:
 permissions:
   contents: read
 jobs:
-  build:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_all: ${{ steps.detect.outputs.run_all }}
+      run_docs: ${{ steps.detect.outputs.run_docs }}
+      run_runtime: ${{ steps.detect.outputs.run_runtime }}
+      run_service: ${{ steps.detect.outputs.run_service }}
+      run_dsh: ${{ steps.detect.outputs.run_dsh }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect changed scopes
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          run_all=false
+          run_docs=false
+          run_runtime=false
+          run_service=false
+          run_dsh=false
+
+          if [ "$EVENT_NAME" != "pull_request" ] || [ -z "$BASE_SHA" ] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            run_all=true
+          else
+            changed=$(git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}..HEAD")
+            echo "Changed files:"
+            echo "$changed"
+            if [ -z "$changed" ]; then
+              run_all=true
+            else
+              while IFS= read -r file; do
+                [ -z "$file" ] && continue
+                case "$file" in
+                  package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.github/workflows/*|scripts/*|tsconfig*.json)
+                    run_all=true
+                    ;;
+                  packages/runtime/*)
+                    run_runtime=true
+                    run_service=true
+                    run_dsh=true
+                    ;;
+                  examples/flows/*)
+                    run_runtime=true
+                    ;;
+                  packages/service/*|packages/file-preview/*|packages/chat-view/*)
+                    run_service=true
+                    run_dsh=true
+                    ;;
+                  .1agents/*|examples/*)
+                    run_service=true
+                    ;;
+                  packages/dsh-plugin/*|packages/dsh-a2a/*)
+                    run_dsh=true
+                    ;;
+                esac
+                case "$file" in
+                  docs/*|site/*|examples/flows/*|packages/runtime/*|*.md)
+                    run_docs=true
+                    ;;
+                esac
+              done <<< "$changed"
+            fi
+          fi
+
+          if [ "$run_all" = "true" ]; then
+            run_docs=true
+            run_runtime=true
+            run_service=true
+            run_dsh=true
+          fi
+
+          {
+            echo "run_all=$run_all"
+            echo "run_docs=$run_docs"
+            echo "run_runtime=$run_runtime"
+            echo "run_service=$run_service"
+            echo "run_dsh=$run_dsh"
+          } >> "$GITHUB_OUTPUT"
+          echo "Scopes: run_all=$run_all run_docs=$run_docs run_runtime=$run_runtime run_service=$run_service run_dsh=$run_dsh"
+
+  docs-check:
+    needs: changes
+    if: needs.changes.outputs.run_docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @scottzx/1acp check:docs
+
+  runtime-build:
+    needs: changes
+    if: needs.changes.outputs.run_runtime == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -20,15 +122,12 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: node --test scripts/*.test.mjs
-      - run: node --test examples/activepieces/wechat-stock/*.test.mjs
       - run: pnpm --filter @scottzx/1acp format:check
       - run: pnpm --filter @scottzx/1acp typecheck
       - run: pnpm --filter @scottzx/1acp lint
       - run: pnpm --filter @scottzx/1acp build
       - run: pnpm --filter @scottzx/1acp viewer:typecheck
       - run: pnpm --filter @scottzx/1acp viewer:build
-      - run: pnpm --filter @scottzx/1acp check:docs
       - run: pnpm --filter @scottzx/1acp build:test
       - name: Archive runtime tests with executable permissions
         run: tar -czf runtime-tests.tgz -C packages/runtime dist dist-test
@@ -37,26 +136,80 @@ jobs:
           name: runtime-tests
           path: runtime-tests.tgz
           retention-days: 7
-      # The workbench page bundles these two workspace packages, so they are built first.
+
+  service-build:
+    needs: changes
+    if: needs.changes.outputs.run_service == 'true' || needs.changes.outputs.run_dsh == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # acp-service embeds packages/runtime/dist during build, and the workbench page bundles file-preview + chat-view.
+      - run: pnpm --filter @scottzx/1acp build
       - run: pnpm --filter @1agents/file-preview build
+      - run: pnpm --filter @1agents/file-preview test
       - run: pnpm --filter @1agents/chat-view build
+      - run: pnpm --filter @1agents/chat-view test
       - run: pnpm --filter @1agents/acp-service build
       - run: pnpm --filter @1agents/acp-service typecheck
-      # The RSI role checks run check_outline.py, which needs a jsonschema with Draft 2020-12.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: python3 -m pip install 'jsonschema>=4.18'
-      - run: pnpm --filter @1agents/acp-service test:only
       - name: Archive service build with executable permissions
         run: tar -czf service-build.tgz -C packages/service dist vendor
+      - name: Archive runtime dist for downstream packaging
+        run: tar -czf runtime-dist.tgz -C packages/runtime dist
       - uses: actions/upload-artifact@v4
         with:
           name: service-build
           path: service-build.tgz
           retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-dist
+          path: runtime-dist.tgz
+          retention-days: 7
+
+  service-test:
+    needs: [changes, service-build]
+    if: needs.changes.outputs.run_service == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Full git history is required by rsi-pr-cr-eval.test.ts to verify historical PR commit ancestors.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: service-build
+      - name: Restore service build with executable permissions
+        run: tar -xzf service-build.tgz -C packages/service
+      # The RSI role checks run check_outline.py, which needs a jsonschema with Draft 2020-12.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-jsonschema-v1-${{ runner.os }}-${{ runner.arch }}-py312
+      - run: python3 -m pip install 'jsonschema>=4.18'
+      - run: node --test scripts/*.test.mjs
+      - run: node --test examples/activepieces/wechat-stock/*.test.mjs
+      - run: pnpm --filter @1agents/acp-service test:only
+
   runtime-tests:
-    needs: build
+    needs: [changes, runtime-build]
+    if: needs.changes.outputs.run_runtime == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -86,8 +239,10 @@ jobs:
       - name: Enforce existing coverage thresholds
         if: matrix.lane == 'coverage'
         run: pnpm --filter @scottzx/1acp test:coverage:only
+
   dsh-plugin:
-    needs: build
+    needs: [changes, service-build]
+    if: needs.changes.outputs.run_dsh == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -106,7 +261,11 @@ jobs:
           repository: deepseek-ai/deepseek-harness
           ref: ${{ env.DSH_REF }}
           path: .dsh-checkout
-      - run: corepack pnpm install --frozen-lockfile
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/dsh-pnpm-store
+          key: dsh-pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.DSH_REF }}-${{ hashFiles('.dsh-checkout/pnpm-lock.yaml') }}
+      - run: corepack pnpm install --frozen-lockfile --store-dir "${{ runner.temp }}/dsh-pnpm-store"
         working-directory: .dsh-checkout
       - uses: actions/cache@v4
         id: dsh-cache
@@ -140,10 +299,10 @@ jobs:
       - run: pnpm --filter @1agents/dsh-a2a test
       - uses: actions/download-artifact@v4
         with:
-          name: runtime-tests
+          name: runtime-dist
       - name: Restore runtime dist for embed verification
         run: |
-          tar -xzf runtime-tests.tgz -C packages/runtime
+          tar -xzf runtime-dist.tgz -C packages/runtime
           test -f packages/runtime/dist/cli.js
       - run: node scripts/embed-dsh.mjs
       - run: node scripts/release-artifacts.mjs
@@ -155,3 +314,68 @@ jobs:
             release/*.tgz
             release/service-manifest.json
           retention-days: 30
+
+  ci-status:
+    if: always()
+    needs: [changes, docs-check, runtime-build, runtime-tests, service-build, service-test, dsh-plugin]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify required job outcomes
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RUN_DOCS: ${{ needs.changes.outputs.run_docs }}
+          RUN_RUNTIME: ${{ needs.changes.outputs.run_runtime }}
+          RUN_SERVICE: ${{ needs.changes.outputs.run_service }}
+          RUN_DSH: ${{ needs.changes.outputs.run_dsh }}
+          DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
+          RUNTIME_BUILD_RESULT: ${{ needs.runtime-build.result }}
+          RUNTIME_TESTS_RESULT: ${{ needs.runtime-tests.result }}
+          SERVICE_BUILD_RESULT: ${{ needs.service-build.result }}
+          SERVICE_TEST_RESULT: ${{ needs.service-test.result }}
+          DSH_PLUGIN_RESULT: ${{ needs.dsh-plugin.result }}
+        run: |
+          set -euo pipefail
+          echo "Scopes: run_docs=$RUN_DOCS run_runtime=$RUN_RUNTIME run_service=$RUN_SERVICE run_dsh=$RUN_DSH"
+          echo "Job outcomes: changes=$CHANGES_RESULT docs-check=$DOCS_CHECK_RESULT runtime-build=$RUNTIME_BUILD_RESULT runtime-tests=$RUNTIME_TESTS_RESULT service-build=$SERVICE_BUILD_RESULT service-test=$SERVICE_TEST_RESULT dsh-plugin=$DSH_PLUGIN_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "changes job did not succeed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          require_success() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "Required job $name did not succeed: $result" >&2
+              exit 1
+            fi
+          }
+          if [ "$RUN_DOCS" = "true" ]; then
+            require_success "docs-check" "$DOCS_CHECK_RESULT"
+          fi
+          if [ "$RUN_RUNTIME" = "true" ]; then
+            require_success "runtime-build" "$RUNTIME_BUILD_RESULT"
+            require_success "runtime-tests" "$RUNTIME_TESTS_RESULT"
+          fi
+          if [ "$RUN_SERVICE" = "true" ]; then
+            require_success "service-build" "$SERVICE_BUILD_RESULT"
+            require_success "service-test" "$SERVICE_TEST_RESULT"
+          fi
+          if [ "$RUN_DSH" = "true" ]; then
+            require_success "service-build" "$SERVICE_BUILD_RESULT"
+            require_success "dsh-plugin" "$DSH_PLUGIN_RESULT"
+          fi
+          for pair in \
+            "docs-check:$DOCS_CHECK_RESULT" \
+            "runtime-build:$RUNTIME_BUILD_RESULT" \
+            "runtime-tests:$RUNTIME_TESTS_RESULT" \
+            "service-build:$SERVICE_BUILD_RESULT" \
+            "service-test:$SERVICE_TEST_RESULT" \
+            "dsh-plugin:$DSH_PLUGIN_RESULT"; do
+            name="${pair%%:*}"
+            result="${pair#*:}"
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "Job $name did not succeed: $result" >&2
+              exit 1
+            fi
+          done

@@ -8,6 +8,7 @@ import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import { A2APreflightError, bindA2AExecution, runA2APreflight, unbindA2AExecution, type A2ABackend, type A2AExecutionRef, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
+import { nativeTurnSafeError } from './native-failure.js';
 import { modelSelectionOf } from './preset-route.js';
 
 import type { DiagnosticLog } from './diagnostics.js';
@@ -143,14 +144,26 @@ export async function inspectSession(ctx: Context, sessionId: SessionId): Promis
   } finally { observation[Symbol.dispose](); }
 }
 
-function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string, diagnostic?: ReturnType<typeof toSafeError>): A2ARunResult {
+/**
+ * The outcome of one DSH turn. A native failure is projected through the
+ * runtime's public error model; an ACP session keeps its durable diagnostic.
+ * @param reason The turn's own ending.
+ * @param text The assistant text collected for this turn.
+ * @param finalAnswerExpected Whether this turn owed a final answer.
+ * @param operationId The caller's request identity, bound to the projected error.
+ * @param diagnostic The durable ACP diagnostic of this turn, when one exists.
+ * @param turnFailure The failure facts of a same-turn error event, when the host published one.
+ */
+export function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string, diagnostic?: ReturnType<typeof toSafeError>, turnFailure?: unknown): A2ARunResult {
   switch (reason.kind) {
     case 'completed': return finalAnswerExpected && !text.trim()
       ? { outcome: 'failed', text, failureReason: 'missing-final-answer', detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
       : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
     case 'error': {
-      const error = diagnostic ?? toSafeError(undefined, { origin: 'dsh', operationId });
+      // A native DSH turn has no ACP diagnostic. Its own failure record names
+      // the cause; without one the failure stays unknown rather than guessed.
+      const error = diagnostic ?? nativeTurnSafeError(reason, operationId, turnFailure);
       return { outcome: 'failed', text, detail: error.message, error };
     }
     case 'max-tokens': return { outcome: 'failed', text, failureReason: 'max-tokens', detail: 'DSH reached the model output token limit' };
@@ -387,6 +400,8 @@ export class DshA2ABackend implements A2ABackend {
     let finalAnswerExpected = false;
     let authoritativeAnswer = false;
     let settled = false;
+    /** The failure facts of this turn's own error event, when the host published one. */
+    let turnFailure: unknown;
     const owns = (message: UserMessage): boolean => message.source.kind === 'user'
       && 'rpcId' in message.source && message.source.rpcId === options.requestId;
     const settle = (result: A2ARunResult): void => {
@@ -402,7 +417,7 @@ export class DshA2ABackend implements A2ABackend {
       let diagnostic;
       try { diagnostic = this.diagnostics?.find(agent.id, options.requestId, turn, start?.seq); }
       catch { /* A stopping storage provider cannot supply durable diagnostics. */ }
-      settle(resultOf(reason, text, finalAnswerExpected, options.requestId, diagnostic));
+      settle(resultOf(reason, text, finalAnswerExpected, options.requestId, diagnostic, turnFailure));
     };
     const cancel = (): void => {
       if (settled) return;
@@ -437,6 +452,7 @@ export class DshA2ABackend implements A2ABackend {
       if (event.agent !== agent || !owns(event.message)) return;
       messageId = undefined;
       turn = event.turn;
+      turnFailure = undefined;
       if (options.signal.aborted) cancel();
     }));
     listeners.push(agent.ctx.on('agent/inbox/discarded', event => {
@@ -452,6 +468,12 @@ export class DshA2ABackend implements A2ABackend {
           error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: turn !== undefined }) });
         startupAbort.abort(new Error('DSH session was disposed before startup'));
       }
+    }));
+    listeners.push(agent.ctx.on('agent/error', event => {
+      // DSH reports the live failure of a turn here. The turn reason stays
+      // authoritative; this only names a cause when the reason carries none.
+      if (event.agent !== agent || event.turn !== turn) return;
+      turnFailure = event.error;
     }));
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;

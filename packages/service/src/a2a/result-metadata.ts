@@ -1,11 +1,14 @@
 /** Host-authored task identity and verified artifact receipts; model text is not an authority. */
+import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { promisify } from 'node:util';
 import { z } from 'zod';
-import { isDefaultJobDirectory } from './job-directory.js';
+import { deliveryModeSchema, isDefaultJobDirectory, isManagedJobDirectory } from './job-directory.js';
 import type { A2APreflightReport, A2ATarget } from './types.js';
+const executeGit = promisify(execFile);
 
 const identifier = z.string().trim().min(1).max(512);
 const absolutePath = z.string().min(1).max(8192).refine(value => isAbsolute(value) && !value.includes('\0'), 'Expected an absolute path');
@@ -16,6 +19,7 @@ export const a2aResultContractSchema = z.object({
   parentSessionId: identifier.optional(),
   originSessionId: identifier.optional(),
   artifactManifestPath: absolutePath.optional(),
+  deliveryMode: deliveryModeSchema.optional(),
 }).strict();
 export type A2AResultContract = z.infer<typeof a2aResultContractSchema>;
 
@@ -35,6 +39,15 @@ export interface A2AVerifiedArtifact {
   sha256: string;
   url?: string;
   mediaType?: string;
+}
+
+/** Read-only sample of the checkout a workspace_git task finished in. Absent when git cannot be read. */
+export interface A2AGitDelivery {
+  branch?: string;
+  headCommit?: string;
+  clean: boolean;
+  dirtyCount: number;
+  diffStat?: string;
 }
 
 export interface A2AResultMetadata {
@@ -59,6 +72,8 @@ export interface A2AResultMetadata {
   lineage?: A2AResultContract & { source: 'caller-declared' };
   preflight?: A2APreflightReport;
   artifacts: A2AVerifiedArtifact[];
+  /** Set for a completed workspace_git task when the cwd is a readable git checkout. */
+  gitDelivery?: A2AGitDelivery;
   validation: { status: 'not-requested' | 'passed' | 'failed'; code?: string };
   recordPath?: string;
 }
@@ -89,7 +104,70 @@ async function scopedFile(roots: string[], path: string): Promise<string> {
   return canonical;
 }
 
-async function verifiedArtifacts(root: string, extraRoots: string[], manifestPath: string): Promise<A2AVerifiedArtifact[]> {
+const DIFF_STAT_LIMIT = 4096;
+
+function truncateUtf8(text: string, max = DIFF_STAT_LIMIT): string {
+  const buffer = Buffer.from(text);
+  if (buffer.length <= max) return text;
+  let end = max;
+  while (end > 0 && (buffer[end]! & 0b1100_0000) === 0b1000_0000) end -= 1;
+  return buffer.subarray(0, end).toString('utf8');
+}
+
+/** Git identity comes from cwd. A caller-injected GIT_DIR must not redirect the sample. */
+function gitSampleEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_COMMON_DIR;
+  return env;
+}
+
+/** Read-only git sample. Never writes the repo; any failure omits the sample instead of failing the task. */
+async function sampleGitDelivery(cwd: string): Promise<A2AGitDelivery | undefined> {
+  const git = async (args: string[], maxBuffer = 1024 * 1024): Promise<string> => {
+    const { stdout } = await executeGit('git', ['--no-optional-locks', ...args], {
+      cwd, timeout: 5000, maxBuffer, encoding: 'utf8', windowsHide: true, env: gitSampleEnv(),
+    });
+    return String(stdout);
+  };
+  try {
+    const branch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+    const headCommit = (await git(['rev-parse', 'HEAD'])).trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(headCommit)) return undefined;
+    const dirtyCount = (await git(['status', '--porcelain'])).split('\n').filter(line => line.length > 0).length;
+    let diffStat: string | undefined;
+    try {
+      const diff = truncateUtf8((await git(['show', '--stat', '--stat-count=50', '--format=', 'HEAD'], 64 * 1024)).trim());
+      if (diff) diffStat = diff;
+    } catch { /* A huge or unreadable stat must not drop the commit sample. */ }
+    return {
+      ...(branch && branch !== 'HEAD' ? { branch } : {}), headCommit, clean: dirtyCount === 0, dirtyCount,
+      ...(diffStat ? { diffStat } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+const ENV_FILE_TEMPLATES = new Set(['.env.example', '.env.sample', '.env.template']);
+
+/** Judge secrets relative to cwd. An absolute path would treat a worktree under `.1agents/worktrees` as internal. */
+function isSensitiveWorkspaceFile(cwdRoot: string, file: string): boolean {
+  const name = basename(file);
+  if (name === '.env' || (name.startsWith('.env.') && !ENV_FILE_TEMPLATES.has(name))) return true;
+  const tail = relative(cwdRoot, file);
+  if (tail === '' || tail === '..' || tail.startsWith(`..${sep}`) || isAbsolute(tail)) return false;
+  const parts = tail.split(sep);
+  return parts.includes('.git') || parts.includes('.1agents');
+}
+
+function isImplicitJobDirectory(cwd: string, directory: string): boolean {
+  return isDefaultJobDirectory(cwd, directory) || isManagedJobDirectory(cwd, directory);
+}
+
+async function verifiedArtifacts(root: string, extraRoots: string[], manifestPath: string, cwdRoot?: string): Promise<A2AVerifiedArtifact[]> {
   const manifestFile = await scopedFile([root], manifestPath);
   const manifest = await open(manifestFile, constants.O_RDONLY | constants.O_NOFOLLOW);
   let source: unknown;
@@ -102,8 +180,11 @@ async function verifiedArtifacts(root: string, extraRoots: string[], manifestPat
   if (!parsed.success) throw new A2AResultValidationError('invalid-artifact-manifest');
   const output: A2AVerifiedArtifact[] = [];
   const seen = new Set<string>();
+  const fileRoots = cwdRoot ? [root, ...extraRoots, cwdRoot] : [root, ...extraRoots];
   for (const item of parsed.data.artifacts) {
-    const path = await scopedFile([root, ...extraRoots], item.path);
+    const path = await scopedFile(fileRoots, item.path);
+    const authorized = [root, ...extraRoots].some(candidate => within(candidate, path));
+    if (cwdRoot && !authorized && isSensitiveWorkspaceFile(cwdRoot, path)) throw new A2AResultValidationError('artifact-sensitive-path');
     if (seen.has(path)) throw new A2AResultValidationError('duplicate-artifact');
     seen.add(path);
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -141,6 +222,10 @@ export async function createA2AResultMetadata(input: {
     ...(target?.preflight || input.preflight ? { preflight: target?.preflight ?? input.preflight } : {}), artifacts: [],
     validation: input.validationCode ? { status: 'failed', code: input.validationCode } : { status: 'not-requested' },
   };
+  if (contract?.deliveryMode === 'workspace_git' && input.outcome === 'completed' && target?.cwd) {
+    const gitDelivery = await sampleGitDelivery(target.cwd);
+    if (gitDelivery) metadata.gitDelivery = gitDelivery;
+  }
   if (contract?.artifactManifestPath && input.outcome === 'completed' && !input.validationCode) {
     const root = target?.preflight?.ok && target.preflight.jobDirectory;
     // A manifest the gateway announced by default is optional: no admitted directory or manifest means no artifacts,
@@ -148,8 +233,8 @@ export async function createA2AResultMetadata(input: {
     // The gateway may name cwd through a symlink while the host stores the resolved path, so compare both spellings.
     const real = async (path: string) => realpath(path).catch(() => path);
     const manifestDirectory = dirname(contract.artifactManifestPath);
-    const implicit = Boolean(target?.cwd) && (isDefaultJobDirectory(target!.cwd, manifestDirectory)
-      || isDefaultJobDirectory(await real(target!.cwd), await real(manifestDirectory)));
+    const implicit = Boolean(target?.cwd) && (isImplicitJobDirectory(target!.cwd, manifestDirectory)
+      || isImplicitJobDirectory(await real(target!.cwd), await real(manifestDirectory)));
     if (!root) {
       if (implicit) return metadata;
       throw new A2AResultValidationError('artifact-job-directory-not-admitted');
@@ -166,7 +251,9 @@ export async function createA2AResultMetadata(input: {
       if (implicit) { metadata.validation = { status: 'failed', code }; return metadata; }
       throw new A2AResultValidationError(code);
     }
-    try { metadata.artifacts = await verifiedArtifacts(root, extraRoots, contract.artifactManifestPath); }
+    let cwdRoot: string | undefined;
+    if (contract.deliveryMode === 'workspace_files' && target?.cwd) cwdRoot = await realpath(target.cwd).catch(() => undefined);
+    try { metadata.artifacts = await verifiedArtifacts(root, extraRoots, contract.artifactManifestPath, cwdRoot); }
     catch (error) {
       const code = error instanceof A2AResultValidationError ? error.code : 'artifact-manifest-or-file-unavailable';
       if (implicit) { metadata.validation = { status: 'failed', code }; return metadata; }

@@ -26,12 +26,12 @@
     "registry": "https://registry.npmjs.org"
   },
   "type": "module",
-  "main": "./dist/src/package.js",
+  "main": "./vendor/dsh/package-entry.js",
   "types": "./dist/src/package.d.ts",
   "exports": {
     ".": {
       "types": "./dist/src/package.d.ts",
-      "import": "./dist/src/package.js"
+      "import": "./vendor/dsh/package-entry.js"
     },
     "./package.json": "./package.json",
     "./roles": {

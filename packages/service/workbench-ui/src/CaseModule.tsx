@@ -1,9 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { acpCaseService } from './api';
-import { acpCaseHash, parseAcpCaseHash } from './model';
-import type { AcpCaseDetail, AcpCaseEdge, AcpCaseList, AcpInboxItem } from './types';
-import { ArtifactDrawer, ArtifactItem, snapshotUrl } from './Preview';
-import { date, EmptyState, ErrorState, errorText, Status, taskStatus, text } from './ui';
+import { navigateCase, parseAcpCaseHash, snapshotUrl } from './model';
+import type { AcpCaseDetail, AcpCaseEdge, AcpCaseSummary, AcpInboxItem, AcpTaskSummary } from './types';
+import { Skeleton } from './LazyView';
+import { LazyArtifactDrawer, LazyArtifactItem } from './lazy-panels';
+import { useChunkedList, useLoadMoreSentinel } from './paging';
+import { channelLabel, date, EmptyState, ErrorState, errorText, navigateAcpTask, Status, taskStatus, text } from './ui';
+
+export { navigateCase };
 
 /**
  * The workbench's first screen is a thing: what it is for, who is working on it, what waits for a person, and
@@ -20,10 +24,6 @@ function CaseRoute() {
         return () => window.removeEventListener('hashchange', update);
     }, []);
     return route;
-}
-
-export function navigateCase(caseId: string, originSessionId?: string) {
-    location.hash = acpCaseHash({ caseId, originSessionId });
 }
 
 /**
@@ -50,16 +50,18 @@ function EdgeRow({
     onDecide,
     busy,
     onPreview,
+    focused,
 }: {
     edge: AcpCaseEdge;
     caseId: string;
     onDecide: (edge: AcpCaseEdge, decision: 'accept' | 'reject') => void;
     busy: boolean;
     onPreview: (artifact: { url: string; name: string; mediaType?: string }) => void;
+    focused?: boolean;
 }) {
     const label = edgeLabels[edge.status];
     return (
-        <li class={`acp-case-edge${edge.happened ? ' is-happened' : ' is-proposed'}`}>
+        <li id={`handoff-${edge.handoffId}`} class={`acp-case-edge${edge.happened ? ' is-happened' : ' is-proposed'}${focused ? ' is-focused' : ''}`}>
             <span class="acp-case-edge-line" aria-hidden="true" />
             <div>
                 <strong>
@@ -110,24 +112,139 @@ function EdgeRow({
 }
 
 function InboxRow({ item, onOpen }: { item: AcpInboxItem; onOpen: (item: AcpInboxItem) => void }) {
-    const kind = item.kind === 'review' ? text('审核', 'Review') : item.kind === 'process_request' ? text('过程请求', 'Request') : text('交接提议', 'Handoff');
+    const kind = item.kind === 'review' ? text('审核', 'Review') : item.kind === 'process_request' ? text('过程请求', 'Request') : item.kind === 'proposal' ? text('规范提议', 'Proposal') : text('交接提议', 'Handoff');
     return (
         <li class="acp-inbox-row">
-            <span class="acp-mode-label">{kind}</span>
+            <span class={`acp-mode-label${item.proposalKind === 'locked' ? ' is-locked' : ''}`}>{kind}</span>
             <div>
                 <strong>{item.title}</strong>
                 <small class="acp-muted">
                     {item.summary}
                     {item.revision ? ` · ${item.revision}` : ''}
+                    {item.channel ? ` · ${channelLabel(item.channel)}` : ''}
                 </small>
             </div>
-            {item.kind === 'handoff' ? null : (
-                <button type="button" class="acp-link" onClick={() => onOpen(item)}>
-                    {text('去处理', 'Open')}
-                </button>
-            )}
+            <button type="button" class="acp-link" onClick={() => onOpen(item)}>
+                {text('去处理', 'Open')}
+            </button>
         </li>
     );
+}
+
+function CaseDag({
+    detail,
+    onOpenTask,
+    onOpenEdge,
+}: {
+    detail: AcpCaseDetail;
+    onOpenTask: (jobId: string) => void;
+    onOpenEdge: (handoffId: string) => void;
+}) {
+    const tasks = detail.tasks;
+    if (!tasks.length) return null;
+    const depth = new Map(tasks.map(task => [task.jobId, 0]));
+    const links = detail.edges.filter(edge => edge.status !== 'rejected' && edge.childJobId && depth.has(edge.childJobId));
+    for (let pass = 0; pass < tasks.length; pass++) {
+        let changed = false;
+        for (const edge of links) {
+            const next = (depth.get(edge.fromJobId) ?? 0) + 1;
+            if ((depth.get(edge.childJobId!) ?? 0) < next) { depth.set(edge.childJobId!, next); changed = true; }
+        }
+        if (!changed) break;
+    }
+    const columns = new Map<number, AcpTaskSummary[]>();
+    for (const task of tasks) {
+        const column = depth.get(task.jobId) ?? 0;
+        columns.set(column, [...(columns.get(column) ?? []), task]);
+    }
+    const nodeW = 168, nodeH = 78, gapX = 56, gapY = 22;
+    const pos = new Map<string, { x: number; y: number }>();
+    let maxX = nodeW + 32, maxY = nodeH + 32;
+    for (const [column, list] of columns) {
+        list.forEach((task, index) => {
+            const point = { x: 20 + column * (nodeW + gapX), y: 20 + index * (nodeH + gapY) };
+            pos.set(task.jobId, point);
+            maxX = Math.max(maxX, point.x + nodeW + 40);
+            maxY = Math.max(maxY, point.y + nodeH + 28);
+        });
+    }
+    const ghosts = detail.edges.filter(edge => edge.status === 'proposed' && !edge.childJobId);
+    ghosts.forEach((edge, index) => {
+        const from = pos.get(edge.fromJobId);
+        if (!from) return;
+        maxX = Math.max(maxX, from.x + nodeW + gapX + nodeW);
+        maxY = Math.max(maxY, from.y + index * 18 + nodeH);
+    });
+    return (
+        <section class="acp-detail-section">
+            <h3>{text('跨角色流转', 'Cross-role flow')}</h3>
+            <div class="acp-dag-scroll">
+                <svg class="acp-dag acp-case-dag" width={maxX} height={maxY} viewBox={`0 0 ${maxX} ${maxY}`} role="img" aria-label={text('事情流转图', 'Case flow')}>
+                    <defs>
+                        <marker id="acp-dag-arrow-case" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+                            <path d="M0,0 L7,3 L0,6 Z" class="acp-dag-arrow" />
+                        </marker>
+                    </defs>
+                    {detail.edges.filter(edge => edge.status !== 'rejected').map(edge => {
+                        const from = pos.get(edge.fromJobId);
+                        const to = edge.childJobId ? pos.get(edge.childJobId) : undefined;
+                        if (!from) return null;
+                        const x2 = to ? to.x : from.x + nodeW + gapX;
+                        const y2 = to ? to.y + nodeH / 2 : from.y + nodeH / 2;
+                        const dashed = edge.status === 'proposed';
+                        const label = edge.artifactDigest.slice(0, 8);
+                        return (
+                            <g key={edge.handoffId}>
+                                <line x1={from.x + nodeW} y1={from.y + nodeH / 2} x2={x2} y2={y2} class={`acp-dag-edge${dashed ? ' is-dashed' : ''}`} marker-end="url(#acp-dag-arrow-case)" />
+                                {dashed && (
+                                    <line x1={from.x + nodeW} y1={from.y + nodeH / 2} x2={x2} y2={y2} class="acp-dag-hit" onClick={() => onOpenEdge(edge.handoffId)}>
+                                        <title>{edge.reason}</title>
+                                    </line>
+                                )}
+                                <text x={(from.x + nodeW + x2) / 2} y={(from.y + nodeH / 2 + y2) / 2 - 4} class="acp-dag-sub acp-dag-edge-label">
+                                    <title>{edge.artifactDigest}</title>
+                                    {label}
+                                </text>
+                            </g>
+                        );
+                    })}
+                    {tasks.map(task => {
+                        const point = pos.get(task.jobId)!;
+                        const name = task.title || task.jobId;
+                        const waiting = detail.conventions.filter(rule => !rule.achieved && (!rule.fromTargetId || rule.fromTargetId === task.targetId) && (!rule.fromPurpose || rule.fromPurpose === task.purpose));
+                        const status = (task.executionStatus || 'unknown').replace(/[^a-z_]/gi, '');
+                        const ticketLine = task.ticketSummary
+                            ? `R${task.ticketSummary.round} ${task.ticketSummary.selfCheckDone}/${task.ticketSummary.selfCheckTotal}${task.ticketSummary.mismatches > 0 ? ` · ${text('分歧', 'mismatch')} ${task.ticketSummary.mismatches}` : ''}`
+                            : text('无任务单', 'No ticket');
+                        return (
+                            <g key={task.jobId} class="acp-dag-click" onClick={() => onOpenTask(task.jobId)}>
+                                <title>{name}</title>
+                                <rect x={point.x} y={point.y} width={nodeW} height={nodeH} rx={8} class={`acp-dag-node is-${status}`} />
+                                <circle cx={point.x + nodeW - 14} cy={point.y + 14} r={4} class={`acp-dag-dot is-${status}`} />
+                                <text x={point.x + 8} y={point.y + 18} class="acp-dag-label">{clip(name, 16)}</text>
+                                <text x={point.x + 8} y={point.y + 34} class="acp-dag-sub">{clip(`${channelLabel(task.channel)} · ${task.executionStatus}`, 22)}</text>
+                                <text x={point.x + 8} y={point.y + 50} class="acp-dag-sub">
+                                    <title>{ticketLine}</title>
+                                    {clip(ticketLine, 22)}
+                                </text>
+                                {!!waiting.length && <text x={point.x + 8} y={point.y + 66} class="acp-dag-sub">{text('待触发', 'Waiting')} {waiting.length}</text>}
+                            </g>
+                        );
+                    })}
+                </svg>
+            </div>
+            <ul class="acp-dag-legend">
+                <li><span class="acp-dag-swatch is-solid" />{text('实线：已交接', 'Solid: handed over')}</li>
+                <li><span class="acp-dag-swatch is-dashed" />{text('虚线：待确认提议', 'Dashed: awaiting confirmation')}</li>
+                <li><span class="acp-dag-swatch is-cached" />{text('蓝底：续跑缓存', 'Blue: cached rerun')}</li>
+            </ul>
+        </section>
+    );
+}
+
+function clip(value: string, max: number) {
+    const chars = Array.from(value);
+    return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : value;
 }
 
 function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: () => void }) {
@@ -135,6 +252,11 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
     const [error, setError] = useState('');
     const [message, setMessage] = useState('');
     const [artifact, setArtifact] = useState<{ url: string; name: string; path?: string; mediaType?: string } | null>(null);
+    const [focusHandoff, setFocusHandoff] = useState<string | undefined>();
+    useEffect(() => {
+        if (!focusHandoff) return;
+        document.getElementById(`handoff-${focusHandoff}`)?.scrollIntoView({ block: 'nearest' });
+    }, [focusHandoff]);
     const decide = async (edge: AcpCaseEdge, decision: 'accept' | 'reject') => {
         setBusy(true);
         setError('');
@@ -151,6 +273,11 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
     };
     return (
         <section class="acp-detail acp-case-detail">
+            <div class="acp-backbar">
+                <button type="button" class="acp-button" onClick={() => navigateCase()}>
+                    {text('← 返回列表', '← Back to list')}
+                </button>
+            </div>
             <header class="acp-detail-header">
                 <div class="acp-detail-tools">
                     <div>
@@ -178,6 +305,7 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
             <div class="acp-detail-content">
                 {error && <p class="acp-decision-error">{error}</p>}
                 {message && <p class="acp-decision-message">{message}</p>}
+                <CaseDag detail={detail} onOpenTask={jobId => navigateAcpTask({ jobId, full: false })} onOpenEdge={setFocusHandoff} />
 
                 <section class="acp-detail-section">
                     <h3>
@@ -186,7 +314,11 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
                     {detail.inbox.length ? (
                         <ul class="acp-stage-list acp-inbox-list">
                             {detail.inbox.map(item => (
-                                <InboxRow key={`${item.kind}-${item.id}`} item={item} onOpen={() => navigateCase(detail.caseId, detail.originSessionId)} />
+                                <InboxRow key={`${item.kind}-${item.id}`} item={item} onOpen={item => {
+                                    if (item.kind === 'handoff') setFocusHandoff(item.id);
+                                    else if (item.kind === 'review') navigateAcpTask({ jobId: item.jobId, reviewId: item.id, full: false });
+                                    else navigateAcpTask({ jobId: item.jobId, full: false });
+                                }} />
                             ))}
                         </ul>
                     ) : (
@@ -199,7 +331,7 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
                     {detail.edges.length ? (
                         <ul class="acp-stage-list acp-case-edges">
                             {detail.edges.map(edge => (
-                                <EdgeRow key={edge.handoffId} edge={edge} caseId={detail.caseId} onDecide={decide} busy={busy} onPreview={setArtifact} />
+                                <EdgeRow key={edge.handoffId} edge={edge} caseId={detail.caseId} onDecide={decide} busy={busy} onPreview={setArtifact} focused={focusHandoff === edge.handoffId} />
                             ))}
                         </ul>
                     ) : (
@@ -271,7 +403,7 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
                                     {group.artifacts.map((item, position) => {
                                         const artifactItem = item as { path?: string; url?: string; mediaType?: string; sha256?: string };
                                         return (
-                                            <ArtifactItem
+                                            <LazyArtifactItem
                                                 key={`${group.revision}-${position}`}
                                                 jobId={group.jobId}
                                                 artifact={artifactItem}
@@ -342,7 +474,7 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
                 </section>
             </div>
             {artifact && (
-                <ArtifactDrawer
+                <LazyArtifactDrawer
                     jobId=""
                     artifact={{ path: artifact.path, url: artifact.url, mediaType: artifact.mediaType }}
                     onClose={() => setArtifact(null)}
@@ -354,36 +486,29 @@ function CaseDetail({ detail, onChanged }: { detail: AcpCaseDetail; onChanged: (
 
 export function CaseModule({ refreshKey }: { refreshKey: number }) {
     const route = CaseRoute();
-    const [payload, setPayload] = useState<AcpCaseList | null>(null);
     const [detail, setDetail] = useState<AcpCaseDetail | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState('');
     const [goal, setGoal] = useState('');
     const [origin, setOrigin] = useState('');
+    const [origins, setOrigins] = useState<string[]>([]);
     const [creating, setCreating] = useState(false);
-    const activeRequest = useRef(false);
-
-    const load = useCallback(async () => {
-        if (activeRequest.current) return;
-        activeRequest.current = true;
-        try {
-            const next = await acpCaseService.list(0, 100);
-            setPayload(next);
-            setError('');
-            if (!origin && next.origins.length) setOrigin(next.origins[0]!);
-        } catch (err) {
-            setError(errorText(err));
-        } finally {
-            activeRequest.current = false;
-            setLoading(false);
-        }
-    }, [origin]);
-
-    useEffect(() => {
-        void load();
-        const interval = window.setInterval(() => void load(), 5000);
-        return () => window.clearInterval(interval);
-    }, [load, refreshKey]);
+    const [formError, setFormError] = useState('');
+    const [detailError, setDetailError] = useState('');
+    const originRef = useRef('');
+    originRef.current = origin;
+    const list = useChunkedList<AcpCaseSummary>({
+        active: true,
+        refreshKey,
+        resetKey: 'cases',
+        pageSize: 20,
+        idOf: item => `${item.originSessionId}:${item.caseId}`,
+        fetchPage: async (offset, limit) => {
+            const next = await acpCaseService.list(offset, limit);
+            setOrigins(next.origins);
+            if (!originRef.current && next.origins[0]) setOrigin(next.origins[0]);
+            return next;
+        },
+    });
+    const sentinel = useLoadMoreSentinel(list.items.length < list.total, list.items.length, list.loadMore);
 
     useEffect(() => {
         if (!route.caseId) {
@@ -393,8 +518,12 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
         let live = true;
         void acpCaseService
             .get(route.caseId)
-            .then(next => live && setDetail(next))
-            .catch(err => live && setError(errorText(err)));
+            .then(next => {
+                if (!live) return;
+                setDetail(next);
+                setDetailError('');
+            })
+            .catch(err => live && setDetailError(errorText(err)));
         return () => {
             live = false;
         };
@@ -403,23 +532,31 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
     const open = async () => {
         if (!goal.trim() || !origin) return;
         setCreating(true);
-        setError('');
+        setFormError('');
         try {
             await acpCaseService.open({ originSessionId: origin, goal: goal.trim() });
             setGoal('');
-            await load();
+            list.reload();
         } catch (err) {
-            setError(errorText(err));
+            setFormError(errorText(err));
         } finally {
             setCreating(false);
         }
     };
 
-    const rows = payload?.items ?? [];
+    const rows = list.items;
+    const error = list.error;
     return (
         <div class={`acp-workbench-body${route.caseId ? ' has-case-detail' : ''}`}>
             <div class="acp-workbench-table">
-                {error && <ErrorState title={text('事情读取失败', 'Could not load cases')} message={error} onRetry={() => void load()} />}
+                {!list.settled && !error && <Skeleton lines={5} />}
+                {(error || formError) && (
+                    <ErrorState
+                        title={text('事情读取失败', 'Could not load cases')}
+                        message={formError || error}
+                        onRetry={() => list.reload()}
+                    />
+                )}
                 <form class="acp-case-create" onSubmit={event => { event.preventDefault(); void open(); }}>
                     <label>
                         {text('新事情的目标', 'What is this thing for')}
@@ -433,7 +570,7 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
                     <label>
                         {text('归属会话', 'Scope')}
                         <select value={origin} onChange={event => setOrigin(event.currentTarget.value)}>
-                            {(payload?.origins ?? []).map(item => (
+                            {origins.map(item => (
                                 <option key={item} value={item}>
                                     {item}
                                 </option>
@@ -444,7 +581,7 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
                         {text('开一件事', 'Open a case')}
                     </button>
                 </form>
-                <table>
+                <table class="acp-desktop-only">
                     <thead>
                         <tr>
                             <th>{text('目标', 'Goal')}</th>
@@ -455,7 +592,7 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
                         </tr>
                     </thead>
                     <tbody>
-                        {!loading && !rows.length && (
+                        {list.settled && !rows.length && (
                             <tr>
                                 <td colSpan={5} class="acp-muted">
                                     {text('还没有事情。开一件事，之后它的任务、交接和待确认都在这里。', 'No case yet. Open one; its tasks, handoffs and decisions live here.')}
@@ -478,18 +615,53 @@ export function CaseModule({ refreshKey }: { refreshKey: number }) {
                                 <td>{item.taskCount}</td>
                                 <td>{item.pendingCount || '—'}</td>
                                 <td class="acp-muted">{item.originSessionId}</td>
-                                <td class="acp-task-updated">{date(item.lastActivityAt)}</td>
+                                <td class="acp-task-updated acp-nums">{date(item.lastActivityAt)}</td>
                             </tr>
                         ))}
                     </tbody>
                 </table>
+                <div class="acp-mobile-cards">
+                    {list.settled && !rows.length && (
+                        <p class="acp-muted">
+                            {text('还没有事情。开一件事，之后它的任务、交接和待确认都在这里。', 'No case yet. Open one; its tasks, handoffs and decisions live here.')}
+                        </p>
+                    )}
+                    {rows.map(item => (
+                        <button
+                            key={`${item.originSessionId}-${item.caseId}`}
+                            type="button"
+                            class={`acp-mobile-card${item.pendingCount ? ' is-waiting_human' : ' is-working'}${route.caseId === item.caseId ? ' is-selected' : ''}`}
+                            onClick={() => navigateCase(item.caseId, item.originSessionId)}
+                        >
+                            <span class="acp-mobile-card-head">
+                                <strong>{item.title || item.goal || item.caseId}</strong>
+                                <Status value={item.pendingCount ? 'waiting_human' : 'working'} />
+                            </span>
+                            <span class="acp-mobile-card-meta">
+                                <span class="acp-mode-label acp-nums">{text(`${item.taskCount} 个任务`, `${item.taskCount} tasks`)}</span>
+                                {!!item.pendingCount && <span class="acp-mode-label acp-nums">{text(`待确认 ${item.pendingCount}`, `${item.pendingCount} waiting`)}</span>}
+                            </span>
+                            <span class="acp-task-blocker">{item.goal}</span>
+                            <time class="acp-task-updated acp-nums">{date(item.lastActivityAt)}</time>
+                        </button>
+                    ))}
+                </div>
+                {rows.length < list.total && (
+                    <div class="acp-pagination">
+                        <button type="button" class="acp-button" disabled={list.loadingMore} onClick={list.loadMore}>
+                            {text(`加载更多（已显示 ${rows.length} / 共 ${list.total} 条）`, `Load more (${rows.length} of ${list.total})`)}
+                        </button>
+                    </div>
+                )}
+                <div ref={sentinel} class="acp-load-sentinel" />
             </div>
             {route.caseId && (
                 <div class="acp-case-panel">
+                    {detailError && <ErrorState title={text('事情读取失败', 'Could not load cases')} message={detailError} />}
                     {detail ? (
-                        <CaseDetail detail={detail} onChanged={() => { void load(); }} />
+                        <CaseDetail detail={detail} onChanged={() => list.reload()} />
                     ) : (
-                        <EmptyState title={text('读取这件事', 'Reading the case')} />
+                        !detailError && <EmptyState title={text('读取这件事', 'Reading the case')} />
                     )}
                 </div>
             )}

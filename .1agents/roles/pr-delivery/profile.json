@@ -1,0 +1,9 @@
+{
+  "id": "pr-delivery",
+  "version": "1.0.0",
+  "instructionsPath": "ROLE.md",
+  "skills": [
+    { "key": "three-green", "name": "pr-three-green-delivery" }
+  ],
+  "entrySkill": "three-green"
+}

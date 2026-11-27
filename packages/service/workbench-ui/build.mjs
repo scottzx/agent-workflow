@@ -1,6 +1,6 @@
 /**
- * Bundles the gateway's workbench page into dist/workbench-ui. Preact ships inside app.js; the preview and
- * chat libraries load their heavy renderers (markdown, highlighting) as chunk-*.js on first use.
+ * Bundles the gateway's workbench page into dist/workbench-ui. The shell stays in app.js. Each top-level
+ * module, and the preview/chat renderers, load as chunk-*.js the first time that view is opened.
  */
 import { build } from 'esbuild';
 import { appendFileSync, readFileSync, copyFileSync, mkdirSync, rmSync } from 'node:fs';

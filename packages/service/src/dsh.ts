@@ -1,4 +1,7 @@
-/** Host services are requested only when DSH activates this package as a plugin. */
+/** Host services are requested only when DSH activates this package as a plugin.
+ * These constants must stay identical to packages/dsh-plugin/src/index.ts.
+ * The published runtime entry is vendor/dsh/package-entry.js (static ESM). This module
+ * remains the type-level package root used by dist/src/package.d.ts. */
 export const name = 'oneagents-acp';
 export const inject = ['llm', 'agents', 'approval', 'userQuestions', 'commands', 'sessionProjections', 'webServer', 'sessionController', 'agentPresets', 'sessions', 'sessionPersistence', 'workspaceRegistry', 'tools', 'connection'];
 

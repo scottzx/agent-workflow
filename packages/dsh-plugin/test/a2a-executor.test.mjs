@@ -642,6 +642,26 @@ test('DSH A2A never infers quota from an unknown host error message or nested ar
   assert.ok(!JSON.stringify(value).includes('SYNTHETIC_SECRET'));
 });
 
+test('a native DSH turn failure keeps its own category instead of a generic ACP error', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd, agentPreset: 'standard' });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'native-quota', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'native-quota', 5);
+  f.output(agent, 5, '这是失败前的半截输出');
+  f.finish(agent, 5, { kind: 'error', error: { code: 'QUOTA', status: 429, message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL' } });
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.text, '这是失败前的半截输出');
+  assert.equal(value.error.category, 'quota');
+  assert.equal(value.error.providerCode, 'quota_exhausted');
+  assert.equal(value.error.retryable, false);
+  assert.equal(value.error.outcomeUnknown, false);
+  assert.equal(value.error.origin, 'dsh');
+  assert.equal(value.error.operationId, 'native-quota');
+  assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
+  assert.equal(f.listenerCount, 0);
+});
+
 test('DSH A2A rejects safe-shaped host category and operation secret spoofing', async t => {
   const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
   const agent = f.agents.get(target.sessionId);

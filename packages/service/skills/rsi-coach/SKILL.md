@@ -1,6 +1,6 @@
 ---
 name: rsi-coach
-description: 作为教练智能体训练一个领域角色（执行者 + 质检），用 acp-service rsi run 跑任务、读程序检查和质检意见、把反复出现的问题沉淀成技能、工具和程序检查。用户提到训练智能体、教练、RSI、执行者和质检、打回重做、角色目录（.1agents/roles）、ROLE.md / QA.md / checklist、把意见写成程序检查、复现或回炉时使用，即使没说“教练”两个字。
+description: 作为教练智能体训练一个领域角色（执行者 + 质检），用 acp-service rsi run 跑任务、读程序检查和质检意见、把反复出现的问题沉淀成技能、工具和程序检查，并用 rsi calibrate 对历史样本回放。用户提到训练智能体、教练、RSI、执行者和质检、打回重做、角色目录（.1agents/roles）、ROLE.md / QA.md / checklist、把意见写成程序检查、回放校准、复现或回炉时使用，即使没说“教练”两个字。
 ---
 
 # RSI 教练
@@ -24,7 +24,8 @@ description: 作为教练智能体训练一个领域角色（执行者 + 质检�
 ├── profile.json        # 角色 id
 ├── ROLE.md             # 执行者的做法（可训练）
 ├── QA.md               # 质检的评分标准和复审规则（可训练）
-├── checklist.json      # 检查项清单，locked: true 的项你不能改
+├── checklist.json      # 单一清单：program / self / self_and_qa；locked: true 的项你不能改
+├── workflow.json       # 角色内检查与审稿的 Micro-DAG，以及 trial / formal 策略
 ├── checks/             # 程序检查，例如 check_outline.py（锁定）
 └── cases/<case-id>/    # 用例：固定提交的仓库、受众、功能清单（人维护）；kind 为 original（原题）或 variant（变体题）
 ```
@@ -41,7 +42,8 @@ acp-service rsi run --role .1agents/roles/<role-id> --case <case-id> \
 所有打回都走任务单，不靠对话里贴意见。任务单挂在执行者的任务上，存在网关的执行台账里，每次变化都是一条 `ticket.*` 台账事件，记着操作者和轮次：
 
 - 程序检查没过的项、质检的意见，都写成带编号的条目（如 `P1-P2`、`Q1-3`），每条记着谁提的、谁处理、谁确认。
-- 执行者用 DSH 工具 `ticket_show`、`ticket_mark`、`ticket_submit` 把条目标成 `done` 或 `disputed` 并写说明，再提交。操作者由调用的方法认定，执行者的会话只能操作自己任务的任务单。它不能核实自己的修改，也不能关单；违规的请求网关直接拒绝。
+- 执行者用 DSH 工具 `ticket_show`、`ticket_mark`、`ticket_submit` 把条目标成 `done` 或 `disputed` 并写说明，再提交。清单挂了必填自检时，交稿前还要用 `ticket_self_check` 把每一项打成 `pass`（已核验）或 `na`（本任务不适用）并写依据；没打完卡，`ticket_submit` 会被拒绝。没有自检项的老角色仍可直接交稿。操作者由调用的方法认定，执行者的会话只能操作自己任务的任务单。它不能核实自己的修改，也不能关单；违规的请求网关直接拒绝。
+- 程序项若同时要求自检，执行者打了 `pass` 但宿主重跑失败，任务单上会记下 L1 分歧（`crossCheck.kind = self_vs_program`）。这种分歧门禁不放行。
 - 程序项由宿主重跑检查核实；质检意见由质检在复审的 `previous` 里按编号核实（`fixed`、`partly`、`not_fixed`、`withdrawn`），宿主合并进任务单，没改到位的会被重新打开。质检没有写任务单的方法，`issues` 只写新问题。
 - 质检通过就关单，否则记下停止原因。
 
@@ -94,7 +96,7 @@ acp-service trail --job <jobId>
 
 - **规则对准实际问题，不图省事。** P11 没有只对照 package.json，因为 xingjian-showroom 自己的记录就不一致（package.json 0.2.0，RELEASE_NOTES.md v0.1.1），质检指出的正是这个。
 - **写明不该拦什么。** 误报会把对的内容打回去，比漏报更伤；判断不了的留给质检。
-- **用已有运行的产出回放验证。** 拿 `reviews/outline-rN.json` 跑新检查，确认质检当时指出的问题被拦下、已改好的版本能通过。P8–P11 在两次实跑的 4 份大纲上就是这样验证的；P13、P14 在之前运行的 10 份大纲上回放，P14 的阈值（8 个字）就是按“只拦真重复”定下来的。
+- **用已有运行的产出回放验证。** 改完检查先跑 `acp-service rsi calibrate`（见下文「三层对校」）：历史通过的稿不能被新的 block 检查误杀，历史被打回的稿应能被拦住。也可以拿 `reviews/outline-rN.json` 手工跑新检查。P8–P11 在两次实跑的 4 份大纲上就是这样验证的；P13、P14 在之前运行的 10 份大纲上回放，P14 的阈值（8 个字）就是按“只拦真重复”定下来的。
 - **加测试**：逐条故意违反、确认能拦住，再确认不会误报。
 - **同步三处**：checklist.json 加条目（锁定），ROLE.md 告诉执行者，QA.md 告诉质检不必再查。打回提示写“全部检查通过”，不写死检查编号。
 
@@ -114,11 +116,29 @@ acp-service rsi gate --role .1agents/roles/<role-id> --workspace .1agents/runtim
 - 在原题上连续 2 次开发运行都通过（`--required` 可调）；
 - 每次的初稿都一次通过程序检查；
 - 没有剩下没核实的“必须改”；
-- 这几次运行里质检没有再提 `check` 或 `locked` 提议（还有能写成程序的、或卡在锁定项上的，就还没练完）。
+- 这几次运行里质检没有再提 `check` 或 `locked` 提议（还有能写成程序的、或卡在锁定项上的，就还没练完）；
+- 这几次运行的任务单里没有自检与机检不一致（L1，`self_vs_program` 为 0）；
+- 若这一版的 `checks/` 相对上一版通过运行变了，必须已有绑定当前 commit 与检查摘要、且历史正样本 0 误报的 `calibration.json`。账本里还没有可对比的旧版本、也没有校准文件时，不为此拦截。校准过期、有误报，或显式要求校准却没做，都不放行。
 
 角色目录一改就是新版本，计数从零开始。所以先把一批沉淀改完、提交，再在这个版本上连跑；不要边跑边改。
 
 放行后用 `--phase test` 跑测试：它要求角色目录已提交、带 `--qa`、门禁已放行。原题和每道变体题都跑一遍，`rsi gate` 会列出每个用例在当前版本上的测试结果。变体题的功能清单要先由人确认，没确认的用例跑不起来。
+
+## 三层对校
+
+- **L1（自检 ↔ 机检）**：执行者用 `ticket_self_check` 对程序项打了 `pass`，宿主重跑同一项却失败。分歧写在对应 `P*` 条目的 `crossCheck` 上。门禁统计最近达标运行里的条数，大于 0 就阻断。
+- **L2（自检 ↔ 质检）**：`self_and_qa` 项由质检在 `selfCheckAudit` 里逐项同意或反对。反对会生成 `X*` 必须改意见（`self_vs_qa`），跟着复审核对，不单独挡门禁。
+- **L3（规则 ↔ 历史样本）**：程序检查新增或改严之后，用当前 `checks/` 和 `checklist.json` 回放历史产物。正样本是验收通过的最终稿，负样本是质检判 `revise` 的中间稿。正样本上的 block 失败是误报，必须为 0；负样本上的失败记入「拦住了哪些历史缺陷」。
+
+```sh
+acp-service rsi calibrate --role .1agents/roles/<role-id> --workspace .1agents/runtime/rsi [--python PATH] [--only P15,P14]
+```
+
+回放是只读的，不改历史工作目录里的文件。报告写到 `<workspace>/<role-id>/calibration.json`，绑定当时的角色 commit 和 `checks/` 摘要。有误报时命令以退出码 1 结束。`--only` 只评估列出的检查项。检查一改，摘要就变，旧报告作废，要重跑再过门禁。
+
+## 工作目录隔离
+
+试跑不要在主工作区里改被测仓库。`workflow.json` 的 `workspace.strategy` 为 `git_worktree` 时，任务在独立 worktree 和分支上做；`trial` 保持隔离，不合并；`formal` 只在验收通过后快进或合并。合并完成，或试跑丢弃之后，再 `git worktree remove` 并清理分支。失败的试跑样本可以按保留策略晚一点回收，留给 L3 回放。
 
 ## 什么时候停下交给人
 

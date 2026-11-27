@@ -4,7 +4,18 @@ import { acpTaskService, AcpTaskApiError } from './api';
 import type { AcpDecisionInput, AcpDshSession, AcpExecution, AcpReview, AcpReviewAction, AcpTaskDetail } from './types';
 import { acpTaskHash, executionLabels, latestReview } from './model';
 import { ProcessRequestPanel } from './ProcessRequests';
-import { ArtifactDrawer, ArtifactItem, Md, ReportPreview, TaskChat, type ArtifactRef } from './Preview';
+import type { ArtifactRef } from './Preview';
+import {
+    LazyArtifactDrawer as ArtifactDrawer,
+    LazyArtifactItem as ArtifactItem,
+    LazyMd as Md,
+    LazyMicroDag as MicroDag,
+    LazyReportPreview as ReportPreview,
+    LazyTaskChat as TaskChat,
+    LazyTicketPanel as TicketPanel,
+    previewHover,
+    ticketHover,
+} from './lazy-panels';
 import {
     channelLabel,
     date,
@@ -25,7 +36,7 @@ import {
     title,
 } from './ui';
 
-type DetailTab = 'overview' | 'progress' | 'review' | 'chat' | 'events';
+type DetailTab = 'overview' | 'ticket' | 'progress' | 'review' | 'chat' | 'events';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const CONTINUE_PROMPT = '上一轮执行中断了，已经完成的不用重做，请接着把任务做完。';
 
@@ -221,9 +232,14 @@ export function AcpTaskDetailPanel({
         const interval = window.setInterval(() => {
             if (!document.hidden) void load();
         }, 5000);
+        const onVisible = () => {
+            if (!document.hidden) void load();
+        };
+        document.addEventListener('visibilitychange', onVisible);
         return () => {
             alive.current = false;
             window.clearInterval(interval);
+            document.removeEventListener('visibilitychange', onVisible);
         };
     }, [load]);
 
@@ -329,8 +345,11 @@ export function AcpTaskDetailPanel({
             setDecisionMessage(text('无法复制链接，可复制地址栏链接', 'Could not copy. Copy the address bar URL.'));
         }
     };
-    const tabs: [DetailTab, string][] = [
+    const openTicket = (detail?.ticket?.items.filter(item => item.state === 'open' || item.state === 'reopened').length ?? 0)
+        + (detail?.ticket?.proposals.filter(item => item.state === 'open' && (item.kind === 'locked' || item.kind === 'check')).length ?? 0);
+    const tabs: [DetailTab, string, number?][] = [
         ['overview', text('概览', 'Overview')],
+        ['ticket', text('任务单与对校', 'Ticket'), openTicket],
         ['progress', text('进展', 'Progress')],
         ['review', text('产物与审核', 'Artifacts & review')],
         ['chat', text('对话', 'Conversation')],
@@ -338,6 +357,11 @@ export function AcpTaskDetailPanel({
     ];
     return (
         <aside class="acp-detail" aria-label={text('任务详情', 'Task details')}>
+            <div class="acp-backbar">
+                <button type="button" class="acp-button" onClick={() => navigateAcpTask({ full: false })}>
+                    {text('← 返回列表', '← Back to list')}
+                </button>
+            </div>
             <header class="acp-detail-header">
                 <div class="acp-detail-tools">
                     <span>{text('任务详情', 'Task details')}</span>
@@ -395,7 +419,7 @@ export function AcpTaskDetailPanel({
                     ))}
                     <span>{jobId}</span>
                 </div>
-                <h2 ref={heading} tabIndex={-1}>
+                <h2 ref={heading} class="acp-detail-heading" tabIndex={-1}>
                     {detail ? title(detail) : text('正在读取任务…', 'Loading task…')}
                 </h2>
                 {detail && (
@@ -417,7 +441,7 @@ export function AcpTaskDetailPanel({
                 )}
             </header>
             <nav class="acp-detail-tabs" aria-label={text('任务详情视图', 'Task detail views')} role="tablist">
-                {tabs.map(([id, label]) => (
+                {tabs.map(([id, label, count]) => (
                     <button
                         key={id}
                         id={`acp-detail-tab-${id}`}
@@ -426,8 +450,10 @@ export function AcpTaskDetailPanel({
                         aria-selected={tab === id}
                         aria-controls="acp-detail-content"
                         onClick={() => setTab(id)}
+                        {...(id === 'chat' || id === 'review' ? previewHover : id === 'ticket' || id === 'progress' ? ticketHover : {})}
                     >
                         {label}
+                        {!!count && <span class="acp-tab-count">{count}</span>}
                     </button>
                 ))}
             </nav>
@@ -483,6 +509,7 @@ export function AcpTaskDetailPanel({
                 )}
                 {detail && (
                     <Fragment>
+                        {tab === 'ticket' && detail && <TicketPanel detail={detail} onChanged={() => { void load(); onChanged(); }} />}
                         {tab === 'overview' && (
                             <TaskOverview
                                 detail={detail}
@@ -551,7 +578,7 @@ export function AcpTaskDetailPanel({
                                                         'Reference page numbers. Feedback is required when requesting changes.'
                                                     )}
                                                 />
-                                                <div class="acp-review-buttons">
+                                                <div class="acp-review-buttons acp-sticky-actions">
                                                     <button
                                                         type="button"
                                                         class="acp-link"
@@ -789,6 +816,7 @@ function TaskProgress({
                 requests={detail.processRequests?.filter(request => request.status !== 'pending')}
                 onReload={onReload}
             />
+            {!!detail.workflowRun?.nodes?.length && <MicroDag nodes={detail.workflowRun.nodes} />}
             {stages.length > 0 && (
                 <section class="acp-detail-section">
                     <h3>{text('阶段进展', 'Stage progress')}</h3>
@@ -1195,12 +1223,16 @@ function ReviewHistory({ review }: { review: AcpReview }) {
 }
 
 function TaskEvents({ detail }: { detail: AcpTaskDetail }) {
+    const [expanded, setExpanded] = useState(false);
+    const ordered = [...detail.events].reverse();
+    const visible = expanded ? ordered : ordered.slice(0, 30);
+    const earlier = ordered.length - visible.length;
     return (
         <section class="acp-detail-section">
             <h3>{text('任务事件', 'Task events')}</h3>
-            {detail.events.length ? (
+            {visible.length ? (
                 <ol class="acp-event-list">
-                    {[...detail.events].reverse().map(event => (
+                    {visible.map(event => (
                         <li key={event.eventId}>
                             <time>{date(event.observedAt)}</time>
                             <div>
@@ -1223,6 +1255,11 @@ function TaskEvents({ detail }: { detail: AcpTaskDetail }) {
                 </ol>
             ) : (
                 <p class="acp-muted">{text('暂无任务事件', 'No task events')}</p>
+            )}
+            {earlier > 0 && (
+                <button type="button" class="acp-button" onClick={() => setExpanded(true)}>
+                    {text(`展开更早事件（还有 ${earlier} 条）`, `Show ${earlier} earlier events`)}
+                </button>
             )}
         </section>
     );

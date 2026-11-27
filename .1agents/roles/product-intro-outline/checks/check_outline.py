@@ -71,6 +71,11 @@ def version_records(root):
     return records
 
 
+def item_kind(item: dict) -> str:
+    """v2 names the discriminator `kind`; v1 used `type`. Both are accepted."""
+    return item.get('kind') or item.get('type') or ''
+
+
 def main(outline_path: str, features_path: str, project: str) -> int:
     checklist = json.loads((ROLE / 'checklist.json').read_text('utf-8'))
     schema = json.loads((ROLE / checklist['program']['schema']).read_text('utf-8'))
@@ -86,7 +91,7 @@ def main(outline_path: str, features_path: str, project: str) -> int:
     report('P1', [{'path': '/'.join(map(str, e.absolute_path)), 'message': e.message} for e in errors])
     if errors:
         for item in checklist['items']:
-            if item['type'] == 'program' and item['id'] != 'P1':
+            if item_kind(item) == 'program' and item['id'] != 'P1':
                 results.append({'itemId': item['id'], 'pass': False, 'evidence': [{'message': 'skipped: P1 failed'}]})
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 1

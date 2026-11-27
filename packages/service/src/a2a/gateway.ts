@@ -13,15 +13,17 @@ import { z } from 'zod';
 import { FileA2AStore } from './store.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
-import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
-import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, type RemoteAgentNotice } from './notices.js';
+import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
+import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary, type RemoteAgentNotice, type SubscriberNotice } from './notices.js';
+import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
-import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
+import { a2aResultContractSchema, type A2AResultContract, type A2AResultMetadata } from './result-metadata.js';
 import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
-import { artifactInstructions, defaultJobDirectory, defaultManifestPath, snapshotInstructions, spaceInstructions } from './job-directory.js';
+import { deliveryInstructions, deliveryModeSchema, resolveDefaultJobDirectory, snapshotInstructions, spaceInstructions, type DeliveryMode } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
+import { noticeErrorSummary, safeErrorSummary, safeErrorText, type SafeErrorSummary } from '../safe-error-summary.js';
 import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
@@ -29,7 +31,7 @@ import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '.
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
-import { invokeTicket, reopenForContinue, TICKET_METHODS } from '../execution/ticket.js';
+import { invokeTicket, reopenForContinue, TicketError, TICKET_METHODS } from '../execution/ticket.js';
 import { continueByConvention, decideHandoff, HANDOFF_METHODS, invokeHandoff, offerConvention, proposeByFact, type Handoff, type HandoffSnapshot } from '../execution/handoff.js';
 import { rolePublicationDirectory } from '../execution/spaces.js';
 import { caseOpenSchema, CaseError, openCase, projectCase, requireCase } from '../execution/cases.js';
@@ -40,6 +42,8 @@ import { answerProcessRequest, createProcessRequest, expireProcessRequest, proce
 import { chatItems, pageChat } from '../execution/workbench-chat.js';
 import { workbenchSnapshot, listWorkbenchTasks, listWorkbenchAgents, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { workbenchCases, getWorkbenchCase } from '../execution/case-view.js';
+import { projectApprovals } from '../execution/approvals-view.js';
+import { discoverProjectRoots, readRoleRsi, RoleRsiError } from '../execution/role-rsi.js';
 import { AgentRegistry, AgentRegistryError, readDevelopment } from '../execution/agent-registry.js';
 import { agentNamePattern, listAgentFiles } from '../execution/agent-files.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
@@ -76,7 +80,9 @@ const configSchema = z.object({
     /** Show a macOS notification when a request starts waiting. */
     desktopNotifications: z.boolean().default(false),
     /** Push a steer wakeup to the bound origin session when a child task opens a process request. */
-    notifyOriginOnProcessRequest: z.boolean().default(true) }).strict().optional(),
+    notifyOriginOnProcessRequest: z.boolean().default(true),
+    /** Project whose `.1agents/roles` the RSI panel reads. Omitted, the gateway walks up from its state directory and the process cwd. */
+    projectRoot: z.string().min(1).refine(value => path.isAbsolute(value) && !value.includes('\0'), 'projectRoot must be an absolute path').optional() }).strict().optional(),
   /** Same-machine ACP ledger. Omitted callers do not read the default home directory. */
   capacityDirectory: z.string().min(1).optional(),
   /** P3 idle close for persistent ACP sessions. idleTtlSeconds on a job overrides persistentIdleTtlSeconds. */
@@ -109,18 +115,21 @@ const actorSchema = z.object({ kind: z.enum(['person', 'coach']), id: string.opt
   via: z.enum(['page', 'relay']).optional() }).strict();
 const taskFields = { ...originFields, remote: string, taskId: string };
 const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'Prompt must contain text');
+const notifySessionsSchema = z.array(notifySubscriptionInputSchema).max(32).optional();
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   cwd: string.refine(value => path.posix.isAbsolute(value), 'cwd must be an absolute remote path'),
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
   roleId: string.optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
+  deliveryMode: deliveryModeSchema.optional(),
   clientRequestId: string.optional(), lifecycle: sessionLifecycleSchema.optional(),
   provider: string.optional(), model: string.optional(), initiatedBy: actorSchema.optional(),
+  notifySessions: notifySessionsSchema,
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const modelCatalogQuerySchema = z.object({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, initiatedBy: actorSchema.optional(), clientRequestId: string.optional(), roleId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(), lifecycle: sessionLifecycleSchema.optional(), autoResume: z.boolean().optional(), provider: string.optional(), model: string.optional(), deliveryMode: deliveryModeSchema.optional() }).strict();
 const closeSchema = z.object({ ...originFields, remote: string, taskId: string.optional(), contextId: string.optional(), sessionId: string.optional(), mode: z.enum(['close', 'delete']).optional(), force: z.boolean().optional(), clientRequestId: string.optional() }).strict();
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
@@ -129,12 +138,13 @@ const executionSubmitSchema = z.object({ ...originFields, targetId: string, inpu
   clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
   parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(), caseId: string.optional(),
   handoffId: string.optional(),
-  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional() }).strict();
+  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional(),
+  notifySessions: notifySessionsSchema }).strict();
 const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
 const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
 const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
   limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0) }).strict();
-const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional(), initiatedBy: actorSchema.optional() }).strict();
+const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional(), initiatedBy: actorSchema.optional(), deliveryMode: deliveryModeSchema.optional() }).strict();
 const executionEventsSchema = z.object({ ...originFields, jobId: string.optional(), afterSequence: z.number().int().nonnegative().optional(),
   limit: z.number().int().min(1).max(500).default(100) }).strict();
 const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
@@ -156,7 +166,7 @@ const executionPendingApprovalsSchema = z.object({
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
-  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。', parameters: z.toJSONSchema(executionSubmitSchema) },
+  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。可选 notifySessions 登记该任务或所属 case 的只读订阅。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
   execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
@@ -170,7 +180,7 @@ const EXECUTION_METHODS = {
   execution_pending_approvals: { description: '跨任务汇总当前待审批的 A2A 过程请求（工具权限/计划/提问）、待裁决的任务单改进提议与活跃任务单；支持按 originSessionId 或 jobId 过滤。', parameters: z.toJSONSchema(executionPendingApprovalsSchema) },
   execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
   execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
-  case_open: { description: '开一件事：写下目标，登记进账本。之后 handoff_space、handoff_offer 和带 caseId 的提交都只能引用已存在的一件事，不会隐式创建。', parameters: z.toJSONSchema(caseOpenSchema) },
+  case_open: { description: '开一件事：写下目标，登记进账本。之后 handoff_space、handoff_offer 和带 caseId 的提交都只能引用已存在的一件事，不会隐式创建。可选 notifySessions 登记 case 级订阅，之后该 case 的新任务与交接自动继承。', parameters: z.toJSONSchema(caseOpenSchema.extend({ notifySessions: notifySessionsSchema }).strict()) },
   case_get: { description: '读取一件事：目标、共享产物空间、其下的任务、交接、约定和待确认。不派单，不决定。', parameters: z.toJSONSchema(caseGetSchema) },
   ...TICKET_METHODS,
   ...HANDOFF_METHODS,
@@ -180,7 +190,7 @@ export const REMOTE_AGENT_METHODS = {
   ...EXECUTION_METHODS,
   remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
   remote_agent_model_catalog: { description: '读取执行宿主 standard 预设当前可选的 provider 与 model，含默认路由和 routing group。不创建会话、不调用模型。填 remote_agent_spawn 或 remote_agent_message 时，provider 用 groups[].id，model 用其中的 models[].id。', parameters: z.toJSONSchema(modelCatalogQuerySchema) },
-  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。', parameters: z.toJSONSchema(spawnSchema) },
+  remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。可选 lifecycle 省略时为 one-shot：完成、失败或取消后普通关闭进程，之后 message 用 session/load 接回；runtime 仍是 persistent。需要进程常驻等追问时显式传 mode persistent。provider 与 model 只用于 standard 等非 oneagents-acp-* 预设，须一起传；宿主模型目录里没有时任务失败，不退回默认模型；省略时用 DSH 当时的默认模型。可选 notifySessions 为该任务登记只读订阅。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。进程名额排队时 state 仍是 submitted，并带 capacity 的队列位置和已等时长，以及 taskSlot 与 processSlot。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。不能释放已经完成的会话进程；释放进程用 remote_agent_close。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_message: { description: '向同一个远端 DSH 会话发送后续指令，返回新 taskId，复用 contextId 与 cwd。未传 lifecycle 时沿用原会话策略。已关闭会话默认接回，任务上返回 resumed: true；historyReplayed 只说明宿主是否把历史重新推给了它的客户端，不影响接回本身。autoResume 为 false 时不向远端发送，返回 SESSION_CLOSED。未传 provider 与 model 时沿用该会话已选模型；传了就在本轮前切换，规则同 spawn。', parameters: z.toJSONSchema(messageSchema) },
@@ -193,6 +203,10 @@ export const REMOTE_AGENT_METHODS = {
   session_send: { description: '向已绑定的主会话可靠投递消息。messageId 是稳定幂等键；立即返回持久投递回执，通过 session_delivery_get 查询。accepted 仅表示宿主已接收入队。', parameters: z.toJSONSchema(sessionSendSchema) },
   session_delivery_get: { description: '查询本主会话的消息投递状态。unknown 必须先核实宿主是否已接收，不能盲目重发。', parameters: z.toJSONSchema(sessionMessageSchema) },
   session_delivery_resolve: { description: '核实 unknown 或处理 rejected 投递并记录依据。accepted=true 表示已确认入队；false 仅用于已证实未入队且已处理阻碍后释放重试。note 必填，不等于任务业务处理确认。', parameters: z.toJSONSchema(sessionResolveSchema) },
+  session_binding_get: { description: '只读查询主会话是否已绑定宿主，以及该归属的投递计数和是否阻塞。不返回宿主凭据、hostFingerprint 或消息正文。unknown 或 rejected 大于 0 时 blocked 为 true。', parameters: z.toJSONSchema(sessionOriginSchema) },
+  notification_subscribe: { description: '为主归属登记一个任务级或 case 级只读订阅。省略 events 时按角色给默认事件：coordinator 含进度/终态/交接，downstream 含终态/交接，observer 仅终态；process_request 必须显式列入。默认 mode 为 queue。同一归属不可把 originSessionId 改成数组。', parameters: z.toJSONSchema(notificationSubscribeSchema) },
+  notification_unsubscribe: { description: '按 subscriptionId 取消本主归属的一条订阅。不影响主归属绑定，也不删除已经入队的通知。', parameters: z.toJSONSchema(notificationUnsubscribeSchema) },
+  notification_subscriptions: { description: '只读列出本主归属的订阅。可按 jobId 或 caseId 过滤。不返回宿主凭据或消息正文。', parameters: z.toJSONSchema(notificationListSchema) },
 };
 
 interface Job {
@@ -216,6 +230,8 @@ interface Job {
   closedAt?: string;
   closeReason?: CloseReason;
   processReleased?: true | 'pending';
+  /** Resolved for this round. A later continue or message inherits it when the caller does not say otherwise. */
+  deliveryMode?: DeliveryMode;
 }
 
 export class WorkbenchArtifactError extends Error {
@@ -235,6 +251,8 @@ interface ExecutionCancellation { jobId: string; attemptId: string; originSessio
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
 interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun>; processRequests?: ProcessRequest[];
+  /** Read-only subscribers. Absent on gateway files written before multi-session notifications. */
+  subscriptions?: NotificationSubscription[];
   /** A shared space or role directory the host refused for a job; the task ran without it. */
   artifactSpaceRefusals?: Record<string, { at: string; path: string; reason: string }> }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
@@ -244,6 +262,22 @@ const taskState = (job: Job): string => wire(Task.fromJSON(job.task)).status?.st
 const resultText = (task: Task): string => task.artifacts.flatMap(artifact => artifact.parts
   .filter(part => part.content?.$case === 'text').map(part => part.content!.value)).join('\n') ||
   task.status?.message?.parts.filter(part => part.content?.$case === 'text').map(part => part.content!.value).join('\n') || '';
+/** A task that did not complete, and whose cause the gateway may report. */
+const failedStates = new Set(['TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
+/**
+ * The failure facts of a remote task: its structured error, or a degraded
+ * summary of the status text it published instead. A task that did not fail
+ * has no failure facts, whatever its metadata claims.
+ */
+function failureOf(task: Task): SafeErrorSummary | undefined {
+  if (!failedStates.has(wire(task).status?.state ?? '')) return undefined;
+  const structured = safeErrorSummary((task.metadata?.['1agents'] as { error?: unknown } | undefined)?.error);
+  if (structured) return structured;
+  const text = safeErrorText(task.status?.message?.parts.filter(part => part.content?.$case === 'text')
+    .map(part => part.content!.value).join(' '));
+  if (!text) return undefined;
+  return { category: 'unknown', message: text, retryable: false };
+}
 
 function atomicJson(file: string, value: unknown): void {
   const temp = `${file}.${randomUUID()}.tmp`;
@@ -252,6 +286,14 @@ function atomicJson(file: string, value: unknown): void {
   renameSync(temp, file);
   const dir = openSync(path.dirname(file), 'r');
   try { fsyncSync(dir); } finally { closeSync(dir); }
+}
+
+function requestedDeliveryMode(field: unknown, declared: DeliveryMode | undefined, inherited?: DeliveryMode): DeliveryMode {
+  if (field === undefined && declared === undefined) return inherited ?? 'artifacts';
+  if (field !== undefined && declared !== undefined && field !== declared) {
+    throw new Error('deliveryMode does not match resultContract.deliveryMode');
+  }
+  return deliveryModeSchema.parse(field ?? declared);
 }
 
 export class RemoteAgentGateway {
@@ -343,6 +385,8 @@ export class RemoteAgentGateway {
       this.state.pptDeliveries ??= { version: 1, runs: {} };
       if (this.state.processRequests !== undefined && !Array.isArray(this.state.processRequests)) throw new Error('Invalid gateway state');
       this.state.processRequests = z.array(processRequestSchema).parse(this.state.processRequests ?? []);
+      if (this.state.subscriptions !== undefined && !Array.isArray(this.state.subscriptions)) throw new Error('Invalid gateway state');
+      this.state.subscriptions = z.array(notificationSubscriptionSchema).parse(this.state.subscriptions ?? []);
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         const attempt = this.ledger.getAttempt(run.attemptId);
         if (attempt.submissionStatus === 'prepared') this.ledger.markDispatching(attempt.attemptId);
@@ -434,6 +478,131 @@ export class RemoteAgentGateway {
     if (local && createHash('sha256').update(local).digest('hex') === artifact.sha256) return local;
     return (await this.workbenchArtifact(jobId, artifact.sha256)).content;
   }
+  /** Explicit host targets are checked immediately. An origin target may be bound later and is resolved at fan-out. */
+  private assertSubscriberTarget(target: NotificationSubscription['target']): void {
+    if (target.originSessionId) return;
+    this.sessions.resolveTarget(target);
+  }
+  /**
+   * Read-only check for a whole notifySessions batch. `pendingJob` / `pendingCase` means that id is about to be
+   * created by this call, so it is not required to exist yet. Every other job or case must already belong to the origin.
+   * Nothing here writes the ledger or the subscription list.
+   */
+  private validateSubscriptions(originSessionId: string, inputs: NotifySubscriptionInput[] | undefined, defaults: { scope: 'job' | 'case'; jobId?: string; caseId?: string; pendingJob?: boolean; pendingCase?: boolean }): void {
+    if (!inputs?.length) return;
+    for (const input of inputs) {
+      const scope = input.scope ?? defaults.scope;
+      const jobId = input.jobId ?? (scope === 'job' ? defaults.jobId : undefined);
+      const caseId = input.caseId ?? defaults.caseId;
+      const jobPending = scope === 'job' && !jobId && defaults.pendingJob === true;
+      const casePending = scope === 'case' && defaults.pendingCase === true && (!caseId || caseId === defaults.caseId);
+      if (scope === 'job' && !jobId && !jobPending) throw new Error('Job subscription requires jobId');
+      if (scope === 'case' && !caseId && !casePending) throw new Error('Case subscription requires caseId');
+      const draft = materializeSubscription(originSessionId, input, {
+        scope, jobId: jobId ?? (jobPending ? 'pending-job' : undefined), caseId: caseId ?? (casePending ? 'pending-case' : undefined),
+      });
+      this.assertSubscriberTarget(draft.target);
+      if (scope === 'job' && jobId) this.ledger.get(originSessionId, jobId);
+      if (scope === 'case' && caseId && !casePending) requireCase(this.ledger, originSessionId, caseId);
+    }
+  }
+  /** Materialize the whole batch first. A later invalid item cannot leave the earlier ones stored. */
+  private attachSubscriptions(originSessionId: string, inputs: NotifySubscriptionInput[] | undefined, defaults: { scope: 'job' | 'case'; jobId?: string; caseId?: string }): void {
+    if (!inputs?.length) return;
+    const existing = this.state.subscriptions ?? [];
+    const created: NotificationSubscription[] = [];
+    for (const input of inputs) {
+      const next = materializeSubscription(originSessionId, input, defaults);
+      this.assertSubscriberTarget(next.target);
+      if (next.scope === 'job' && next.jobId) this.ledger.get(originSessionId, next.jobId);
+      if (next.scope === 'case' && next.caseId) requireCase(this.ledger, originSessionId, next.caseId);
+      if (existing.some(item => item.subscriptionId === next.subscriptionId) || created.some(item => item.subscriptionId === next.subscriptionId)) continue;
+      created.push(next);
+    }
+    if (!created.length) return;
+    const previous = this.state.subscriptions;
+    this.state.subscriptions = [...existing, ...created];
+    try { this.save(); } catch (error) { this.state.subscriptions = previous; throw error; }
+  }
+  private noteHandoffTaken(originSessionId: string, handoffId: string, childJobId: string): void {
+    const taken = this.ledger.markHandoffTaken(originSessionId, handoffId, childJobId);
+    this.fanoutSubscribers({
+      originSessionId, jobId: taken.fromJobId, caseId: taken.caseId, purpose: taken.purpose, targetId: taken.toTargetId,
+      event: 'handoff', eventKey: `handoff:taken:${taken.handoffId}`, status: 'taken', summary: taken.reason,
+      handoff: { handoffId: taken.handoffId, status: 'taken', purpose: taken.purpose, toTargetId: taken.toTargetId, childJobId },
+    });
+  }
+  /** Merge job and case subscriptions, skip the owner session, and isolate each target queue. */
+  private fanoutSubscribers(input: {
+    originSessionId: string; jobId?: string; caseId?: string; purpose?: string; targetId?: string;
+    event: SubscriberNotice['event']; eventKey: string; status: string; title?: string; summary?: string;
+    artifacts?: SubscriberNotice['artifacts']; handoff?: SubscriberNotice['handoff']; processRequest?: SubscriberNotice['processRequest'];
+    error?: SubscriberNotice['error'];
+  }): void {
+    if (!this.sessions.healthy) return;
+    const matches = (this.state.subscriptions ?? []).filter(sub => {
+      if (sub.originSessionId !== input.originSessionId || !sub.events.includes(input.event)) return false;
+      const jobMatch = Boolean(input.jobId && sub.scope === 'job' && sub.jobId === input.jobId);
+      const caseMatch = Boolean(input.caseId && sub.scope === 'case' && sub.caseId === input.caseId);
+      if (!jobMatch && !caseMatch) return false;
+      if (sub.filter?.purpose && sub.filter.purpose !== input.purpose) return false;
+      if (sub.filter?.targetId && sub.filter.targetId !== input.targetId) return false;
+      return true;
+    });
+    if (!matches.length) return;
+    let owner: { host: string; sessionId: string } | undefined;
+    try {
+      const status = this.sessions.getBindingStatus(input.originSessionId);
+      if (status.binding) owner = { host: status.binding.host, sessionId: status.binding.sessionId };
+    } catch { return; }
+    const seen = new Set<string>();
+    for (const sub of matches) {
+      try {
+        const resolved = this.sessions.resolveTarget(sub.target);
+        const key = `${resolved.host}\0${resolved.sessionId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (owner && owner.host === resolved.host && owner.sessionId === resolved.sessionId) continue;
+        const notice: SubscriberNotice = {
+          role: sub.role, event: input.event, originSessionId: input.originSessionId, status: input.status,
+          ...(input.caseId ? { caseId: input.caseId } : {}), ...(input.jobId ? { jobId: input.jobId } : {}),
+          ...(input.title ? { title: input.title } : {}), ...(input.summary ? { summary: input.summary } : {}),
+          ...(input.artifacts?.length ? { artifacts: input.artifacts } : {}),
+          ...(input.handoff ? { handoff: input.handoff } : {}),
+          ...(input.processRequest ? { processRequest: input.processRequest } : {}),
+          ...(input.error ? { error: input.error } : {}),
+        };
+        this.sessions.enqueueTarget({
+          targetKey: subscriberTargetKey(resolved.host, resolved.sessionId),
+          host: resolved.host, sessionId: resolved.sessionId,
+          messageId: subscriberMessageId(input.eventKey, resolved.host, resolved.sessionId),
+          mode: sub.mode, notice: { form: 'notice', summary: formatSubscriberNoticeSummary(notice) },
+          text: formatSubscriberNotice(notice),
+        });
+      } catch { /* One subscriber must not block the owner or any other subscriber. */ }
+    }
+    void this.sessions.reconcile().catch(() => {});
+  }
+  private notifyTaskSubscribers(job: Job, task: Task): void {
+    if (!job.ledgerJobId) return;
+    let view: { caseId?: string; purpose?: string; targetId: string; title?: string };
+    try { view = this.ledger.get(job.originSessionId, job.ledgerJobId); }
+    catch { return; }
+    const state = taskState(job);
+    const status = this.standardState(state);
+    const attemptId = job.attemptId ?? job.taskId;
+    const failure = failureOf(task);
+    const base = {
+      originSessionId: job.originSessionId, jobId: job.ledgerJobId, caseId: view.caseId, purpose: view.purpose, targetId: view.targetId,
+      title: job.title ?? view.title, summary: resultText(task).slice(0, 500),
+      artifacts: artifactLinks(task).map(link => ({ name: link.name, url: link.url })),
+    };
+    if (state === 'TASK_STATE_SUBMITTED') this.fanoutSubscribers({ ...base, event: 'progress', eventKey: `progress:submitted:${attemptId}`, status: 'submitted' });
+    if (state === 'TASK_STATE_WORKING') this.fanoutSubscribers({ ...base, event: 'progress', eventKey: `progress:working:${attemptId}`, status: 'working' });
+    // A failed task tells the subscribers why, not only that it ended.
+    if (actionable.has(state)) this.fanoutSubscribers({ ...base, event: 'terminal', eventKey: `terminal:${attemptId}:${status}`, status,
+      ...(failure ? { error: noticeErrorSummary(failure) } : {}) });
+  }
   private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; deliveryRecoveryInput?: PptDeliveryRecoveryInput; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
     if (input.handoffId) {
       const handoff = this.ledger.findHandoff(input.originSessionId, input.handoffId);
@@ -443,7 +612,12 @@ export class RemoteAgentGateway {
       if (input.caseId && input.caseId !== handoff.caseId) throw new Error('Handoff case does not match');
       // The accepted version is the one the handoff names. Another version needs a new proposal.
       if (input.resultRevision && input.resultRevision !== handoff.artifactRevision) throw new Error('Handoff version does not match; propose the new version instead');
-      if (handoff.status === 'taken' && handoff.childJobId) return this.ledgerView(input.originSessionId, handoff.childJobId);
+      if (handoff.status === 'taken' && handoff.childJobId) {
+        const takenDefaults = { scope: 'job' as const, jobId: handoff.childJobId, caseId: handoff.caseId };
+        this.validateSubscriptions(input.originSessionId, input.notifySessions, takenDefaults);
+        this.attachSubscriptions(input.originSessionId, input.notifySessions, takenDefaults);
+        return this.ledgerView(input.originSessionId, handoff.childJobId);
+      }
       const frozen = handoff.snapshots ?? [];
       const snapshot = { caseId: handoff.caseId, handoffId: handoff.handoffId, revision: handoff.artifactRevision, digest: handoff.artifactDigest,
         files: frozen.map(item => ({ digest: item.digest, name: item.name, size: item.size,
@@ -454,8 +628,15 @@ export class RemoteAgentGateway {
     }
     // A task may only join a thing that exists; it never creates one by naming it.
     if (input.caseId) requireCase(this.ledger, input.originSessionId, input.caseId);
+    // Reject the whole notifySessions batch before prepare, so a bad subscriber cannot persist an orphan request id.
+    this.validateSubscriptions(input.originSessionId, input.notifySessions, {
+      scope: 'job', jobId: options.jobId, caseId: input.caseId, pendingJob: !options.jobId,
+    });
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
-    if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+    if (replay) {
+      this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: replay.job.jobId, caseId: replay.job.caseId ?? input.caseId });
+      return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+    }
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
     const resolved = this.targets.resolve(input.targetId, input.input);
     if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
@@ -468,11 +649,13 @@ export class RemoteAgentGateway {
     const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(development ? { development } : {}), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
     if (prepared.idempotent) {
-      if (input.handoffId) this.ledger.markHandoffTaken(input.originSessionId, input.handoffId, prepared.job.jobId);
+      this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: prepared.job.jobId, caseId: prepared.job.caseId ?? input.caseId });
+      if (input.handoffId) this.noteHandoffTaken(input.originSessionId, input.handoffId, prepared.job.jobId);
       return this.ledgerView(input.originSessionId, prepared.job.jobId);
     }
     const { job, attempt } = prepared;
-    if (input.handoffId) this.ledger.markHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
+    this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: job.jobId, caseId: job.caseId ?? input.caseId });
+    if (input.handoffId) this.noteHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
     let sent = false;
     try {
       if (reportRequest !== undefined) {
@@ -510,13 +693,25 @@ export class RemoteAgentGateway {
       const sandboxed = resolved.sandbox ? { ...declaredRequirements, sandbox: resolved.sandbox } : declaredRequirements;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
       const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
-      // Unless the caller declared its own artifact location, every task gets <cwd>/.1agents/jobs/<jobId>/ and a
-      // per-attempt manifest, announced to the agent in the prompt. The host creates the directory during preflight.
-      let artifacts = !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && resolved.cwd
-        ? { directory: defaultJobDirectory(resolved.cwd, job.jobId), manifest: defaultManifestPath(resolved.cwd, job.jobId, attempt.attemptId) } : undefined;
-      const withArtifacts = <T>(declared: T, add: (found: NonNullable<typeof artifacts>) => T): T => artifacts ? add(artifacts) : declared;
-      let requirements = withArtifacts(sandboxed, found => ({ ...sandboxed, jobDirectory: found.directory }));
-      let resultContract = withArtifacts(declaredResult, found => ({ ...(declaredResult ?? { jobId: job.jobId }), artifactManifestPath: found.manifest }));
+      const explicitMode = fields.deliveryMode !== undefined || declaredResult?.deliveryMode !== undefined;
+      const mode = requestedDeliveryMode(fields.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
+      const includeMode = mode !== 'artifacts' || explicitMode;
+      const contractBase = (): A2AResultContract | undefined => {
+        if (!declaredResult && !includeMode) return undefined;
+        return { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: mode } : {}) };
+      };
+      // artifacts and workspace_files get <cwd>/.1agents/jobs/<jobId> unless the caller already named a location.
+      // The directory stays inside cwd; .gitignore keeps it out of git status. none and workspace_git do not
+      // invent one; an explicit jobDirectory or manifest is kept. The host creates a default directory at preflight.
+      const located = resolved.cwd ? resolveDefaultJobDirectory(resolved.cwd, job.jobId) : undefined;
+      const autoLocate = (mode === 'artifacts' || mode === 'workspace_files')
+        && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && Boolean(located);
+      let artifacts = autoLocate && located
+        ? { directory: located, manifest: path.posix.join(located, `manifest-${attempt.attemptId}.json`) } : undefined;
+      let requirements = artifacts ? { ...sandboxed, jobDirectory: artifacts.directory } : sandboxed;
+      let resultContract = artifacts
+        ? { ...(contractBase() ?? { jobId: job.jobId }), artifactManifestPath: artifacts.manifest }
+        : contractBase();
       const boundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
       try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
@@ -524,7 +719,7 @@ export class RemoteAgentGateway {
         // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
         // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
         if (!artifacts) throw error;
-        artifacts = undefined; requirements = sandboxed; resultContract = declaredResult;
+        artifacts = undefined; requirements = sandboxed; resultContract = contractBase();
         await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       }
       const publicationRole = boundRole ?? explicitRole ?? job.roleId;
@@ -552,12 +747,16 @@ export class RemoteAgentGateway {
       const fresh = this.targets.resolve(input.targetId, input.input);
       if (fresh.configVersion !== resolved.configVersion || fresh.connectionVersion !== resolved.connectionVersion) throw new Error('Execution target changed before dispatch');
       this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
+      let hasTicket = false;
+      try { this.ledger.ticket(input.originSessionId, job.jobId); hasTicket = true; }
+      catch (error) { if (!(error instanceof TicketError)) throw error; }
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) + (artifacts ? artifactInstructions(artifacts.directory, artifacts.manifest) : '')
+        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
+          + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest ?? resultContract?.artifactManifestPath)
           + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
-            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication })
+            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
           + snapshotInstructions(input.input?.handoffSnapshot) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
           ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
@@ -570,7 +769,7 @@ export class RemoteAgentGateway {
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
-        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}) });
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: mode });
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
@@ -787,8 +986,15 @@ export class RemoteAgentGateway {
         if (delivery) {
           if (['completed', 'failed', 'canceled'].includes(delivery.executionStatus)) {
             const partial = deliveryException(delivery, delivery.resultSummary ?? delivery.diagnostics.at(-1) ?? 'Delivery terminated');
-            this.ledger.observe(attempt.attemptId, delivery.parentUpdatePending ?? { executionStatus: delivery.executionStatus,
-              phase: delivery.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
+            // A delivery reports its own free-text problem; the ledger keeps that
+            // as a diagnostic and reserves `error` for the structured failure.
+            const pending = delivery.parentUpdatePending;
+            this.ledger.observe(attempt.attemptId, pending
+              ? { executionStatus: pending.executionStatus, phase: pending.phase,
+                ...(pending.resultSummary !== undefined ? { resultSummary: pending.resultSummary } : {}),
+                ...(pending.artifactLinks !== undefined ? { artifactLinks: pending.artifactLinks } : {}),
+                ...(pending.error !== undefined ? { diagnostic: pending.error } : {}) }
+              : { executionStatus: delivery.executionStatus, phase: delivery.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
             delete delivery.parentUpdatePending;
           } else localRuns.push(delivery);
           continue;
@@ -1202,10 +1408,12 @@ export class RemoteAgentGateway {
     const task = Task.fromJSON(job.task);
     const meta = task.metadata?.['1agents'] as { sessionId?: string; preflight?: unknown; result?: unknown; capacity?: unknown; taskSlot?: unknown; processSlot?: unknown; resumed?: unknown; restoreMethod?: unknown; provider?: unknown; model?: unknown } | undefined;
     const result = job.attemptId ? this.ledger.getAttempt(job.attemptId).result : undefined;
+    const failure = failureOf(task);
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
       ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
       cwd: job.cwd, agentPreset: job.agentPreset, sessionId: meta?.sessionId ?? job.sessionId,
       preflight: meta?.preflight, resultMetadata: meta?.result,
+      ...(failure ? { error: failure } : {}),
       ...(meta?.capacity ? { capacity: meta.capacity } : {}),
       ...(meta?.taskSlot ? { taskSlot: meta.taskSlot } : {}),
       ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
@@ -1221,9 +1429,11 @@ export class RemoteAgentGateway {
   }
   private resultObservation(task: Task): LedgerObservation {
     const metadata = task.metadata?.['1agents']?.result as A2AResultMetadata | undefined;
+    const failure = failureOf(task);
     return { executionStatus: this.standardState(wire(task).status?.state), providerState: wire(task).status?.state,
       resultSummary: resultText(task), artifactLinks: artifactLinks(task),
-      resultArtifacts: metadata?.artifacts ?? [], ...(metadata?.recordPath ? { structuredResultRef: metadata.recordPath } : {}) };
+      resultArtifacts: metadata?.artifacts ?? [], ...(metadata?.recordPath ? { structuredResultRef: metadata.recordPath } : {}),
+      ...(failure ? { error: failure } : {}) };
   }
   private accept(task: Task, fields: Omit<Job, 'task' | 'taskId' | 'contextId' | 'checkedAt'>): Job {
     const target = task.metadata?.['1agents'] as Record<string, unknown> | undefined;
@@ -1245,12 +1455,14 @@ export class RemoteAgentGateway {
     const state = taskState(job);
     if (actionable.has(state)) {
       const reason = state === 'TASK_STATE_CANCELED' && job.attemptId ? this.state.executionCancellations?.[job.attemptId]?.reason : undefined;
+      const failure = failureOf(task);
       const noticeId = createHash('sha256').update(JSON.stringify([job.remote, job.taskId, state, task.status?.timestamp])).digest('hex');
       if (!this.state.notices.some(value => value.notice.noticeId === noticeId)) this.state.notices.push({
         ...(this.sessions.hasBinding(job.originSessionId) ? { sessionDeliveryId: `a2a-notice:${noticeId}` } : { target: job.notificationTarget }),
         notice: { noticeId, originSessionId: job.originSessionId, remote: job.remote, taskId: job.taskId, contextId: job.contextId,
           cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: reason ? `${reason}\n\n${resultText(task)}`.trim() : resultText(task),
-          ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}), createdAt: new Date().toISOString() } });
+          ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}),
+          ...(failure ? { error: noticeErrorSummary(failure) } : {}), createdAt: new Date().toISOString() } });
     }
     if (job.attemptId) {
       const observed = { ...this.resultObservation(task), stale: false };
@@ -1259,6 +1471,7 @@ export class RemoteAgentGateway {
       else this.ledger.observe(job.attemptId, observed);
     } else this.save();
     if (oneShotShouldClose(job.lifecycle, state, this.taskAcknowledged(job, state))) this.releaseOneShot(job);
+    try { this.notifyTaskSubscribers(job, task); } catch { /* subscriber fan-out must not block the owner */ }
   }
   private async refresh(job: Job): Promise<void> {
     const key = `${job.remote}:${job.taskId}`;
@@ -1393,10 +1606,13 @@ export class RemoteAgentGateway {
     }
     if (method === 'execution_submit') return this.submitExecution(executionSubmitSchema.parse(params));
     if (method === 'case_open') {
-      const input = caseOpenSchema.parse(params);
+      const { notifySessions, ...input } = caseOpenSchema.extend({ notifySessions: notifySessionsSchema }).strict().parse(params);
       // This channel is an agent's. It may not write that a person opened the case.
       if (input.createdBy?.kind === 'person') throw new Error('A person opens a case on the workbench page, not through this channel');
-      return openCase(this.ledger, input);
+      this.validateSubscriptions(input.originSessionId, notifySessions, { scope: 'case', caseId: input.caseId, pendingCase: true });
+      const opened = openCase(this.ledger, input);
+      this.attachSubscriptions(opened.originSessionId, notifySessions, { scope: 'case', caseId: opened.caseId });
+      return opened;
     }
     if (method === 'case_get') {
       const input = caseGetSchema.parse(params);
@@ -1406,9 +1622,10 @@ export class RemoteAgentGateway {
     }
     if (method === 'execution_continue') {
       const input = executionContinueSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
+      const continueInput = { ...input.input, ...(input.deliveryMode !== undefined ? { deliveryMode: input.deliveryMode } : {}) };
       const replay = this.ledger.replay({ originSessionId: input.originSessionId, jobId: job.jobId,
         operation: 'continue', title: job.title, targetSnapshot: { targetId: job.targetId },
-        input: input.input, requestDigestInput: input.input, clientRequestId: input.clientRequestId });
+        input: continueInput, requestDigestInput: continueInput, clientRequestId: input.clientRequestId });
       if (replay) return { ...this.ledgerView(input.originSessionId, job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
       const attempt = job.attempts.find(item => item.attemptId === job.currentAttemptId)!;
       if (job.unresolvedAttemptIds.length) throw new Error('Job has submission_unknown or unresolved attempts; reconcile before continuing');
@@ -1447,7 +1664,7 @@ export class RemoteAgentGateway {
       if (current.attempts.some(item => current.inFlightAttemptIds.includes(item.attemptId) && item.executionStatus !== 'input_required'))
         throw new Error('Job still has a running round; wait for it to end or cancel it before continuing');
       const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
-        input: { ...(attempt.input as Record<string, unknown>), ...input.input }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: input.input });
+        input: { ...(attempt.input as Record<string, unknown>), ...continueInput }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: continueInput });
       reopenForContinue(this.ledger, input.originSessionId, job.jobId);
       return submitted;
     }
@@ -1481,7 +1698,16 @@ export class RemoteAgentGateway {
       const result = invokeHandoff(this.ledger, method, params);
       // The bytes a handoff talks about are frozen once, so a later round of the source job cannot change them.
       if ((method === 'handoff_propose' || method === 'handoff_decide') && result && typeof result === 'object' && 'handoffId' in result) {
-        await this.freezeHandoff(result as Handoff);
+        const handoff = result as Handoff;
+        await this.freezeHandoff(handoff);
+        const origin = this.ledger.originOf(handoff.fromJobId);
+        if (origin) this.fanoutSubscribers({
+          originSessionId: origin, jobId: handoff.fromJobId, caseId: handoff.caseId, purpose: handoff.purpose, targetId: handoff.toTargetId,
+          event: 'handoff',
+          eventKey: method === 'handoff_propose' ? `handoff:propose:${handoff.handoffId}` : `handoff:decide:${handoff.handoffId}:${handoff.status}`,
+          status: handoff.status, summary: handoff.reason,
+          handoff: { handoffId: handoff.handoffId, status: handoff.status, purpose: handoff.purpose, toTargetId: handoff.toTargetId, ...(handoff.childJobId ? { childJobId: handoff.childJobId } : {}) },
+        });
       }
       return result;
     }
@@ -1550,11 +1776,35 @@ export class RemoteAgentGateway {
       void this.reconcile().catch(() => {});
       return result;
     }
+    if (method === 'session_binding_get') return this.sessions.getBindingStatus(sessionOriginSchema.parse(params).originSessionId);
+    if (method === 'notification_subscribe') {
+      const input = notificationSubscribeSchema.parse(params);
+      this.attachSubscriptions(input.originSessionId, [input], { scope: input.scope, jobId: input.jobId, caseId: input.caseId });
+      const subscriptionId = materializeSubscription(input.originSessionId, input, { scope: input.scope, jobId: input.jobId, caseId: input.caseId }).subscriptionId;
+      const subscription = (this.state.subscriptions ?? []).find(item => item.subscriptionId === subscriptionId);
+      if (!subscription) throw new Error('Subscription was not recorded');
+      return subscription;
+    }
+    if (method === 'notification_unsubscribe') {
+      const input = notificationUnsubscribeSchema.parse(params);
+      const list = this.state.subscriptions ?? [];
+      const index = list.findIndex(item => item.subscriptionId === input.subscriptionId && item.originSessionId === input.originSessionId);
+      if (index < 0) throw new Error('Subscription not found for this origin session');
+      list.splice(index, 1);
+      this.state.subscriptions = list;
+      this.save();
+      return { removed: true, subscriptionId: input.subscriptionId };
+    }
+    if (method === 'notification_subscriptions') {
+      const input = notificationListSchema.parse(params);
+      return { subscriptions: (this.state.subscriptions ?? []).filter(item => item.originSessionId === input.originSessionId
+        && (!input.jobId || item.jobId === input.jobId) && (!input.caseId || item.caseId === input.caseId)) };
+    }
     if (method === 'remote_agent_spawn') {
       const input = spawnSchema.parse(params);
       if (input.notificationTarget && !this.config.notificationTargets[input.notificationTarget]) throw new Error('Unknown notificationTarget');
-      const { originSessionId, remote, clientRequestId, title, initiatedBy, ...fields } = input;
-      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title, initiatedBy });
+      const { originSessionId, remote, clientRequestId, title, initiatedBy, notifySessions, ...fields } = input;
+      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title, initiatedBy, ...(notifySessions ? { notifySessions } : {}) });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
       if (!raw) throw new Error(`Task admission unresolved; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
@@ -1585,6 +1835,7 @@ export class RemoteAgentGateway {
           ...(input.roleId ? { roleId: input.roleId } : {}),
           ...(input.lifecycle ? { lifecycle: input.lifecycle } : previous.lifecycle ? { lifecycle: previous.lifecycle } : {}),
           ...(input.provider !== undefined ? { provider: input.provider } : {}), ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.deliveryMode !== undefined ? { deliveryMode: input.deliveryMode } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
@@ -1900,6 +2151,27 @@ export class RemoteAgentGateway {
     if (reviewer !== this.config.workbench!.reviewerId) throw new Error(`发布放行的负责人是 ${reviewer}。`);
     return this.workbench(async () => ({ release: this.agents.publish(agentId, input), ...this.workbenchAgents() }));
   }
+  /** The four gates a person still has to clear. `summary` drops the rows and keeps the counts. */
+  workbenchApprovals() { return projectApprovals(this.workbenchSource()); }
+  /** Checklist, workflow, gate and calibration for one role directory. The role id cannot leave `.1agents/roles`. */
+  workbenchRoleRsi(roleId: string) {
+    const root = this.config.workbench?.projectRoot;
+    const roots = root ? [root] : discoverProjectRoots([this.config.stateDirectory, process.cwd()]);
+    return readRoleRsi(roots, roleId);
+  }
+  /**
+   * Settle one ticket proposal as the person on the page. The body cannot name `by`: the route writes it,
+   * so an agent holding the bearer token cannot claim a person decided.
+   */
+  async decideWorkbenchProposal(jobId: string, proposalId: string, input: unknown, via: 'page' | 'relay') {
+    return this.workbench(async () => {
+      const scope = this.workbenchTask(jobId);
+      const parsed = z.object({ state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional() }).strict().parse(input);
+      const ticket = invokeTicket(this.ledger, 'ticket_proposal', { originSessionId: scope.originSessionId, jobId, proposalId,
+        state: parsed.state, ...(parsed.note ? { note: parsed.note } : {}), by: { kind: 'person' as const, via } });
+      return { ticket, task: this.workbenchTask(jobId) };
+    });
+  }
   workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
   /** Read-only transcript from the stored A2A history of the job's attempts; the same scope check as the task detail. */
   workbenchChat(jobId: string, query: { limit?: number; before?: number } = {}) {
@@ -1992,6 +2264,14 @@ export class RemoteAgentGateway {
           void this.sessions.reconcile().catch(() => {});
         } catch { /* Best-effort origin wakeup must not hide the durable workbench request. */ }
       }
+      try {
+        this.fanoutSubscribers({
+          originSessionId: scope.originSessionId, jobId: created.jobId, caseId: scope.caseId, purpose: scope.purpose, targetId: scope.targetId,
+          event: 'process_request', eventKey: `process:${created.requestId}`, status: created.kind, title: scope.title,
+          summary: created.kind === 'permission' ? created.toolTitle : created.kind,
+          processRequest: { requestId: created.requestId, kind: created.kind },
+        });
+      } catch { /* Subscriber copies are optional and must not hide the durable request. */ }
       return created;
     });
   }
@@ -2284,7 +2564,7 @@ function authenticated(req: IncomingMessage, token: string): boolean {
 }
 /** Publishing, review decisions and handoff decisions are a person's acts, made on the workbench page. */
 const PAGE_ONLY_ROUTES = [/^\/workbench\/agents\/[^/]+\/publish$/, /^\/workbench\/tasks\/[^/]+\/reviews\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/continue$/, /^\/workbench\/tasks\/[^/]+\/acceptance$/,
-  /^\/workbench\/cases\/[^/]+\/handoffs\/[^/]+\/decisions$/];
+  /^\/workbench\/cases\/[^/]+\/handoffs\/[^/]+\/decisions$/, /^\/workbench\/tasks\/[^/]+\/ticket\/proposals\/[^/]+$/];
 function relayedFromPage(req: IncomingMessage, secret: string | undefined): boolean {
   if (!secret) return false;
   const expected = Buffer.from(secret), supplied = Buffer.from(String(req.headers['x-workbench-page-relay'] ?? ''));
@@ -2353,6 +2633,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         return json(res, gateway.sessions.healthy ? 200 : 503, {
           status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes),
           sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable',
+          sessionDeliveryStats: gateway.sessions.summary(),
           ...(slots ? { taskSlot: slots.taskSlot, processSlot: slots.processSlot } : {}),
           sessions: gateway.lifecycleReport(),
           ...(callbackHealth.state === 'pending' ? { callback: 'pending' } : {}) });
@@ -2371,13 +2652,31 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
           if (gateway.config.workbench.token && !authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
           if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated workbench page' });
           if (req.method === 'POST' && PAGE_ONLY_ROUTES.some(route => route.test(pathname)) && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) {
-            return json(res, 403, { error: 'page_action_required', message: '发布、验收决定和继续任务只能由人在工作台页面发起。' });
+            return json(res, 403, { error: 'page_action_required', message: '发布、验收决定、继续任务和规范提议只能由人在工作台页面发起。' });
           }
         }
         if (req.method === 'GET' && pathname === '/workbench/tasks') {
           const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
             limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
           return json(res, 200, gateway.workbenchList(query));
+        }
+        if (pathname === '/workbench/approvals') {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          const query = z.object({ summary: z.literal('1').optional() }).strict().parse(Object.fromEntries(url.searchParams));
+          const view = gateway.workbenchApprovals();
+          if (query.summary !== '1') return json(res, 200, view);
+          const { items: _items, ...summary } = view;
+          return json(res, 200, summary);
+        }
+        const roleRsi = /^\/workbench\/roles\/([^/]+)\/rsi$/.exec(pathname);
+        if (roleRsi) {
+          if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+          if (url.search) return json(res, 400, { error: 'Invalid workbench parameters' });
+          try { return json(res, 200, await gateway.workbenchRoleRsi(decodeURIComponent(roleRsi[1]!))); }
+          catch (error) {
+            if (error instanceof RoleRsiError) return json(res, error.status, { error: error.status === 400 ? 'invalid_role' : 'not_found', message: error.message });
+            throw error;
+          }
         }
         if (pathname === '/workbench/cases') {
           if (req.method === 'GET') {
@@ -2495,6 +2794,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
         const review = /^\/reviews\/([^/]+)\/decisions$/.exec(rest);
         const answer = /^\/process-requests\/([^/]+)\/answers$/.exec(rest);
         const one = /^\/process-requests\/([^/]+)$/.exec(rest);
+        const proposal = /^\/ticket\/proposals\/([^/]+)$/.exec(rest);
         try {
           if (rest === '' && req.method === 'GET') return json(res, 200, gateway.workbenchTask(jobId));
           if (rest === '/refresh' && req.method === 'POST') return json(res, 200, await gateway.refreshWorkbenchTask(jobId));
@@ -2511,6 +2811,10 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             catch (error) { return json(res, 409, { error: 'accept_refused', message: error instanceof Error ? error.message : String(error) }); }
           }
           if (review && req.method === 'POST') return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(review[1]!), await body(req)));
+          if (proposal && req.method === 'POST') {
+            if (!page && !relayedFromPage(req, gateway.config.workbench.pageRelaySecret)) return json(res, 403, { error: 'page_action_required', message: '规范提议只能由人在工作台页面发起。' });
+            return json(res, 200, await gateway.decideWorkbenchProposal(jobId, decodeURIComponent(proposal[1]!), await body(req), page ? 'page' : 'relay'));
+          }
           if (rest === '/process-requests' && req.method === 'POST') return json(res, 200, await gateway.openProcessRequest(jobId, await body(req)));
           // The page, here or relayed by its host, always answers as a person; only the gateway's own callers name a coach.
           if (answer && req.method === 'POST') {
@@ -2518,7 +2822,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             return json(res, 200, await gateway.answerProcessRequest(jobId, decodeURIComponent(answer[1]!), asPerson ? { ...(input as object), decidedBy: { kind: 'person' } } : input));
           }
           if (one && req.method === 'GET') return json(res, 200, gateway.processRequest(jobId, decodeURIComponent(one[1]!)));
-          if (rest === '' || rest === '/refresh' || rest === '/continue' || rest === '/acceptance' || review || answer || one || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
+          if (rest === '' || rest === '/refresh' || rest === '/continue' || rest === '/acceptance' || review || answer || one || proposal || rest === '/process-requests') return json(res, 405, { error: 'Method not allowed' });
           return json(res, 404, { error: 'No workbench route' });
         } catch (error) {
           if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });
@@ -2526,6 +2830,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
             const status = error.code === 'forbidden' ? 403 : error.code === 'not_found' ? 404 : error.code === 'invalid' ? 400 : 409;
             return json(res, status, { error: error.code, message: error.message });
           }
+          if (error instanceof TicketError) return json(res, 409, { error: 'conflict', message: error.message });
           if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
           return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
         }

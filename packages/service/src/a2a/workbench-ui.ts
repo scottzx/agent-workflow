@@ -15,10 +15,13 @@ const COOKIE = 'acp_workbench';
 const SESSION_MS = 12 * 60 * 60 * 1000;
 const MAX_SESSIONS = 64;
 const ASSETS: Record<string, string> = { 'app.js': 'text/javascript; charset=utf-8', 'app.css': 'text/css; charset=utf-8' };
-/** Lazy-loaded renderer chunks (markdown, highlighting) emitted by the page build. */
+/** Content-hashed lazy chunks (modules, markdown, highlighting). Names are checked before the file is read. */
 const CHUNK = /^chunk-[A-Za-z0-9_-]+\.js$/;
+/** Only hashed chunks are immutable. The shell and the API stay uncached so a rebuild shows up immediately. */
+const IMMUTABLE_CHUNK = { 'Cache-Control': 'public, max-age=31536000, immutable' };
 const SECURITY_HEADERS = {
-  'Content-Security-Policy': "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  // The inline SVG favicon is the one data: image the page needs; everything else stays same-origin.
+  'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
   'Cache-Control': 'no-store',
@@ -62,7 +65,7 @@ export async function serveWorkbenchPage(req: IncomingMessage, res: ServerRespon
   const asset = pathname.slice(`${WORKBENCH_UI_PATH}/`.length);
   const type = Object.hasOwn(ASSETS, asset) ? ASSETS[asset] : CHUNK.test(asset) ? ASSETS['app.js'] : undefined;
   if (!type) return sendJson(res, 404, { error: 'No workbench page asset' }, headers);
-  try { return send(res, 200, type, await readFile(path.join(directory, asset)), headers); }
+  try { return send(res, 200, type, await readFile(path.join(directory, asset)), { ...headers, ...(CHUNK.test(asset) ? IMMUTABLE_CHUNK : {}) }); }
   catch { return sendJson(res, 404, { error: 'No workbench page asset' }, headers); }
 }
 
