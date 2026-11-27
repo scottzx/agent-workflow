@@ -34,6 +34,7 @@ const v2ItemSchema = z.object({
   severity: z.enum(['must', 'should']),
   locked: z.boolean(),
   rule: z.string().min(1),
+  source: z.string().min(1).optional(),
   nonGoals: z.array(z.string()).optional(),
   selfCheck: z.boolean().optional(),
   recheckOnRevision: z.boolean().optional(),
@@ -84,6 +85,8 @@ export interface NormalizedCheckItem {
   severity: 'must' | 'should';
   locked: boolean;
   rule: string;
+  /** Provenance explaining where this check originated (e.g. PR/CR/case id). Required for newly added block checks. */
+  source?: string;
   nonGoals?: string[];
   selfCheck?: boolean;
   recheckOnRevision?: boolean;
@@ -107,11 +110,12 @@ type Policy = z.infer<typeof modePolicySchema> | undefined;
 
 function copyItem(item: {
   id: string; kind: CheckKind; dependsOn?: string[]; severity: 'must' | 'should'; locked: boolean; rule: string;
-  nonGoals?: string[]; selfCheck?: boolean; recheckOnRevision?: boolean; evidenceHint?: string;
+  source?: string; nonGoals?: string[]; selfCheck?: boolean; recheckOnRevision?: boolean; evidenceHint?: string;
   runner?: NormalizedCheckItem['runner']; modePolicy?: Policy; legacyType?: 'program' | 'agent';
 }): NormalizedCheckItem {
   return {
     id: item.id, kind: item.kind, severity: item.severity, locked: item.locked, rule: item.rule,
+    ...(item.source ? { source: item.source } : {}),
     ...(item.dependsOn ? { dependsOn: item.dependsOn } : {}),
     ...(item.nonGoals ? { nonGoals: item.nonGoals } : {}),
     ...(item.selfCheck !== undefined ? { selfCheck: item.selfCheck } : {}),
@@ -141,6 +145,7 @@ function normalizeV1(raw: z.infer<typeof checklistV1Schema>): NormalizedChecklis
       severity: item.severity === 'should' ? 'should' : 'must',
       locked: item.locked,
       rule: item.rule,
+      ...(item.source?.trim() ? { source: item.source.trim() } : {}),
       ...(item.dependsOn ? { dependsOn: item.dependsOn } : {}),
       ...(item.nonGoals ? { nonGoals: item.nonGoals } : {}),
       ...(item.selfCheck !== undefined ? { selfCheck: item.selfCheck } : {}),
@@ -173,6 +178,85 @@ export async function loadChecklist(roleDirectory: string): Promise<NormalizedCh
 export function effectiveEnforcement(item: NormalizedCheckItem, mode: RsiMode, enforceObserveAsBlock = false): CheckEnforcement {
   const chosen = item.modePolicy?.[mode] ?? 'block';
   return chosen === 'observe' && enforceObserveAsBlock ? 'block' : chosen;
+}
+
+export interface ProvenanceAuditResult {
+  /** Newly added block checks missing a non-empty `source` provenance string. */
+  missingSource: string[];
+  /** Block checks downgraded to `observe` because they have 0 negative sample coverage (or missing provenance). */
+  downgradedToObserve: string[];
+  /** Resolved effective enforcement per item id after provenance & negative-coverage checks. */
+  effectiveModes: Record<string, CheckEnforcement>;
+}
+
+/**
+ * Resolves effective enforcement for a single check item with provenance and negative-sample coverage rules:
+ * - A newly added `block` check without `source` fails provenance validation and cannot block.
+ * - A `block` program check with zero negative sample coverage (`negativeCoverage === 0`) is automatically downgraded to `observe`.
+ */
+export function effectiveEnforcementWithCoverage(
+  item: NormalizedCheckItem,
+  mode: RsiMode,
+  options: {
+    enforceObserveAsBlock?: boolean;
+    negativeCoverage?: number;
+    requireSourceForBlock?: boolean;
+  } = {},
+): { enforcement: CheckEnforcement; downgradedReason?: 'missing_source' | 'zero_negative_coverage' } {
+  const base = effectiveEnforcement(item, mode, options.enforceObserveAsBlock ?? false);
+  if (base !== 'block' || item.kind !== 'program') {
+    return { enforcement: base };
+  }
+  if (options.requireSourceForBlock && !item.source?.trim()) {
+    return { enforcement: 'observe', downgradedReason: 'missing_source' };
+  }
+  if (options.negativeCoverage !== undefined && options.negativeCoverage <= 0) {
+    return { enforcement: 'observe', downgradedReason: 'zero_negative_coverage' };
+  }
+  return { enforcement: 'block' };
+}
+
+/**
+ * Validates newly added `block` checks for required `source` provenance and downgrades
+ * any `block` program check with 0 negative sample coverage to `observe`.
+ */
+export function auditChecklistProvenance(
+  checklist: NormalizedChecklist,
+  options: {
+    mode?: RsiMode;
+    enforceObserveAsBlock?: boolean;
+    /** Item ids that already existed in the previous version. Items not in this set (or unlocked items) are treated as newly added. */
+    existingItemIds?: ReadonlySet<string>;
+    /** Negative sample hit counts per item id. Newly added block checks with count 0 are downgraded to `observe`. */
+    negativeCoverageByItem?: Readonly<Record<string, number>>;
+  } = {},
+): ProvenanceAuditResult {
+  const mode = options.mode ?? 'formal';
+  const enforceObserveAsBlock = options.enforceObserveAsBlock ?? false;
+  const missingSource: string[] = [];
+  const downgradedToObserve: string[] = [];
+  const effectiveModes: Record<string, CheckEnforcement> = {};
+
+  for (const item of checklist.items) {
+    const isNew = options.existingItemIds ? !options.existingItemIds.has(item.id) : !item.locked;
+    const base = effectiveEnforcement(item, mode, enforceObserveAsBlock);
+    const hasCoverageMap = options.negativeCoverageByItem !== undefined;
+    const coverage = isNew && hasCoverageMap ? (options.negativeCoverageByItem![item.id] ?? 0) : undefined;
+    if (isNew && item.kind === 'program' && base === 'block' && !item.source?.trim()) {
+      missingSource.push(item.id);
+    }
+    const resolved = effectiveEnforcementWithCoverage(item, mode, {
+      enforceObserveAsBlock,
+      requireSourceForBlock: isNew,
+      ...(coverage !== undefined ? { negativeCoverage: coverage } : {}),
+    });
+    effectiveModes[item.id] = resolved.enforcement;
+    if (resolved.downgradedReason) {
+      downgradedToObserve.push(item.id);
+    }
+  }
+
+  return { missingSource, downgradedToObserve, effectiveModes };
 }
 
 /** Self-checks to mount on `ticket_open`. Skipped items for this mode are left off. */

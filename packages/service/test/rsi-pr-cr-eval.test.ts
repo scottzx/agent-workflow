@@ -438,10 +438,10 @@ test('eval-cr CLI and run-l3-eval.mjs agree on verify-only, pass, and fail', { t
     { label: 'cli verify', args: ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--json'], status: 0, mode: 'verify-only' },
     { label: 'cli verify repo', args: ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--json'], status: 0, mode: 'verify-only' },
     { label: 'script verify', args: [script, '--role-dir', roleDir, '--repo', repoRoot, '--json'], status: 0, mode: 'verify-only' },
-    { label: 'cli pass', args: ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--results', passFile, '--json'], status: 0, mode: 'score', promotionReady: true },
-    { label: 'script pass', args: [script, '--role-dir', roleDir, '--repo', repoRoot, '--results', passFile, '--json'], status: 0, mode: 'score', promotionReady: true },
-    { label: 'cli fail', args: ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--results', failFile, '--json'], status: 1, mode: 'score', promotionReady: false },
-    { label: 'script fail', args: [script, '--role-dir', roleDir, '--repo', repoRoot, '--results', failFile, '--json'], status: 1, mode: 'score', promotionReady: false },
+    { label: 'cli pass', args: ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--results', passFile, '--workspace', dir, '--json'], status: 0, mode: 'score', promotionReady: true },
+    { label: 'script pass', args: [script, '--role-dir', roleDir, '--repo', repoRoot, '--results', passFile, '--workspace', dir, '--json'], status: 0, mode: 'score', promotionReady: true },
+    { label: 'cli fail', args: ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--results', failFile, '--workspace', dir, '--json'], status: 1, mode: 'score', promotionReady: false },
+    { label: 'script fail', args: [script, '--role-dir', roleDir, '--repo', repoRoot, '--results', failFile, '--workspace', dir, '--json'], status: 1, mode: 'score', promotionReady: false },
   ];
   for (const check of checks) {
     const result = await spawn(check.args);
@@ -479,7 +479,7 @@ test('run-l3-eval resolves relative role, repo and results from the caller cwd',
   const passFile = join(dir, 'pass.json');
   await writeFile(passFile, JSON.stringify(manifest.cases.map(item => ({ caseId: item.id, markdown: deepSeek(item) }))));
   const result = await spawn([
-    script, '--role-dir=.1agents/roles/pr-delivery', '--repo=.', '--results', relative(repoRoot, passFile), '--json',
+    script, '--role-dir=.1agents/roles/pr-delivery', '--repo=.', '--results', relative(repoRoot, passFile), '--workspace', relative(repoRoot, dir), '--json',
   ], repoRoot);
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
   const body = JSON.parse(result.stdout) as { mode: string; repoRoot: string; promotionReady: boolean; ok: boolean };

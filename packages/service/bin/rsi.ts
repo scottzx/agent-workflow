@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
-import { checkGate } from '../src/rsi/gate.js';
+import { checkGate, writeCrEvalReport } from '../src/rsi/gate.js';
 import { formatLearningsLookupText, lookupLearnings } from '../src/rsi/learnings-lookup.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
@@ -18,7 +18,7 @@ const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [o
        acp-service rsi calibrate --rubric --role DIR --judgments FILE [--workspace DIR] [--json]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
        acp-service rsi lookup --paths FILE1,FILE2 [--repo DIR] [--limit N] [--json]
-       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
+       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--workspace DIR] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
 executor, runs the role's program checks and sends failures back to the same session.
@@ -182,8 +182,12 @@ async function runCalibrate(argv: string[]): Promise<void> {
   for (const hit of report.falsePositives) console.log(`  误报 ${hit.runDir} ${hit.artifactPath}：${hit.failedChecks.join('、')}`);
   console.log(`拦截历史缺陷 ${report.caughtHistoricalIssues.length}`);
   for (const hit of report.caughtHistoricalIssues) console.log(`  第 ${hit.round} 轮 ${hit.runDir} ${hit.artifactPath}：${hit.caughtBy.join('、')}${hit.qaSummary ? `（${hit.qaSummary}）` : ''}`);
-  console.log(`校准报告：${calibrationPath(resolve(values.workspace!), report.roleId)}`);
-  console.log(report.passed ? '回放校准通过（历史正样本 0 误报）。' : '回放校准未通过：历史正样本有误报。');
+  if (report.only?.length) {
+    console.log('诊断模式（--only），未写入 calibration.json。');
+  } else {
+    console.log(`校准报告：${calibrationPath(resolve(values.workspace!), report.roleId)}`);
+  }
+  console.log(report.passed ? '回放校准通过（历史正样本 0 误报）。' : `回放校准未通过：${report.failureReasons.join('；') || '历史正样本有误报。'}`);
   if (!report.passed) process.exitCode = 1;
 }
 
@@ -234,7 +238,9 @@ async function runLookup(argv: string[]): Promise<void> {
 
 async function runEvalCr(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
-    role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' }, json: { type: 'boolean', default: false },
+    role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' },
+    workspace: { type: 'string' },
+    json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
   const roleDirectory = resolve(values.role);
@@ -275,10 +281,19 @@ async function runEvalCr(argv: string[]): Promise<void> {
   let raw: unknown;
   try { raw = JSON.parse(text.replace(/^\uFEFF/, '')); }
   catch { throw new Error(`results file is not valid JSON: ${values.results}`); }
-  const score = scoreCrEvalSuite(manifest, coerceCrEvalResults(raw));
+  const normalizedResults = coerceCrEvalResults(raw);
+  const score = scoreCrEvalSuite(manifest, normalizedResults);
+  const evalWorkspace = values.workspace ? resolve(values.workspace) : resolve(repoRoot, '.1agents', 'runtime', 'rsi');
+  const written = await writeCrEvalReport({
+    roleDirectory,
+    workspace: evalWorkspace,
+    results: normalizedResults,
+    score,
+  });
   const ready = verification.ok && score.promotionReady;
   const report = {
-    mode: 'score' as const, roleId: manifest.roleId, evalDigest, repoRoot,
+    mode: 'score' as const, roleId: manifest.roleId, evalDigest, roleDigest: written.report.roleDigest,
+    reportPath: written.path, repoRoot,
     verification, ...score, ok: ready,
   };
   if (values.json) console.log(JSON.stringify(report));
@@ -291,6 +306,7 @@ async function runEvalCr(argv: string[]): Promise<void> {
     for (const item of score.caseResults.filter(row => !row.passed)) {
       console.log(`  未通过 ${item.caseId}：结论 ${item.actualVerdict}${item.missedDefects.length ? `，漏检 ${item.missedDefects.join('、')}` : ''}${item.falsePositive ? '，误报' : ''}`);
     }
+    console.log(`已写入评估报告：${written.path}`);
     console.log(ready ? '达到 trial → formal 晋升门槛。' : '未达到 trial → formal 晋升门槛。');
   }
   if (!ready) process.exitCode = 1;

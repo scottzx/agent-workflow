@@ -64,7 +64,7 @@ async function readRoleCalibration(file: string): Promise<CalibrationReport | un
   const value = await readJson(file);
   if (!value || typeof value !== 'object' || Array.isArray(value)) return;
   const report = value as CalibrationReport;
-  if (report.schemaVersion !== 1 || typeof report.calibratedAt !== 'string' || typeof report.passed !== 'boolean') return;
+  if ((report.schemaVersion !== 1 && report.schemaVersion !== 2) || typeof report.calibratedAt !== 'string' || typeof report.passed !== 'boolean') return;
   return report;
 }
 

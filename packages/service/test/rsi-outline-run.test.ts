@@ -5,6 +5,7 @@ import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { calibrateRole } from '../src/rsi/calibrate.js';
 import { checkGate } from '../src/rsi/gate.js';
 import { JobLedger } from '../src/execution/ledger.js';
 import { invokeTicket, pendingItems, type Ticket } from '../src/execution/ticket.js';
@@ -971,4 +972,22 @@ test('work directory copies rubric.json, check_outline dispatches P16 rubric_lin
   const p16Item = formalTicket.items.find(item => item.checkId === 'P16');
   assert.ok(p16Item, 'formal mode must raise P16 ticket item');
   assert.equal(p16Item.severity, 'must');
+
+  // 3) Formal calibration.json (where P16 effectiveMode is `block`) must NEVER override `trial: observe` in trial mode.
+  const calWorkspace = join(f.root, 'runs-trial-with-cal');
+  const calReport = await calibrateRole({ roleDirectory: f.role, workspace: calWorkspace });
+  assert.equal(calReport.effectiveModes.P16, 'block');
+  const gwTrialWithCal = ticketGateway();
+  const trialWithCal = await runOutlineCase({
+    roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: calWorkspace,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, mode: 'trial',
+    invoke: gwTrialWithCal.invoke(async (method, params: any) => {
+      if (method === 'execution_submit') {
+        await writeFile(join(params.input.cwd, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        return { jobId: 'job-r1-trial-cal' };
+      }
+      return { executionStatus: 'completed' };
+    }),
+  });
+  assert.equal(trialWithCal.passed, true, 'formal calibration effectiveModes must never override trial observe into block');
 });
