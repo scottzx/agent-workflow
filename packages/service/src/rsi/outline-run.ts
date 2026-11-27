@@ -502,25 +502,28 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const steps = ticketSteps(jobId, options.cli);
   const rounds: OutlineRound[] = prior ? [...prior.rounds] : [];
   // Load bound v2 calibration effectiveModes so newly added zero-negative-coverage checks downgraded to `observe`
-  // take real effect during production `rsi run` execution (both in `enforcementOf` and `runRoundDag`).
+  // take real effect during production `rsi run` execution — strictly as a downgrade (never overriding `trial: observe` into `block`).
   const currentChecksDigest = await computeChecksDigest(roleDirectory).catch(() => undefined);
   const currentRoleDigest = await computeRoleDigest(roleDirectory).catch(() => undefined);
   const savedCalibration = await loadCalibration(options.workspace, roleId);
-  const calibratedEffectiveModes =
+  const calibratedDowngrades =
     savedCalibration?.schemaVersion === 2
     && !savedCalibration.only?.length
     && currentChecksDigest && savedCalibration.checksDigest === currentChecksDigest
     && currentRoleDigest && savedCalibration.roleDigest === currentRoleDigest
-      ? savedCalibration.effectiveModes
+      ? Object.fromEntries(
+          Object.entries(savedCalibration.effectiveModes).filter(([, eff]) => eff === 'observe'),
+        )
       : undefined;
 
   // Where a resumed run picks up: the round its host never finished waiting on, or the review QA did not finish.
   const enforcementOf = (itemId: string) => {
-    if (calibratedEffectiveModes && Object.hasOwn(calibratedEffectiveModes, itemId)) {
-      return calibratedEffectiveModes[itemId]!;
-    }
     const item = checklist.items.find(entry => entry.id === itemId);
-    return item ? effectiveEnforcement(item, mode, policy.enforceObserveAsBlock) : 'block';
+    const base = item ? effectiveEnforcement(item, mode, policy.enforceObserveAsBlock) : 'block';
+    if (base === 'block' && calibratedDowngrades?.[itemId] === 'observe') {
+      return 'observe';
+    }
+    return base;
   };
   const isBlockingFailure = (result: CheckResult) => !result.pass && enforcementOf(result.itemId) === 'block';
   let startRound = 1, resumingReview = false;
@@ -597,7 +600,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       // produce already finished above. The check layer is the micro-DAG: schema, then rules ∥ digest, then L1.
       const dag = await runRoundDag({
         workflow, round, workDirectory: work, mode, checklist,
-        ...(calibratedEffectiveModes ? { effectiveModes: calibratedEffectiveModes } : {}),
+        ...(calibratedDowngrades && Object.keys(calibratedDowngrades).length ? { effectiveModes: calibratedDowngrades } : {}),
         nodes: workflow.nodes.filter(node => node.type === 'program_check' || node.type === 'artifact_digest_check' || node.type === 'ticket_apply_checks'),
         precompleted: [{ round, nodeId: produce?.id ?? 'produce', inputDigest: 'produce', status: 'completed',
           startedAt: now().toISOString(), finishedAt: now().toISOString(), output: { executionStatus: 'completed' } }],

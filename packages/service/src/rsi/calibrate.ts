@@ -334,8 +334,8 @@ async function resolveBaselineItemIds(
     const headIds = await readChecklistIdsFromGitCommit(roleDirectory, role.commit);
     if (headIds) return headIds;
   }
-  // 2) Clean working tree with a prior v2 calibration for an older version: compare against its known items.
-  if (previousCalibration?.schemaVersion === 2 && previousCalibration.role.commit && previousCalibration.role.commit !== role.commit) {
+  // 2) Clean working tree with a prior v2 calibration: prefer its recorded checklist items as baseline.
+  if (previousCalibration?.schemaVersion === 2 && previousCalibration.role.commit) {
     return new Set(Object.keys(previousCalibration.effectiveModes));
   }
   // 3) Clean working tree with a previous passing ledger commit: compare against that commit's checklist.json.
