@@ -4,7 +4,7 @@
  * Twin of packages/service/src/roles/worktree-projection.ts validateSkillFrontmatter.
  * DSH 0.2.2-rc.5 drops a skill whose frontmatter uses disableModelInvocation, modelInvocable, or userInvocable.
  *
- *   node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <dir> [--role-dir <dir>]
+ *   node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <dir> [--role-dir <dir>] [--base-ref <ref>]
  */
 import { execFile } from 'node:child_process';
 import { lstat, readFile, readdir, readlink, realpath, stat } from 'node:fs/promises';
@@ -13,6 +13,8 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const HEADER = '<!-- AUTO-GENERATED FROM .1agents/roles/pr-delivery — DO NOT EDIT -->';
+const AOCI_BEGIN = '<!-- aoci:begin -->';
+const AOCI_END = '<!-- aoci:end -->';
 const CONFIG_EXAMPLE = /^\.1agents\/config\/[^/]+\.example\.(?:json|yml)$/;
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const LEGACY = {
@@ -24,10 +26,23 @@ const LEGACY = {
 const args = process.argv.slice(2);
 let worktree;
 let roleDir;
+let baseRef;
+let hasBaseRef = false;
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
   if (arg === '--worktree') worktree = args[++index];
   else if (arg === '--role-dir') roleDir = args[++index];
+  else if (arg === '--base-ref') {
+    hasBaseRef = true;
+    baseRef = args[++index];
+    if (baseRef === undefined) {
+      await finish({
+        ok: false,
+        worktree: worktree ?? null,
+        checks: [{ id: 'usage', ok: false, detail: 'missing value for --base-ref <ref>' }],
+      });
+    }
+  }
   else {
     await finish({
       ok: false,
@@ -53,6 +68,7 @@ checks.push(await checkAgentsLocal(root));
 checks.push(await checkClaudeLink(root));
 checks.push(await checkNoHooks(root));
 checks.push(anchor.ok ? await checkGitStatus(root) : { id: 'git-status', ok: true, skipped: true, detail: 'skipped because .git anchor is missing' });
+checks.push(await checkAociBlockImmutable(root, hasBaseRef ? baseRef : undefined, anchor.ok));
 if (roleDir) checks.push(await checkRoleSource(resolve(roleDir)));
 
 await finish({ ok: checks.every(item => item.ok), worktree: root, checks });
@@ -198,6 +214,196 @@ async function checkGitStatus(dir) {
   return leaks.length
     ? { id: 'git-status', ok: false, detail: `projection or untracked role path in git status: ${leaks.join(', ')}` }
     : { id: 'git-status', ok: true };
+}
+
+async function gitOutput(dir, gitArgs) {
+  const result = await execFileAsync('git', ['--no-optional-locks', ...gitArgs], {
+    cwd: dir,
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return result.stdout;
+}
+
+function extractAociBlock(text, label) {
+  const beginIndex = text.indexOf(AOCI_BEGIN);
+  if (beginIndex === -1) return { ok: false, detail: `${label} is missing ${AOCI_BEGIN}` };
+  if (text.indexOf(AOCI_BEGIN, beginIndex + AOCI_BEGIN.length) !== -1) {
+    return { ok: false, detail: `${label} has multiple ${AOCI_BEGIN} markers` };
+  }
+  const endIndex = text.indexOf(AOCI_END);
+  if (endIndex === -1) return { ok: false, detail: `${label} is missing ${AOCI_END}` };
+  if (text.indexOf(AOCI_END, endIndex + AOCI_END.length) !== -1) {
+    return { ok: false, detail: `${label} has multiple ${AOCI_END} markers` };
+  }
+  if (endIndex < beginIndex) {
+    return { ok: false, detail: `${label} has ${AOCI_END} before ${AOCI_BEGIN}` };
+  }
+  return { ok: true, block: text.slice(beginIndex, endIndex + AOCI_END.length) };
+}
+
+async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
+  const reportedRef = explicitBaseRef ?? 'origin/main';
+  if (!anchorOk) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha: null, detail: 'missing .git anchor (fail-closed)' };
+  }
+  if (explicitBaseRef !== undefined && (!explicitBaseRef.trim() || explicitBaseRef.startsWith('-'))) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: explicitBaseRef, baseSha: null, detail: 'invalid --base-ref (fail-closed)' };
+  }
+  let originMainSha;
+  try {
+    originMainSha = (await gitOutput(dir, ['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'])).trim();
+  } catch {
+    return {
+      id: 'aoci_block_immutable',
+      ok: false,
+      baseRef: reportedRef,
+      baseSha: null,
+      detail: 'missing refs/remotes/origin/main (fail-closed; gate never fetches)',
+    };
+  }
+  let originMergeBase;
+  try {
+    originMergeBase = (await gitOutput(dir, ['merge-base', 'HEAD', originMainSha])).trim();
+  } catch (error) {
+    return {
+      id: 'aoci_block_immutable',
+      ok: false,
+      baseRef: reportedRef,
+      baseSha: null,
+      detail: `cannot compute merge-base(HEAD, origin/main): ${errorMessage(error)}`,
+    };
+  }
+
+  let baseSha = originMergeBase;
+  if (explicitBaseRef !== undefined) {
+    let resolvedRefSha;
+    try {
+      resolvedRefSha = (await gitOutput(dir, ['rev-parse', '--verify', `${explicitBaseRef}^{commit}`])).trim();
+    } catch {
+      return {
+        id: 'aoci_block_immutable',
+        ok: false,
+        baseRef: reportedRef,
+        baseSha: null,
+        detail: `--base-ref "${explicitBaseRef}" does not resolve to a commit`,
+      };
+    }
+    try {
+      baseSha = (await gitOutput(dir, ['merge-base', 'HEAD', resolvedRefSha])).trim();
+    } catch (error) {
+      return {
+        id: 'aoci_block_immutable',
+        ok: false,
+        baseRef: reportedRef,
+        baseSha: null,
+        detail: `cannot compute merge-base(HEAD, ${explicitBaseRef}): ${errorMessage(error)}`,
+      };
+    }
+    try {
+      await gitOutput(dir, ['merge-base', '--is-ancestor', baseSha, originMainSha]);
+    } catch {
+      return {
+        id: 'aoci_block_immutable',
+        ok: false,
+        baseRef: reportedRef,
+        baseSha,
+        detail: `resolved baseSha ${baseSha} for --base-ref "${explicitBaseRef}" is not an ancestor of origin/main`,
+      };
+    }
+    if (baseSha !== originMergeBase) {
+      return {
+        id: 'aoci_block_immutable',
+        ok: false,
+        baseRef: reportedRef,
+        baseSha,
+        detail: `merge-base(HEAD, ${explicitBaseRef}) (${baseSha}) does not match merge-base(HEAD, origin/main) (${originMergeBase})`,
+      };
+    }
+  }
+
+  let baseAgents;
+  try {
+    baseAgents = await gitOutput(dir, ['show', `${baseSha}:AGENTS.md`]);
+  } catch {
+    return {
+      id: 'aoci_block_immutable',
+      ok: false,
+      baseRef: reportedRef,
+      baseSha,
+      detail: `baseline ${baseSha}:AGENTS.md is missing (fail-closed)`,
+    };
+  }
+  const baseBlock = extractAociBlock(baseAgents, `${baseSha}:AGENTS.md`);
+  if (!baseBlock.ok) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: `${baseBlock.detail} (fail-closed)` };
+  }
+
+  const agentsPath = join(dir, 'AGENTS.md');
+  let agentsInfo;
+  try {
+    agentsInfo = await lstat(agentsPath);
+  } catch (error) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: `working tree AGENTS.md missing: ${errorMessage(error)}` };
+  }
+  if (agentsInfo.isSymbolicLink() || !agentsInfo.isFile()) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: 'working tree AGENTS.md must be a regular file' };
+  }
+  const worktreeAgents = await readFile(agentsPath, 'utf8');
+  const worktreeBlock = extractAociBlock(worktreeAgents, 'working tree AGENTS.md');
+  if (!worktreeBlock.ok) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: worktreeBlock.detail };
+  }
+  if (worktreeBlock.block !== baseBlock.block) {
+    return {
+      id: 'aoci_block_immutable',
+      ok: false,
+      baseRef: reportedRef,
+      baseSha,
+      detail: `working tree AGENTS.md modified the AOCI block relative to ${baseSha}`,
+    };
+  }
+
+  let headAgents;
+  try {
+    headAgents = await gitOutput(dir, ['show', 'HEAD:AGENTS.md']);
+  } catch {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: 'HEAD:AGENTS.md is missing (fail-closed)' };
+  }
+  const headBlock = extractAociBlock(headAgents, 'HEAD:AGENTS.md');
+  if (!headBlock.ok) {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: headBlock.detail };
+  }
+  if (headBlock.block !== baseBlock.block) {
+    return {
+      id: 'aoci_block_immutable',
+      ok: false,
+      baseRef: reportedRef,
+      baseSha,
+      detail: `HEAD:AGENTS.md modified the AOCI block relative to ${baseSha}`,
+    };
+  }
+
+  try {
+    const stagedAgents = await gitOutput(dir, ['show', ':AGENTS.md']);
+    const stagedBlock = extractAociBlock(stagedAgents, 'index :AGENTS.md');
+    if (!stagedBlock.ok) {
+      return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: stagedBlock.detail };
+    }
+    if (stagedBlock.block !== baseBlock.block) {
+      return {
+        id: 'aoci_block_immutable',
+        ok: false,
+        baseRef: reportedRef,
+        baseSha,
+        detail: `staged :AGENTS.md modified the AOCI block relative to ${baseSha}`,
+      };
+    }
+  } catch {
+    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha, detail: 'staged :AGENTS.md is missing (fail-closed)' };
+  }
+
+  return { id: 'aoci_block_immutable', ok: true, baseRef: reportedRef, baseSha };
 }
 
 async function checkRoleSource(dir) {

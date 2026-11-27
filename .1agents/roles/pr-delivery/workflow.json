@@ -2,7 +2,8 @@
   "schemaVersion": 1,
   "entry": "implement",
   "nodes": [
-    { "id": "implement", "type": "executor_turn", "requireTicketSubmit": false },
+    { "id": "learnings_lookup", "type": "learnings_lookup", "checks": ["learnings_lookup"] },
+    { "id": "implement", "type": "executor_turn", "dependsOn": ["learnings_lookup"], "requireTicketSubmit": false },
     { "id": "l1_gate", "type": "program_check", "checks": ["l1_deterministic"], "dependsOn": ["implement"] },
     { "id": "draft_pr", "type": "executor_turn", "dependsOn": ["l1_gate"], "when": "checks_passed" },
     { "id": "cross_model_cr", "type": "qa_session_review", "dependsOn": ["draft_pr"], "when": "checks_passed" },

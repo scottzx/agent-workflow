@@ -35,6 +35,7 @@ CR 未过则回到实现节点修到三绿，再进入 Ready for review。人只
 Worker 不 push、不开 PR、不改授权范围外的文件；门禁与红线以角色包最新声明为准。
 L1 以 `checks/l1-gate.mjs` 的退出码和 JSON 摘要为准，不用口头说明代替。
 没有 `.git` 的裸目录不能当技能根；DSH 会向上找到父仓库。
+仓库历史经验卡片与只追加退化记录索引见 [docs/solutions/README.md](docs/solutions/README.md)（开工前可经 `acp-service rsi lookup --paths <files>` 检索）。
 
 <!-- aoci:begin -->
 ## AOCI 仓库认知
