@@ -378,15 +378,31 @@ async function evalCrGate(input: {
   };
 }
 
-/** Checks whether any file in the role directory changed between two commits. Fails closed (true) on git errors. */
-async function roleDirectoryChangedBetween(roleDirectory: string, fromCommit: string, toCommit: string): Promise<boolean> {
+/**
+ * Checks whether any file in the role directory changed between two commits.
+ * When `previousHasDigest` is true or `fromCommit` exists in git, git errors fail closed (`true`).
+ * Legacy ledger entries without digests whose commit is absent in git do not retroactively block.
+ */
+async function roleDirectoryChangedBetween(
+  roleDirectory: string,
+  fromCommit: string,
+  toCommit: string,
+  previousHasDigest: boolean,
+): Promise<boolean> {
+  if (!previousHasDigest) {
+    try {
+      await execFileAsync('git', ['-C', roleDirectory, 'cat-file', '-e', `${fromCommit}^{commit}`], { encoding: 'utf8' });
+    } catch {
+      return false;
+    }
+  }
   try {
     const { stdout } = await execFileAsync('git', ['-C', roleDirectory, 'diff', '--name-only', fromCommit, toCommit, '--', '.'], {
       encoding: 'utf8',
     });
     return stdout.trim().length > 0;
   } catch {
-    // Fail-closed: if git cannot prove the role directory is unchanged between distinct commits, require calibration.
+    // Fail-closed: if git cannot prove the role directory is unchanged between real commits, require calibration.
     return true;
   }
 }
@@ -413,7 +429,7 @@ async function calibrationGate(input: {
   const digestChanged = Boolean(previous?.checksDigest && checksDigest && previous.checksDigest !== checksDigest);
   const roleDirChanged = Boolean(
     previous?.role.commit && input.role.commit
-    && await roleDirectoryChangedBetween(input.roleDirectory, previous.role.commit, input.role.commit),
+    && await roleDirectoryChangedBetween(input.roleDirectory, previous.role.commit, input.role.commit, Boolean(previous.checksDigest)),
   );
   const saved = await loadCalibration(input.workspace, input.roleId);
   const base: Partial<GateReport['calibration']> = {
