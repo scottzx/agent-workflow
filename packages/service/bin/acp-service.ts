@@ -35,10 +35,12 @@ function printServeHelp(binName: string) {
 启动 DreamMate Network ACP Agent 运行时常驻服务（HTTP + WebSocket）
 
 选项:
-  --port, -p <n>    指定监听端口（默认: 36812）
-  --host <ip>       指定绑定 IP（默认: 0.0.0.0）
-  --no-report       不向本机 node agent (36908) 报备
-  -h, --help        显示帮助信息
+  --port, -p <n>          指定监听端口（默认: 36812）
+  --host <ip>             指定绑定 IP（默认: 0.0.0.0）
+  --no-report             不向本机 node agent (36908) 报备
+  --log-dir <dir>         启用按天日志轮转的目录（也可用 ACP_LOG_DIR）
+  --log-retain-days <n>   日志保留天数，到期自动清理（默认: 30，也可用 ACP_LOG_RETAIN_DAYS）
+  -h, --help              显示帮助信息
 `);
 }
 
@@ -61,6 +63,7 @@ function printUnifiedHelp(binName: string) {
   const serverCommands = `Commands:
   roles sync|check --profile <file> --cwd <dir> [--source <dir>]   Copy role skills into <dir>/.agents/skills and link .claude/skills
   roles project --role-dir <dir> --worktree <dir> [--skills-source <dir>]   Project a role package into a git worktree
+  profile list|show|init|path             Inspect or prepare session-level Agent profiles (same CLI, another account)
   a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
@@ -113,8 +116,16 @@ function parseServerArgs(args: string[]): {
   port?: number;
   host?: string;
   report?: boolean;
+  logDir?: string;
+  logRetainDays?: number;
 } {
-  const options: { port?: number; host?: string; report?: boolean } = {};
+  const options: {
+    port?: number;
+    host?: string;
+    report?: boolean;
+    logDir?: string;
+    logRetainDays?: number;
+  } = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--port' || arg === '-p') {
@@ -124,12 +135,37 @@ function parseServerArgs(args: string[]): {
       options.host = args[++i];
     } else if (arg === '--no-report') {
       options.report = false;
+    } else if (arg === '--log-dir') {
+      options.logDir = args[++i];
+    } else if (arg === '--log-retain-days') {
+      const val = args[++i];
+      if (val) options.logRetainDays = Number.parseInt(val, 10);
     }
   }
   return options;
 }
 
-async function runServer(options: { port?: number; host?: string; report?: boolean }) {
+async function runServer(options: {
+  port?: number;
+  host?: string;
+  report?: boolean;
+  logDir?: string;
+  logRetainDays?: number;
+}) {
+  const logDir = options.logDir?.trim() || process.env.ACP_LOG_DIR?.trim();
+  const envRetainRaw = process.env.ACP_LOG_RETAIN_DAYS?.trim();
+  const envRetain = envRetainRaw ? Number.parseInt(envRetainRaw, 10) : undefined;
+  const retainDays = options.logRetainDays ?? (Number.isFinite(envRetain) ? envRetain : undefined);
+
+  let logRotation: { close: () => Promise<void> } | undefined;
+  if (logDir) {
+    const { installDailyLogRotation } = await import('../src/log-rotation.js');
+    logRotation = installDailyLogRotation({ logDir, retainDays });
+    process.once('exit', () => {
+      void logRotation?.close();
+    });
+  }
+
   const { serveAcpService } = await import('../src/server.js');
   const { attachProcessSignalHandlers } = await import('../src/bridge.js');
   attachProcessSignalHandlers();
@@ -137,6 +173,7 @@ async function runServer(options: { port?: number; host?: string; report?: boole
     await serveAcpService(options);
   } catch (error) {
     console.error(`[${invokedBin}] 启动失败:`, error instanceof Error ? error.message : error);
+    await logRotation?.close();
     process.exit(1);
   }
 }
@@ -145,6 +182,11 @@ async function main() {
   if (rawArgs[0] === 'roles') {
     const { runRolesCli } = await import('./roles.js');
     await runRolesCli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'profile') {
+    const { runProfileCli } = await import('./profile.js');
+    await runProfileCli(rawArgs.slice(1));
     return;
   }
   if (rawArgs.includes('--skill')) {

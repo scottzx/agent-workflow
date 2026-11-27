@@ -14,8 +14,9 @@ import { registerWorkbenchPanel } from './workbench-panel.js';
 import { registerRowConfigPanels } from './row-config-panel.js';
 import { acpToolDefinition } from './acp-tool-definition.js';
 import { installAcpToolCards } from './acp-tool-cards.js';
+import { registerMagpieQuota } from './magpie-quota-client.js';
 
-export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'conversation', 'uiConversation'];
+export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.pluginManager', 'remote.session', 'locale', 'conversation', 'uiConversation'];
 
 const dictionaries = {
   zh: {
@@ -418,4 +419,8 @@ export function apply(ctx) {
   // Register per-row `plugins.row.config` panels for `oneagents-acp` and `oneagents-dsh-a2a`
   // when the host supports Typert remote mounting and Plugin Manager row config slots.
   registerRowConfigPanels(ctx);
+
+  // Settings quota page; its enable/disable switch toggles the bundled
+  // `@1agents/acp-service/magpie-quota` host row, not the whole ACP plugin.
+  registerMagpieQuota(ctx);
 }

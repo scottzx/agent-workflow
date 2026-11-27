@@ -5,6 +5,7 @@
  * 保证整台机器上的所有服务共享同一个 node_id 与 name。
  */
 import { createAgentRegistry } from '@1agents/acp-service/runtime';
+import { loadAgentProfiles } from './agent-profiles.js';
 import { nodeIdentity, type NodeIdentity } from '@1agents/dreammate-node';
 import {
   PROTOCOL_VERSION,
@@ -16,6 +17,16 @@ import {
 
 export { nodeIdentity, PROTOCOL_VERSION };
 export type { AccessDescriptor, NetworkService, NodeIdentity, NodeManifest, Reachability };
+
+/** Profile ids are real Agent endpoints; a broken profile file must not break discovery. */
+function agentProfileIds(): string[] {
+  try {
+    return loadAgentProfiles().profiles.map(profile => profile.id);
+  } catch (error) {
+    console.warn(`[acp-service] agent profiles ignored in manifest: ${error instanceof Error ? error.message : error}`);
+    return [];
+  }
+}
 
 /**
  * 默认 ACP 运行时端口（36xx2 服务系列约定）
@@ -70,7 +81,7 @@ export async function buildManifest(baseUrl: string): Promise<NodeManifest> {
       service_type: 'agent_runtime',
       acp_protocol_version: 1,
       acp_transport: 'websocket',
-      acp_agent_endpoints: Object.fromEntries(createAgentRegistry().list().map(name => [name, `/agents/${encodeURIComponent(name)}`])),
+      acp_agent_endpoints: Object.fromEntries([...createAgentRegistry().list(), ...agentProfileIds()].map(name => [name, `/agents/${encodeURIComponent(name)}`])),
     },
     services: [
       {

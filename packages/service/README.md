@@ -316,6 +316,36 @@ Discovery checks PATH, `~/.local/bin`, `~/.grok/bin`, and installed adapter pack
 
 The service launcher uses the same local command resolution, including absolute paths to user-local binaries. The catalog originates from 1agents_app's former Go detector; consumers no longer probe their own host or maintain separate detection tables. `discoverAgents()` is also exported for embedded service consumers and includes local executable paths; the HTTP response omits these paths.
 
+## Agent profiles (one CLI, several accounts)
+
+A built-in Agent is one installation and therefore one account. When the same native CLI must carry several accounts, declare **profiles**: extra Agent ids that reuse the built-in adapter with a profile-scoped child environment. The session, its settings and its history stay separate because the profile id is the Agent id the client selects.
+
+```json
+{
+  "profiles": {
+    "agy1": { "agent": "antigravity", "label": "Antigravity · 账号1" },
+    "agy2": {
+      "agent": "antigravity",
+      "label": "Antigravity · 账号2",
+      "home": "~/.1agents/acp-profiles/agy2",
+      "env": { "JETSKI_APP_DATA_DIR": "~/.1agents/acp-profiles/agy2/appdata" }
+    }
+  }
+}
+```
+
+The file is `$DSH_HOME/plugins/1agents-acp/profiles.json`; `ACP_PROFILES_FILE` overrides the location, and `acp-service profile path` prints it. Fields are `agent` (required, a built-in registry id), `label`, `home` (expands `~/`, injected as the child's `HOME`) and `env` for additional credential/home variables. Unknown fields, unknown Agents, id collisions with built-ins, and variables that would change how the adapter itself is launched (`PATH`, `NODE_OPTIONS`, `DYLD_*`, …) are rejected when the file is read, not ignored. `HOME` from the profile wins over any client-supplied `env`; the underlying Agent's argv is untouched.
+
+`GET /agents` lists each profile beside its built-in Agent with the profile id and label and the same readiness as the underlying CLI, so DSH shows one preset per profile (`ACP · Antigravity · 账号2`). Prepare an isolated account with:
+
+```sh
+acp-service profile init agy2   # creates the home, an isolated macOS login keychain, and dotfile links
+HOME=~/.1agents/acp-profiles/agy2 agy   # complete the browser login once, in that home
+acp-service profile list        # id, label, underlying Agent, readiness, home
+```
+
+Account isolation is a property of the credentials, not of this configuration. Antigravity's CLI keeps its OAuth token in the **macOS login keychain** (service `gemini`, account `antigravity`) and only falls back to files that are not authoritative: changing `JETSKI_APP_DATA_DIR` or a data directory does not change the account, while changing `HOME` does, because the login keychain is resolved per home. `profile init` therefore creates a default keychain inside the profile home and unlocks it with an empty password before each session; without that, both profiles would read and overwrite the same keychain item. File-based CLIs (for example Codex with `CODEX_HOME`) need only `env` and no keychain step. Switching preset means starting a new session: an existing session keeps the Agent it was created with, and A2A session restore rejects cwd or preset changes.
+
 ## Remote DSH tools and completion inbox
 
 The optional automation listener supports Activepieces scheduled tasks:
