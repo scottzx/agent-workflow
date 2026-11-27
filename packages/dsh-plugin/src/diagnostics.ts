@@ -31,10 +31,13 @@ const recordSchema = z.object({
 /** Built on first open so importing this module does not touch @deepseek-ai/*. */
 let specPromise: Promise<unknown> | undefined;
 function diagnosticSpec(): Promise<unknown> {
-  return specPromise ??= loadDshStorage().then(({ defineDomain, domainTable }) => defineDomain({
-    name: 'oneagents_acp_diagnostics', version: 1,
-    tables: { attempts: domainTable(recordSchema) },
-  }));
+  return specPromise ??= loadDshStorage()
+    .then(({ defineDomain, domainTable }) => defineDomain({
+      name: 'oneagents_acp_diagnostics', version: 1,
+      tables: { attempts: domainTable(recordSchema) },
+    }))
+    // A failed build must not stay cached: the next mount has to be able to try again.
+    .catch((error: unknown) => { specPromise = undefined; throw error; });
 }
 type DiagnosticRecord = z.infer<typeof recordSchema>;
 interface AttemptTable {
@@ -211,20 +214,28 @@ export async function openDiagnostics(directory: string, options?: { onConflict?
   }
   // The host's shared facility can close concurrently during root teardown.
   // This private composition gives the consumer an explicit drain-before-close order.
-  const { Context, Storage, JsonStorage, StorageDomain } = await loadDshStorage();
-  const storage = new Context();
+  // Every step after the lease is taken runs inside this guard: a failure anywhere
+  // must release the lease, or the next hot reload silently degrades to read-only.
   try {
-    await storage.plugin(Storage);
-    await storage.plugin(JsonStorage, { root: directory });
-    const mounted = await storage.plugin(StorageDomain, { backend: 'json' });
-    await mounted.await();
-    const diagnostics = await Diagnostics.open(storage.storageDomain);
-    let closing: Promise<void> | undefined;
-    return { diagnostics, mode: 'read-write', close: () => closing ??= (async () => {
-      try { await diagnostics.close(); } finally { try { await storage.fiber.dispose(); } finally { lease.close(); } }
-    })() };
-  } catch {
-    try { await storage.fiber.dispose(); } finally { lease.close(); }
-    throw new Error('ACP diagnostic storage could not be opened; check its configuration and version.');
+    const { Context, Storage, JsonStorage, StorageDomain } = await loadDshStorage();
+    const storage = new Context();
+    try {
+      await storage.plugin(Storage);
+      await storage.plugin(JsonStorage, { root: directory });
+      const mounted = await storage.plugin(StorageDomain, { backend: 'json' });
+      await mounted.await();
+      const diagnostics = await Diagnostics.open(storage.storageDomain);
+      let closing: Promise<void> | undefined;
+      return { diagnostics, mode: 'read-write', close: () => closing ??= (async () => {
+        try { await diagnostics.close(); } finally { try { await storage.fiber.dispose(); } finally { lease.close(); } }
+      })() };
+    } catch {
+      try { await storage.fiber.dispose(); } finally { lease.close(); }
+      throw new Error('ACP diagnostic storage could not be opened; check its configuration and version.');
+    }
+  } catch (error) {
+    // DirectoryLease.close() is idempotent, so the inner guard may have closed it already.
+    lease.close();
+    throw error;
   }
 }

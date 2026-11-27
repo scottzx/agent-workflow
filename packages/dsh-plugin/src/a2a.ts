@@ -84,6 +84,20 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
       storage: { onConflict: 'readonly' } });
     if (server.mode === 'read-only') console.warn('oneagents-acp A2A storage is read-only because another instance owns it');
     const routes: (() => void)[] = [];
+    /**
+     * Unregister every route. One failing disposer must not skip the others: the
+     * A2A storage lease is only released by server.close(), and a route left
+     * registered would answer requests for a plugin that is already gone.
+     */
+    const releaseRoutes = (): unknown[] => {
+      const errors: unknown[] = [];
+      for (const dispose of [...routes].reverse()) {
+        try { dispose(); } catch (error) { errors.push(error); }
+      }
+      routes.length = 0;
+      return errors;
+    };
+    const failures: unknown[] = [];
     try {
       routes.push(ctx.webServer.register({ kind: 'exact', path: '/.well-known/agent-card.json', handler: server.cardHandler }));
       routes.push(ctx.webServer.register({ kind: 'exact', path: server.path, handler: server.handler }));
@@ -93,17 +107,26 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
       routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/sessions/status`, handler: server.handler }));
       routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/sessions/delete`, handler: server.handler }));
       routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/artifacts/content`, handler: server.handler }));
+      expose?.({ sessionTask: server.sessionTask, taskSession: server.taskSession, resubmit: server.resubmit });
     } catch (error) {
-      for (const dispose of routes.reverse()) dispose();
-      await server.close();
-      throw error;
+      failures.push(error);
+    }
+    if (failures.length) {
+      failures.push(...releaseRoutes());
+      // The storage lease lives on the server, so it is released even when the
+      // route registration failed halfway.
+      try { await server.close(); } catch (error) { failures.push(error); }
+      throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'A2A mount failed');
     }
     let closing: Promise<void> | undefined;
-    expose?.({ sessionTask: server.sessionTask, taskSession: server.taskSession, resubmit: server.resubmit });
     close = () => closing ??= (async () => {
-      expose?.(undefined);
-      for (const dispose of routes.reverse()) dispose();
-      await server.close();
+      const errors: unknown[] = [];
+      try { expose?.(undefined); } catch (error) { errors.push(error); }
+      errors.push(...releaseRoutes());
+      // server.close() releases the A2A DirectoryLease. It must run even when a
+      // route disposer threw, or the next hot reload degrades to read-only.
+      try { await server.close(); } catch (error) { errors.push(error); }
+      if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, 'A2A close failed');
     })();
     return close;
   };

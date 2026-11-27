@@ -1,4 +1,4 @@
-/** Mount, unload, and immediately remount the real plugin on one mock Cordis host. */
+/** Mount, unload and remount the real plugin on one mock Cordis host. */
 import assert from 'node:assert/strict';
 import { access, mkdtemp, rm } from 'node:fs/promises';
 import { register } from 'node:module';
@@ -27,6 +27,11 @@ const launchdRelease = await acquireService({
 });
 await launchdRelease();
 
+/**
+ * A mock Cordis host. `failNextEffect` makes the next ctx.effect() registration
+ * fail the way Cordis fails on an inactive fiber, and `failRouteDispose` makes the
+ * disposer of a matching route throw.
+ */
 function createHost() {
   const effects = [];
   const routes = new Map();
@@ -37,6 +42,10 @@ function createHost() {
     provide(key, value) { ctx[key] = value; },
     on() { return () => {}; },
     effect(run) {
+      if (host.failNextEffect) {
+        host.failNextEffect = false;
+        throw new Error('INACTIVE_EFFECT: the plugin fiber is no longer active');
+      }
       const result = run();
       if (typeof result === 'function') effects.push(result);
       else if (result && typeof result.then === 'function') {
@@ -54,7 +63,10 @@ function createHost() {
         const key = `${route.kind}:${route.path}`;
         if (routes.has(key)) throw new Error(`duplicate route ${key}`);
         routes.set(key, route);
-        return () => { routes.delete(key); };
+        return () => {
+          routes.delete(key);
+          if (host.failRouteDispose?.(route.path)) throw new Error(`route disposer failed for ${route.path}`);
+        };
       },
     },
     tools: {
@@ -73,16 +85,20 @@ function createHost() {
     },
     sessionController: { async resolveAgent() { return { error: new Error('unused') }; } },
   };
-  return {
+  const host = {
     ctx, routes, tools, presets,
+    failNextEffect: false,
+    failRouteDispose: undefined,
     async dispose() {
-      await Promise.all([...effects].reverse().map(async disposeEffect => {
-        await Promise.resolve();
-        await disposeEffect();
-      }));
-      effects.length = 0;
+      try {
+        await Promise.all([...effects].reverse().map(async disposeEffect => {
+          await Promise.resolve();
+          await disposeEffect();
+        }));
+      } finally { effects.length = 0; }
     },
   };
+  return host;
 }
 
 async function locked(directory) {
@@ -111,6 +127,7 @@ process.env.ACP_SERVICE_SKIP_GLOBAL_SYNC = '1';
 const warnings = [];
 const originalWarn = console.warn;
 console.warn = (...args) => { warnings.push(args.map(String).join(' ')); originalWarn(...args); };
+const scenario = process.argv[2] ?? 'remount';
 try {
   const stateDirectory = join(root, 'sessions');
   const diagnosticsDirectory = join(root, 'diagnostics');
@@ -129,10 +146,19 @@ try {
       workbench: { url: 'http://127.0.0.1:9/workbench' },
     },
   };
+  const readOnlyWarning = () => warnings.some(line => /read-only/.test(line));
+  const snapshot = async () => ({
+    routes: [...host.routes.keys()].sort(),
+    tools: [...host.tools.keys()].sort(),
+    presets: [...host.presets.keys()].sort(),
+    a2aHostCurrent: host.ctx.oneagentsA2aHost?.current === undefined ? undefined : 'set',
+    diagnosticsLocked: await locked(diagnosticsDirectory),
+    a2aLocked: await locked(a2aDirectory),
+  });
   const assertMounted = async (label) => {
     assert.equal(await locked(diagnosticsDirectory), true, `${label} diagnostics lock`);
     assert.equal(await locked(a2aDirectory), true, `${label} a2a lock`);
-    assert.equal(warnings.some(line => /read-only/.test(line)), false, `${label} degraded to read-only: ${warnings.join(' | ')}`);
+    assert.equal(readOnlyWarning(), false, `${label} degraded to read-only: ${warnings.join(' | ')}`);
     for (const path of ['/1agents-acp/role-rules', '/.well-known/agent-card.json', '/a2a']) {
       assert.equal([...host.routes.values()].some(route => route.path === path), true, `${label} missing ${path}`);
     }
@@ -150,22 +176,67 @@ try {
     assert.equal(host.presets.has('oneagents-acp-codex'), true);
     assert.equal(host.ctx.oneagentsA2aHost?.current == null, false);
   };
-  await apply(host.ctx, input);
-  await assertMounted('first');
-  await host.dispose();
-  assert.equal(host.routes.size, 0);
-  assert.equal(host.tools.size, 0);
-  assert.equal(host.presets.size, 0);
-  assert.equal(host.ctx.oneagentsA2aHost.current, undefined);
-  assert.equal(await locked(diagnosticsDirectory), false, 'diagnostics lease survived dispose');
-  assert.equal(await locked(a2aDirectory), false, 'a2a lease survived dispose');
-  warnings.length = 0;
-  await apply(host.ctx, input);
-  await assertMounted('second');
-  await host.dispose();
-  assert.equal(await locked(diagnosticsDirectory), false);
-  assert.equal(await locked(a2aDirectory), false);
-  console.log(JSON.stringify({ ok: true }));
+  const assertReleased = async (label) => {
+    assert.equal(host.routes.size, 0, `${label} routes survived`);
+    assert.equal(host.tools.size, 0, `${label} tools survived`);
+    assert.equal(host.presets.size, 0, `${label} presets survived`);
+    assert.equal(host.ctx.oneagentsA2aHost?.current, undefined, `${label} a2a host survived`);
+    assert.equal(await locked(diagnosticsDirectory), false, `${label} diagnostics lease survived`);
+    assert.equal(await locked(a2aDirectory), false, `${label} a2a lease survived`);
+  };
+
+  const report = { scenario, ok: true };
+
+  if (scenario === 'remount') {
+    await apply(host.ctx, input);
+    await assertMounted('first');
+    await host.dispose();
+    await assertReleased('dispose');
+    warnings.length = 0;
+    await apply(host.ctx, input);
+    await assertMounted('second');
+    await host.dispose();
+    await assertReleased('second dispose');
+    report.afterDispose = await snapshot();
+    report.remount = { mounted: true, readOnlyWarning: readOnlyWarning() };
+  } else if (scenario === 'inactive-effect') {
+    // The fiber dies after the A2A mount and before the disposer is registered.
+    host.failNextEffect = true;
+    let failure = '';
+    await assert.rejects(apply(host.ctx, input), error => { failure = error.message; return /INACTIVE_EFFECT/.test(error.message); });
+    report.error = failure;
+    report.afterFailure = await snapshot();
+    report.failureReadOnlyWarning = readOnlyWarning();
+    await assertReleased('failed start');
+    // The next hot reload must find both directories free and take them read-write.
+    warnings.length = 0;
+    await apply(host.ctx, input);
+    await assertMounted('after failed start');
+    report.remount = { mounted: true, readOnlyWarning: readOnlyWarning(), snapshot: await snapshot() };
+    await host.dispose();
+    await assertReleased('dispose after remount');
+  } else if (scenario === 'throwing-route') {
+    // One A2A route disposer throws while the plugin unloads.
+    host.failRouteDispose = path => path === '/a2a';
+    await apply(host.ctx, input);
+    await assertMounted('first');
+    let failure = '';
+    await assert.rejects(host.dispose(), error => { failure = error.message; return /route disposer failed/.test(error.message); });
+    report.error = failure;
+    report.afterFailure = await snapshot();
+    await assertReleased('faulty dispose');
+    host.failRouteDispose = undefined;
+    warnings.length = 0;
+    await apply(host.ctx, input);
+    await assertMounted('after faulty dispose');
+    report.remount = { mounted: true, readOnlyWarning: readOnlyWarning(), snapshot: await snapshot() };
+    await host.dispose();
+    await assertReleased('dispose after remount');
+  } else {
+    throw new Error(`Unknown hot reload scenario: ${scenario}`);
+  }
+
+  console.log(JSON.stringify(report));
 } finally {
   console.warn = originalWarn;
   await rm(root, { recursive: true, force: true });

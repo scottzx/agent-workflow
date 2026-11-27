@@ -30,7 +30,10 @@ let storagePromise: Promise<DshStorageModule> | undefined;
 /** Async load used by plugin startup. Shares the instance a sync caller already cached. */
 export function loadDshTools(): Promise<DshToolsModule> {
   if (toolsModule) return Promise.resolve(toolsModule);
-  return toolsPromise ??= import('@deepseek-ai/dsh-tools').then(mod => toolsModule = mod as DshToolsModule);
+  return toolsPromise ??= import('@deepseek-ai/dsh-tools')
+    .then(mod => { toolsModule = mod as DshToolsModule; return toolsModule; })
+    // A failed load must not stay cached: the next mount has to be able to try again.
+    .catch((error: unknown) => { toolsPromise = undefined; throw error; });
 }
 
 /**
@@ -45,7 +48,10 @@ export function loadDshToolsSync(): DshToolsModule {
 
 export function loadDshLlm(): Promise<DshLlmModule> {
   if (llmModule) return Promise.resolve(llmModule);
-  return llmPromise ??= import('@deepseek-ai/dsh-llm').then(mod => llmModule = mod as DshLlmModule);
+  return llmPromise ??= import('@deepseek-ai/dsh-llm')
+    .then(mod => { llmModule = mod as DshLlmModule; return llmModule; })
+    // A failed load must not stay cached: the next mount has to be able to try again.
+    .catch((error: unknown) => { llmPromise = undefined; throw error; });
 }
 
 /** Storage packages used only while opening the diagnostics domain. */
@@ -67,5 +73,7 @@ export function loadDshStorage(): Promise<DshStorageModule> {
       defineDomain: domainNs.defineDomain,
       domainTable: domainNs.domainTable,
     };
-  })();
+  })()
+    // A failed load must not stay cached: the next mount has to be able to try again.
+    .catch((error: unknown) => { storagePromise = undefined; throw error; });
 }

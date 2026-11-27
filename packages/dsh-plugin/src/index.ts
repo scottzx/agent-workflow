@@ -66,19 +66,40 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   if (diagnosticOwner.mode === 'read-only') console.warn('oneagents-acp diagnostics are read-only because another instance owns the storage');
   let releaseService: Stop = async () => {};
   const stops: Stop[] = [];
-  let armed = false;
-  const rollback = async () => {
+  let review: ReviewHandBack | undefined;
+  let a2aHost: A2AHostRef | undefined;
+  let closeA2A: (() => Promise<void>) | undefined;
+  let nativeSessions: NativeSessions | undefined;
+  let adapter: AcpAdapter | undefined;
+  let torndown = false;
+  /**
+   * The one release chain for a failed start and for a normal unload. Every step is
+   * attempted even when an earlier one throws: a skipped step leaks a DirectoryLease,
+   * and the next hot reload then silently degrades to read-only instead of failing.
+   */
+  const teardown = async (): Promise<unknown[]> => {
+    if (torndown) return [];
+    torndown = true;
+    const errors: unknown[] = [];
     for (const stop of [...stops].reverse()) {
-      try { await stop(); } catch { /* A failed start still has to drop every registration it made. */ }
+      try { await stop(); } catch (error) { errors.push(error); }
     }
-    try { await releaseService(); } finally { await diagnosticOwner.close(); }
+    stops.length = 0;
+    if (a2aHost) a2aHost.current = undefined;
+    if (review) review.host = undefined;
+    try { await closeA2A?.(); } catch (error) { errors.push(error); }
+    try { await nativeSessions?.dispose(); } catch (error) { errors.push(error); }
+    try { await adapter?.dispose(); } catch (error) { errors.push(error); }
+    try { await diagnosticOwner.close(); } catch (error) { errors.push(error); }
+    try { await releaseService(); } catch (error) { errors.push(error); }
+    return errors;
   };
   try {
     releaseService = await acquireService(service);
     const a2aEnabled = Boolean(input.a2a && input.a2a.enabled !== false);
     const workbench = a2aEnabled ? await resolveA2AWorkbench(input.a2a?.workbench, input.a2a?.workbenchConfigFile) : undefined;
     const processRequests = workbench ? createWorkbenchProcessClient(workbench) : undefined;
-    const adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
+    adapter = new AcpAdapter(ctx, config, diagnostics, processRequests);
     const track = (dispose: unknown) => { if (typeof dispose === 'function') stops.push(dispose as Stop); };
     track(ctx.llm.registerAdapter(['1agents-acp'], adapter));
     // Archiving a Session in DSH stops its work but never reaches the service daemon, where the
@@ -97,7 +118,7 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       stops.push(() => clearInterval(timer));
     }
     if (processRequests) track(registerNativeApprovals(ctx, processRequests));
-    const nativeSessions = new NativeSessions(ctx, adapter, config);
+    nativeSessions = new NativeSessions(ctx, adapter, config);
     ctx.provide('oneagentsAcpSessions', nativeSessions);
     const sessionDeliverHandler = createSessionDeliverHandler(ctx);
     track(ctx.webServer.register({ kind: 'prefix', path: '/api/1agents-acp', handler: async (req, res) => {
@@ -142,9 +163,6 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     track(ctx.on('agent-preset/selected', (sessionId: SessionId, agentPreset: string) => {
       void selectAcpRoute(ctx, sessionId, agentPreset, presets.map(preset => preset.id));
     }));
-    let review: ReviewHandBack | undefined;
-    let a2aHost: A2AHostRef | undefined;
-    let closeA2A: () => Promise<void> = async () => {};
     if (input.a2a) {
       a2aHost = {};
       ctx.provide('oneagentsA2aHost', a2aHost);
@@ -190,27 +208,18 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     }
     // One effect, disposed as a single awaited chain. Sibling ctx.effect() calls run
     // concurrently on fiber unload and can release a DirectoryLease while the next
-    // hot reload is already trying to take it.
+    // hot reload is already trying to take it. The same chain is the failed-start
+    // rollback, so a start that dies after the A2A mount releases exactly as much.
     ctx.effect(() => async () => {
-      const errors: unknown[] = [];
-      for (const stop of [...stops].reverse()) {
-        try { await stop(); } catch (error) { errors.push(error); }
-      }
-      if (review) review.host = undefined;
-      if (a2aHost) a2aHost.current = undefined;
-      try {
-        await closeA2A();
-        await nativeSessions.dispose();
-        await adapter.dispose();
-      } finally {
-        try { await diagnosticOwner.close(); }
-        finally { await releaseService(); }
-      }
-      if (errors.length) throw errors[0];
+      const errors = await teardown();
+      if (!errors.length) return;
+      throw errors.length === 1 ? errors[0] : new AggregateError(errors, 'oneagents-acp teardown failed');
     });
-    armed = true;
   } catch (error) {
-    if (!armed) await rollback();
+    // The start failed. Release everything it had already taken, then keep the
+    // original failure as the reason: a release error must not hide it.
+    const errors = await teardown();
+    if (errors.length) console.warn(`oneagents-acp rollback released ${errors.length} resource(s) with errors:`, errors);
     throw error;
   }
 }
