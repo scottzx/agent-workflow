@@ -5,7 +5,12 @@ import { resolve, join } from 'node:path';
 const checkout = process.argv[2];
 if (!checkout) throw new Error('Usage: node scripts/link-dsh-types.mjs /absolute/path/DSH');
 const root = resolve(checkout);
-const needed = new Set(['dsh-llm', 'dsh-agent', 'dsh-session', 'dsh-user-approval', 'dsh-user-questions', 'dsh-commands', 'dsh-host-webserver', 'dsh-api-session-controller', 'dsh-session-projection', 'dsh-agent-preset-registry', 'dsh-workspace', 'dsh-session-persistence', 'dsh-storage', 'dsh-storage-domain', 'dsh-storage-json', 'dsh-tools', 'dsh-client-connection']);
+const needed = new Set([
+  'dsh-llm', 'dsh-agent', 'dsh-session', 'dsh-user-approval', 'dsh-user-questions', 'dsh-commands',
+  'dsh-host-webserver', 'dsh-api-session-controller', 'dsh-session-projection', 'dsh-agent-preset-registry',
+  'dsh-workspace', 'dsh-session-persistence', 'dsh-storage', 'dsh-storage-domain', 'dsh-storage-json',
+  'dsh-tools', 'dsh-client-connection', 'dsh-util-values', 'dsh-client-ui-conversation', 'dsh-client-ui-chat',
+]);
 const links = new Map();
 for (const group of readdirSync(join(root, 'packages'), { withFileTypes: true })) {
   if (!group.isDirectory()) continue;
@@ -24,8 +29,8 @@ for (const group of readdirSync(join(root, 'packages'), { withFileTypes: true })
     let manifest;
     try { manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    const short = manifest.name?.replace('@deepseek-ai/', '');
-    if (needed.has(short)) links.set(short, directory);
+    const short = manifest.name?.startsWith('@deepseek-ai/') ? manifest.name.slice('@deepseek-ai/'.length) : undefined;
+    if (short && !links.has(short)) links.set(short, directory);
   }
 }
 for (const name of needed) if (!links.has(name)) throw new Error(`Missing DSH package: ${name}`);
