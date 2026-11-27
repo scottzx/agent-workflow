@@ -943,7 +943,10 @@ export class AcpRuntimeManager {
     record: SessionRecord,
     sessionMode: "persistent" | "oneshot",
     run: (context: { client: AcpClient; sessionId: string; record: SessionRecord }) => Promise<T>,
-    replayOptions?: Pick<ConnectAndLoadSessionOptions, "replacingMode" | "replacingConfigOption"> & {
+    replayOptions?: Pick<
+      ConnectAndLoadSessionOptions,
+      "replacingMode" | "replacingConfigOption"
+    > & {
       retainClient?: boolean;
     },
     authority?: AcpControlAuthority,
@@ -988,7 +991,10 @@ export class AcpRuntimeManager {
     record: SessionRecord,
     sessionMode: "persistent" | "oneshot",
     run: (context: { client: AcpClient; sessionId: string; record: SessionRecord }) => Promise<T>,
-    replayOptions?: Pick<ConnectAndLoadSessionOptions, "replacingMode" | "replacingConfigOption"> & {
+    replayOptions?: Pick<
+      ConnectAndLoadSessionOptions,
+      "replacingMode" | "replacingConfigOption"
+    > & {
       retainClient?: boolean;
     },
     authority?: AcpControlAuthority,
