@@ -8,12 +8,14 @@ import { checkGate } from '../src/rsi/gate.js';
 import { formatLearningsLookupText, lookupLearnings } from '../src/rsi/learnings-lookup.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
+import { calibrateRubric, formatRubricCalibrationText, rubricCalibrationPath } from '../src/rsi/rubric.js';
 import { computeRoleScorecard, formatScorecardText } from '../src/rsi/scorecard.js';
 import { stampActor } from './ticket.js';
 
 const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [options]
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
+       acp-service rsi calibrate --rubric --role DIR --judgments FILE [--workspace DIR] [--json]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
        acp-service rsi lookup --paths FILE1,FILE2 [--repo DIR] [--limit N] [--json]
        acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
@@ -138,6 +140,10 @@ async function runGate(argv: string[]): Promise<void> {
   console.log(`L1 对校分歧：${gate.l1Mismatches}`);
   const calibrationLabel = { passed: '已通过', failed: '未通过', missing: '缺少', stale: '已过期', not_required: '不要求' }[gate.calibration.status];
   console.log(`L3 回放校准：${calibrationLabel}${gate.calibration.falsePositives ? `，误报 ${gate.calibration.falsePositives}` : ''}`);
+  if (gate.rubricCalibration?.present) {
+    const rubricLabel = { passed: '已通过', failed: '未通过', stale: '已过期', not_required: '未校准（observe）' }[gate.rubricCalibration.status];
+    console.log(`Rubric 校准：${rubricLabel}${gate.rubricCalibration.blockedBy?.length ? `（未达标：${gate.rubricCalibration.blockedBy.join('、')}）` : ''}`);
+  }
   for (const kase of gate.testCases) console.log(`  测试 ${kase.caseId}（${kase.kind === 'original' ? '原题' : '变体题'}）：${{ passed: '通过', failed: '未通过', not_run: '未跑' }[kase.result]}`);
   if (!gate.ready) process.exitCode = 1;
 }
@@ -146,8 +152,26 @@ async function runCalibrate(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, workspace: { type: 'string', default: '.1agents/runtime/rsi' },
     python: { type: 'string' }, only: { type: 'string' },
+    rubric: { type: 'boolean', default: false }, judgments: { type: 'string' }, json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
+  if (values.rubric) {
+    if (!values.judgments) throw new Error('--judgments <jsonl> is required with --rubric');
+    if (values.only) throw new Error('--only cannot be combined with --rubric');
+    if (values.python) throw new Error('--python cannot be combined with --rubric');
+    const report = await calibrateRubric({
+      roleDirectory: resolve(values.role),
+      judgmentsPath: resolve(values.judgments),
+      workspace: resolve(values.workspace!),
+    });
+    if (values.json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.log(formatRubricCalibrationText(report));
+      console.log(`校准报告：${rubricCalibrationPath(resolve(values.workspace!), report.roleId)}`);
+    }
+    if (!report.passed) process.exitCode = 1;
+    return;
+  }
   const only = values.only?.split(',').map(item => item.trim()).filter(Boolean);
   const report = await calibrateRole({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!),
     ...(values.python ? { python: values.python } : {}), ...(only?.length ? { only } : {}) });

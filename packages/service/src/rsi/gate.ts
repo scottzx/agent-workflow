@@ -8,12 +8,13 @@
  * Two further bars apply when the evidence exists: no self-check that disagreed with the program (L1), and a
  * current replay calibration when this version's checks differ from the previous passing version (L3).
  */
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import type { Ticket } from '../execution/ticket.js';
 import { computeChecksDigest, loadCalibration } from './calibrate.js';
 import { type LedgerEntry, ledgerPath, roleVersion, type RoleVersion, type StopReason } from './outline-run.js';
+import { computeRubricDigest, readRubricCalibration } from './rubric.js';
 
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 
@@ -33,6 +34,13 @@ export interface GateReport {
     status: 'passed' | 'failed' | 'missing' | 'stale' | 'not_required';
     checksDigest?: string;
     falsePositives?: number;
+  };
+  /** Dual-ceiling rubric calibration status when `rubric.json` is present. */
+  rubricCalibration?: {
+    present: boolean;
+    status: 'passed' | 'failed' | 'stale' | 'not_required';
+    rubricDigest?: string;
+    blockedBy?: string[];
   };
 }
 
@@ -87,7 +95,47 @@ export async function checkGate(options: { roleDirectory: string; workspace: str
   }
   const calibration = await calibrationGate({ roleDirectory, workspace: options.workspace, roleId, role, history, requireCalibration: options.requireCalibration === true });
   if (calibration.reason) reasons.push(calibration.reason);
-  return { roleId, role, ready: reasons.length === 0, reasons, required, devRuns, unfinished, testCases, l1Mismatches, calibration: calibration.report };
+  const rubricCal = await rubricCalibrationGate({ roleDirectory, workspace: options.workspace, roleId });
+  if (rubricCal.reason) reasons.push(rubricCal.reason);
+  return {
+    roleId, role, ready: reasons.length === 0, reasons, required, devRuns, unfinished, testCases, l1Mismatches,
+    calibration: calibration.report,
+    ...(rubricCal.report ? { rubricCalibration: rubricCal.report } : {}),
+  };
+}
+
+async function rubricCalibrationGate(input: {
+  roleDirectory: string;
+  workspace: string;
+  roleId: string;
+}): Promise<{ report?: GateReport['rubricCalibration']; reason?: string }> {
+  const hasRubric = await stat(path.join(input.roleDirectory, 'rubric.json')).then(s => s.isFile(), () => false);
+  if (!hasRubric) return {};
+  const rubricDigest = await computeRubricDigest(input.roleDirectory);
+  const loaded = await readRubricCalibration(input.workspace, input.roleId);
+  if (loaded.state === 'missing') {
+    return { report: { present: true, status: 'not_required', rubricDigest } };
+  }
+  if (loaded.state === 'invalid') {
+    return {
+      report: { present: true, status: 'failed', rubricDigest },
+      reason: `Rubric 校准报告损坏或格式无效（${loaded.error}），请重新运行 acp-service rsi calibrate --rubric`,
+    };
+  }
+  const saved = loaded.report;
+  if (saved.rubricDigest !== rubricDigest) {
+    return {
+      report: { present: true, status: 'stale', rubricDigest, blockedBy: saved.blockedBy },
+      reason: 'Rubric 校准报告已过期（rubric.json 或 checks 摘要已变更），请重新运行 acp-service rsi calibrate --rubric',
+    };
+  }
+  if (!saved.passed) {
+    return {
+      report: { present: true, status: 'failed', rubricDigest, blockedBy: saved.blockedBy },
+      reason: `Rubric 校准未通过（未达标阻断项：${saved.blockedBy.join('、')}），请调整或拆改条目后重跑 acp-service rsi calibrate --rubric`,
+    };
+  }
+  return { report: { present: true, status: 'passed', rubricDigest, blockedBy: [] } };
 }
 
 /**

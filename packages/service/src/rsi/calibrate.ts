@@ -96,10 +96,11 @@ export interface CalibrateRoleOptions {
 
 export const calibrationPath = (workspace: string, roleId: string) => path.join(path.resolve(workspace), roleId, 'calibration.json');
 
-/** Stable SHA-256 over `checklist.json` and every regular file in `checks/`. */
+/** Stable SHA-256 over `checklist.json`, optional `rubric.json`, and every regular file in `checks/`. */
 export async function computeChecksDigest(roleDirectory: string): Promise<string> {
   const root = path.resolve(roleDirectory);
   const files = ['checklist.json'];
+  if (await isFile(path.join(root, 'rubric.json'))) files.push('rubric.json');
   await collectFiles(path.join(root, 'checks'), root, files);
   files.sort();
   const hash = createHash('sha256');
