@@ -557,3 +557,18 @@ test('checkGate works on pr-delivery without ENOENT /cases, wires real eval-cr C
   assert.equal(staleRole.crEval?.status, 'stale');
   assert.equal(staleRole.ready, false);
 });
+
+test('M1: calibrating clean committed existing roles in a fresh workspace treats committed items as baseline', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'rsi-clean-existing-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const repoRoot = join(import.meta.dirname, '../../..');
+
+  for (const roleId of ['product-intro-outline', 'ppt-beautifier']) {
+    const rep = await calibrateRole({
+      roleDirectory: join(repoRoot, '.1agents/roles', roleId),
+      workspace,
+    });
+    assert.deepEqual(rep.missingSource, [], `${roleId} already-committed checks must not be flagged as new`);
+    assert.equal(rep.passed, true, `${roleId} clean calibration must pass: ${rep.failureReasons.join('; ')}`);
+  }
+});

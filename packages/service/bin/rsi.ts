@@ -158,8 +158,12 @@ async function runCalibrate(argv: string[]): Promise<void> {
   for (const hit of report.falsePositives) console.log(`  误报 ${hit.runDir} ${hit.artifactPath}：${hit.failedChecks.join('、')}`);
   console.log(`拦截历史缺陷 ${report.caughtHistoricalIssues.length}`);
   for (const hit of report.caughtHistoricalIssues) console.log(`  第 ${hit.round} 轮 ${hit.runDir} ${hit.artifactPath}：${hit.caughtBy.join('、')}${hit.qaSummary ? `（${hit.qaSummary}）` : ''}`);
-  console.log(`校准报告：${calibrationPath(resolve(values.workspace!), report.roleId)}`);
-  console.log(report.passed ? '回放校准通过（历史正样本 0 误报）。' : '回放校准未通过：历史正样本有误报。');
+  if (report.only?.length) {
+    console.log('诊断模式（--only），未写入 calibration.json。');
+  } else {
+    console.log(`校准报告：${calibrationPath(resolve(values.workspace!), report.roleId)}`);
+  }
+  console.log(report.passed ? '回放校准通过（历史正样本 0 误报）。' : `回放校准未通过：${report.failureReasons.join('；') || '历史正样本有误报。'}`);
   if (!report.passed) process.exitCode = 1;
 }
 
@@ -211,7 +215,7 @@ async function runLookup(argv: string[]): Promise<void> {
 async function runEvalCr(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' },
-    workspace: { type: 'string', default: '.1agents/runtime/rsi' },
+    workspace: { type: 'string' },
     json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
@@ -255,9 +259,10 @@ async function runEvalCr(argv: string[]): Promise<void> {
   catch { throw new Error(`results file is not valid JSON: ${values.results}`); }
   const normalizedResults = coerceCrEvalResults(raw);
   const score = scoreCrEvalSuite(manifest, normalizedResults);
+  const evalWorkspace = values.workspace ? resolve(values.workspace) : resolve(repoRoot, '.1agents', 'runtime', 'rsi');
   const written = await writeCrEvalReport({
     roleDirectory,
-    workspace: resolve(values.workspace!),
+    workspace: evalWorkspace,
     results: normalizedResults,
     score,
   });

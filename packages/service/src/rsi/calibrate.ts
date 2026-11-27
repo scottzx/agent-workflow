@@ -14,7 +14,7 @@
  */
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
@@ -318,39 +318,47 @@ function holdoutKeysDigest(keys: readonly string[]): string {
 }
 
 /**
- * Auto-discovers baseline checklist item ids from git history so newly added `block` checks
- * are checked for required `source` provenance in production CLI runs (not just unit tests).
+ * Auto-discovers baseline checklist item ids so newly added `block` checks are checked for
+ * required `source` provenance in production CLI runs without misclassifying already-committed
+ * checks on existing roles in a clean fresh workspace.
  */
-async function resolveBaselineItemIds(roleDirectory: string, role: RoleVersion, ledger: readonly LedgerEntry[]): Promise<ReadonlySet<string> | undefined> {
+async function resolveBaselineItemIds(
+  roleDirectory: string,
+  role: RoleVersion,
+  ledger: readonly LedgerEntry[],
+  previousCalibration: CalibrationReport | undefined,
+  currentItemIds: readonly string[],
+): Promise<ReadonlySet<string>> {
+  // 1) Uncommitted edits in the role directory: compare against HEAD:checklist.json.
+  if (role.dirty && role.commit) {
+    const headIds = await readChecklistIdsFromGitCommit(roleDirectory, role.commit);
+    if (headIds) return headIds;
+  }
+  // 2) Clean working tree with a prior v2 calibration for an older version: compare against its known items.
+  if (previousCalibration?.schemaVersion === 2 && previousCalibration.role.commit && previousCalibration.role.commit !== role.commit) {
+    return new Set(Object.keys(previousCalibration.effectiveModes));
+  }
+  // 3) Clean working tree with a previous passing ledger commit: compare against that commit's checklist.json.
+  const prevPassing = [...ledger].reverse().find(e => e.passed && !UNFINISHED.includes(e.stopReason) && e.role.commit && e.role.commit !== role.commit);
+  if (prevPassing?.role.commit) {
+    const prevIds = await readChecklistIdsFromGitCommit(roleDirectory, prevPassing.role.commit);
+    if (prevIds) return prevIds;
+  }
+  // 4) Clean existing role being calibrated for the first time (or re-calibrated on the same commit):
+  //    all already-committed items in the current checklist are the baseline.
+  return new Set(currentItemIds);
+}
+
+async function readChecklistIdsFromGitCommit(roleDirectory: string, commit: string): Promise<ReadonlySet<string> | undefined> {
   try {
-    const { stdout: topRaw } = await execFileAsync('git', ['-C', roleDirectory, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
-    const repoTop = topRaw.trim();
+    const realRoleDir = await realpath(roleDirectory);
+    const { stdout: topRaw } = await execFileAsync('git', ['-C', realRoleDir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    const repoTop = await realpath(topRaw.trim());
     if (!repoTop) return undefined;
-    const relChecklist = path.relative(repoTop, path.join(roleDirectory, 'checklist.json')).split(path.sep).join('/');
-
-    const candidates: string[] = [];
-    // If working tree has uncommitted edits, compare against HEAD first.
-    if (role.dirty && role.commit) candidates.push(role.commit);
-    // Previous passing ledger commit if distinct from current commit.
-    const prevPassing = [...ledger].reverse().find(e => e.passed && !UNFINISHED.includes(e.stopReason) && e.role.commit && e.role.commit !== role.commit);
-    if (prevPassing?.role.commit) candidates.push(prevPassing.role.commit);
-    // Previous git commit that touched checklist.json.
-    const { stdout: logOut } = await execFileAsync(
-      'git',
-      ['-C', repoTop, 'log', '-n', '2', '--format=%H', '--', relChecklist],
-      { encoding: 'utf8' },
-    );
-    const commits = logOut.trim().split(/\r?\n/).filter(Boolean);
-    if (commits.length >= 2) candidates.push(commits[1]!);
-
-    for (const commit of candidates) {
-      try {
-        const { stdout: rawChecklist } = await execFileAsync('git', ['-C', repoTop, 'show', `${commit}:${relChecklist}`], { encoding: 'utf8' });
-        const parsed = parseChecklist(JSON.parse(rawChecklist));
-        return new Set(parsed.items.map(item => item.id));
-      } catch { /* try next baseline candidate */ }
-    }
-    return undefined;
+    const relChecklist = path.relative(repoTop, path.join(realRoleDir, 'checklist.json')).split(path.sep).join('/');
+    const { stdout: rawChecklist } = await execFileAsync('git', ['-C', repoTop, 'show', `${commit}:${relChecklist}`], { encoding: 'utf8' });
+    const parsed = parseChecklist(JSON.parse(rawChecklist));
+    return new Set(parsed.items.map(item => item.id));
   } catch {
     return undefined;
   }
@@ -447,7 +455,9 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
   const runs = latest.filter(entry => !UNFINISHED.includes(entry.stopReason));
   const runner = options.checkRunner ?? defaultCheckRunner;
 
-  const baselineItemIds = options.existingItemIds ?? await resolveBaselineItemIds(roleDirectory, role, latest);
+  const previousCalibration = await loadCalibration(options.workspace, roleId);
+  const baselineItemIds = options.existingItemIds
+    ?? await resolveBaselineItemIds(roleDirectory, role, latest, previousCalibration, checklist.items.map(item => item.id));
 
   const allSamples: ReplaySample[] = [];
   for (const run of runs) {

@@ -28,6 +28,7 @@ Exit code is the scorer's exit code.`);
 let roleDir;
 let repo;
 let results;
+let workspace;
 let json = false;
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
@@ -36,6 +37,7 @@ for (let index = 0; index < args.length; index += 1) {
   if (taken.name === '--role-dir' || taken.name === '--role') roleDir = taken.value;
   else if (taken.name === '--repo') repo = taken.value;
   else if (taken.name === '--results') results = taken.value;
+  else if (taken.name === '--workspace') workspace = taken.value;
   else {
     console.error(`unknown argument ${arg}`);
     process.exit(1);
@@ -50,6 +52,7 @@ if (!roleDir) {
 const forwarded = ['rsi', 'eval-cr', '--role', absolute(roleDir)];
 if (repo) forwarded.push('--repo', absolute(repo));
 if (results) forwarded.push('--results', absolute(results));
+if (workspace) forwarded.push('--workspace', absolute(workspace));
 if (json) forwarded.push('--json');
 
 const distCli = join(serviceDir, 'dist/bin/acp-service.js');
