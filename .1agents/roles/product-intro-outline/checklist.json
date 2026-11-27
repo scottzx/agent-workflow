@@ -47,7 +47,10 @@
       "rule": "不同页的两条要点引用同一组出处文件时，不能有连续 8 个以上相同的汉字（换了说法的重复）；英文词、命令和链接不算",
       "nonGoals": ["英文词、命令和链接的相同不算"] },
     { "id": "P15", "kind": "program", "dependsOn": ["P1"], "severity": "must", "locked": true,
-      "rule": "收尾页里提到“下载”“源码”“附件”的要点，必须带一个完整的 http(s) 地址" }
+      "rule": "收尾页里提到“下载”“源码”“附件”的要点，必须带一个完整的 http(s) 地址" },
+    { "id": "P16", "kind": "program", "dependsOn": ["P1"], "severity": "must", "locked": false,
+      "rule": "角色 rubric.json 符合 .1agents/schemas/rubric.schema.json 及权重/锚点/阈值结构规范",
+      "modePolicy": { "trial": "observe" } }
   ],
   "program": { "run": "checks/check_outline.py", "schema": "checks/outline.schema.json" }
 }

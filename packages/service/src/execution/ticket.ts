@@ -108,10 +108,12 @@ function selfProgramConflict(ticket: Ticket, result: CheckResult): CrossCheckFin
   return { kind: 'self_vs_program', checkId: result.itemId, claimedState: 'pass', ...(sc.note ? { claimedNote: sc.note } : {}), actualVerdict: 'fail' };
 }
 
-/** Host: failed checks become or reopen program items, items whose check now passes are verified; all passing moves the ticket to review. */
-export function applyChecks(ticket: Ticket, results: CheckResult[]): TicketChange[] {
+/** Host: failed blocking checks become or reopen program items, items whose check now passes are verified; all blocking checks passing moves the ticket to review. Observe-only failures are recorded on the check event without raising must items or blocking review. */
+export function applyChecks(ticket: Ticket, results: CheckResult[], options?: { observeItemIds?: ReadonlySet<string> | readonly string[] }): TicketChange[] {
   expect(ticket, ['drafting', 'ready_for_review'], '只有执行者交稿后才能合并程序检查');
   const round = ticket.round, changes: TicketChange[] = [];
+  const observeSet = options?.observeItemIds ? new Set(options.observeItemIds) : undefined;
+  const isObserve = (itemId: string) => Boolean(observeSet?.has(itemId));
   const settle = (item: TicketItem, state: ItemState, note: string) => {
     item.state = state; item.log.push({ round, by: 'host', action: state, note });
     changes.push({ type: 'ticket.item_settled', data: { actor: 'host', round, itemId: item.id, state, note } });
@@ -121,9 +123,13 @@ export function applyChecks(ticket: Ticket, results: CheckResult[]): TicketChang
   };
   for (const result of results) {
     const item = ticket.items.find(entry => entry.source === 'program' && entry.checkId === result.itemId && entry.state !== 'verified');
+    if (result.pass) { if (item) settle(item, 'verified', `${result.itemId} 通过`); continue; }
+    if (isObserve(result.itemId)) {
+      if (item) settle(item, 'withdrawn', `${result.itemId} 当前为 observe，不阻断`);
+      continue;
+    }
     const finding = selfProgramConflict(ticket, result);
-    if (result.pass) { if (item) settle(item, 'verified', `${result.itemId} 通过`); }
-    else if (item) {
+    if (item) {
       item.evidence = result.evidence;
       if (finding) item.crossCheck = finding;
       const reopened = item.state !== 'open';
@@ -139,9 +145,10 @@ export function applyChecks(ticket: Ticket, results: CheckResult[]): TicketChang
       if (finding) mismatch(raised.id, finding);
     }
   }
-  const failed = results.filter(result => !result.pass).map(result => result.itemId);
+  const failed = results.filter(result => !result.pass && !isObserve(result.itemId)).map(result => result.itemId);
+  const observeFailed = results.filter(result => !result.pass && isObserve(result.itemId)).map(result => result.itemId);
   if (!failed.length) ticket.status = 'in_review';
-  changes.push({ type: 'ticket.checked', data: { actor: 'host', round, passed: !failed.length, failed, status: ticket.status } });
+  changes.push({ type: 'ticket.checked', data: { actor: 'host', round, passed: !failed.length, failed, ...(observeFailed.length ? { observeFailed } : {}), status: ticket.status } });
   return changes;
 }
 
@@ -294,7 +301,7 @@ const openSchema = jobSchema.extend({ roleId: id, caseId: id,
 const settlerSchema = z.object({
   kind: z.enum(['person', 'coach']), agent: id.optional(), sessionId: id.optional(), via: z.enum(['page', 'relay']).optional(),
 }).strict().refine(by => by.kind === 'coach' || (!by.agent && !by.sessionId), 'Only a coach names an agent session');
-const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200) }).strict();
+const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200), observeItemIds: z.array(id).max(200).optional() }).strict();
 const reviewSchema = jobSchema.extend({ review: qualityReviewSchema, qaJobId: id.optional() }).strict();
 const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).optional() }).strict();
 const reopenSchema = reviseSchema;
@@ -317,7 +324,7 @@ const selfCheckSchema = executorBase.extend({ checkId: id, status: z.enum(['pass
 export const TICKET_METHODS = {
   ticket_get: { description: '读取执行者任务上的任务单（意见、状态、轮次、提议、历史）。每次改动都在 execution_events 里留有 ticket.* 事件。', parameters: z.toJSONSchema(jobSchema) },
   ticket_open: { description: '宿主：在执行者任务上开任务单，一个任务一张。exportPath 为只读导出的绝对路径，之后每次改动都会重写。可选 artifacts 与 selfChecks，自检项初始为 pending。', parameters: z.toJSONSchema(openSchema) },
-  ticket_checks: { description: '宿主：执行者交稿后合并本轮程序检查结果。未通过的项成为或重开意见，通过的核实；执行者曾把同一项自检为 pass 时写入 self_vs_program 对校分歧。全部通过则进入审阅。', parameters: z.toJSONSchema(checksSchema) },
+  ticket_checks: { description: '宿主：执行者交稿后合并本轮程序检查结果。未通过的阻断项成为或重开意见，通过的核实；执行者曾把同一阻断项自检为 pass 时写入 self_vs_program 对校分歧。observeItemIds 中的观察项失败仅记录在 ticket.checked 事件，不开 must 意见且不阻断进入审阅。全部阻断项通过则进入审阅。', parameters: z.toJSONSchema(checksSchema) },
   ticket_review: { description: '宿主：审阅中合并质检结果（previous 按意见编号 fixed/partly/not_fixed/withdrawn、新意见、selfCheckAudit 对校、去重后的提议），记录质检任务 qaJobId。质检自己不能改任务单。', parameters: z.toJSONSchema(reviewSchema) },
   ticket_revise: { description: '宿主：把任务单打回执行者，进入下一轮修改，并把 recheckOnRevision 的自检项重置为 pending。', parameters: z.toJSONSchema(reviseSchema) },
   ticket_show: { description: '执行者：用正在执行的 jobId、attemptId 和 sessionId 读取自己的任务单；命令行只给 jobId，via 为 cli，按该任务当前这一轮执行。', parameters: z.toJSONSchema(executorSchema) },
@@ -362,7 +369,7 @@ export function invokeTicket(ledger: JobLedger, method: string, params: unknown)
       writeExport(ticket);
       return ticket;
     }
-    case 'ticket_checks': { const input = checksSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyChecks(ticket, input.results)); }
+    case 'ticket_checks': { const input = checksSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyChecks(ticket, input.results, input.observeItemIds ? { observeItemIds: input.observeItemIds } : undefined)); }
     case 'ticket_review': { const input = reviewSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyReview(ticket, input.review, input.qaJobId)); }
     case 'ticket_revise': { const input = reviseSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => startRevision(ticket, input.note)); }
     case 'ticket_proposal': { const input = proposalSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => setProposal(ticket, input.proposalId, input.state, input.note, input.by)); }

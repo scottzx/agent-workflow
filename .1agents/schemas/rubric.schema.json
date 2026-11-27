@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://1agents.dev/schema/rsi/rubric.schema.json",
+  "title": "RSI role rubric (schemaVersion 1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "roleId", "artifacts", "criteria", "aggregation", "calibration"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "roleId": { "type": "string", "minLength": 1 },
+    "artifacts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+    "purpose": { "enum": ["formative", "summative"] },
+    "layers": {
+      "description": "Which validators this rubric assumes. program = checklist.json + checks/; vision = rendered PNG; text = artifact text; xml = OOXML/structured XML.",
+      "type": "array",
+      "items": { "enum": ["program", "text", "vision", "xml"] },
+      "uniqueItems": true
+    },
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "layer", "modality", "scale", "weight", "evidence", "gate"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Z][0-9]{1,2}$" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 60 },
+          "question": {
+            "description": "One focused judgment question, one construct only.",
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 400
+          },
+          "layer": { "enum": ["program", "content", "narrative", "visual"] },
+          "modality": { "enum": ["text", "vision", "xml"] },
+          "scale": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type"],
+                "properties": {
+                  "type": { "const": "binary" },
+                  "metLabel": { "type": "string" },
+                  "unmetLabel": { "type": "string" },
+                  "cannotAssess": { "enum": ["abstain", "fail", "partial"], "default": "abstain" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "levels"],
+                "properties": {
+                  "type": { "const": "ordinal" },
+                  "levels": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 5,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["value", "anchor"],
+                      "properties": {
+                        "value": { "type": "integer", "minimum": 0 },
+                        "label": { "type": "string" },
+                        "anchor": { "type": "string", "minLength": 10 },
+                        "counterExample": { "type": "string", "minLength": 5 }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "weight": {
+            "description": "Signed points. Positive = met adds points; negative = penalty criterion; 0 = observe only.",
+            "type": "number"
+          },
+          "severity": { "enum": ["must", "should"] },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["required", "kind"],
+            "properties": {
+              "required": { "const": true },
+              "kind": { "enum": ["quote", "path", "shape", "bbox", "pixel", "none"] },
+              "hint": { "type": "string" },
+              "minChars": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "gate": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mode"],
+            "properties": {
+              "mode": { "enum": ["block", "advise", "observe"] },
+              "minScore": { "type": "number" },
+              "minAlpha": { "type": "number", "minimum": 0, "maximum": 1 },
+              "onLowAgreement": { "enum": ["keep", "advise", "demote", "split"], "default": "advise" }
+            }
+          },
+          "appliesTo": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "sections": { "type": "array", "items": { "type": "string" } },
+              "slideKinds": { "type": "array", "items": { "type": "string" } },
+              "skipWhen": { "type": "string" }
+            }
+          },
+          "antiGaming": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "shortcuts": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
+              "pairedWith": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "programItem": { "type": "string", "description": "checklist.json item id that already covers this, if any" },
+          "replaces": { "type": "array", "items": { "type": "string" }, "description": "QA.md score dimension names this criterion replaces" }
+        }
+      }
+    },
+    "aggregation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method"],
+      "properties": {
+        "method": { "enum": ["normalized_positive_sum", "weighted_mean", "per_criterion_gate"] },
+        "passScore": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mustAllPass": {
+          "description": "Positive-weight (weight > 0) criterion IDs that must all pass/be met; negative penalty criteria are forbidden here.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mustNotTrigger": {
+          "description": "Negative-weight penalty (weight < 0) criterion IDs that must remain unmet; triggering any entry fails the rubric.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "pairwise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "purpose": { "enum": ["version_regression"], "default": "version_regression" },
+        "swapPositions": { "type": "boolean", "default": true },
+        "tieOnDisagreement": { "type": "boolean", "default": true },
+        "judges": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+        "minWinRate": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "abstainOn": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "calibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goldSet", "minSamples", "metrics", "bands"],
+      "properties": {
+        "goldSet": { "type": "string", "description": "path under the role dir, e.g. cases/calibration/gold.jsonl" },
+        "minSamples": {
+          "description": "Minimum gold-set sample count to run calibration (auto-blocking promotion separately requires n >= 40 and alpha >= 0.8).",
+          "type": "integer",
+          "minimum": 5
+        },
+        "metrics": { "type": "array", "items": { "enum": ["cohen_kappa", "krippendorff_alpha", "spearman_rho", "raw_agreement"] }, "minItems": 1 },
+        "bands": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["auto", "advise", "split"],
+          "properties": {
+            "auto": { "type": "number" },
+            "advise": { "type": "number" },
+            "split": { "type": "number" }
+          }
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["at", "digest", "n", "perCriterion"],
+            "properties": {
+              "at": { "type": "string" },
+              "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "n": { "type": "integer", "minimum": 0 },
+              "annotators": { "type": "array", "items": { "type": "string" } },
+              "perCriterion": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kappa": { "type": ["number", "null"] },
+                    "alpha": { "type": ["number", "null"] },
+                    "rho": { "type": ["number", "null"] },
+                    "agreement": { "type": ["number", "null"] },
+                    "band": { "enum": ["auto", "advise", "split"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

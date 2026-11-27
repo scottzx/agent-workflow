@@ -9,6 +9,7 @@ any item fails.
 """
 import json
 import re
+import subprocess
 import sys
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -74,6 +75,36 @@ def version_records(root):
 def item_kind(item: dict) -> str:
     """v2 names the discriminator `kind`; v1 used `type`. Both are accepted."""
     return item.get('kind') or item.get('type') or ''
+
+
+def run_rubric_lint(role_dir: Path) -> dict:
+    """Always dispatch checks/rubric_lint.py for P16; stderr carries diagnostics, stdout returns strict CheckResult."""
+    linter = role_dir / 'checks' / 'rubric_lint.py'
+    rubric_file = role_dir / 'rubric.json'
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-I', str(linter), str(rubric_file)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr, end='')
+        parsed = json.loads(proc.stdout)
+        if (
+            isinstance(parsed, dict)
+            and set(parsed.keys()) == {'itemId', 'pass', 'evidence'}
+            and parsed['itemId'] == 'P16'
+            and isinstance(parsed['pass'], bool)
+            and isinstance(parsed['evidence'], list)
+        ):
+            return parsed
+        print(f'check_outline: rubric_lint returned unexpected payload: {proc.stdout[:200]}', file=sys.stderr)
+        return {'itemId': 'P16', 'pass': False, 'evidence': [{'path': 'rubric.json', 'message': 'rubric_lint returned invalid CheckResult payload'}]}
+    except Exception as exc:
+        print(f'check_outline: rubric_lint dispatch failed: {exc}', file=sys.stderr)
+        return {'itemId': 'P16', 'pass': False, 'evidence': [{'path': 'rubric.json', 'message': f'rubric_lint failed: {exc}'}]}
 
 
 def main(outline_path: str, features_path: str, project: str) -> int:
@@ -193,6 +224,8 @@ def main(outline_path: str, features_path: str, project: str) -> int:
     report('P15', [] if not closing_slide else [
         {'path': f"{closing_slide[0]}/points/{j}", 'message': f"mentions {FETCH.search(point['text']).group(0)} without an http(s) link: {point['text']}"}
         for j, point in enumerate(closing_slide[1]['points']) if FETCH.search(point['text']) and not LINK.search(point['text'])])
+
+    results.append(run_rubric_lint(ROLE))
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 0 if all(r['pass'] for r in results) else 1

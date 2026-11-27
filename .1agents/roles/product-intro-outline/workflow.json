@@ -4,7 +4,7 @@
   "nodes": [
     { "id": "produce", "type": "executor_turn", "requireTicketSubmit": false },
     { "id": "check_schema", "type": "program_check", "checks": ["P1"], "dependsOn": ["produce"] },
-    { "id": "check_rules", "type": "program_check", "checks": ["P2..P15"], "dependsOn": ["check_schema"] },
+    { "id": "check_rules", "type": "program_check", "checks": ["P2..P16"], "dependsOn": ["check_schema"] },
     { "id": "check_digest", "type": "artifact_digest_check", "dependsOn": ["check_schema"] },
     { "id": "l1_crosscheck", "type": "ticket_apply_checks", "dependsOn": ["check_rules", "check_digest"] },
     { "id": "qa_review", "type": "qa_session_review", "dependsOn": ["l1_crosscheck"], "when": "checks_passed" },

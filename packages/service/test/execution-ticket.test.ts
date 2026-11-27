@@ -344,3 +344,44 @@ test('a ticket opened without self-checks keeps the old check, revision and subm
   assert.equal((f.executor('ticket_submit') as Ticket).status, 'ready_for_review');
   assert.equal(f.events().some(event => event.type === 'ticket.self_checked' || event.type === 'ticket.crosscheck_mismatch'), false);
 });
+
+test('observe-only check failures do not raise must items or block transition to in_review, and qualityReviewSchema passes through rubric', () => {
+  const f = fixture();
+  f.call('ticket_open', { roleId: 'product-intro-outline', caseId: 'demo' });
+  const checked = f.call('ticket_checks', {
+    results: [
+      { itemId: 'P1', pass: true, evidence: [] },
+      { itemId: 'P16', pass: false, evidence: [{ path: 'rubric.json', message: 'broken rubric' }] },
+    ],
+    observeItemIds: ['P16'],
+  });
+  assert.equal(checked.status, 'in_review', 'observe-only failure must not block in_review');
+  assert.deepEqual(checked.items, [], 'observe-only failure must not open a must ticket item');
+  const checkedEvent = f.events().find(event => event.type === 'ticket.checked')!;
+  assert.equal((checkedEvent.data as any).passed, true);
+  assert.deepEqual((checkedEvent.data as any).failed, []);
+  assert.deepEqual((checkedEvent.data as any).observeFailed, ['P16']);
+
+  // QualityReview with extra rubric field passes through unchanged (zero qualityReviewSchema change).
+  const reviewed = f.call('ticket_review', {
+    review: {
+      ...review({ verdict: 'pass', issues: [] }),
+      rubric: { roleId: 'product-intro-outline', items: [{ id: 'R1', met: true, evidence: 'README.md:1' }] },
+    },
+  });
+  assert.equal(reviewed.history.at(-1)?.verdict, 'pass');
+
+  // Contrast: same P16 failure without observeItemIds (formal/block mode) raises a must item and blocks in_review.
+  const formal = fixture();
+  formal.call('ticket_open', { roleId: 'product-intro-outline', caseId: 'demo' });
+  const blocked = formal.call('ticket_checks', {
+    results: [
+      { itemId: 'P1', pass: true, evidence: [] },
+      { itemId: 'P16', pass: false, evidence: [{ path: 'rubric.json', message: 'broken rubric' }] },
+    ],
+  });
+  assert.equal(blocked.status, 'drafting');
+  assert.equal(blocked.items.length, 1);
+  assert.equal(blocked.items[0]!.id, 'P1-P16');
+  assert.equal(blocked.items[0]!.severity, 'must');
+});

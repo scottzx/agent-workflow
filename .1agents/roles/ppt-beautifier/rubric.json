@@ -1,0 +1,198 @@
+{
+  "schemaVersion": 1,
+  "roleId": "ppt-beautifier",
+  "artifacts": ["deck.pptx", "preview.png", "slides/*.png"],
+  "purpose": "summative",
+  "layers": ["program", "xml", "vision", "text"],
+  "criteria": [
+    {
+      "id": "V1",
+      "title": "元素不出画布",
+      "question": "每个形状的包围盒是否都落在 16:9 画布内（允许 1pt 抗锯齿余量）？",
+      "layer": "program",
+      "modality": "xml",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "shape", "hint": "页号 + 形状名 + left/top/width/height(pt) + 溢出量(pt)" },
+      "gate": { "mode": "block", "minAlpha": 0.9, "onLowAgreement": "split" },
+      "programItem": "V1"
+    },
+    {
+      "id": "V2",
+      "title": "文本不溢出文本框",
+      "question": "估算出的文本需求高度是否不超过文本框高度 ×1.1？",
+      "layer": "program",
+      "modality": "xml",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "shape", "hint": "页号 + 形状名 + 框高(pt) + 需求高(pt) + 比值" },
+      "gate": { "mode": "block", "minAlpha": 0.9, "onLowAgreement": "split" },
+      "programItem": "V2"
+    },
+    {
+      "id": "V3",
+      "title": "正文不小于字号下限",
+      "question": "除页码与脚注外，正文字号是否都 ≥ 12pt（投影场景）/ 10pt（打印场景）？",
+      "layer": "program",
+      "modality": "xml",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "shape", "hint": "页号 + 形状名 + 实际 pt" },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "programItem": "V3"
+    },
+    {
+      "id": "V4",
+      "title": "文本块不互相压盖",
+      "question": "任意两个含文本形状的包围盒 IoU 是否 ≤ 0.15？",
+      "layer": "program",
+      "modality": "xml",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "shape", "hint": "页号 + 形状对 + IoU" },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "programItem": "V4"
+    },
+    {
+      "id": "V5",
+      "title": "页面存在明确视觉层级",
+      "question": "只看渲染 PNG：不看文字内容，能否在 3 秒内指出哪一块是标题、哪一块是主体信息？（以字号/字重/颜色的对比为依据）",
+      "layer": "visual",
+      "modality": "vision",
+      "scale": {
+        "type": "ordinal",
+        "levels": [
+          { "value": 0, "label": "无层级", "anchor": "所有文字字号与字重接近，找不出标题", "counterExample": "标题 20pt、正文 18pt、字重相同" },
+          { "value": 1, "label": "层级弱", "anchor": "标题比正文大 2–4pt，但仍需读内容才能分辨主次", "counterExample": "标题 24pt / 正文 20pt，同色" },
+          { "value": 2, "label": "层级清晰", "anchor": "标题与正文的字号差 ≥ 8pt 或字重明显不同，视线第一落点是标题，第二落点是结论句", "counterExample": "标题 32pt 加粗 / 正文 18pt 常规，标题居上" },
+          { "value": 3, "label": "层级引导阅读", "anchor": "除标题外，还通过对比把视线引向该页唯一结论，第三层信息（脚注/来源）明显弱化", "counterExample": "标题 32pt / 结论 24pt 强调色 / 来源 10pt 灰色" }
+        ]
+      },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "bbox", "hint": "页号 + 截图区域 [x,y,w,h]（归一化 0–1）+ 你据以判断的字号对比或截图原话" },
+      "gate": { "mode": "block", "minAlpha": 0.67, "onLowAgreement": "advise" },
+      "antiGaming": { "shortcuts": ["把标题无限放大、正文缩到 12pt 以制造对比", "整页只留一个巨大标题"], "pairedWith": ["V3", "V6"] }
+    },
+    {
+      "id": "V6",
+      "title": "留白与对齐成网格",
+      "question": "只看渲染 PNG：页边距是否四边一致、元素是否落在同一条左基线或栅格上、是否存在明显拥挤区与空旷区并存？",
+      "layer": "visual",
+      "modality": "vision",
+      "scale": {
+        "type": "ordinal",
+        "levels": [
+          { "value": 0, "label": "未对齐", "anchor": "元素左右边缘参差 ≥ 3 种，页边距四边不等", "counterExample": "左 0.4in、上 0.3in、右 0.9in，正文与图片左边缘差 0.3in" },
+          { "value": 1, "label": "局部对齐", "anchor": "多数元素共用一条左基线，但存在 1–2 处明显错位或贴边", "counterExample": "标题与正文对齐，图表左移 0.2in" },
+          { "value": 2, "label": "成网格", "anchor": "页边距四边一致（误差 ≤ 0.05in），元素共享 1–2 条对齐线，留白集中在信息块之间", "counterExample": "四边 0.6in，两栏 gutter 0.3in 一致" },
+          { "value": 3, "label": "留白有节奏", "anchor": "在满足 2 的基础上，留白随信息重要性变化：结论区留白最大，注释区最紧，且不出现“挤成一团 + 大片死白”", "counterExample": "结论区上下留白 0.8in，注释区 0.15in，全页无 >2.5in 连续空白" }
+        ]
+      },
+      "weight": 2,
+      "severity": "should",
+      "evidence": { "required": true, "kind": "bbox", "hint": "页号 + 两处最明显的错位区域坐标 + 估算的页边距(in)" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "split" }
+    },
+    {
+      "id": "V7",
+      "title": "图表与数据匹配",
+      "question": "只看渲染 PNG：图表类型是否与数据关系匹配（趋势/构成/对比），坐标轴与单位是否可读，数据标签是否遮挡？",
+      "layer": "visual",
+      "modality": "vision",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "bbox", "hint": "页号 + 图表区域坐标 + 你读到的轴标签/单位；读不出时写“读不出”并标 cannotAssess" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "split" }
+    },
+    {
+      "id": "V8",
+      "title": "全篇风格一致",
+      "question": "把 6 页缩略图并排看：配色、字号阶梯、圆角/描边、图标风格是否来自同一套？",
+      "layer": "visual",
+      "modality": "vision",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "should",
+      "evidence": { "required": true, "kind": "bbox", "hint": "列出至少两页的对比区域坐标 + 不一致的那一项（颜色/字号/圆角）" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "advise" }
+    },
+    {
+      "id": "V9",
+      "title": "单页一个结论",
+      "question": "只看渲染 PNG 与标题：这一页能不能用一句话说出它想让受众记住什么？",
+      "layer": "narrative",
+      "modality": "vision",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "quote", "hint": "页号 + 标题原文 + 一句话结论（若说不出，写“说不出”）" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "advise" },
+      "antiGaming": { "shortcuts": ["每页标题都写成“关于 X”", "把整段正文塞进标题"] }
+    },
+    {
+      "id": "V10",
+      "title": "跨页叙事连贯",
+      "question": "把各页标题连起来读：是否构成一条完整论证线，且相邻两页之间有明确承接？",
+      "layer": "narrative",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "quote", "hint": "按顺序抄下全部标题；指出断裂处（第 N 页→第 N+1 页）" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "advise" }
+    },
+    {
+      "id": "V11",
+      "title": "字号缩到投影仍可读（负向）",
+      "question": "是否存在为了塞内容而把正文字号压到 12pt 以下、或把三栏挤成四栏的情况？",
+      "layer": "visual",
+      "modality": "vision",
+      "scale": { "type": "binary" },
+      "weight": -3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "bbox", "hint": "页号 + 区域坐标 + 估算字号(pt)" },
+      "gate": { "mode": "block", "minAlpha": 0.67, "onLowAgreement": "split" },
+      "antiGaming": { "shortcuts": ["把内容拆成更多页来规避拥挤，但破坏叙事"], "pairedWith": ["V10"] }
+    },
+    {
+      "id": "V12",
+      "title": "装饰压过信息（负向）",
+      "question": "是否存在大色块、渐变、阴影、装饰图形抢走注意力，或对比度不足导致正文难读？",
+      "layer": "visual",
+      "modality": "vision",
+      "scale": { "type": "binary" },
+      "weight": -2,
+      "severity": "should",
+      "evidence": { "required": true, "kind": "bbox", "hint": "页号 + 区域坐标 + 说明是抢注意力还是对比度不足" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "advise" }
+    }
+  ],
+  "aggregation": {
+    "method": "normalized_positive_sum",
+    "passScore": 0.8,
+    "mustAllPass": ["V1", "V2", "V3"],
+    "mustNotTrigger": ["V11"],
+    "note": "程序层（V1–V4）先跑，任一不过直接打回执行者，不进入 VLM 评判，省 token 也避免 VLM 去猜像素；负向 V11 列入 mustNotTrigger。"
+  },
+  "pairwise": {
+    "enabled": true,
+    "purpose": "version_regression",
+    "swapPositions": true,
+    "tieOnDisagreement": true,
+    "judges": ["anthropic:claude", "openai:gpt", "google:gemini"],
+    "minWinRate": 0.6,
+    "abstainOn": ["V5", "V6", "V8"]
+  },
+  "calibration": {
+    "goldSet": "cases/calibration/gold.jsonl",
+    "minSamples": 24,
+    "metrics": ["krippendorff_alpha", "cohen_kappa", "spearman_rho"],
+    "bands": { "auto": 0.8, "advise": 0.67, "split": 0.67 }
+  }
+}

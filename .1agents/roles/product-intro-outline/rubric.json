@@ -1,0 +1,148 @@
+{
+  "schemaVersion": 1,
+  "roleId": "product-intro-outline",
+  "artifacts": ["outline.json"],
+  "purpose": "summative",
+  "layers": ["program", "text"],
+  "criteria": [
+    {
+      "id": "R1",
+      "title": "要点有出处且出处支持它",
+      "question": "这一条要点所说的内容，能不能在被引用的文件与行号范围内找到原话或等价表述？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "quote", "hint": "引用出处文件里支持该要点的原句（≤120 字），并写 path:line", "minChars": 8 },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "programItem": "A1",
+      "antiGaming": { "shortcuts": ["只抄 README 的营销句，不核对功能实现", "把出处写成整个目录而不给行号"] },
+      "replaces": ["具体", "可信"]
+    },
+    {
+      "id": "R2",
+      "title": "开头给具体场景和结果",
+      "question": "前两页有没有出现一个具体使用者、具体动作和可验证的结果，而不是“让展示更专业”这类口号？",
+      "layer": "content",
+      "modality": "text",
+      "scale": {
+        "type": "ordinal",
+        "levels": [
+          { "value": 0, "label": "口号", "anchor": "只有形容词与愿景，没有任何使用者、动作或结果", "counterExample": "“让展示更专业、更高效”" },
+          { "value": 1, "label": "半个场景", "anchor": "有使用者或动作，但没有可验证的结果", "counterExample": "“帮助设计师展示方案”" },
+          { "value": 2, "label": "场景+结果", "anchor": "有具体使用者、具体动作和可验证结果，且结果来自项目里的真实材料", "counterExample": "“客户看不懂图纸，用三维逐区域核对材质，当场指出三处不一致”" }
+        ]
+      },
+      "weight": 2,
+      "severity": "should",
+      "evidence": { "required": true, "kind": "path", "hint": "引用被评的那句话 + 大纲路径，如 sections/positioning/slides/0/points/0" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "split" },
+      "replaces": ["吸引力"]
+    },
+    {
+      "id": "R3",
+      "title": "受众匹配",
+      "question": "每一页讲的是受众关心的收益，而不是只有开发者关心的实现细节？受众不是技术人员时，architecture 整章省略或压成附录算满足。",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "path", "hint": "指出越界的那一页与那句开发者视角的话" },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "programItem": "A2",
+      "replaces": ["受众"]
+    },
+    {
+      "id": "R4",
+      "title": "单页有结论句",
+      "question": "这一页的标题或首条要点，是不是一个能被复述的结论，而不是一个话题标签？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "path", "hint": "页路径 + 现标题 + 一句话改写建议" },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "replaces": ["结构"]
+    },
+    {
+      "id": "R5",
+      "title": "跨页主线",
+      "question": "把每页结论句连起来读，是否构成“问题→能做什么→怎么做到→怎么开始”的一条线，且没有换了说法的重复？",
+      "layer": "narrative",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "path", "hint": "按顺序列出各页结论句；指出断裂或重复的两页" },
+      "gate": { "mode": "block", "minAlpha": 0.67, "onLowAgreement": "advise" },
+      "programItem": "P10",
+      "antiGaming": { "shortcuts": ["为凑主线在每页加一句“接下来我们看”"], "pairedWith": ["R4"] },
+      "replaces": ["结构"]
+    },
+    {
+      "id": "R6",
+      "title": "行动项可直接执行",
+      "question": "最后一页有没有给出受众当场就能做的动作：可点开的地址、要下载的文件或明确联系人？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "quote", "hint": "引用收尾页那条要点原文" },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "programItem": "P15",
+      "replaces": ["行动"]
+    },
+    {
+      "id": "R7",
+      "title": "不编造能力（负向）",
+      "question": "有没有把仓库里不存在、或项目自己声明尚未核验的能力，写成已有能力？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": -4,
+      "severity": "must",
+      "evidence": { "required": true, "kind": "quote", "hint": "被编造的那句 + 仓库里与之矛盾的文件路径" },
+      "gate": { "mode": "block", "minAlpha": 0.8, "onLowAgreement": "split" },
+      "replaces": ["可信"]
+    },
+    {
+      "id": "R8",
+      "title": "不为过审堆砌（负向）",
+      "question": "有没有为了满足评分细则而堆砌要点、拉长句子、把一句话拆成三页，导致整体更难读？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": -2,
+      "severity": "should",
+      "evidence": { "required": true, "kind": "path", "hint": "指出堆砌的两页与前后对比" },
+      "gate": { "mode": "advise", "minAlpha": 0.67, "onLowAgreement": "advise" },
+      "antiGaming": { "shortcuts": ["每页都顶到 5 条要点上限", "标题统一改成“三个动作”句式"] }
+    }
+  ],
+  "aggregation": {
+    "method": "normalized_positive_sum",
+    "passScore": 0.8,
+    "mustAllPass": ["R1", "R3", "R6"],
+    "mustNotTrigger": ["R7"],
+    "note": "分母只算正权重之和；负向条目（R7/R8）命中直接扣分，且 R7 列入 mustNotTrigger（命中即判失败）。比现有 6 维 1–5 求和更抗漂移，因为每条只有 met/unmet。"
+  },
+  "pairwise": {
+    "enabled": true,
+    "purpose": "version_regression",
+    "swapPositions": true,
+    "tieOnDisagreement": true,
+    "judges": ["anthropic:claude", "openai:gpt"],
+    "minWinRate": 0.6,
+    "abstainOn": ["R7"]
+  },
+  "calibration": {
+    "goldSet": "cases/calibration/gold.jsonl",
+    "minSamples": 20,
+    "metrics": ["krippendorff_alpha", "cohen_kappa", "spearman_rho"],
+    "bands": { "auto": 0.8, "advise": 0.67, "split": 0.67 }
+  }
+}
