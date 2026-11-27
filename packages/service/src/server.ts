@@ -9,6 +9,7 @@
  */
 import http from 'node:http';
 import { discoverAgents } from './catalog.js';
+import { loadAgentProfilesSafe } from './agent-profiles.js';
 import type { AddressInfo } from 'node:net';
 import { nodeIdentity } from '@1agents/dreammate-node';
 import { reportAndHoldRegistration } from '@1agents/dreammate-node/client';
@@ -41,7 +42,8 @@ export function createAcpServer(): {
         const { pathname } = url;
         if (req.method === 'GET' && pathname === '/agents') {
           res.setHeader('Cache-Control', 'no-store');
-          return json(res, 200, { agents: discoverAgents().map(({ path: _path, ...agent }) => agent) });
+          const { profiles } = loadAgentProfilesSafe();
+          return json(res, 200, { agents: discoverAgents({ profiles }).map(({ path: _path, ...agent }) => agent) });
         }
         const identity = await nodeIdentity();
 

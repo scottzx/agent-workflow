@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { WebSocketServer } from "ws";
 import { attachAcpConnection } from "./acp-connection.js";
 import { createServiceAgentRegistry } from "./catalog.js";
+import { resolveAgentLaunchSafe, resolveAgentProfileSafe } from "./agent-profiles.js";
 import { CapacityQueue } from "./capacity-queue.js";
 import { createCapacityLifecycle } from "./capacity-lifecycle.js";
 import {
@@ -142,10 +143,10 @@ function interactionTimeoutText() {
 // Inactive sessions (no running turn, no queued prompt, no pending interactive prompt,
 // no running background task) release their child process and capacity lease while
 // keeping their durable session record on disk for fast session/load (~0.5-1.5s).
-// Defaults: interactive (user-opened) 30min, background A2A job 60s, pressure eviction grace 15s.
+// Defaults: interactive (user-opened) 10min, background A2A job 60s, pressure eviction grace 15s.
 // Set ACP_IDLE_SESSION_TTL_MS=0 to disable periodic idle reaping.
 // Set ACP_PRESSURE_EVICT_ENABLED=0 to disable on-demand capacity eviction.
-const DEFAULT_IDLE_SESSION_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_IDLE_SESSION_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_IDLE_JOB_TTL_MS = 60 * 1000;
 const DEFAULT_PRESSURE_EVICT_GRACE_MS = 15 * 1000;
 const RUNNING_BACKGROUND_TASK_STATUSES = new Set(["running", "in_progress", "pending"]);
@@ -1201,11 +1202,14 @@ async function loadSessionHistory(sessionId, payload = {}) {
     }
   }
   const agentType = payload.agentType || session?.agentType || session?.handle?.agent;
+  // A profile session reports the profile id; its native history lives with the
+  // underlying CLI, so adapters and identity checks use the launch Agent instead.
+  const historyAgent = resolveAgentProfileSafe(agentType)?.agent || agentType;
   const acpSessionId =
     session?.handle?.agentSessionId || session?.handle?.backendSessionId || payload.acpSessionId;
   const workspacePath = session?.handle?.cwd || payload.workspacePath;
-  const historyContext = { sessionId, agentType, acpSessionId, workspacePath };
-  const prefersNativeHistory = agentType === "claude" || agentType === "claudecode";
+  const historyContext = { sessionId, agentType: historyAgent, acpSessionId, workspacePath };
+  const prefersNativeHistory = historyAgent === "claude" || historyAgent === "claudecode";
 
   const runtimeItems = await loadRuntimeHistory(sessionId, session);
   if (runtimeItems.some((item) => item.turnId)) {
@@ -1727,6 +1731,15 @@ export async function dispatchCommand(ws, payload) {
               sessionOptions.env = safeEnv;
             }
           }
+          // A profile id is an extra Agent that reuses its underlying adapter with a
+          // profile-scoped child environment (usually HOME — the credential boundary for
+          // browser-login CLIs such as `agy`, whose token lives in the login keychain).
+          // The session keeps the profile id as its identity; only the spawn target and
+          // the child environment switch. Server-side profile entries win over client
+          // entries: a session may add tokens, but it may not move another account's HOME.
+          const launchPlan = resolveAgentLaunchSafe(agentType, sessionOptions.env, { ensureHome: true });
+          const agentLaunch = launchPlan.agent;
+          if (launchPlan.env) sessionOptions.env = launchPlan.env;
 
           const launchArgv = Array.isArray(launch?.argv)
             ? launch.argv.filter((value) => typeof value === "string" && value.length > 0)
@@ -1855,7 +1868,7 @@ export async function dispatchCommand(ws, payload) {
               const tArgv = performance.now();
               await runtime.ensureSession({
                 sessionKey: runtimeSessionKey,
-                agent: agentType,
+                agent: agentLaunch,
                 mode: "persistent",
                 cwd: normalizedPath,
                 resumeSessionId: resumeId || undefined,
@@ -1949,7 +1962,7 @@ export async function dispatchCommand(ws, payload) {
                 sess.ws = ws;
                 sess.agentType = agentType;
                 const tGrok = performance.now();
-                sess.sessionMode = await resolveGrokPermissionMode(handle, agentType);
+                sess.sessionMode = await resolveGrokPermissionMode(handle, agentLaunch);
                 grokModeMs = performance.now() - tGrok;
                 if (seededMode) {
                   sess.permissionMode = seededMode;
@@ -1993,7 +2006,7 @@ export async function dispatchCommand(ws, payload) {
 
           // Phase 2: Instant pre-warm hit for fresh grok-build sessions if CWD matches!
           // The spare was created without this session's MCP servers, so such a session starts its own process.
-          if (agentType === "grok-build" && launchArgv.length === 0 && !resumeId && !hasMcpServers && prewarmedGrokHandle) {
+          if (agentLaunch === "grok-build" && launchArgv.length === 0 && !resumeId && !hasMcpServers && prewarmedGrokHandle) {
             if (prewarmedGrokCwd === normalizedPath) {
               console.log(
                 `[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`,
@@ -2015,7 +2028,7 @@ export async function dispatchCommand(ws, payload) {
               }
 
               const tGrok = performance.now();
-              const prewarmSessionMode = await resolveGrokPermissionMode(handle, agentType);
+              const prewarmSessionMode = await resolveGrokPermissionMode(handle, agentLaunch);
               const grokModeMs = performance.now() - tGrok;
               activeSessions.set(sessionId, {
                 handle,
@@ -2144,7 +2157,7 @@ export async function dispatchCommand(ws, payload) {
           let profileResumeFallback = profileChanged && !resumeId;
           const ensureInput = {
             sessionKey: runtimeSessionKey,
-            agent: agentType,
+            agent: agentLaunch,
             mode: "persistent",
             cwd: normalizedPath,
             resumeSessionId: resumeId || undefined,
@@ -2185,7 +2198,7 @@ export async function dispatchCommand(ws, payload) {
             initializedHandle = handle;
             initialization.controller.signal.throwIfAborted();
             const tGrokMode = performance.now();
-            const sessionMode = await resolveGrokPermissionMode(handle, agentType);
+            const sessionMode = await resolveGrokPermissionMode(handle, agentLaunch);
             const grokModeMs = performance.now() - tGrokMode;
             initialization.controller.signal.throwIfAborted();
             console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);

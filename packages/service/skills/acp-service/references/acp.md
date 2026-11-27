@@ -43,6 +43,18 @@ acp-service --cwd /absolute/project codex set <config-key> <advertised-value> -s
 
 更多 runtime 选项以 `acp-service <agent> --help`、`acp-service --skill show acpx` 为准；阅读内嵌 `acpx` 技能中的示例时，此统一包使用 `acp-service` 命令和 `@1agents/acp-service/runtime`、`/flows` 导入路径。
 
+## Agent profile（同一 CLI 多账号）
+
+内置 Agent 一个 id 对应一份安装和一个账号。需要同一原生 CLI 承载多个账号时，在 `$DSH_HOME/plugins/1agents-acp/profiles.json`（或用 `ACP_PROFILES_FILE` 指定）声明 profile：
+
+```json
+{ "profiles": { "agy2": { "agent": "antigravity", "label": "Antigravity · 账号2", "home": "~/.1agents/acp-profiles/agy2" } } }
+```
+
+`GET /agents` 会把 profile 与底层 Agent 并列返回，客户端用 profile id 建会话即可；服务端只替换启动所用 Agent，并给该子进程注入 profile 的 `HOME` 等环境变量（profile 值优先于客户端传入的 `env`）。`acp-service profile list|show|init|path` 负责查看与准备；`init` 会建目录、建并解锁 macOS 独立 login keychain、链接 dotfiles。
+
+账号隔离取决于凭据本身，不是配置开关：Antigravity CLI 的 token 在 macOS login keychain（service `gemini`、account `antigravity`），只改数据目录不会换账号，改 `HOME` 才会；文件型凭据的 CLI（如 Codex 的 `CODEX_HOME`）只需 `env`。切换 preset 等于新建会话，已有会话保持创建时的 Agent。
+
 ## 常驻 HTTP/WebSocket 服务
 
 ```sh
@@ -88,7 +100,7 @@ curl http://127.0.0.1:36812/manifest
 
 后续请求使用 `session/new` 返回的 **服务 session ID**。`_meta.1agents.agentSessionId` 可能是原生 ID，不能混用。传输断开后的恢复应使用已有身份；不明确的已受理 prompt 不应自动重发。
 
-**非活跃会话进程分级回收与压力驱逐**：`acp-service` 会自动回收空闲且无保护状态（无进行中回合、无排队 prompt、无待答复交互请求、无运行中后台任务）的 ACP 子进程，释放进程名额租约，同时保留磁盘上的持久会话记录与历史。默认按会话意图分级保活：交互会话（`user-opened`）默认 5 分钟（`ACP_IDLE_SESSION_TTL_MS`，设为 `0` 关闭定期回收），后台 A2A 任务（`job`）默认 60 秒（`ACP_IDLE_JOB_TTL_MS`）。当新会话申请进程槽位遇到名额满或内存水位不足时，还会触发按需压力驱逐（默认开启，可用 `ACP_PRESSURE_EVICT_ENABLED=0` 关闭；最低空闲宽限 `ACP_PRESSURE_EVICT_GRACE_MS` 默认 15 秒），按「已断连 WS → 后台 `job` → 交互 `user-opened`（同级 LRU）」顺序逐个驱逐直到释放出可用名额。回收后会向所属连接发出 `_1agents/events/session_closed`（`reason: "idle_timeout"` 或 `"capacity_evicted"`）并在连接无其它附着会话时正常关闭空闲 WebSocket；客户端（含 DSH 插件）在下次发言时通过 `session/load` 无缝恢复原会话，不丢失会话身份与记录。注意：`runtime.close()` 会连同 ACP 子进程的后代进程一并终止，因此含运行中 `background_task` 的会话受保护不会被回收。
+**非活跃会话进程分级回收与压力驱逐**：`acp-service` 会自动回收空闲且无保护状态（无进行中回合、无排队 prompt、无待答复交互请求、无运行中后台任务）的 ACP 子进程，释放进程名额租约，同时保留磁盘上的持久会话记录与历史。默认按会话意图分级保活：交互会话（`user-opened`）默认 10 分钟（`ACP_IDLE_SESSION_TTL_MS`，设为 `0` 关闭定期回收），后台 A2A 任务（`job`）默认 60 秒（`ACP_IDLE_JOB_TTL_MS`）。当新会话申请进程槽位遇到名额满或内存水位不足时，还会触发按需压力驱逐（默认开启，可用 `ACP_PRESSURE_EVICT_ENABLED=0` 关闭；最低空闲宽限 `ACP_PRESSURE_EVICT_GRACE_MS` 默认 15 秒），按「已断连 WS → 后台 `job` → 交互 `user-opened`（同级 LRU）」顺序逐个驱逐直到释放出可用名额。回收后会向所属连接发出 `_1agents/events/session_closed`（`reason: "idle_timeout"` 或 `"capacity_evicted"`）并在连接无其它附着会话时正常关闭空闲 WebSocket；客户端（含 DSH 插件）在下次发言时通过 `session/load` 无缝恢复原会话，不丢失会话身份与记录。注意：`runtime.close()` 会连同 ACP 子进程的后代进程一并终止，因此含运行中 `background_task` 的会话受保护不会被回收。
 
 ## 编程入口与流程
 

@@ -29,3 +29,6 @@
         runtime:
           command: dsh
           args: ['--profile', 'headless']
+    - id: oneagents-magpie-quota
+      name: '@1agents/acp-service/magpie-quota'
+      config: {}

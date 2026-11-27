@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { createAgentRegistry } from '@1agents/acp-service/runtime';
+import type { AgentProfile } from './agent-profiles.js';
 import { catalogDescriptors } from './catalog-descriptors.js';
 
 export interface DiscoveryOptions {
@@ -12,6 +13,8 @@ export interface DiscoveryOptions {
   platform?: NodeJS.Platform;
   /** Package search roots, nearest first. Defaults to the runtime's ancestor directories. */
   packageRoots?: string[];
+  /** Extra Agent ids that reuse a built-in adapter with their own child environment. */
+  profiles?: readonly AgentProfile[];
 }
 
 export interface AgentStatus {
@@ -27,6 +30,8 @@ export interface AgentStatus {
   integrated: boolean;
   install_command?: string;
   chat_ready: boolean;
+  /** Set on profile entries: the built-in Agent whose adapter they launch. */
+  underlying_agent?: string;
 }
 
 const registry = createAgentRegistry();
@@ -153,7 +158,7 @@ export function discoverAgents(options: DiscoveryOptions = {}): AgentStatus[] {
   const descriptors = new Map(catalogDescriptors.map(d => [d.type === 'claudecode' ? 'claude' : d.type, d]));
   const supportedAgents = new Set(registry.list());
   const platform = options.platform ?? process.platform;
-  return [...new Set([...supportedAgents, ...descriptors.keys()])].map(id => {
+  const agents: AgentStatus[] = [...new Set([...supportedAgents, ...descriptors.keys()])].map(id => {
     const descriptor = descriptors.get(id);
     const argv = registry.resolve(id);
     let binary = discoveryBinary(id, descriptor, argv);
@@ -177,6 +182,24 @@ export function discoverAgents(options: DiscoveryOptions = {}): AgentStatus[] {
       chat_ready: supported && (!!localLaunch(id, options) || (!!path && Array.isArray(argv) && argv[0] === 'npx' && !!findAgentBinary('npx', options))),
     };
   });
+  if (!options.profiles?.length) return agents;
+  // A profile reuses its underlying Agent's binary and readiness; only the id and
+  // label differ, so switching the preset switches the child environment instead of
+  // requiring another installation.
+  const byId = new Map(agents.map(agent => [agent.id, agent]));
+  for (const profile of options.profiles) {
+    const underlying = byId.get(profile.agent);
+    if (!underlying) throw new Error(`Agent profile ${profile.id} uses unknown Agent ${profile.agent}`);
+    const entry: AgentStatus = {
+      ...underlying,
+      id: profile.id,
+      label: profile.label,
+      underlying_agent: profile.agent,
+    };
+    agents.push(entry);
+    byId.set(entry.id, entry);
+  }
+  return agents;
 }
 
 /** Use the same resolved local commands as discovery, including binaries outside PATH. Explicit launches retain runtime fallback behavior. */
