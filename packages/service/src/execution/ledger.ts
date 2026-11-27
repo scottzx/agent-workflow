@@ -6,6 +6,7 @@ import type { CaseRecord } from './cases.js';
 import { caseKey } from './cases.js';
 import type { CaseFact, CaseReceipt } from './externals.js';
 import { TicketError, type Ticket, type TicketChange } from './ticket.js';
+import type { SafeErrorSummary } from '../safe-error-summary.js';
 
 export type ExecutionStatus = 'not_started' | 'submitted' | 'working' | 'input_required' | 'auth_required' | 'completed' | 'failed' | 'canceled' | 'rejected' | 'unknown';
 export type SubmissionStatus = 'prepared' | 'dispatching' | 'accepted' | 'known_not_submitted' | 'submission_unknown';
@@ -63,6 +64,8 @@ export interface LedgerAttempt {
   backendRunRef?: BackendRunRef; submissionStatus: SubmissionStatus; executionStatus: ExecutionStatus;
   providerState?: string; phase?: string; cancellationRequestedAt?: string; checkedAt?: string; stale: boolean;
   createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult; resultHistory?: LedgerResult[];
+  /** The whitelisted failure facts of this round. Absent while the round has not failed. */
+  error?: SafeErrorSummary;
   /** The origin stopped waiting on this round before it ended (it timed out, or the caller itself failed); it may still run or have finished unseen. */
   unwatched?: { at: string; reason: string };
   /** Who asked for this round, when the caller named itself. */
@@ -112,6 +115,8 @@ export interface LedgerObservation {
   executionStatus?: ExecutionStatus; providerState?: string; phase?: string; checkedAt?: string; stale?: boolean;
   resultSummary?: string; structuredResultRef?: unknown; resultDigest?: string; resultRevision?: string;
   artifactLinks?: unknown[]; resultArtifacts?: unknown[]; resultAvailable?: boolean; diagnostic?: string;
+  /** The whitelisted failure facts of a failed round. */
+  error?: SafeErrorSummary;
 }
 export interface LegacyLedgerRecord {
   originSessionId: string; remote: string; taskId: string; contextId?: string; sessionId?: string;
@@ -122,9 +127,13 @@ export interface LegacyLedgerRecord {
 export interface LedgerJobView extends LedgerJob {
   attempts: LedgerAttempt[]; children: LedgerJob[]; result?: LedgerResult; resultHistory: LedgerResult[];
   businessAcceptance?: BusinessAcceptance; acceptanceHistory: BusinessAcceptance[];
+  /** The whitelisted failure facts of the current round. */
+  error?: SafeErrorSummary;
 }
 
 const terminal = new Set<ExecutionStatus>(['completed', 'failed', 'canceled', 'rejected']);
+/** The statuses that may carry failure facts. */
+const failedExecutionStatuses = new Set<ExecutionStatus>(['failed', 'canceled', 'rejected']);
 const statuses = new Set<ExecutionStatus>(['not_started', 'submitted', 'working', 'input_required', 'auth_required', 'completed', 'failed', 'canceled', 'rejected', 'unknown']);
 const clone = <T>(value: T): T => structuredClone(value);
 const now = () => new Date().toISOString();
@@ -353,6 +362,9 @@ export class JobLedger {
     if (input.providerState !== undefined && !conflict) attempt.providerState = input.providerState;
     if (input.phase !== undefined && !conflict) attempt.phase = input.phase;
     if (input.diagnostic !== undefined && !conflict) attempt.diagnostic = input.diagnostic;
+    if (input.error !== undefined && !conflict) attempt.error = clone(input.error);
+    // A non-conflicting transition into a non-failed status carries no failure facts.
+    if (!conflict && input.executionStatus !== undefined && !failedExecutionStatuses.has(input.executionStatus)) delete attempt.error;
     attempt.stale = input.stale ?? false; attempt.checkedAt = timestamp; attempt.updatedAt = timestamp;
     if (!conflict && (input.resultSummary !== undefined || input.structuredResultRef !== undefined || input.resultDigest !== undefined
       || input.artifactLinks !== undefined || input.resultArtifacts !== undefined || input.resultAvailable !== undefined || input.resultRevision !== undefined)) {
@@ -395,7 +407,7 @@ export class JobLedger {
       const previous = clone(attempt), conflict = this.applyObservation(attempt, input);
       // Repeated polling with no changed facts updates checkedAt without growing the immutable event log.
       const relevant = (item: LedgerAttempt) => ({ status: item.executionStatus, providerState: item.providerState, phase: item.phase, stale: item.stale,
-        diagnostic: item.diagnostic, result: item.result ? { ...item.result, observedAt: undefined } : undefined });
+        diagnostic: item.diagnostic, error: item.error, result: item.result ? { ...item.result, observedAt: undefined } : undefined });
       if (canonical(relevant(previous)) !== canonical(relevant(attempt))) this.event(state, state.jobs[attempt.jobId]!, attemptId,
         conflict ? 'attempt.observation_conflict' : previous.executionStatus !== attempt.executionStatus ? 'attempt.state_changed' : 'attempt.result_updated',
         attempt.result?.resultRevision && previous.result?.resultRevision !== attempt.result.resultRevision
@@ -420,6 +432,7 @@ export class JobLedger {
     return clone({ ...job, attempts: Object.values(this.state.attempts).filter(item => item.jobId === jobId),
       children: Object.values(this.state.jobs).filter(item => item.parentJobRef?.sourceId === this.sourceId && item.parentJobRef.jobId === jobId),
       ...(current.result ? { result: current.result } : {}), resultHistory: current.resultHistory ?? [],
+      ...(current.error ? { error: current.error } : {}),
       ...(acceptance ? { businessAcceptance: acceptance } : {}), acceptanceHistory: history });
   }
   list(originSessionId: string): LedgerJobView[] {

@@ -23,6 +23,7 @@ import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
 import { deliveryInstructions, deliveryModeSchema, resolveDefaultJobDirectory, snapshotInstructions, spaceInstructions, type DeliveryMode } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
+import { noticeErrorSummary, safeErrorSummary, safeErrorText, type SafeErrorSummary } from '../safe-error-summary.js';
 import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
@@ -261,6 +262,22 @@ const taskState = (job: Job): string => wire(Task.fromJSON(job.task)).status?.st
 const resultText = (task: Task): string => task.artifacts.flatMap(artifact => artifact.parts
   .filter(part => part.content?.$case === 'text').map(part => part.content!.value)).join('\n') ||
   task.status?.message?.parts.filter(part => part.content?.$case === 'text').map(part => part.content!.value).join('\n') || '';
+/** A task that did not complete, and whose cause the gateway may report. */
+const failedStates = new Set(['TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
+/**
+ * The failure facts of a remote task: its structured error, or a degraded
+ * summary of the status text it published instead. A task that did not fail
+ * has no failure facts, whatever its metadata claims.
+ */
+function failureOf(task: Task): SafeErrorSummary | undefined {
+  if (!failedStates.has(wire(task).status?.state ?? '')) return undefined;
+  const structured = safeErrorSummary((task.metadata?.['1agents'] as { error?: unknown } | undefined)?.error);
+  if (structured) return structured;
+  const text = safeErrorText(task.status?.message?.parts.filter(part => part.content?.$case === 'text')
+    .map(part => part.content!.value).join(' '));
+  if (!text) return undefined;
+  return { category: 'unknown', message: text, retryable: false };
+}
 
 function atomicJson(file: string, value: unknown): void {
   const temp = `${file}.${randomUUID()}.tmp`;
@@ -520,6 +537,7 @@ export class RemoteAgentGateway {
     originSessionId: string; jobId?: string; caseId?: string; purpose?: string; targetId?: string;
     event: SubscriberNotice['event']; eventKey: string; status: string; title?: string; summary?: string;
     artifacts?: SubscriberNotice['artifacts']; handoff?: SubscriberNotice['handoff']; processRequest?: SubscriberNotice['processRequest'];
+    error?: SubscriberNotice['error'];
   }): void {
     if (!this.sessions.healthy) return;
     const matches = (this.state.subscriptions ?? []).filter(sub => {
@@ -552,6 +570,7 @@ export class RemoteAgentGateway {
           ...(input.artifacts?.length ? { artifacts: input.artifacts } : {}),
           ...(input.handoff ? { handoff: input.handoff } : {}),
           ...(input.processRequest ? { processRequest: input.processRequest } : {}),
+          ...(input.error ? { error: input.error } : {}),
         };
         this.sessions.enqueueTarget({
           targetKey: subscriberTargetKey(resolved.host, resolved.sessionId),
@@ -572,6 +591,7 @@ export class RemoteAgentGateway {
     const state = taskState(job);
     const status = this.standardState(state);
     const attemptId = job.attemptId ?? job.taskId;
+    const failure = failureOf(task);
     const base = {
       originSessionId: job.originSessionId, jobId: job.ledgerJobId, caseId: view.caseId, purpose: view.purpose, targetId: view.targetId,
       title: job.title ?? view.title, summary: resultText(task).slice(0, 500),
@@ -579,7 +599,9 @@ export class RemoteAgentGateway {
     };
     if (state === 'TASK_STATE_SUBMITTED') this.fanoutSubscribers({ ...base, event: 'progress', eventKey: `progress:submitted:${attemptId}`, status: 'submitted' });
     if (state === 'TASK_STATE_WORKING') this.fanoutSubscribers({ ...base, event: 'progress', eventKey: `progress:working:${attemptId}`, status: 'working' });
-    if (actionable.has(state)) this.fanoutSubscribers({ ...base, event: 'terminal', eventKey: `terminal:${attemptId}:${status}`, status });
+    // A failed task tells the subscribers why, not only that it ended.
+    if (actionable.has(state)) this.fanoutSubscribers({ ...base, event: 'terminal', eventKey: `terminal:${attemptId}:${status}`, status,
+      ...(failure ? { error: noticeErrorSummary(failure) } : {}) });
   }
   private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; deliveryRecoveryInput?: PptDeliveryRecoveryInput; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
     if (input.handoffId) {
@@ -964,8 +986,15 @@ export class RemoteAgentGateway {
         if (delivery) {
           if (['completed', 'failed', 'canceled'].includes(delivery.executionStatus)) {
             const partial = deliveryException(delivery, delivery.resultSummary ?? delivery.diagnostics.at(-1) ?? 'Delivery terminated');
-            this.ledger.observe(attempt.attemptId, delivery.parentUpdatePending ?? { executionStatus: delivery.executionStatus,
-              phase: delivery.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
+            // A delivery reports its own free-text problem; the ledger keeps that
+            // as a diagnostic and reserves `error` for the structured failure.
+            const pending = delivery.parentUpdatePending;
+            this.ledger.observe(attempt.attemptId, pending
+              ? { executionStatus: pending.executionStatus, phase: pending.phase,
+                ...(pending.resultSummary !== undefined ? { resultSummary: pending.resultSummary } : {}),
+                ...(pending.artifactLinks !== undefined ? { artifactLinks: pending.artifactLinks } : {}),
+                ...(pending.error !== undefined ? { diagnostic: pending.error } : {}) }
+              : { executionStatus: delivery.executionStatus, phase: delivery.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
             delete delivery.parentUpdatePending;
           } else localRuns.push(delivery);
           continue;
@@ -1379,10 +1408,12 @@ export class RemoteAgentGateway {
     const task = Task.fromJSON(job.task);
     const meta = task.metadata?.['1agents'] as { sessionId?: string; preflight?: unknown; result?: unknown; capacity?: unknown; taskSlot?: unknown; processSlot?: unknown; resumed?: unknown; restoreMethod?: unknown; provider?: unknown; model?: unknown } | undefined;
     const result = job.attemptId ? this.ledger.getAttempt(job.attemptId).result : undefined;
+    const failure = failureOf(task);
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
       ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
       cwd: job.cwd, agentPreset: job.agentPreset, sessionId: meta?.sessionId ?? job.sessionId,
       preflight: meta?.preflight, resultMetadata: meta?.result,
+      ...(failure ? { error: failure } : {}),
       ...(meta?.capacity ? { capacity: meta.capacity } : {}),
       ...(meta?.taskSlot ? { taskSlot: meta.taskSlot } : {}),
       ...(meta?.processSlot ? { processSlot: meta.processSlot } : {}),
@@ -1398,9 +1429,11 @@ export class RemoteAgentGateway {
   }
   private resultObservation(task: Task): LedgerObservation {
     const metadata = task.metadata?.['1agents']?.result as A2AResultMetadata | undefined;
+    const failure = failureOf(task);
     return { executionStatus: this.standardState(wire(task).status?.state), providerState: wire(task).status?.state,
       resultSummary: resultText(task), artifactLinks: artifactLinks(task),
-      resultArtifacts: metadata?.artifacts ?? [], ...(metadata?.recordPath ? { structuredResultRef: metadata.recordPath } : {}) };
+      resultArtifacts: metadata?.artifacts ?? [], ...(metadata?.recordPath ? { structuredResultRef: metadata.recordPath } : {}),
+      ...(failure ? { error: failure } : {}) };
   }
   private accept(task: Task, fields: Omit<Job, 'task' | 'taskId' | 'contextId' | 'checkedAt'>): Job {
     const target = task.metadata?.['1agents'] as Record<string, unknown> | undefined;
@@ -1422,12 +1455,14 @@ export class RemoteAgentGateway {
     const state = taskState(job);
     if (actionable.has(state)) {
       const reason = state === 'TASK_STATE_CANCELED' && job.attemptId ? this.state.executionCancellations?.[job.attemptId]?.reason : undefined;
+      const failure = failureOf(task);
       const noticeId = createHash('sha256').update(JSON.stringify([job.remote, job.taskId, state, task.status?.timestamp])).digest('hex');
       if (!this.state.notices.some(value => value.notice.noticeId === noticeId)) this.state.notices.push({
         ...(this.sessions.hasBinding(job.originSessionId) ? { sessionDeliveryId: `a2a-notice:${noticeId}` } : { target: job.notificationTarget }),
         notice: { noticeId, originSessionId: job.originSessionId, remote: job.remote, taskId: job.taskId, contextId: job.contextId,
           cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: reason ? `${reason}\n\n${resultText(task)}`.trim() : resultText(task),
-          ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}), createdAt: new Date().toISOString() } });
+          ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}),
+          ...(failure ? { error: noticeErrorSummary(failure) } : {}), createdAt: new Date().toISOString() } });
     }
     if (job.attemptId) {
       const observed = { ...this.resultObservation(task), stale: false };
