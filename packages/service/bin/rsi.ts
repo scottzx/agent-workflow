@@ -7,12 +7,14 @@ import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate } from '../src/rsi/gate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
+import { calibrateRubric, formatRubricCalibrationText, rubricCalibrationPath } from '../src/rsi/rubric.js';
 import { computeRoleScorecard, formatScorecardText } from '../src/rsi/scorecard.js';
 import { stampActor } from './ticket.js';
 
 const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [options]
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
+       acp-service rsi calibrate --rubric --role DIR --judgments FILE [--workspace DIR] [--json]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
        acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
 
@@ -143,8 +145,24 @@ async function runCalibrate(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, workspace: { type: 'string', default: '.1agents/runtime/rsi' },
     python: { type: 'string' }, only: { type: 'string' },
+    rubric: { type: 'boolean', default: false }, judgments: { type: 'string' }, json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
+  if (values.rubric) {
+    if (!values.judgments) throw new Error('--judgments <jsonl> is required with --rubric');
+    const report = await calibrateRubric({
+      roleDirectory: resolve(values.role),
+      judgmentsPath: resolve(values.judgments),
+      workspace: resolve(values.workspace!),
+    });
+    if (values.json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.log(formatRubricCalibrationText(report));
+      console.log(`校准报告：${rubricCalibrationPath(resolve(values.workspace!), report.roleId)}`);
+    }
+    if (!report.passed) process.exitCode = 1;
+    return;
+  }
   const only = values.only?.split(',').map(item => item.trim()).filter(Boolean);
   const report = await calibrateRole({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!),
     ...(values.python ? { python: values.python } : {}), ...(only?.length ? { only } : {}) });
