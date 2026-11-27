@@ -110,6 +110,14 @@ test('the workbench entry is code-split and only hashed chunks are immutable', a
   assert.match(cssText, /\.acp-workbench-views button[^}]*flex: 0 0 auto/);
   assert.match(cssText, /\.acp-workbench-views button[^}]*white-space: nowrap/);
   assert.match(cssText, /\.acp-header-actions[^}]*flex: 0 0 auto/);
+  // All four desktop split-pane tabs (approvals, cases, tasks, agents) lock to viewport height with independent pane scrolling.
+  assert.match(cssText, /\.acp-workbench:not\(\.is-full-detail\)\s*\{[^}]*height:\s*100dvh;[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*overflow:\s*hidden;/);
+  assert.match(cssText, /\.acp-workbench:not\(\.is-full-detail\)\s*>\s*\.acp-approvals,\s*\.acp-workbench:not\(\.is-full-detail\)\s*>\s*\.acp-agent-module\s*\{[^}]*flex:\s*1;[^}]*min-height:\s*0;[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/);
+  assert.match(cssText, /\.acp-workbench:not\(\.is-full-detail\)\s+\.acp-workbench-body,\s*\.acp-workbench:not\(\.is-full-detail\)\s+\.acp-approvals-split,\s*\.acp-workbench:not\(\.is-full-detail\)\s+\.acp-agent-layout\s*\{[^}]*flex:\s*1;[^}]*min-height:\s*0;[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\);/);
+  for (const pane of ['.acp-workbench-table', '.acp-detail', '.acp-approval-queue', '.acp-approval-detail', '.acp-agent-list', '.acp-agent-detail']) {
+    assert.match(cssText, new RegExp(`\\.acp-workbench:not\\(\\.is-full-detail\\)\\s+\\${pane}[^{]*\\{[^}]*min-height:\\s*0;[^}]*overflow-y:\\s*auto;[^}]*overscroll-behavior:\\s*contain;`));
+  }
+  assert.match(cssText, /@media \(max-width: 768px\)\s*\{[\s\S]*\.acp-workbench:not\(\.is-full-detail\)\s*\{[^}]*height:\s*auto;[^}]*display:\s*block;[^}]*overflow:\s*visible;/);
   const session = await fetch(`${base}/workbench/ui/api/session`);
   assert.equal(session.headers.get('cache-control'), 'no-store');
 

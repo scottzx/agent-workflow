@@ -382,6 +382,7 @@ tbody tr:last-child td { border-bottom: 0; }
   box-shadow: var(--shadow-1);
   overflow: hidden;
 }
+.acp-agent-list:empty { display: none; }
 .acp-agent-list > .acp-button { margin: 8px 8px 0; }
 .acp-agent-list > .acp-button:last-of-type { margin-bottom: 8px; }
 .acp-agent-row {
@@ -434,11 +435,26 @@ tbody tr:last-child td { border-bottom: 0; }
 .acp-chat { height: min(70vh, 640px); border: 1px solid var(--border-color); border-radius: var(--radius); overflow: hidden; }
 .acp-artifact-row { display: inline-flex; gap: 12px; align-items: baseline; }
 
-/* With a detail open, the list and the drawer scroll on their own inside the viewport. */
-.acp-workbench.has-detail:not(.is-full-detail) { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
-.has-detail:not(.is-full-detail) .acp-workbench-body { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
-.has-detail:not(.is-full-detail) .acp-workbench-table, .has-detail:not(.is-full-detail) .acp-detail { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-.has-detail:not(.is-full-detail) .acp-workbench-table { overflow-x: auto; }
+/* On desktop split screens, all four tabs lock to the viewport height so left and right panes scroll independently. */
+.acp-workbench:not(.is-full-detail) { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+.acp-workbench:not(.is-full-detail) > * { flex-shrink: 0; }
+.acp-workbench:not(.is-full-detail) > .acp-approvals,
+.acp-workbench:not(.is-full-detail) > .acp-agent-module { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.acp-workbench:not(.is-full-detail) > .acp-approvals > *,
+.acp-workbench:not(.is-full-detail) > .acp-agent-module > * { flex-shrink: 0; }
+.acp-workbench:not(.is-full-detail) .acp-workbench-body,
+.acp-workbench:not(.is-full-detail) .acp-approvals-split,
+.acp-workbench:not(.is-full-detail) .acp-agent-layout { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); align-items: stretch; }
+.acp-workbench:not(.is-full-detail) .acp-agent-layout { margin-top: 0; }
+.acp-workbench:not(.is-full-detail) .acp-workbench-table,
+.acp-workbench:not(.is-full-detail) .acp-detail,
+.acp-workbench:not(.is-full-detail) .acp-approval-queue,
+.acp-workbench:not(.is-full-detail) .acp-approval-detail,
+.acp-workbench:not(.is-full-detail) .acp-agent-list,
+.acp-workbench:not(.is-full-detail) .acp-agent-detail { min-height: 0; min-width: 0; overflow-y: auto; overscroll-behavior: contain; }
+.acp-workbench:not(.is-full-detail) .acp-workbench-table { overflow-x: auto; }
+.acp-workbench:not(.is-full-detail) .acp-approval-queue,
+.acp-workbench:not(.is-full-detail) .acp-agent-list { overflow-x: hidden; }
 /* Agent markdown sits on the section's text edge. The file-preview CSS is appended after this file, so the
    doubled class is what wins over its .fp-md padding and margins rather than source order. */
 .fp-md.acp-md { padding: 0; }
@@ -452,8 +468,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .acp-case-create { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); }
 .acp-case-create label { display: grid; gap: 4px; font-size: 12px; color: var(--text-muted); flex: 1 1 240px; }
 .acp-case-create input, .acp-case-create select { padding: 6px 8px; border: 1px solid var(--border-color); border-radius: var(--radius-control); background: var(--bg-panel); color: var(--text-main); }
-.acp-case-panel { min-height: 0; display: flex; }
-.acp-case-panel .acp-detail { flex: 1; }
+.acp-case-panel { min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+.acp-case-panel > .acp-error { flex-shrink: 0; }
+.acp-case-panel .acp-detail { flex: 1; min-height: 0; }
 /* With a case open, its list and its detail sit side by side and scroll on their own. */
 .has-case-detail { grid-template-columns: minmax(0, 1fr) minmax(360px, 46%); }
 .has-case-detail .acp-workbench-table { overflow-x: auto; }
@@ -474,7 +491,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .acp-ticket-lights .is-unknown { color: var(--text-muted); }
 .acp-ticket-lights .is-bad, .acp-mode-label.is-locked { color: var(--danger); }
 
-.acp-approvals-split { display: grid; grid-template-columns: minmax(260px, 330px) minmax(0, 1fr); gap: 20px; min-height: 420px; align-items: start; }
+.acp-approvals-split { display: grid; grid-template-columns: minmax(260px, 330px) minmax(0, 1fr); gap: 20px; }
 /* One surface holds the queue; rows are separated by hairlines, not by their own cards. */
 .acp-approval-queue {
   list-style: none;
@@ -814,8 +831,20 @@ tbody tr:last-child td { border-bottom: 0; }
   .acp-agent-layout:not(.is-showing-detail) .acp-agent-detail { display: none; }
   .acp-agent-layout.is-showing-detail .acp-agent-list { display: none; }
   .acp-sticky-actions { bottom: calc(64px + env(safe-area-inset-bottom)); }
-  .acp-workbench.has-detail:not(.is-full-detail) { height: auto; overflow: visible; }
-  .has-detail:not(.is-full-detail) .acp-detail { max-height: none; }
+  .acp-workbench:not(.is-full-detail) { height: auto; display: block; overflow: visible; }
+  .acp-workbench:not(.is-full-detail) > .acp-approvals,
+  .acp-workbench:not(.is-full-detail) > .acp-agent-module { display: block; flex: none; }
+  .acp-workbench:not(.is-full-detail) .acp-workbench-body,
+  .acp-workbench:not(.is-full-detail) .acp-approvals-split,
+  .acp-workbench:not(.is-full-detail) .acp-agent-layout { flex: none; grid-template-rows: auto; align-items: start; }
+  .acp-workbench:not(.is-full-detail) .acp-agent-layout { margin-top: 12px; }
+  .acp-workbench:not(.is-full-detail) .acp-workbench-table,
+  .acp-workbench:not(.is-full-detail) .acp-detail,
+  .acp-workbench:not(.is-full-detail) .acp-approval-detail,
+  .acp-workbench:not(.is-full-detail) .acp-agent-detail { overflow-y: visible; overscroll-behavior: auto; max-height: none; }
+  .acp-workbench:not(.is-full-detail) .acp-workbench-table { overflow-x: visible; }
+  .acp-workbench:not(.is-full-detail) .acp-approval-queue,
+  .acp-workbench:not(.is-full-detail) .acp-agent-list { overflow: hidden; overscroll-behavior: auto; }
 }
 
 @media (prefers-color-scheme: dark) {
