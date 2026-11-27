@@ -435,6 +435,42 @@ test('revisions continue up to three by default, stop early when the same issue 
   assert.equal(ledger[2]!.phase, 'dev'); assert.equal(ledger[2]!.caseKind, 'original');
 });
 
+test('runs started within the same second allocate distinct work directories and clientRequestIds without leaking run-state', async t => {
+  const f = await fixture(t), workspace = join(f.root, 'runs');
+  const frozenNow = () => new Date('2026-11-27T00:00:00.000Z');
+  const seenRequestIds: string[] = [];
+  const runOnce = async (index: number) => {
+    let work = '', reviews = 0;
+    const gw = ticketGateway();
+    return runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
+      targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {}, now: frozenNow,
+      invoke: gw.invoke(async (method, params: any) => {
+        if (typeof params?.clientRequestId === 'string') seenRequestIds.push(params.clientRequestId);
+        if (method === 'execution_submit' && params.title.startsWith('质检')) {
+          reviews++;
+          await writeFile(join(work, 'reviews', `review-r${reviews}.json`), JSON.stringify({
+            verdict: 'pass', summary: `第 ${index} 次通过`, scores: { 吸引力: 4, 具体: 4, 受众: 4, 结构: 4, 可信: 4, 行动: 4 }, issues: [],
+          }));
+          return { jobId: `qa-${index}` };
+        }
+        if (method === 'execution_submit') {
+          work = params.input.cwd;
+          await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+          return { jobId: `job-${index}` };
+        }
+        return { executionStatus: 'completed' };
+      }) });
+  };
+  const first = await runOnce(1);
+  const second = await runOnce(2);
+  assert.equal(first.passed, true);
+  assert.equal(second.passed, true);
+  assert.notEqual(first.workDirectory, second.workDirectory);
+  assert.match(first.workDirectory, /demo-20261127T000000Z$/);
+  assert.match(second.workDirectory, /demo-20261127T000000Z-2$/);
+  assert.equal(new Set(seenRequestIds).size, seenRequestIds.length, 'same-second runs must not reuse clientRequestId values');
+});
+
 test('the gate opens only after consecutive clean passes on the committed role version, and a test run needs a committed role', async t => {
   const f = await fixture(t), workspace = join(f.root, 'runs');
   const git = (...args: string[]) => execFileSync('git', ['-C', f.role, ...args], { encoding: 'utf8' }).trim();
