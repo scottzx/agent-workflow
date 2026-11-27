@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate } from '../src/rsi/gate.js';
+import { formatLearningsLookupText, lookupLearnings } from '../src/rsi/learnings-lookup.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
 import { computeRoleScorecard, formatScorecardText } from '../src/rsi/scorecard.js';
@@ -14,6 +15,7 @@ const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [o
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
+       acp-service rsi lookup --paths FILE1,FILE2 [--repo DIR] [--limit N] [--json]
        acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
@@ -84,6 +86,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   if (argv[0] === 'gate') return runGate(argv.slice(1));
   if (argv[0] === 'calibrate') return runCalibrate(argv.slice(1));
   if (argv[0] === 'scorecard') return runScorecard(argv.slice(1));
+  if (argv[0] === 'lookup') return runLookup(argv.slice(1));
   if (argv[0] === 'eval-cr') return runEvalCr(argv.slice(1));
   if (argv[0] !== 'run') throw new Error('Unknown rsi command; use rsi --help');
   const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
@@ -175,6 +178,34 @@ async function runScorecard(argv: string[]): Promise<void> {
   });
   if (values.json) console.log(JSON.stringify(report, null, 2));
   else console.log(formatScorecardText(report));
+}
+
+async function runLookup(argv: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({ args: argv, strict: true, allowPositionals: true, options: {
+    paths: { type: 'string', multiple: true },
+    repo: { type: 'string' },
+    limit: { type: 'string' },
+    json: { type: 'boolean', default: false },
+  } });
+  const rawPaths = [
+    ...(values.paths ?? []).flatMap(entry => entry.split(',')),
+    ...positionals,
+  ].map(item => item.trim()).filter(Boolean);
+  if (!rawPaths.length) throw new Error('--paths <files> is required');
+  const repoRoot = values.repo ? resolve(values.repo) : await findRepoRoot(process.cwd()).catch(() => resolve('.'));
+  let limit: number | undefined;
+  if (values.limit !== undefined) {
+    const parsed = Number(values.limit);
+    if (!Number.isInteger(parsed) || parsed < 0) throw new Error('--limit must be a non-negative integer');
+    limit = parsed;
+  }
+  const report = await lookupLearnings({
+    repoRoot,
+    paths: rawPaths,
+    ...(limit !== undefined ? { limit } : {}),
+  });
+  if (values.json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatLearningsLookupText(report));
 }
 
 async function runEvalCr(argv: string[]): Promise<void> {

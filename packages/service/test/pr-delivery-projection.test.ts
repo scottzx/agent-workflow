@@ -6,9 +6,10 @@ import { join, resolve, sep } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { roleSkillProfileSchema } from '../src/roles/skills.js';
-import { AGENTS_LOCAL_GENERATED_HEADER, projectRoleToWorktree, validateSkillFrontmatter } from '../src/roles/index.js';
+import { AGENTS_LOCAL_GENERATED_HEADER, projectRoleToWorktree, readRoleRules, validateSkillFrontmatter } from '../src/roles/index.js';
 import { loadChecklist } from '../src/rsi/checklist.js';
-import { loadWorkflow } from '../src/rsi/engine.js';
+import { loadWorkflow, runRoundDag } from '../src/rsi/engine.js';
+import { createLearningsLookupHandler, type LearningsLookupReport } from '../src/rsi/learnings-lookup.js';
 
 const exec = promisify(execFile);
 const repoRoot = resolve(import.meta.dirname, '../../..');
@@ -22,28 +23,48 @@ const gitEnv = {
   GIT_COMMITTER_EMAIL: 'projection-test@example.com',
 };
 const ignoreRules = ['/.agents/skills/*', '!/.agents/skills/autoreview/', '/.claude/', '**/AGENTS.local.md', '**/CLAUDE.local.md'];
+const DEFAULT_AGENTS_MD = [
+  '# Repo Agents',
+  'SENTINEL',
+  '',
+  '<!-- aoci:begin -->',
+  '## AOCI 仓库认知',
+  'DO NOT MODIFY THIS BLOCK',
+  '<!-- aoci:end -->',
+  '',
+].join('\n');
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const result = await exec('git', args, { cwd, env: gitEnv });
   return result.stdout;
 }
 
-async function initRepo(): Promise<{ parent: string; root: string; worktree: string }> {
+async function seedOriginMain(cwd: string): Promise<string> {
+  const head = (await git(cwd, ['rev-parse', 'HEAD'])).trim();
+  await git(cwd, ['update-ref', 'refs/remotes/origin/main', head]);
+  return head;
+}
+
+async function initRepo(): Promise<{ parent: string; root: string; worktree: string; baseSha: string }> {
   const parent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-proj-')));
   const root = join(parent, 'repo');
   const worktree = join(parent, 'wt');
   await mkdir(root);
   await git(root, ['init', '-b', 'main']);
   await writeFile(join(root, '.gitignore'), `${ignoreRules.join('\n')}\n`);
-  await writeFile(join(root, 'AGENTS.md'), 'SENTINEL\n');
+  await writeFile(join(root, 'AGENTS.md'), DEFAULT_AGENTS_MD);
   await writeFile(join(root, 'README.md'), 'anchor\n');
   await git(root, ['add', '.gitignore', 'AGENTS.md', 'README.md']);
   await git(root, ['commit', '--no-gpg-sign', '-m', 'init']);
+  const baseSha = await seedOriginMain(root);
   await git(root, ['worktree', 'add', '-b', 'delivery', worktree]);
-  return { parent, root, worktree };
+  return { parent, root, worktree, baseSha };
 }
 
-async function runGate(worktree: string, extra: string[] = []): Promise<{ status: number; body: { ok: boolean; checks: { id: string; ok: boolean; detail?: string }[] } }> {
+async function runGate(worktree: string, extra: string[] = []): Promise<{
+  status: number;
+  body: { ok: boolean; checks: { id: string; ok: boolean; detail?: string; baseRef?: string; baseSha?: string | null }[] };
+}> {
   try {
     const result = await exec(process.execPath, [gate, '--worktree', worktree, ...extra], { encoding: 'utf8' });
     return { status: 0, body: JSON.parse(result.stdout) };
@@ -63,7 +84,10 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
 
   const workflow = await loadWorkflow(roleDir);
   assert.equal(workflow.schemaVersion, 1);
-  assert.deepEqual(workflow.nodes.map(node => node.id), ['implement', 'l1_gate', 'draft_pr', 'cross_model_cr', 'ready_for_human']);
+  assert.equal(workflow.entry, 'implement');
+  assert.deepEqual(workflow.nodes.map(node => node.id), ['learnings_lookup', 'implement', 'l1_gate', 'draft_pr', 'cross_model_cr', 'ready_for_human']);
+  assert.deepEqual(workflow.nodes.find(node => node.id === 'implement')?.dependsOn, ['learnings_lookup']);
+  assert.equal(workflow.nodes.find(node => node.id === 'learnings_lookup')?.type, 'learnings_lookup');
   assert.equal(workflow.cycles.programBounce.when, 'block_failed');
   assert.equal(workflow.cycles.programBounce.from, 'l1_gate');
   assert.equal(workflow.cycles.qaRevise.when, 'verdict_revise');
@@ -77,9 +101,15 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
   assert.equal(checklist.roleId, 'pr-delivery');
   assert.deepEqual(checklist.artifacts, ['commit']);
   const ids = checklist.items.map(item => item.id);
-  for (const id of ['self_check', 'l1_deterministic', 'cross_model_cr', 'ci_status', 'proj_git_anchor', 'proj_skill_frontmatter', 'proj_claude_symlink', 'proj_agents_local_header', 'proj_no_hooks']) {
+  for (const id of [
+    'self_check', 'l1_deterministic', 'cross_model_cr', 'ci_status',
+    'proj_git_anchor', 'proj_skill_frontmatter', 'proj_claude_symlink', 'proj_agents_local_header', 'proj_no_hooks',
+    'learnings_lookup', 'aoci_block_immutable',
+  ]) {
     assert.ok(ids.includes(id), id);
   }
+  assert.equal(checklist.items.find(item => item.id === 'learnings_lookup')?.modePolicy?.trial, 'observe');
+  assert.deepEqual(checklist.items.find(item => item.id === 'aoci_block_immutable')?.dependsOn, ['l1_deterministic']);
   assert.equal(checklist.items.find(item => item.id === 'self_check')?.kind, 'self');
   assert.equal(checklist.items.find(item => item.id === 'l1_deterministic')?.kind, 'program');
   assert.equal(checklist.items.find(item => item.id === 'cross_model_cr')?.kind, 'self_and_qa');
@@ -247,9 +277,11 @@ test('l1-gate blocks a forced add and allows a tracked .agents edit', async t =>
   await mkdir(join(staged, '.agents/skills/foo'), { recursive: true });
   await git(staged, ['init', '-b', 'main']);
   await writeFile(join(staged, 'README.md'), 'anchor\n');
+  await writeFile(join(staged, 'AGENTS.md'), DEFAULT_AGENTS_MD);
   await writeFile(join(staged, '.gitignore'), `${ignoreRules.join('\n')}\n`);
-  await git(staged, ['add', 'README.md', '.gitignore']);
+  await git(staged, ['add', 'README.md', 'AGENTS.md', '.gitignore']);
   await git(staged, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await seedOriginMain(staged);
   await writeFile(join(staged, '.agents/skills/foo/SKILL.md'), '---\nname: foo\ndescription: x\n---\n');
   await git(staged, ['add', '-f', '.agents/skills/foo/SKILL.md']);
   const addedSkill = await runGate(staged);
@@ -266,9 +298,11 @@ test('l1-gate blocks a forced add and allows a tracked .agents edit', async t =>
   const tracked = join(parent, 'tracked');
   await mkdir(join(tracked, '.agents/skills/autoreview'), { recursive: true });
   await git(tracked, ['init', '-b', 'main']);
+  await writeFile(join(tracked, 'AGENTS.md'), DEFAULT_AGENTS_MD);
   await writeFile(join(tracked, '.agents/skills/autoreview/test.md'), 'v1\n');
-  await git(tracked, ['add', '.agents/skills/autoreview/test.md']);
+  await git(tracked, ['add', 'AGENTS.md', '.agents/skills/autoreview/test.md']);
   await git(tracked, ['commit', '--no-gpg-sign', '-m', 'track']);
+  await seedOriginMain(tracked);
   await writeFile(join(tracked, '.agents/skills/autoreview/test.md'), 'v2\n');
   const edited = await runGate(tracked);
   assert.equal(edited.status, 0, JSON.stringify(edited.body));
@@ -395,8 +429,10 @@ test('l1-gate allows a config example and still rejects a forced local secret', 
   await mkdir(join(root, '.1agents/config'), { recursive: true });
   await git(root, ['init', '-b', 'main']);
   await writeFile(join(root, 'README.md'), 'anchor\n');
-  await git(root, ['add', 'README.md']);
+  await writeFile(join(root, 'AGENTS.md'), DEFAULT_AGENTS_MD);
+  await git(root, ['add', 'README.md', 'AGENTS.md']);
   await git(root, ['commit', '--no-gpg-sign', '-m', 'init']);
+  await seedOriginMain(root);
   await writeFile(join(root, '.1agents/config/new.example.json'), '{}\n');
   const untracked = await runGate(root);
   assert.equal(untracked.status, 0, JSON.stringify(untracked.body));
@@ -411,4 +447,168 @@ test('l1-gate allows a config example and still rejects a forced local secret', 
   assert.equal(secret.status, 1);
   assert.equal(secret.body.ok, false);
   assert.match(secret.body.checks.find(item => item.id === 'git-status')?.detail ?? '', /host\.local\.json/);
+});
+
+test('l1-gate aoci_block_immutable fails closed without origin/main and defeats committed & --base-ref cheats', async t => {
+  const repo = await initRepo();
+  t.after(() => rm(repo.parent, { recursive: true, force: true }));
+
+  // Clean baseline passes and exposes baseRef + baseSha in JSON summary.
+  const baseline = await runGate(repo.worktree);
+  assert.equal(baseline.status, 0, JSON.stringify(baseline.body));
+  const baselineCheck = baseline.body.checks.find(item => item.id === 'aoci_block_immutable');
+  assert.equal(baselineCheck?.ok, true);
+  assert.equal(baselineCheck?.baseRef, 'origin/main');
+  assert.equal(baselineCheck?.baseSha, repo.baseSha);
+
+  // Case 5: committing an index line strictly OUTSIDE the AOCI block passes (exit 0).
+  const outsideEdited = DEFAULT_AGENTS_MD.replace('SENTINEL', 'SENTINEL\n知识层索引见 docs/solutions/README.md');
+  await writeFile(join(repo.worktree, 'AGENTS.md'), outsideEdited);
+  await git(repo.worktree, ['add', 'AGENTS.md']);
+  await git(repo.worktree, ['commit', '--no-gpg-sign', '-m', 'add index outside aoci block']);
+  const outsideResult = await runGate(repo.worktree);
+  assert.equal(outsideResult.status, 0, JSON.stringify(outsideResult.body));
+  assert.equal(outsideResult.body.checks.find(item => item.id === 'aoci_block_immutable')?.ok, true);
+
+  // Create a diverged branch from baseSha that ALSO modifies the AOCI block (anti-cheat Case 4).
+  await git(repo.root, ['checkout', '-b', 'diverged-evil', repo.baseSha]);
+  await writeFile(join(repo.root, 'AGENTS.md'), DEFAULT_AGENTS_MD.replace('DO NOT MODIFY THIS BLOCK', 'DO NOT MODIFY THIS BLOCX'));
+  await git(repo.root, ['add', 'AGENTS.md']);
+  await git(repo.root, ['commit', '--no-gpg-sign', '-m', 'evil base modifies aoci']);
+  await git(repo.root, ['checkout', 'main']);
+
+  // Commit a 1-character change INSIDE the AOCI block on the delivery worktree branch.
+  await writeFile(join(repo.worktree, 'AGENTS.md'), outsideEdited.replace('DO NOT MODIFY THIS BLOCK', 'DO NOT MODIFY THIS BLOCX'));
+  await git(repo.worktree, ['add', 'AGENTS.md']);
+  await git(repo.worktree, ['commit', '--no-gpg-sign', '-m', 'modify 1 char inside aoci block']);
+  const cheatSha = (await git(repo.worktree, ['rev-parse', 'HEAD'])).trim();
+
+  // Case 1: default merge-base(HEAD, origin/main) catches committed 1-char edit inside AOCI block.
+  const case1 = await runGate(repo.worktree);
+  assert.equal(case1.status, 1, JSON.stringify(case1.body));
+  assert.equal(case1.body.checks.find(item => item.id === 'aoci_block_immutable')?.ok, false);
+
+  // Case 2: passing --base-ref HEAD cannot bypass the check.
+  const case2 = await runGate(repo.worktree, ['--base-ref', 'HEAD']);
+  assert.equal(case2.status, 1, JSON.stringify(case2.body));
+  assert.equal(case2.body.checks.find(item => item.id === 'aoci_block_immutable')?.ok, false);
+
+  // Case 3: passing --base-ref <committed SHA> cannot bypass the check.
+  const case3 = await runGate(repo.worktree, ['--base-ref', cheatSha]);
+  assert.equal(case3.status, 1, JSON.stringify(case3.body));
+  assert.equal(case3.body.checks.find(item => item.id === 'aoci_block_immutable')?.ok, false);
+
+  // Case 4: passing a diverged branch sharing merge-base with HEAD that also edited AOCI still reads baseSha and fails.
+  const case4 = await runGate(repo.worktree, ['--base-ref', 'diverged-evil']);
+  assert.equal(case4.status, 1, JSON.stringify(case4.body));
+  const check4 = case4.body.checks.find(item => item.id === 'aoci_block_immutable');
+  assert.equal(check4?.ok, false);
+  assert.equal(check4?.baseRef, 'diverged-evil');
+  assert.equal(check4?.baseSha, repo.baseSha);
+
+  // Missing origin/main fails closed (never skipped).
+  const noOriginParent = await realpath(await mkdtemp(join(tmpdir(), 'pr-delivery-no-origin-')));
+  t.after(() => rm(noOriginParent, { recursive: true, force: true }));
+  const noOriginRepo = join(noOriginParent, 'repo');
+  await mkdir(noOriginRepo);
+  await git(noOriginRepo, ['init', '-b', 'main']);
+  await writeFile(join(noOriginRepo, 'AGENTS.md'), DEFAULT_AGENTS_MD);
+  await git(noOriginRepo, ['add', 'AGENTS.md']);
+  await git(noOriginRepo, ['commit', '--no-gpg-sign', '-m', 'init']);
+  const missingOrigin = await runGate(noOriginRepo);
+  assert.equal(missingOrigin.status, 1, JSON.stringify(missingOrigin.body));
+  const missingCheck = missingOrigin.body.checks.find(item => item.id === 'aoci_block_immutable');
+  assert.equal(missingCheck?.ok, false);
+  assert.equal('skipped' in (missingCheck ?? {}), false);
+});
+
+test('pr-delivery workflow runs learnings_lookup strictly before implement with <=3 recall and trial/formal enforcement', async t => {
+  const workDir = await mkdtemp(join(tmpdir(), 'pr-delivery-dag-'));
+  t.after(() => rm(workDir, { recursive: true, force: true }));
+
+  const rules = await readRoleRules({ projectRoot: repoRoot, roleId: 'pr-delivery', phase: 'all' });
+  const workflow = await loadWorkflow(rules.roleDir);
+  assert.ok(rules.checklist);
+
+  // Seed a temporary repo with 5 active knowledge entries to verify <=3 recall cap.
+  const sampleRepo = join(workDir, 'sample-repo');
+  await mkdir(join(sampleRepo, 'docs/solutions/rsi'), { recursive: true });
+  for (let i = 1; i <= 5; i += 1) {
+    await writeFile(
+      join(sampleRepo, `docs/solutions/rsi/lesson-${i}.md`),
+      `---\nmodule: packages/service/src/rsi\ntags: [rsi, outline, lookup]\nproblem_type: regression\nstatus: active\nsource: PR #2${i}\npaths:\n  - packages/service/src/rsi/\n---\n# Lesson ${i}\nConstraint number ${i} for RSI modules.\n`,
+    );
+  }
+
+  const calls: string[] = [];
+  const okRun = await runRoundDag({
+    workflow,
+    round: 1,
+    workDirectory: join(workDir, 'run-ok'),
+    mode: 'trial',
+    checklist: rules.checklist,
+    handlersById: {
+      learnings_lookup: async ctx => {
+        calls.push(ctx.node.id);
+        return createLearningsLookupHandler({
+          repoRoot: sampleRepo,
+          paths: ['packages/service/src/rsi/engine.ts'],
+        })(ctx);
+      },
+      implement: async ctx => { calls.push(ctx.node.id); return { status: 'completed' }; },
+      l1_gate: async ctx => { calls.push(ctx.node.id); return { results: [{ itemId: 'l1_deterministic', pass: true, evidence: [] }] }; },
+      draft_pr: async ctx => { calls.push(ctx.node.id); return { status: 'completed' }; },
+      cross_model_cr: async ctx => { calls.push(ctx.node.id); return { status: 'completed' }; },
+      ready_for_human: async ctx => { calls.push(ctx.node.id); return { status: 'completed' }; },
+    },
+  });
+  assert.equal(okRun.blocked, false);
+  assert.equal(okRun.checksPassed, true);
+  assert.ok(calls.indexOf('learnings_lookup') >= 0);
+  assert.ok(calls.indexOf('implement') > calls.indexOf('learnings_lookup'));
+  const lookupOutput = okRun.records.find(r => r.nodeId === 'learnings_lookup')?.output as LearningsLookupReport;
+  assert.equal(lookupOutput.matches.length, 3);
+
+  // Dual check: learnings_lookup failure via results is non-blocking in trial, blocking in formal.
+  const failingLookup = async () => ({
+    results: [{ itemId: 'learnings_lookup', pass: false, evidence: ['index parse error'] }],
+  });
+  const trialCalls: string[] = [];
+  const trialFail = await runRoundDag({
+    workflow,
+    round: 1,
+    workDirectory: join(workDir, 'run-trial-fail'),
+    mode: 'trial',
+    checklist: rules.checklist,
+    handlersById: {
+      learnings_lookup: async ctx => { trialCalls.push(ctx.node.id); return failingLookup(); },
+      implement: async ctx => { trialCalls.push(ctx.node.id); return { status: 'completed' }; },
+      l1_gate: async ctx => { trialCalls.push(ctx.node.id); return { results: [{ itemId: 'l1_deterministic', pass: true, evidence: [] }] }; },
+      draft_pr: async ctx => { trialCalls.push(ctx.node.id); return { status: 'completed' }; },
+      cross_model_cr: async ctx => { trialCalls.push(ctx.node.id); return { status: 'completed' }; },
+      ready_for_human: async ctx => { trialCalls.push(ctx.node.id); return { status: 'completed' }; },
+    },
+  });
+  assert.equal(trialFail.blocked, false, 'trial observe failure must not block');
+  assert.ok(trialCalls.includes('implement'), 'implement still runs in trial when learnings_lookup fails');
+
+  const formalCalls: string[] = [];
+  const formalFail = await runRoundDag({
+    workflow,
+    round: 1,
+    workDirectory: join(workDir, 'run-formal-fail'),
+    mode: 'formal',
+    checklist: rules.checklist,
+    handlersById: {
+      learnings_lookup: async ctx => { formalCalls.push(ctx.node.id); return failingLookup(); },
+      implement: async ctx => { formalCalls.push(ctx.node.id); return { status: 'completed' }; },
+      l1_gate: async ctx => { formalCalls.push(ctx.node.id); return { results: [{ itemId: 'l1_deterministic', pass: true, evidence: [] }] }; },
+      draft_pr: async ctx => { formalCalls.push(ctx.node.id); return { status: 'completed' }; },
+      cross_model_cr: async ctx => { formalCalls.push(ctx.node.id); return { status: 'completed' }; },
+      ready_for_human: async ctx => { formalCalls.push(ctx.node.id); return { status: 'completed' }; },
+    },
+  });
+  assert.equal(formalFail.blocked, true, 'formal enforceObserveAsBlock must block on learnings_lookup failure');
+  assert.equal(formalCalls.includes('implement'), false, 'implement must be skipped when formal learnings_lookup fails');
+  assert.equal(formalFail.records.find(r => r.nodeId === 'implement')?.status, 'skipped');
 });

@@ -72,6 +72,22 @@
       "severity": "must",
       "locked": true,
       "rule": "worktree 中不得出现 .agents/hooks/。本流程不使用钩子目录，也不依赖 ~/.dsh/.agent-presets/"
+    },
+    {
+      "id": "learnings_lookup",
+      "kind": "program",
+      "severity": "must",
+      "locked": true,
+      "modePolicy": { "trial": "observe" },
+      "rule": "开工前按目标文件路径检索 docs/solutions/ 与 rejected-edits.jsonl，召回不超过 3 条活跃历史约束（trial 为 observe 不阻断，formal 自动阻断）"
+    },
+    {
+      "id": "aoci_block_immutable",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": "AGENTS.md 中 <!-- aoci:begin --> 至 <!-- aoci:end --> 区块字节相对 merge-base(HEAD, origin/main) 基线不可改写（基线或 origin/main 缺失时 fail-closed 返回非 0）"
     }
   ]
 }
