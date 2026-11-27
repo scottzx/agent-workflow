@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { qualityReviewSchema } from '../src/execution/ticket.js';
 import { checkGate } from '../src/rsi/gate.js';
 import {
+  digestPairwiseVotes,
   evaluatePairwiseRegression,
   pairwiseRegressionPath,
   readPairwiseRegression,
@@ -188,7 +189,7 @@ test('evaluatePairwiseRegression enforces AB/BA swap, dual-judge tie on disagree
   assert.equal(biasedReport.ties, 2);
   assert.equal(biasedReport.winRate, 0.4);
 
-  // Single judge, missing BA direction, or cross-criterion splice (AB on R1 + BA on R2 without matching pairs) all fail closed.
+  // Single judge, missing BA direction, cross-criterion splice, or cherry-picking a single criterion subset (R1 only, missing R2..R6,R8) all fail closed.
   const incompleteReport = evaluatePairwiseRegression({
     rubric,
     rubricDigest: digest,
@@ -200,10 +201,26 @@ test('evaluatePairwiseRegression enforces AB/BA swap, dual-judge tie on disagree
       { caseId: 'c-cross-crit-splice', judgeId: 'anthropic:claude', order: 'BA', winner: 'B', criterionId: 'R2' },
       { caseId: 'c-cross-crit-splice', judgeId: 'openai:gpt', order: 'AB', winner: 'A', criterionId: 'R1' },
       { caseId: 'c-cross-crit-splice', judgeId: 'openai:gpt', order: 'BA', winner: 'B', criterionId: 'R2' },
+      { caseId: 'c-single-crit-subset', judgeId: 'anthropic:claude', order: 'AB', winner: 'A', criterionId: 'R1' },
+      { caseId: 'c-single-crit-subset', judgeId: 'anthropic:claude', order: 'BA', winner: 'B', criterionId: 'R1' },
+      { caseId: 'c-single-crit-subset', judgeId: 'openai:gpt', order: 'AB', winner: 'A', criterionId: 'R1' },
+      { caseId: 'c-single-crit-subset', judgeId: 'openai:gpt', order: 'BA', winner: 'B', criterionId: 'R1' },
     ],
   });
   assert.equal(incompleteReport.passed, false);
-  assert.deepEqual(incompleteReport.incompleteCases.sort(), ['c-cross-crit-splice', 'c-missing-ba', 'c-one-judge']);
+  assert.deepEqual(incompleteReport.incompleteCases.sort(), ['c-cross-crit-splice', 'c-missing-ba', 'c-one-judge', 'c-single-crit-subset']);
+
+  // Unknown criterionId (not in rubric.criteria) throws immediately.
+  assert.throws(() => evaluatePairwiseRegression({
+    rubric,
+    rubricDigest: digest,
+    votes: [
+      { caseId: 'x1', judgeId: 'anthropic:claude', order: 'AB', winner: 'A', criterionId: 'R9' },
+      { caseId: 'x1', judgeId: 'anthropic:claude', order: 'BA', winner: 'B', criterionId: 'R9' },
+      { caseId: 'x1', judgeId: 'openai:gpt', order: 'AB', winner: 'A', criterionId: 'R9' },
+      { caseId: 'x1', judgeId: 'openai:gpt', order: 'BA', winner: 'B', criterionId: 'R9' },
+    ],
+  }), /unknown rubric criterion "R9"/);
 
   // Duplicate vote throws; rubric trying to lower minWinRate below 0.6 throws.
   assert.throws(() => evaluatePairwiseRegression({
@@ -259,7 +276,7 @@ test('pairwise CLI, report persistence, and checkGate rubricDigest binding', asy
   assert.equal(gateOk.pairwiseRegression?.status, 'passed');
   assert.equal(gateOk.pairwiseRegression?.winRate, 0.8);
 
-  // M2: tampering pairwise-regression.json invariants or self-attesting passed=true on losing votes MUST fail in checkGate.
+  // M2a: tampering config invariants is rejected by guard.
   const savedPath = pairwiseRegressionPath(workspace, 'product-intro-outline');
   const savedOriginal = JSON.parse(await readFile(savedPath, 'utf8')) as Record<string, unknown>;
   const tamperedInvariants = {
@@ -276,6 +293,33 @@ test('pairwise CLI, report persistence, and checkGate rubricDigest binding', asy
   const gateTampered = await checkGate({ roleDirectory: roleCopy, workspace, requirePairwise: true });
   assert.equal(gateTampered.pairwiseRegression?.status, 'failed');
   assert.ok(gateTampered.reasons.some(r => r.includes('策略不变量或投票摘要校验失败')));
+
+  // M2b: valid config invariants + validly re-signed votesDigest on ALL-LOSING votes + forged passed=true MUST fail via in-process re-evaluation!
+  const losingVotes: PairwiseVote[] = [
+    ...makeConsistentCase('loss-1', 'baseline'),
+    ...makeConsistentCase('loss-2', 'baseline'),
+  ];
+  const forgedReeval = {
+    ...savedOriginal,
+    votes: losingVotes,
+    votesDigest: digestPairwiseVotes(losingVotes),
+    passed: true,
+    promotionReady: true,
+    failureReasons: [],
+  };
+  await writeFile(savedPath, JSON.stringify(forgedReeval, null, 2));
+  const gateForgedReeval = await checkGate({ roleDirectory: roleCopy, workspace, requirePairwise: true });
+  assert.equal(gateForgedReeval.pairwiseRegression?.status, 'failed');
+  assert.equal(gateForgedReeval.pairwiseRegression?.winRate, 0);
+  assert.ok(gateForgedReeval.reasons.some(r => r.includes('Pairwise A/B 换位双评回归未通过')));
+
+  // M2c: broken votesDigest is rejected.
+  const badDigest = { ...savedOriginal, votesDigest: '0'.repeat(64) };
+  await writeFile(savedPath, JSON.stringify(badDigest, null, 2));
+  const gateBadDigest = await checkGate({ roleDirectory: roleCopy, workspace, requirePairwise: true });
+  assert.equal(gateBadDigest.pairwiseRegression?.status, 'failed');
+  assert.ok(gateBadDigest.reasons.some(r => r.includes('策略不变量或投票摘要校验失败')));
+
   // Restore clean report before staleness test.
   await writeFile(savedPath, JSON.stringify(savedOriginal, null, 2));
 

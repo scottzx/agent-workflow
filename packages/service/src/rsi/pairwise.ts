@@ -177,8 +177,15 @@ export function evaluatePairwiseRegression(options: {
   }
   const minWinRate = declaredMinWinRate;
   const minJudges = POLICY_MIN_PAIRWISE_JUDGES;
+  const knownCriteria = new Set(options.rubric.criteria.map(c => c.id));
   const abstainOn = [...new Set(pw?.abstainOn ?? [])];
+  for (const cid of abstainOn) {
+    if (!knownCriteria.has(cid)) {
+      throw new Error(`rubric.json pairwise.abstainOn references unknown criterion "${cid}"`);
+    }
+  }
   const abstainSet = new Set(abstainOn);
+  const requiredCriteria = options.rubric.criteria.map(c => c.id).filter(id => !abstainSet.has(id));
 
   const normalizedVotes = options.votes.map(vote => pairwiseVoteSchema.parse(vote));
   const seenKeys = new Set<string>();
@@ -186,6 +193,9 @@ export function evaluatePairwiseRegression(options: {
   let abstainedVotes = 0;
 
   for (const vote of normalizedVotes) {
+    if (vote.criterionId !== undefined && !knownCriteria.has(vote.criterionId)) {
+      throw new Error(`Pairwise vote references unknown rubric criterion "${vote.criterionId}"`);
+    }
     const key = `${vote.caseId}\0${vote.judgeId}\0${vote.order}\0${vote.criterionId ?? ''}`;
     if (seenKeys.has(key)) {
       throw new Error(`Duplicate pairwise vote for (${vote.caseId}, ${vote.judgeId}, ${vote.order}${vote.criterionId ? `, ${vote.criterionId}` : ''})`);
@@ -245,6 +255,9 @@ export function evaluatePairwiseRegression(options: {
     let casePositionFlips = 0;
     let hasIncompleteJudge = false;
 
+    const caseHasCriterionVotes = [...judgeMap.values()].some(cm => [...cm.keys()].some(k => k !== ''));
+    const caseHasHolisticVotes = [...judgeMap.values()].some(cm => cm.has(''));
+
     for (const judgeId of [...judgeMap.keys()].sort()) {
       const critMap = judgeMap.get(judgeId)!;
       const abAll: LogicalWinner[] = [];
@@ -252,6 +265,20 @@ export function evaluatePairwiseRegression(options: {
       const critOutcomes: LogicalWinner[] = [];
       let judgeIncomplete = false;
       let judgeFlipped = false;
+
+      // Mixing holistic and per-criterion votes within the same case fails closed as incomplete.
+      if (caseHasCriterionVotes && caseHasHolisticVotes) {
+        judgeIncomplete = true;
+      }
+      // When per-criterion votes are used, every judge must cover ALL non-abstained rubric criteria in both AB and BA.
+      if (caseHasCriterionVotes) {
+        for (const reqCid of requiredCriteria) {
+          const reqPair = critMap.get(reqCid);
+          if (!reqPair || reqPair.AB === undefined || reqPair.BA === undefined) {
+            judgeIncomplete = true;
+          }
+        }
+      }
 
       for (const [, pair] of [...critMap.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
         if (pair.AB !== undefined) abAll.push(pair.AB);
