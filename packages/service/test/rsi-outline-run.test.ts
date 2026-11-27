@@ -800,3 +800,41 @@ test('a run the training stopped by its own rules does not resume', async t => {
   await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard',
     originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, resume: work, invoke: gw.invoke(async () => ({})) }), /training's rules/);
 });
+
+test('runOutlineCase records observe-only route, usage, durationMs, env and reworkRounds on the ledger', async t => {
+  const f = await fixture(t), gw = ticketGateway();
+  const workspace = join(f.root, 'runs');
+  let work = '', tick = 0;
+  const times = [new Date('2026-11-27T10:00:00.000Z'), new Date('2026-11-27T10:00:01.000Z'), new Date('2026-11-27T10:00:02.000Z'), new Date('2026-11-27T10:00:05.500Z')];
+  const now = () => times[Math.min(tick++, times.length - 1)]!;
+  const report = await runOutlineCase({
+    roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 120_000,
+    route: { provider: 'magpie', model: 'group/deepseek-v4.1' }, concurrency: 2, now,
+    invoke: gw.invoke(async (method, params: any) => {
+      if (method === 'execution_submit') {
+        work = params.input.cwd;
+        await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit, 'Arial')));
+        return { jobId: 'job-m1' };
+      }
+      if (method === 'execution_continue') {
+        await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        handleTicket(gw.round('job-m1'), '改为微软雅黑');
+        return { jobId: 'job-m1' };
+      }
+      return { executionStatus: 'completed', usage: { promptTokens: 400, completionTokens: 150, costUsd: 0.015 } };
+    }),
+  });
+  assert.equal(report.passed, true);
+  assert.equal(report.rounds.length, 2);
+  const lines = (await readFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as LedgerEntry);
+  const entry = lines.at(-1)!;
+  assert.deepEqual(entry.route, { provider: 'magpie', model: 'group/deepseek-v4.1' });
+  assert.deepEqual(entry.usage, { promptTokens: 800, completionTokens: 300, costUsd: 0.03 });
+  assert.equal(entry.durationMs, 5500);
+  assert.equal(entry.reworkRounds, 1);
+  assert.equal(entry.env?.nodeVersion, process.version);
+  assert.equal(entry.env?.timeoutMs, 120_000);
+  assert.equal(entry.env?.concurrency, 2);
+  assert.ok(entry.env?.harnessVersion);
+});

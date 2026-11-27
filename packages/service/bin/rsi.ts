@@ -7,11 +7,13 @@ import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate } from '../src/rsi/gate.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
 import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
+import { computeRoleScorecard, formatScorecardText } from '../src/rsi/scorecard.js';
 import { stampActor } from './ticket.js';
 
 const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [options]
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
+       acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
        acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
@@ -79,6 +81,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
   if (argv[0] === 'gate') return runGate(argv.slice(1));
   if (argv[0] === 'calibrate') return runCalibrate(argv.slice(1));
+  if (argv[0] === 'scorecard') return runScorecard(argv.slice(1));
   if (argv[0] === 'eval-cr') return runEvalCr(argv.slice(1));
   if (argv[0] !== 'run') throw new Error('Unknown rsi command; use rsi --help');
   const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
@@ -150,6 +153,23 @@ async function runCalibrate(argv: string[]): Promise<void> {
   console.log(`校准报告：${calibrationPath(resolve(values.workspace!), report.roleId)}`);
   console.log(report.passed ? '回放校准通过（历史正样本 0 误报）。' : '回放校准未通过：历史正样本有误报。');
   if (!report.passed) process.exitCode = 1;
+}
+
+async function runScorecard(argv: string[]): Promise<void> {
+  const { values } = parseArgs({ args: argv, strict: true, options: {
+    role: { type: 'string' },
+    workspace: { type: 'string', default: '.1agents/runtime/rsi' },
+    since: { type: 'string' },
+    json: { type: 'boolean', default: false },
+  } });
+  if (!values.role) throw new Error('--role is required');
+  const report = await computeRoleScorecard({
+    roleDirectory: resolve(values.role),
+    workspace: resolve(values.workspace!),
+    ...(values.since ? { since: values.since } : {}),
+  });
+  if (values.json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatScorecardText(report));
 }
 
 async function runEvalCr(argv: string[]): Promise<void> {

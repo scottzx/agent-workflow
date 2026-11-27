@@ -9,8 +9,10 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { appendFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { checkResultSchema, pendingItems, qualityReviewSchema, type QualityReview, type CheckResult, type Ticket, unsettledMust } from '../execution/ticket.js';
 import { loadChecklist, renderExecutorChecklistPrompt, renderQaChecklistPrompt, toTicketSelfChecks } from './checklist.js';
@@ -57,6 +59,13 @@ export interface OutlineRunReport {
   /** The host error that stopped the run. */
   error?: string;
 }
+/** Model route metadata recorded on a run (observe-only). */
+export interface RunRoute { provider?: string; model?: string }
+/** Token and cost metrics recorded on a run when reported by the gateway/executor. */
+export interface RunUsage { promptTokens?: number; completionTokens?: number; costUsd?: number }
+/** Runtime environment snapshot recorded on a run for cross-run comparability. */
+export interface RunEnvironment { harnessVersion?: string; nodeVersion?: string; concurrency?: number; timeoutMs?: number }
+
 /** One line of `<workspace>/<role>/ledger.jsonl`. */
 export interface LedgerEntry {
   startedAt: string; phase: Phase; caseId: string; caseKind: 'original' | 'variant'; role: RoleVersion; passed: boolean; stopReason: StopReason;
@@ -67,6 +76,12 @@ export interface LedgerEntry {
   jobId?: string; originSessionId?: string;
   /** SHA-256 of checklist.json and checks/ at this run, so a later version can see whether the rules changed. */
   checksDigest?: string;
+  /** Optional observe-only run metrics (backward-compatible with legacy ledger rows). */
+  route?: RunRoute;
+  usage?: RunUsage;
+  durationMs?: number;
+  env?: RunEnvironment;
+  reworkRounds?: number;
 }
 export interface OutlineRunOptions {
   roleDirectory: string; caseId: string; projectPath: string; workspace: string;
@@ -75,6 +90,9 @@ export interface OutlineRunOptions {
   targetId: string; agentPreset: string; originSessionId: string;
   /** Times a failed check goes back to the executor. The design default is one. */
   maxBounces?: number; pollMs?: number; timeoutMs?: number; python?: string;
+  /** Optional model route metadata and concurrency hint recorded on the ledger (observe-only). */
+  route?: RunRoute;
+  concurrency?: number;
   /** How to run acp-service: the executor's ticket commands, and the coach's answer to a process request. */
   cli?: { command: string; url: string };
   /** A QA agent reviews each outline that passes the program checks and may send it back for revision, by default up to three times. */
@@ -90,6 +108,58 @@ export interface OutlineRunOptions {
 /** Runs that stopped because something did not finish; the others stopped by the training's rules. */
 const RESUMABLE: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 const terminal = new Set(['completed', 'failed', 'canceled', 'rejected']);
+
+function readHarnessVersion(): string | undefined {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const rel of ['../../package.json', '../../../package.json']) {
+    try {
+      const pkg = JSON.parse(readFileSync(path.resolve(here, rel), 'utf8')) as { name?: string; version?: string };
+      if (pkg.name === '@1agents/acp-service' && typeof pkg.version === 'string' && pkg.version.trim()) return pkg.version.trim();
+    } catch { /* try next candidate */ }
+  }
+  return undefined;
+}
+const HARNESS_VERSION = readHarnessVersion();
+
+const nonEmptyString = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+const nonNegativeNumber = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+
+function extractRoute(value: unknown): RunRoute | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const routeObj = (record.route && typeof record.route === 'object' ? record.route : undefined) as Record<string, unknown> | undefined;
+  const targetObj = (record.targetSnapshot && typeof record.targetSnapshot === 'object' ? record.targetSnapshot : undefined) as Record<string, unknown> | undefined;
+  const provider = nonEmptyString(routeObj?.provider) ?? nonEmptyString(record.provider) ?? nonEmptyString(targetObj?.provider);
+  const model = nonEmptyString(routeObj?.model) ?? nonEmptyString(record.model) ?? nonEmptyString(targetObj?.model);
+  if (!provider && !model) return undefined;
+  return { ...(provider ? { provider } : {}), ...(model ? { model } : {}) };
+}
+
+function extractUsage(value: unknown): RunUsage | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const resultObj = (record.result && typeof record.result === 'object' ? record.result : undefined) as Record<string, unknown> | undefined;
+  const raw = (record.usage && typeof record.usage === 'object'
+    ? record.usage
+    : resultObj?.usage && typeof resultObj.usage === 'object' ? resultObj.usage : undefined) as Record<string, unknown> | undefined;
+  if (!raw) return undefined;
+  const promptTokens = nonNegativeNumber(raw.promptTokens) ?? nonNegativeNumber(raw.inputTokens);
+  const completionTokens = nonNegativeNumber(raw.completionTokens) ?? nonNegativeNumber(raw.outputTokens);
+  const costUsd = nonNegativeNumber(raw.costUsd) ?? nonNegativeNumber(raw.cost);
+  if (promptTokens === undefined && completionTokens === undefined && costUsd === undefined) return undefined;
+  return {
+    ...(promptTokens !== undefined ? { promptTokens } : {}),
+    ...(completionTokens !== undefined ? { completionTokens } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
+  };
+}
+
+function mergeUsage(target: RunUsage, delta?: RunUsage): void {
+  if (!delta) return;
+  if (delta.promptTokens !== undefined) target.promptTokens = (target.promptTokens ?? 0) + delta.promptTokens;
+  if (delta.completionTokens !== undefined) target.completionTokens = (target.completionTokens ?? 0) + delta.completionTokens;
+  if (delta.costUsd !== undefined) target.costUsd = Number(((target.costUsd ?? 0) + delta.costUsd).toFixed(8));
+}
 
 function run(command: string, args: string[], options: { cwd?: string; input?: NodeJS.ReadableStream } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -270,10 +340,23 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
 
   /** Process requests already reported, so each is said once. */
   const reported = new Set<string>();
+  const runStartedMs = Number.isFinite(Date.parse(startedAt)) ? Date.parse(startedAt) : now().getTime();
+  let observedRoute: RunRoute | undefined = extractRoute(options.route ? { route: options.route } : undefined);
+  const observedUsage: RunUsage = {};
+  const recordJobTelemetry = (view: unknown, isExecutor: boolean) => {
+    if (isExecutor && !observedRoute) {
+      const detected = extractRoute(view);
+      if (detected) observedRoute = detected;
+    } else if (isExecutor && observedRoute && (!observedRoute.provider || !observedRoute.model)) {
+      const detected = extractRoute(view);
+      if (detected) observedRoute = { provider: observedRoute.provider ?? detected.provider, model: observedRoute.model ?? detected.model };
+    }
+    mergeUsage(observedUsage, extractUsage(view));
+  };
   /** Tells the gateway this run no longer waits on a job that may still run, so the workbench lists it for a later re-query. */
   const unwatch = (jobId: string, reason: string) => options.invoke('execution_unwatch', { originSessionId: options.originSessionId, jobId, reason })
     .catch(error => log(`任务 ${jobId}：没能记下停止等待（${error instanceof Error ? error.message : String(error)}）`));
-  const wait = async (jobId: string): Promise<string> => {
+  const wait = async (jobId: string, isExecutor = false): Promise<string> => {
     const deadline = Date.now() + timeoutMs; let last = '';
     for (;;) {
       // The query only reads; a slow or failed one is retried until the round's time is up.
@@ -281,7 +364,10 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
         .catch(error => { log(`任务 ${jobId}：查询状态失败（${error instanceof Error ? error.message : String(error)}），继续等待`); return undefined; });
       const status = view ? String(view.executionStatus ?? 'unknown') : last;
       if (status !== last) { log(`任务 ${jobId}：${status}${status === 'input_required' ? '（等待人在工作台处理）' : ''}`); last = status; }
-      if (terminal.has(status)) return status;
+      if (terminal.has(status)) {
+        if (view) recordJobTelemetry(view, isExecutor);
+        return status;
+      }
       // A request beyond the executor's preset leaves the task working while it waits; the coach answers it by default.
       const requests = (await options.invoke('execution_process_requests', { originSessionId: options.originSessionId, jobId }).catch(() => undefined) as
         { requests?: { requestId: string; status: string; kind: string; toolTitle?: string }[] } | undefined)?.requests ?? [];
@@ -396,7 +482,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   }
   for (let round = startRound; ; round++) {
     const reviewOnly = resumingReview && round === startRound;
-    const executionStatus = reviewOnly ? 'completed' : await wait(jobId);
+    const executionStatus = reviewOnly ? 'completed' : await wait(jobId, true);
     if (!reviewOnly && round > 1 && executionStatus === 'completed') {
       ticket = await ticketCall('ticket_get');
       if (ticket.status !== 'ready_for_review') {
@@ -482,9 +568,11 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   if ((stopReason === 'stalled' || stopReason === 'max_revisions') && ticket.proposals.some(p => p.kind === 'locked')) stopReason = 'needs_human';
   try { ticket = await ticketCall('ticket_close', { status: passed ? 'closed' : 'stopped', stopReason }); }
   catch (error) { if (!hostError) throw error; } // The gateway may be what failed; the ledger line below still records the run.
+  const finishedDate = now(), finishedAt = finishedDate.toISOString();
+  const durationMs = Math.max(0, finishedDate.getTime() - runStartedMs);
   const report: OutlineRunReport = { roleId, caseId: kase.id, phase, role, repo: kase.input.repo, commit: kase.input.commit, workDirectory: work, jobId,
     outlinePath, ticketPath, featuresConfirmed: Boolean(features.confirmation), rounds,
-    passed, stopReason, startedAt, finishedAt: now().toISOString(),
+    passed, stopReason, startedAt, finishedAt,
     ...(hostError ? { error: hostError instanceof Error ? hostError.message : String(hostError) } : {}) };
   await writeFile(path.join(work, 'run.json'), JSON.stringify(report, null, 2) + '\n');
   const first = rounds[0];
@@ -492,11 +580,22 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   let checksDigest: string | undefined;
   try { checksDigest = await (await import('./calibrate.js')).computeChecksDigest(roleDirectory); }
   catch { checksDigest = undefined; }
+  const hasUsage = observedUsage.promptTokens !== undefined || observedUsage.completionTokens !== undefined || observedUsage.costUsd !== undefined;
+  const env: RunEnvironment = {
+    ...(HARNESS_VERSION ? { harnessVersion: HARNESS_VERSION } : {}),
+    nodeVersion: process.version,
+    timeoutMs,
+    ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+  };
+  const reworkRounds = Math.max(0, rounds.length - 1);
   const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed, stopReason,
     firstDraftPassed: first?.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
     scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
     mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath,
-    jobId, originSessionId: options.originSessionId, ...(checksDigest ? { checksDigest } : {}) };
+    jobId, originSessionId: options.originSessionId, ...(checksDigest ? { checksDigest } : {}),
+    ...(observedRoute ? { route: observedRoute } : {}),
+    ...(hasUsage ? { usage: observedUsage } : {}),
+    durationMs, env, reworkRounds };
   await appendFile(ledgerPath(options.workspace, roleId), JSON.stringify(entry) + '\n');
   log(`停止原因：${stopReason}`);
   if (hostError) throw hostError;
