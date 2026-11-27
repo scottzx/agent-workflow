@@ -116,13 +116,16 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
   assert.equal(checklist.items.every(item => typeof item.locked === 'boolean'), true);
 
   const routing = JSON.parse(await readFile(join(roleDir, 'routing.json'), 'utf8'));
-  assert.equal(routing.worker.provider, 'magpie-responses');
-  assert.equal(routing.worker.model, 'grok/grok-4.7@500k');
-  assert.equal(routing.worker.deliveryMode, 'workspace_git');
-  assert.equal(routing.reviewer.provider, 'magpie');
-  assert.equal(routing.reviewer.model, 'group/deepseek-v4.1');
-  assert.equal(routing.reviewer.readOnly, true);
-  assert.equal(routing.reviewer.deliveryMode, 'none');
+  assert.equal(routing.schemaVersion, 2);
+  assert.equal(routing.worker.primary.provider, 'magpie-responses');
+  assert.equal(routing.worker.primary.model, 'grok/grok-4.7@500k');
+  assert.equal(routing.worker.primary.deliveryMode, 'workspace_git');
+  assert.ok(Array.isArray(routing.worker.fallbacks) && routing.worker.fallbacks.length >= 1);
+  assert.equal(routing.reviewer.primary.provider, 'magpie');
+  assert.equal(routing.reviewer.primary.model, 'group/deepseek-v4.1');
+  assert.equal(routing.reviewer.primary.readOnly, true);
+  assert.equal(routing.reviewer.primary.deliveryMode, 'none');
+  assert.ok(Array.isArray(routing.reviewer.fallbacks) && routing.reviewer.fallbacks.length >= 1);
 
   const skill = await readFile(join(roleDir, 'skills/pr-three-green-delivery/SKILL.md'), 'utf8');
   assert.deepEqual(validateSkillFrontmatter(skill, 'pr-three-green-delivery'), {

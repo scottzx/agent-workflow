@@ -9,6 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { z } from 'zod';
 import { loadChecklist, type NormalizedChecklist } from '../rsi/checklist.js';
 import { loadWorkflow, type Workflow } from '../rsi/engine.js';
+import { roleRoutingSchema, type RoleRouting } from './routing.js';
 import { roleSkillProfileSchema, type RoleSkillProfile } from './skills.js';
 
 const ROLE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
@@ -18,19 +19,7 @@ type RoleFileName = typeof ROLE_FILES[number];
 export const roleRulesPhaseSchema = z.enum(['all', 'implement', 'review', 'gate', 'coach']);
 export type RoleRulesPhase = z.infer<typeof roleRulesPhaseSchema>;
 
-const routingEndpointSchema = z.object({
-  provider: z.string().min(1),
-  model: z.string().min(1),
-  deliveryMode: z.string().min(1),
-  readOnly: z.boolean().optional(),
-}).strict();
-
-export const roleRoutingSchema = z.object({
-  schemaVersion: z.literal(1),
-  worker: routingEndpointSchema,
-  reviewer: routingEndpointSchema,
-}).strict();
-export type RoleRouting = z.infer<typeof roleRoutingSchema>;
+export { roleRoutingSchema, type RoleRouting };
 
 export const readRoleRulesOptionsSchema = z.object({
   projectRoot: z.string().min(1),

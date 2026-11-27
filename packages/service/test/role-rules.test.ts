@@ -37,8 +37,13 @@ test('readRoleRules loads the tracked pr-delivery role and isolates phases', asy
   assert.match(all.agentsLocalTemplate ?? '', /AUTO-GENERATED FROM \.1agents\/roles\/pr-delivery/);
   assert.equal(all.workflow?.entry, 'implement');
   assert.equal(all.checklist?.roleId, 'pr-delivery');
-  assert.equal(all.routing?.reviewer.model, 'group/deepseek-v4.1');
-  assert.equal(all.routing?.worker.deliveryMode, 'workspace_git');
+  assert.equal(all.routing?.schemaVersion, 2);
+  if (all.routing?.schemaVersion === 2) {
+    assert.equal(all.routing.reviewer.primary.model, 'group/deepseek-v4.1');
+    assert.equal(all.routing.worker.primary.deliveryMode, 'workspace_git');
+    assert.ok(all.routing.worker.fallbacks.length >= 1);
+    assert.ok(all.routing.reviewer.fallbacks.length >= 1);
+  }
   assert.match(all.digest, /^[a-f0-9]{64}$/);
   assert.deepEqual(all.files, [...all.files].sort());
   for (const name of ['AGENTS.local.template.md', 'QA.md', 'ROLE.md', 'checklist.json', 'profile.json', 'routing.json', 'workflow.json']) {

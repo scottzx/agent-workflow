@@ -49,6 +49,17 @@ import { agentNamePattern, listAgentFiles } from '../execution/agent-files.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
+import {
+  classifyFallbackTrigger,
+  DEFAULT_MAX_FALLBACK_DURATION_MS,
+  endpointKey,
+  FALLBACK_TRIGGER_KINDS,
+  routingEndpointSchema,
+  routingSlotV2Schema,
+  selectDispatchCandidate,
+  type FallbackTriggerKind,
+  type RoutingEndpoint,
+} from '../roles/routing.js';
 export type { RemoteAgentNotice } from './notices.js';
 
 const string = z.string().trim().min(1).max(512);
@@ -752,25 +763,112 @@ export class RemoteAgentGateway {
       catch (error) { if (!(error instanceof TicketError)) throw error; }
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
-      const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
-          + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest ?? resultContract?.artifactManifestPath)
-          + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
-            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
-          + snapshotInstructions(input.input?.handoffSnapshot) }] },
-        metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
-          ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
-          ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
-          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
-          execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
-        configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
-          authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
-      if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
+      const routingPolicy = fields.routingFallback !== undefined
+        ? z.object({
+            slot: routingSlotV2Schema,
+            peerActualEndpoint: routingEndpointSchema.optional(),
+          }).strict().parse(fields.routingFallback)
+        : undefined;
+
+      const sendWithRoute = async (routeProvider: string | undefined, routeModel: string | undefined, messageId: string) => {
+        const res = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId, role: 'ROLE_USER',
+          ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
+            + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest ?? resultContract?.artifactManifestPath)
+            + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
+              artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
+            + snapshotInstructions(input.input?.handoffSnapshot) }] },
+          metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
+            ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
+            ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
+            ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}),
+            ...(routeProvider && routeModel ? { provider: routeProvider, model: routeModel } : {}),
+            execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
+          configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
+            authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
+        if (!('id' in res)) throw new Error('Remote did not return an A2A Task');
+        return res;
+      };
+
+      const dispatchStartedAt = this.now();
+      let task: Task;
+      let selectedRoute: RoutingEndpoint | undefined;
+      const fallbackEvents: { from: string; to: string; trigger: FallbackTriggerKind; elapsedMs: number }[] = [];
+
+      if (routingPolicy) {
+        if (isAcpAgentPreset(resolved.agentPreset)) {
+          throw new Error('routingFallback applies only to standard presets');
+        }
+        const attemptedKeys = new Set<string>();
+        const maxDurationMs = routingPolicy.slot.maxFallbackDurationMs ?? DEFAULT_MAX_FALLBACK_DURATION_MS;
+        const allowedTriggers = routingPolicy.slot.fallbackOn ?? [...FALLBACK_TRIGGER_KINDS];
+        let lastError: unknown;
+        let acceptedTask: Task | undefined;
+
+        for (;;) {
+          const picked = selectDispatchCandidate({
+            slot: routingPolicy.slot,
+            attemptedKeys,
+            ...(routingPolicy.peerActualEndpoint ? { peerActualEndpoint: routingPolicy.peerActualEndpoint } : {}),
+          });
+          const candidate = picked.endpoint;
+          attemptedKeys.add(endpointKey(candidate));
+          const msgId = attemptedKeys.size === 1 ? attempt.attemptId : `${attempt.attemptId}-fb${attemptedKeys.size - 1}`;
+          try {
+            const candidateTask = await sendWithRoute(candidate.provider, candidate.model, msgId);
+            const dispatchFailure = failureOf(candidateTask);
+            const trigger = dispatchFailure ? classifyFallbackTrigger(dispatchFailure, allowedTriggers) : undefined;
+            if (!trigger) {
+              acceptedTask = candidateTask;
+              selectedRoute = candidate;
+              break;
+            }
+            lastError = new Error(`Dispatch failed on ${candidate.provider}/${candidate.model} (${trigger}): ${dispatchFailure?.message ?? 'rejected'}`);
+            const elapsedMs = this.now() - dispatchStartedAt;
+            if (elapsedMs > maxDurationMs) throw lastError;
+            const peek = selectDispatchCandidate({
+              slot: routingPolicy.slot,
+              attemptedKeys,
+              ...(routingPolicy.peerActualEndpoint ? { peerActualEndpoint: routingPolicy.peerActualEndpoint } : {}),
+            });
+            fallbackEvents.push({
+              from: `${candidate.provider}/${candidate.model}`,
+              to: `${peek.endpoint.provider}/${peek.endpoint.model}`,
+              trigger,
+              elapsedMs,
+            });
+          } catch (dispatchError) {
+            const trigger = classifyFallbackTrigger(dispatchError, allowedTriggers);
+            if (!trigger) throw dispatchError;
+            lastError = dispatchError;
+            const elapsedMs = this.now() - dispatchStartedAt;
+            if (elapsedMs > maxDurationMs) throw dispatchError;
+            const peek = selectDispatchCandidate({
+              slot: routingPolicy.slot,
+              attemptedKeys,
+              ...(routingPolicy.peerActualEndpoint ? { peerActualEndpoint: routingPolicy.peerActualEndpoint } : {}),
+            });
+            fallbackEvents.push({
+              from: `${candidate.provider}/${candidate.model}`,
+              to: `${peek.endpoint.provider}/${peek.endpoint.model}`,
+              trigger,
+              elapsedMs,
+            });
+          }
+        }
+        if (!acceptedTask) throw lastError ?? new Error('Routing fallback failed without accepted task');
+        task = acceptedTask;
+      } else {
+        task = await sendWithRoute(provider, model, attempt.attemptId);
+      }
+
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
         ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: mode });
-      return this.ledgerView(input.originSessionId, job.jobId);
+      const view = this.ledgerView(input.originSessionId, job.jobId);
+      return selectedRoute
+        ? { ...view, routing: { selected: selectedRoute, fallbacks: fallbackEvents, elapsedMs: this.now() - dispatchStartedAt } }
+        : view;
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
       if (sent) this.ledger.markUnknown(attempt.attemptId, diagnostic);
