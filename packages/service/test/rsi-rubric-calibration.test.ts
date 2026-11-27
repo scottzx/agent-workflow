@@ -101,6 +101,34 @@ test('M1: loadRubric and CLI calibrate --rubric parse both real repository rubri
   assert.equal(rep.passed, true);
   assert.ok(rep.autoBlockAllowed.includes('R1'));
   assert.ok(rep.autoBlockAllowed.includes('R7'));
+
+  // Also run real calibrateRubric end-to-end on ppt-beautifier and verify advise criteria stay advisory-only.
+  const pptJudgments: RubricJudgment[] = [];
+  for (const c of pptRubric.criteria) {
+    pptJudgments.push(...makeBinaryJudgments(c.id, 40));
+  }
+  const pptJPath = join(workspace, 'ppt-gold.jsonl');
+  await writeFile(pptJPath, `${pptJudgments.map(j => JSON.stringify(j)).join('\n')}\n`);
+  const pptRep = await calibrateRubric({ roleDirectory: pptDir, judgmentsPath: pptJPath, workspace });
+  assert.equal(pptRep.passed, true);
+  assert.equal(pptRep.perCriterion.V1?.canAutoBlock, true);
+  assert.equal(pptRep.perCriterion.V7?.canAutoBlock, false, 'must + gate.mode: advise stays advisory-only');
+
+  // M6: all four rubric.schema.json gate.onLowAgreement values (keep|advise|demote|split) must parse cleanly.
+  const schemaRole = join(workspace, 'schema-role');
+  await mkdir(schemaRole, { recursive: true });
+  await writeFile(join(schemaRole, 'rubric.json'), JSON.stringify({
+    schemaVersion: 1,
+    roleId: 'schema-role',
+    criteria: (['keep', 'advise', 'demote', 'split'] as const).map((policy, idx) => ({
+      id: `C${idx + 1}`,
+      severity: 'must',
+      scale: { type: 'binary' },
+      gate: { mode: 'block', onLowAgreement: policy },
+    })),
+  }));
+  const loadedSchema = await loadRubric(schemaRole);
+  assert.equal(loadedSchema.criteria.length, 4);
 });
 
 test('M2, M4, M5 & S1/S5/S9: pair-count n, minAlpha consistency, policy floors, tie handling, and duplicate rejection', () => {
@@ -175,6 +203,20 @@ test('M2, M4, M5 & S1/S5/S9: pair-count n, minAlpha consistency, policy floors, 
     ],
     rubricDigest: 'd'.repeat(64),
   }), /Duplicate judgment/);
+
+  // S5: 1:1 judge tie is excluded (unbiased consensus), yielding n=0 and band=split.
+  const tieJudgments: RubricJudgment[] = [];
+  for (let i = 0; i < 40; i += 1) {
+    tieJudgments.push(
+      { unit: `u${i}`, criterion: 'R1', rater: 'human:a', value: 1 },
+      { unit: `u${i}`, criterion: 'R1', rater: 'judge:a', value: 1 },
+      { unit: `u${i}`, criterion: 'R1', rater: 'judge:b', value: 0 },
+    );
+  }
+  const tieRep = evaluateRubricJudgments({ rubric: sparseRubric, judgments: tieJudgments, rubricDigest: 'f'.repeat(64) });
+  assert.equal(tieRep.perCriterion.R1?.n, 0);
+  assert.equal(tieRep.perCriterion.R1?.band, 'split');
+  assert.equal(tieRep.perCriterion.R1?.canAutoBlock, false);
 
   // Dual-ceiling low human-human alpha forces split even if judge agrees 100% with human majority.
   const dualRubric: RubricDefinition = {

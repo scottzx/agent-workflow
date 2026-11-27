@@ -47,7 +47,7 @@ const rubricCriterionSchema = z.object({
   gate: z.object({
     mode: z.enum(['observe', 'advise', 'block']).optional(),
     minAlpha: z.number().min(0).max(1).optional(),
-    onLowAgreement: z.enum(['split', 'advise', 'observe']).optional(),
+    onLowAgreement: z.enum(['keep', 'advise', 'demote', 'split']).optional(),
   }).passthrough().optional(),
 }).passthrough();
 
@@ -522,7 +522,7 @@ export function evaluateRubricJudgments(options: {
     const ceilingLow = alphaHumanCeiling !== null && alphaHumanCeiling < bands.advise;
     const minAlpha = criterion.gate?.minAlpha;
     const meetsMinAlpha = minAlpha === undefined || (effectiveAlpha !== null && effectiveAlpha >= minAlpha);
-    const canAutoBlock = band === 'auto' && isMust && meetsMinAlpha;
+    const canAutoBlock = band === 'auto' && isMust && declaredGateMode === 'block' && meetsMinAlpha;
     const effectiveEnforcement: 'block' | 'observe' = canAutoBlock ? 'block' : 'observe';
     const action: CriterionCalibrationResult['action'] =
       canAutoBlock
@@ -653,7 +653,10 @@ export async function readRubricCalibration(workspace: string, roleId: string): 
     }
     return { state: 'ok', report };
   } catch (error) {
-    return { state: 'invalid', error: error instanceof Error ? error.message : String(error) };
+    const summary = error instanceof z.ZodError
+      ? error.issues.map(issue => `${issue.path.join('.') || '(root)'}: ${issue.message}`).slice(0, 3).join('; ')
+      : (error instanceof Error ? error.message.split(/\r?\n/, 1)[0] ?? 'invalid report' : String(error));
+    return { state: 'invalid', error: summary };
   }
 }
 
