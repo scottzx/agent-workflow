@@ -132,6 +132,8 @@ export interface LedgerJobView extends LedgerJob {
 }
 
 const terminal = new Set<ExecutionStatus>(['completed', 'failed', 'canceled', 'rejected']);
+/** The statuses that may carry failure facts. */
+const failedExecutionStatuses = new Set<ExecutionStatus>(['failed', 'canceled', 'rejected']);
 const statuses = new Set<ExecutionStatus>(['not_started', 'submitted', 'working', 'input_required', 'auth_required', 'completed', 'failed', 'canceled', 'rejected', 'unknown']);
 const clone = <T>(value: T): T => structuredClone(value);
 const now = () => new Date().toISOString();
@@ -361,6 +363,9 @@ export class JobLedger {
     if (input.phase !== undefined && !conflict) attempt.phase = input.phase;
     if (input.diagnostic !== undefined && !conflict) attempt.diagnostic = input.diagnostic;
     if (input.error !== undefined && !conflict) attempt.error = clone(input.error);
+    // A round that is not failed carries no failure facts: an earlier failure
+    // must not survive into a later observation of the same round.
+    if (input.executionStatus !== undefined && !failedExecutionStatuses.has(input.executionStatus)) attempt.error = undefined;
     attempt.stale = input.stale ?? false; attempt.checkedAt = timestamp; attempt.updatedAt = timestamp;
     if (!conflict && (input.resultSummary !== undefined || input.structuredResultRef !== undefined || input.resultDigest !== undefined
       || input.artifactLinks !== undefined || input.resultArtifacts !== undefined || input.resultAvailable !== undefined || input.resultRevision !== undefined)) {

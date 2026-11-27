@@ -452,6 +452,7 @@ export class DshA2ABackend implements A2ABackend {
       if (event.agent !== agent || !owns(event.message)) return;
       messageId = undefined;
       turn = event.turn;
+      turnFailure = undefined;
       if (options.signal.aborted) cancel();
     }));
     listeners.push(agent.ctx.on('agent/inbox/discarded', event => {
@@ -468,6 +469,12 @@ export class DshA2ABackend implements A2ABackend {
         startupAbort.abort(new Error('DSH session was disposed before startup'));
       }
     }));
+    listeners.push(agent.ctx.on('agent/error', event => {
+      // DSH reports the live failure of a turn here. The turn reason stays
+      // authoritative; this only names a cause when the reason carries none.
+      if (event.agent !== agent || event.turn !== turn) return;
+      turnFailure = event.error;
+    }));
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;
       if (event.type === 'assistant/message' && event.data.turn === turn) {
@@ -477,11 +484,6 @@ export class DshA2ABackend implements A2ABackend {
         else if (!finalAnswerExpected && next.text.length > 0) text = next.text;
       } else if (event.type === 'turn/end' && event.data.turn === turn) {
         finishTurn(event.data.reason);
-      } else if (event.type.endsWith('/error')) {
-        // A same-turn error event carries the host's failure facts. It is only
-        // a fallback: the turn reason stays authoritative.
-        const data = event.data as { turn?: number; error?: unknown } | undefined;
-        if (data?.turn === undefined || data.turn === turn) turnFailure = data?.error ?? data;
       }
     }));
     options.signal.addEventListener('abort', cancel, { once: true });

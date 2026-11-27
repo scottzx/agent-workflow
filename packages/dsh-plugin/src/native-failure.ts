@@ -13,35 +13,20 @@ export type NativeFailureSignal =
   | 'quota_exhausted' | 'rateLimitExceeded' | 'sessionBudgetExceeded' | 'unauthorized' | 'TIMEOUT';
 
 /**
- * Failure codes a native DSH turn may carry. DSH normalizes provider failures
- * into its own vocabulary before the turn ends, and the public category names
- * are accepted as well. A provider-shaped code is trusted only inside a real
- * failure record; see {@link nativeFailureSignal}.
+ * DSH's own stable failure codes. DSH normalizes a provider failure into this
+ * vocabulary before the turn ends, so these are host facts.
+ *
+ * A provider-shaped code (`usageLimitExceeded`, `quota_exhausted`,
+ * `unauthorized`, ...) is deliberately absent: such a string may be written by
+ * any producer, and a turn reason without the canonical `publicError` must not
+ * let it establish a cause.
  */
 const nativeFailureCodes: Record<string, NativeFailureSignal> = {
-  // DSH's own normalized failure codes.
   QUOTA: 'quota_exhausted', ACCOUNT_QUOTA: 'quota_exhausted',
   RATE_LIMIT: 'rateLimitExceeded',
   AUTH: 'unauthorized', ACCOUNT_SIGN_IN_REQUIRED: 'unauthorized', ACCOUNT_TOKEN_INVALID: 'unauthorized',
   INVALID_CREDENTIAL: 'unauthorized', MISSING_CREDENTIAL: 'unauthorized', NO_CREDENTIAL_STORE: 'unauthorized',
   TIMEOUT: 'TIMEOUT',
-  // Public category names a host may use directly.
-  quota: 'quota_exhausted', rate_limit: 'rateLimitExceeded', budget: 'sessionBudgetExceeded',
-  auth: 'unauthorized', timeout: 'TIMEOUT',
-};
-
-/**
- * Provider-shaped codes. They name a cause only inside a real failure record:
- * DSH's failure record always carries the host's failure text or the HTTP status
- * that produced it, while a lone provider-shaped string carries no failure
- * context and never establishes a cause on its own.
- */
-const providerFailureCodes: Record<string, NativeFailureSignal> = {
-  quota_exhausted: 'quota_exhausted', insufficient_quota: 'quota_exhausted', usageLimitExceeded: 'quota_exhausted',
-  usage_limit_exceeded: 'quota_exhausted',
-  rateLimitExceeded: 'rateLimitExceeded', rate_limited: 'rateLimitExceeded', rate_limit_exceeded: 'rateLimitExceeded',
-  sessionBudgetExceeded: 'sessionBudgetExceeded', budget_exhausted: 'sessionBudgetExceeded',
-  unauthorized: 'unauthorized', auth_required: 'unauthorized', authentication_required: 'unauthorized',
 };
 
 /** HTTP statuses that name a failure class on their own. */
@@ -81,7 +66,11 @@ export function nativeFailureRecord(reason: unknown): unknown {
   return reason;
 }
 
-/** The runtime signal a native failure names, if any. */
+/**
+ * The runtime signal a native failure names, if any. Only DSH's own stable
+ * codes and an explicit HTTP status are trusted; prose and provider-shaped
+ * codes never establish a cause.
+ */
 export function nativeFailureSignal(facts: NativeFailureFacts | undefined): NativeFailureSignal | undefined {
   if (!facts) return undefined;
   const code = facts.code;
@@ -90,16 +79,8 @@ export function nativeFailureSignal(facts: NativeFailureFacts | undefined): Nati
     if (host) return host;
     const http = /^HTTP_(\d{3})$/u.exec(code);
     if (http) { const byStatus = nativeFailureStatuses[Number(http[1])]; if (byStatus) return byStatus; }
-    // A provider-shaped code names the cause only inside a real failure record.
-    if (facts.message !== undefined || facts.status !== undefined) {
-      const provider = signalOf(providerFailureCodes, code);
-      if (provider) return provider;
-    }
   }
   if (facts.status !== undefined) { const byStatus = nativeFailureStatuses[facts.status]; if (byStatus) return byStatus; }
-  // A message that is exactly a signal names the cause; prose never does.
-  const message = facts.message?.trim();
-  if (message) return signalOf(nativeFailureCodes, message) ?? signalOf(providerFailureCodes, message);
   return undefined;
 }
 

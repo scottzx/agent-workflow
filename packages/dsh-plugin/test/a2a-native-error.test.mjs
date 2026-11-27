@@ -15,7 +15,7 @@ function assertNoProviderData(value) {
 
 test('a native DSH quota failure keeps its category, its retry policy and no provider text', () => {
   const error = nativeTurnSafeError({ kind: 'error', error: {
-    code: 'quota_exhausted', status: 429, message: `quota exhausted for ${secret} ${authLink}`,
+    code: 'QUOTA', status: 429, message: `quota exhausted for ${secret} ${authLink}`,
   } }, 'native-request');
   assert.equal(error.category, 'quota');
   assert.equal(error.providerCode, 'quota_exhausted');
@@ -35,9 +35,12 @@ test("DSH's own failure vocabulary names the same categories as the provider sig
     ['AUTH', 'auth', 'unauthorized'],
     ['ACCOUNT_SIGN_IN_REQUIRED', 'auth', 'unauthorized'],
     ['INVALID_CREDENTIAL', 'auth', 'unauthorized'],
+    ['MISSING_CREDENTIAL', 'auth', 'unauthorized'],
+    ['NO_CREDENTIAL_STORE', 'auth', 'unauthorized'],
     ['TIMEOUT', 'timeout', undefined],
     ['HTTP_429', 'rate_limit', 'rateLimitExceeded'],
     ['HTTP_401', 'auth', 'unauthorized'],
+    ['HTTP_402', 'quota', 'quota_exhausted'],
   ];
   for (const [code, category, providerCode] of cases) {
     const error = nativeTurnSafeError({ kind: 'error', error: { code, message: `${code} on the host` } }, 'native-request');
@@ -48,25 +51,29 @@ test("DSH's own failure vocabulary names the same categories as the provider sig
   }
 });
 
-test('public category names and an exact signal message name the cause', () => {
-  const rate = nativeTurnSafeError({ kind: 'error', error: { code: 'rate_limit', message: 'rate limited' } }, 'native-request');
+test('an explicit HTTP status names the cause on its own', () => {
+  const rate = nativeTurnSafeError({ kind: 'error', error: { status: 429, message: 'too many requests' } }, 'native-request');
   assert.equal(rate.category, 'rate_limit');
-  const auth = nativeTurnSafeError({ kind: 'error', error: { code: 'auth', message: 'credential rejected' } }, 'native-request');
+  assert.equal(rate.providerCode, 'rateLimitExceeded');
+  const auth = nativeTurnSafeError({ kind: 'error', error: { status: 401, message: 'credential rejected' } }, 'native-request');
   assert.equal(auth.category, 'auth');
-  const budget = nativeTurnSafeError({ kind: 'error', error: { code: 'budget', message: 'session budget spent' } }, 'native-request');
-  assert.equal(budget.category, 'budget');
-  const message = nativeTurnSafeError({ kind: 'error', message: 'insufficient_quota' }, 'native-request');
-  assert.equal(message.category, 'quota');
-  const status = nativeTurnSafeError({ kind: 'error', error: { status: 429, message: 'too many requests' } }, 'native-request');
-  assert.equal(status.category, 'rate_limit');
+  const timeout = nativeTurnSafeError({ kind: 'error', error: { status: 408, message: 'request timed out' } }, 'native-request');
+  assert.equal(timeout.category, 'timeout');
 });
 
-test('a provider-shaped code names the cause only inside a real failure record', () => {
-  const bare = nativeTurnSafeError({ kind: 'error', error: { code: 'usageLimitExceeded' } }, 'native-request');
-  assert.equal(bare.category, 'unknown');
-  assert.equal(bare.providerCode, undefined);
-  const recorded = nativeTurnSafeError({ kind: 'error', error: { code: 'usageLimitExceeded', message: 'usage limit' } }, 'native-request');
-  assert.equal(recorded.category, 'quota');
+test('a provider-shaped host code without a canonical public error stays unknown', () => {
+  // The host reason is data, not a projection: a provider-shaped string there
+  // must not establish a cause. This mirrors a2a-executor.test.mjs.
+  for (const code of ['usageLimitExceeded', 'quota_exhausted', 'rateLimitExceeded', 'sessionBudgetExceeded', 'unauthorized']) {
+    const error = nativeTurnSafeError({ kind: 'error', error: { code, message: 'SYNTHETIC_HOST_CODE_SECRET_NOT_REAL' } }, 'native-request');
+    assert.equal(error.category, 'unknown', code);
+    assert.equal(error.providerCode, undefined, code);
+    assert.equal(error.retryable, false, code);
+    assert.equal(error.outcomeUnknown, false, code);
+    assert.equal(error.origin, 'dsh', code);
+    assert.equal(error.operationId, 'native-request', code);
+    assert.ok(!JSON.stringify(error).includes('SYNTHETIC_'), code);
+  }
 });
 
 test('prose, nested envelopes and caller-shaped fields never establish a cause', () => {
@@ -80,6 +87,8 @@ test('prose, nested envelopes and caller-shaped fields never establish a cause',
   assert.equal(nested.category, 'unknown');
   const cause = nativeTurnSafeError({ kind: 'error', error: { code: 'ACP_TURN_FAILED', cause: { code: 'unauthorized' } } }, 'native-request');
   assert.equal(cause.category, 'unknown');
+  const message = nativeTurnSafeError({ kind: 'error', message: 'insufficient_quota' }, 'native-request');
+  assert.equal(message.category, 'unknown', 'a bare message never names a cause');
   const spoof = nativeTurnSafeError({ kind: 'error', error: {
     message: secret, category: 'quota', origin: 'acp', retryable: true, outcomeUnknown: true,
     operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL', providerCode: 'usageLimitExceeded',
@@ -92,8 +101,8 @@ test('prose, nested envelopes and caller-shaped fields never establish a cause',
   assertNoProviderData(spoof);
 });
 
-test('an Error instance and a same-turn error event keep their structured cause', () => {
-  const failure = Object.assign(new Error(`provider said ${secret}`), { code: 'insufficient_quota', status: 429 });
+test('an Error instance and a same-turn agent error keep their structured cause', () => {
+  const failure = Object.assign(new Error(`provider said ${secret}`), { code: 'QUOTA', status: 429 });
   const error = nativeTurnSafeError({ kind: 'error', error: failure }, 'native-request');
   assert.equal(error.category, 'quota');
   assertNoProviderData(error);

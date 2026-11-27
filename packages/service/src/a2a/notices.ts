@@ -1,6 +1,6 @@
 /** Human-readable task results, with machine-readable acknowledgement locators at the end. */
 import type { Task } from '@a2a-js/sdk';
-import type { SafeErrorSummary } from '../safe-error-summary.js';
+import { noticeErrorSummary, safeErrorText, type SafeErrorSummary } from '../safe-error-summary.js';
 
 export type { SafeErrorSummary } from '../safe-error-summary.js';
 
@@ -45,18 +45,32 @@ const labels: Record<string, string> = {
   TASK_STATE_REJECTED: '任务被拒绝', TASK_STATE_INPUT_REQUIRED: '任务需要补充输入', TASK_STATE_AUTH_REQUIRED: '任务需要授权',
 };
 
-/** A notice carries a failure only for a task that did not complete. */
-function failureOf(notice: { state: string; error?: SafeErrorSummary }): SafeErrorSummary | undefined {
-  if (!notice.error) return undefined;
-  return notice.state === 'TASK_STATE_COMPLETED' ? undefined : notice.error;
+/**
+ * A notice carries a failure only for a task that did not complete. The record
+ * is re-validated before it is rendered: a dirty stored notice must never
+ * break the delivery of the whole round.
+ */
+function failureOf(notice: { state: string; error?: unknown }): SafeErrorSummary | undefined {
+  if (notice.state === 'TASK_STATE_COMPLETED') return undefined;
+  return noticeErrorSummary(notice.error);
+}
+
+/** The retry advice of a failure. A category without a policy says so plainly. */
+function retryAdvice(error: SafeErrorSummary): string {
+  if (error.retryable) return '可重试';
+  switch (error.category) {
+    case 'quota': case 'budget': case 'auth': return '不可原地重试，请切换模型或检查额度/凭据';
+    case 'rate_limit': case 'timeout': return '可稍后退避重试';
+    default: return '未声明可重试，请核查后决定';
+  }
 }
 
 /** The failure line a coordinator reads first: the cause, the category and the retry policy. */
 function failureSummary(error: SafeErrorSummary): string {
-  const message = error.message.replace(/\s+/gu, ' ').trim() || '远端未提供失败说明';
+  const message = safeErrorText(error.message) || '远端未提供失败说明';
   const provider = error.providerCode ? `/${error.providerCode}` : '';
-  const retry = error.retryable ? '可重试' : '不可重试，请勿原地重试';
-  return `失败原因：${message}（category=${error.category}${provider}，${retry}）`;
+  const line = `失败原因：${message}（category=${error.category}${provider}，${retryAdvice(error)}）`;
+  return Buffer.byteLength(line) > 1024 ? `${line.slice(0, 1000)}…` : line;
 }
 
 /** One-line collapsed notice summary for DSH's ContextFormed `form: 'notice'` row (<= 120 chars). */
@@ -231,9 +245,15 @@ function oneLine(text: string): string {
 /** One-line collapsed subscriber notice for DSH's ContextFormed `form: 'notice'` row (<= 120 chars). */
 export function formatSubscriberNoticeSummary(notice: SubscriberNotice): string {
   const where = notice.caseId ? `case ${notice.caseId}` : notice.jobId ? `job ${notice.jobId}` : notice.originSessionId;
-  const failure = notice.event === 'terminal' && notice.error ? ` · ${notice.error.category}` : '';
-  const line = oneLine(`A2A订阅 · ${roleLabels[notice.role]} · ${eventLabels[notice.event]} · ${notice.status} · ${where}${failure}`);
+  const failure = subscriberFailure(notice);
+  const line = oneLine(`A2A订阅 · ${roleLabels[notice.role]} · ${eventLabels[notice.event]} · ${notice.status} · ${where}${failure ? ` · ${failure.category}` : ''}`);
   return line.length <= 120 ? line : `${line.slice(0, 119)}…`;
+}
+
+/** A subscriber sees the cause of a failed task, and only of a failed task. */
+function subscriberFailure(notice: SubscriberNotice): SafeErrorSummary | undefined {
+  if (notice.event !== 'terminal') return undefined;
+  return noticeErrorSummary(notice.error);
 }
 
 /** Subscriber copy is explicitly read-only and names the role, case, job, status, and handoff or artifact summary. */
@@ -249,13 +269,13 @@ export function formatSubscriberNotice(notice: SubscriberNotice): string {
     return item.url ? `- ${name} ${item.url}` : `- ${name}`;
   });
   const body = notice.summary ? boundedDetail(notice.summary, 4 * 1024) : '';
-  const failure = notice.event === 'terminal' && notice.error ? failureSummary(notice.error) : '';
+  const failure = subscriberFailure(notice);
   return [
     `[A2A订阅通知] ${eventLabels[notice.event]} · ${roleLabels[notice.role]}`,
     '这是只读订阅通知，不替代主归属会话的审批或主 ack。',
     ...(notice.title ? [`任务：${oneLine(notice.title).slice(0, 200)}`] : []),
     `状态：${oneLine(notice.status).slice(0, 80) || 'unknown'}`,
-    ...(failure ? [failure] : []),
+    ...(failure ? [failureSummary(failure)] : []),
     ...(notice.caseId ? [`caseId：${notice.caseId}`] : []),
     ...(notice.jobId ? [`jobId：${notice.jobId}`] : []),
     `主归属：${notice.originSessionId}`,

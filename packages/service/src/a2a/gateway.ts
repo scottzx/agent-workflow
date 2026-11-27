@@ -23,7 +23,7 @@ import { ARTIFACT_CONTENT_LIMIT } from './artifact-content.js';
 import { deliveryInstructions, deliveryModeSchema, resolveDefaultJobDirectory, snapshotInstructions, spaceInstructions, type DeliveryMode } from './job-directory.js';
 import { WORKBENCH_UI_PATH, WorkbenchUi } from './workbench-ui.js';
 import { notifyDesktop } from './desktop-notify.js';
-import { noticeErrorSummary, safeErrorSummary, type SafeErrorSummary } from '../safe-error-summary.js';
+import { noticeErrorSummary, safeErrorSummary, safeErrorText, type SafeErrorSummary } from '../safe-error-summary.js';
 import { isAcpAgentPreset, legacyLifecycle, normalizeLifecycle, oneShotShouldClose, type CloseReason, type SessionLifecycle, sessionLifecycleSchema } from './session-lifecycle.js';
 import { CapacityGovernor, type CapacityInspection } from '../capacity.js';
 import { CapacityQueue } from '../capacity-queue.js';
@@ -267,16 +267,16 @@ const failedStates = new Set(['TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_
 /**
  * The failure facts of a remote task: its structured error, or a degraded
  * summary of the status text it published instead. A task that did not fail
- * has no failure facts.
+ * has no failure facts, whatever its metadata claims.
  */
 function failureOf(task: Task): SafeErrorSummary | undefined {
+  if (!failedStates.has(wire(task).status?.state ?? '')) return undefined;
   const structured = safeErrorSummary((task.metadata?.['1agents'] as { error?: unknown } | undefined)?.error);
   if (structured) return structured;
-  if (!failedStates.has(wire(task).status?.state ?? '')) return undefined;
-  const text = task.status?.message?.parts.filter(part => part.content?.$case === 'text')
-    .map(part => part.content!.value).join(' ').trim();
+  const text = safeErrorText(task.status?.message?.parts.filter(part => part.content?.$case === 'text')
+    .map(part => part.content!.value).join(' '));
   if (!text) return undefined;
-  return { category: 'unknown', message: text.slice(0, 512), retryable: false };
+  return { category: 'unknown', message: text, retryable: false };
 }
 
 function atomicJson(file: string, value: unknown): void {
