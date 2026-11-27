@@ -52,6 +52,8 @@ and both kinds are present. Without --results the mode is verify-only and does n
 Options:
   --target ID            agent_host target on the gateway (default legacy:ppt-beautifier)
   --preset ID            DSH agent preset for the executor (default standard)
+  --provider ID          model provider for standard preset (must be paired with --model)
+  --model ID             model id for standard preset (must be paired with --provider)
   --origin ID            originSessionId for the tasks (default rsi-cli)
   --workspace DIR        where run directories go (default .1agents/runtime/rsi)
   --url URL              gateway (default http://127.0.0.1:36814)
@@ -87,6 +89,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
     role: { type: 'string' }, case: { type: 'string' }, project: { type: 'string' },
     target: { type: 'string', default: 'legacy:ppt-beautifier' }, preset: { type: 'string', default: 'standard' },
+    provider: { type: 'string' }, model: { type: 'string' },
     origin: { type: 'string', default: 'rsi-cli' }, workspace: { type: 'string', default: '.1agents/runtime/rsi' },
     url: { type: 'string', default: 'http://127.0.0.1:36814' }, 'max-bounces': { type: 'string', default: '1' },
     'timeout-minutes': { type: 'string', default: '60' }, python: { type: 'string', default: 'python3' },
@@ -94,6 +97,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
     phase: { type: 'string', default: 'dev' }, resume: { type: 'string' },
   } });
   if (!values.role || !values.case || (!values.project && !values.resume)) throw new Error('--role, --case and --project are required (--project not with --resume)');
+  if (Boolean(values.provider) !== Boolean(values.model)) throw new Error('--provider and --model must be passed together');
   if (values.phase !== 'dev' && values.phase !== 'test') throw new Error('--phase is dev or test');
   if (values.phase === 'test') {
     const gate = await checkGate({ roleDirectory: resolve(values.role), workspace: resolve(values.workspace!), invoke: gatewayInvoke(values.url!) });
@@ -102,6 +106,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   const invoke = gatewayInvoke(values.url!);
   const report = await runOutlineCase({ roleDirectory: resolve(values.role), caseId: values.case, projectPath: resolve(values.project ?? '.'),
     ...(values.resume ? { resume: resolve(values.resume) } : {}),
+    ...(values.provider && values.model ? { route: { provider: values.provider, model: values.model } } : {}),
     workspace: resolve(values.workspace!), phase: values.phase, targetId: values.target!, agentPreset: values.preset!, originSessionId: values.origin!,
     maxBounces: Number(values['max-bounces']), timeoutMs: Number(values['timeout-minutes']) * 60_000, python: values.python!,
     ...(values.qa ? { qa: { ...(values['qa-preset'] ? { agentPreset: values['qa-preset'] } : {}), maxRevisions: Number(values['qa-max-revisions']) } } : {}),

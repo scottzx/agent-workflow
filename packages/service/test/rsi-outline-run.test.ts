@@ -801,38 +801,83 @@ test('a run the training stopped by its own rules does not resume', async t => {
     originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, resume: work, invoke: gw.invoke(async () => ({})) }), /training's rules/);
 });
 
-test('runOutlineCase records observe-only route, usage, durationMs, env and reworkRounds on the ledger', async t => {
+test('runOutlineCase records route from gateway resultMetadata, ignores transport provider, and carries active durationMs & usage across --resume', async t => {
   const f = await fixture(t), gw = ticketGateway();
   const workspace = join(f.root, 'runs');
   let work = '', tick = 0;
-  const times = [new Date('2026-11-27T10:00:00.000Z'), new Date('2026-11-27T10:00:01.000Z'), new Date('2026-11-27T10:00:02.000Z'), new Date('2026-11-27T10:00:05.500Z')];
-  const now = () => times[Math.min(tick++, times.length - 1)]!;
-  const report = await runOutlineCase({
+  // Segment 1 (night before): runs 4 seconds then times out with partial usage.
+  // Realistic LedgerJobView shape: attempts[].provider is transport 'a2a', model route is in resultMetadata.
+  const seg1Times = [new Date('2026-11-26T22:00:00.000Z'), new Date('2026-11-26T22:00:04.000Z')];
+  const stopped = await runOutlineCase({
     roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace,
-    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 120_000,
-    route: { provider: 'magpie', model: 'group/deepseek-v4.1' }, concurrency: 2, now,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 5,
+    concurrency: 2, now: () => seg1Times[Math.min(tick++, seg1Times.length - 1)]!,
     invoke: gw.invoke(async (method, params: any) => {
-      if (method === 'execution_submit') {
-        work = params.input.cwd;
-        await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit, 'Arial')));
-        return { jobId: 'job-m1' };
+      if (method === 'execution_submit') { work = params.input.cwd; return { jobId: 'job-m1' }; }
+      if (method === 'execution_unwatch') return {};
+      if (method === 'execution_get') {
+        return {
+          executionStatus: 'failed',
+          attemptId: 'att-1',
+          currentAttemptId: 'att-1',
+          attempts: [{ attemptId: 'att-1', provider: 'a2a', targetSnapshot: { provider: 'a2a' }, input: {} }],
+          resultMetadata: { provider: 'magpie', model: 'group/deepseek-v4.1', usage: { promptTokens: 400, completionTokens: 100, costUsd: 0.01 } },
+        };
       }
-      if (method === 'execution_continue') {
-        await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
-        handleTicket(gw.round('job-m1'), '改为微软雅黑');
-        return { jobId: 'job-m1' };
-      }
-      return { executionStatus: 'completed', usage: { promptTokens: 400, completionTokens: 150, costUsd: 0.015 } };
+      return { executionStatus: 'failed' };
     }),
   });
-  assert.equal(report.passed, true);
-  assert.equal(report.rounds.length, 2);
+  assert.equal(stopped.stopReason, 'not_completed');
+  assert.deepEqual(stopped.route, { provider: 'magpie', model: 'group/deepseek-v4.1' });
+  assert.deepEqual(stopped.usage, { promptTokens: 400, completionTokens: 100, costUsd: 0.01 });
+  assert.equal(stopped.durationMs, 4000);
+
+  // Segment 2 (11 hours later next morning): resumes and passes in 3 seconds with new attempt usage.
+  let tick2 = 0;
+  const seg2Times = [
+    new Date('2026-11-27T09:00:00.000Z'),
+    new Date('2026-11-27T09:00:01.000Z'),
+    new Date('2026-11-27T09:00:02.000Z'),
+    new Date('2026-11-27T09:00:03.000Z'),
+  ];
+  let resumeCalls = 0;
+  const resumed = await runOutlineCase({
+    roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace, resume: work,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, timeoutMs: 120_000,
+    concurrency: 2, now: () => seg2Times[Math.min(tick2++, seg2Times.length - 1)]!,
+    invoke: gw.invoke(async (method, params: any) => {
+      if (method === 'execution_rewatch') return {};
+      if (method === 'execution_continue') {
+        await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        return { jobId: 'job-m1' };
+      }
+      if (method === 'execution_get') {
+        resumeCalls++;
+        // First get sees prior failed attempt; after continue, second get returns completed attempt att-2.
+        if (resumeCalls === 1) return { executionStatus: 'failed', attemptId: 'att-1' };
+        return {
+          executionStatus: 'completed',
+          attemptId: 'att-2',
+          currentAttemptId: 'att-2',
+          attempts: [{ attemptId: 'att-2', provider: 'a2a', targetSnapshot: { provider: 'a2a' }, input: {} }],
+          resultMetadata: { provider: 'magpie', model: 'group/deepseek-v4.1', usage: { promptTokens: 600, completionTokens: 250, costUsd: 0.025 } },
+        };
+      }
+      return { executionStatus: 'completed' };
+    }),
+  });
+  assert.equal(resumed.passed, true);
+  assert.equal(resumed.startedAt, '2026-11-26T22:00:00.000Z');
+  assert.equal(resumed.finishedAt, '2026-11-27T09:00:03.000Z');
+  assert.equal(resumed.durationMs, 7000, 'durationMs must sum active segments (4s + 3s) and exclude 11h idle gap');
+
   const lines = (await readFile(join(workspace, 'product-intro-outline', 'ledger.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as LedgerEntry);
   const entry = lines.at(-1)!;
   assert.deepEqual(entry.route, { provider: 'magpie', model: 'group/deepseek-v4.1' });
-  assert.deepEqual(entry.usage, { promptTokens: 800, completionTokens: 300, costUsd: 0.03 });
-  assert.equal(entry.durationMs, 5500);
-  assert.equal(entry.reworkRounds, 1);
+  assert.deepEqual(entry.usage, { promptTokens: 1000, completionTokens: 350, costUsd: 0.035 });
+  assert.equal(entry.durationMs, 7000);
+  assert.equal(entry.finishedAt, '2026-11-27T09:00:03.000Z');
+  assert.equal(entry.reworkRounds, 0);
   assert.equal(entry.env?.nodeVersion, process.version);
   assert.equal(entry.env?.timeoutMs, 120_000);
   assert.equal(entry.env?.concurrency, 2);

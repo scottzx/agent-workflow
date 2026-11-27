@@ -8,7 +8,8 @@ import { z } from 'zod';
 import { ledgerPath, type LedgerEntry, type RunRoute, type StopReason } from './outline-run.js';
 
 const UNFINISHED: ReadonlySet<StopReason> = new Set(['not_completed', 'review_failed', 'host_error']);
-const ISO_PREFIX_RE = /^\d{4}-\d{2}-\d{2}/;
+const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:T.*)?$/;
+const HEX_COMMIT_RE = /^[0-9a-f]{4,40}$/i;
 
 export interface QuantileStats { p50: number; p90: number }
 export interface OptionalQuantileStats { p50: number | null; p90: number | null; samples: number }
@@ -16,6 +17,8 @@ export interface PassPowK { '2': number | null; '3': number | null }
 
 export interface ScorecardMetrics {
   runs: number;
+  /** Runs that reached a role verdict (excludes `not_completed`, `review_failed`, `host_error`, matching gate.ts). */
+  verdictedRuns: number;
   passed: number;
   unfinishedRuns: number;
   firstDraftPassRate: number;
@@ -23,7 +26,7 @@ export interface ScorecardMetrics {
   passPowK: PassPowK;
   bounces: QuantileStats;
   revisions: QuantileStats;
-  reworkRounds: QuantileStats;
+  reworkRounds: OptionalQuantileStats;
   mustIssues: { mean: number };
   cost: OptionalQuantileStats;
   durationMs: OptionalQuantileStats;
@@ -75,6 +78,25 @@ export function passPowK(passed: number, runs: number, k: number): number | null
   return roundMetric(ratio);
 }
 
+/** Task-level τ-bench pass^k: compute C(c_i, k)/C(n_i, k) per caseId first, then average over cases with n_i >= k. */
+function meanCasePassPowK(verdicted: LedgerEntry[], k: number): number | null {
+  const byCase = new Map<string, { passed: number; runs: number }>();
+  for (const entry of verdicted) {
+    const key = entry.caseId || 'default';
+    const cur = byCase.get(key) ?? { passed: 0, runs: 0 };
+    cur.runs += 1;
+    if (entry.passed) cur.passed += 1;
+    byCase.set(key, cur);
+  }
+  const perCase: number[] = [];
+  for (const { passed, runs } of byCase.values()) {
+    const score = passPowK(passed, runs, k);
+    if (score !== null) perCase.push(score);
+  }
+  if (!perCase.length) return null;
+  return roundMetric(perCase.reduce((sum, value) => sum + value, 0) / perCase.length);
+}
+
 function roundMetric(value: number): number {
   return Number(value.toFixed(6));
 }
@@ -86,17 +108,17 @@ function optionalQuantiles(values: number[]): OptionalQuantileStats {
 
 function aggregateMetrics(entries: LedgerEntry[]): ScorecardMetrics {
   const runs = entries.length;
-  const passed = entries.filter(entry => entry.passed).length;
-  const unfinishedRuns = entries.filter(entry => UNFINISHED.has(entry.stopReason)).length;
-  const firstDraftPassed = entries.filter(entry => entry.firstDraftPassed).length;
-  const bounces = entries.map(entry => typeof entry.bounces === 'number' && Number.isFinite(entry.bounces) ? entry.bounces : 0);
-  const revisions = entries.map(entry => typeof entry.revisions === 'number' && Number.isFinite(entry.revisions) ? entry.revisions : 0);
-  const reworkRounds = entries.map(entry =>
-    typeof entry.reworkRounds === 'number' && Number.isFinite(entry.reworkRounds)
-      ? entry.reworkRounds
-      : (entry.bounces ?? 0) + (entry.revisions ?? 0),
-  );
-  const mustIssues = entries.map(entry => typeof entry.mustIssues === 'number' && Number.isFinite(entry.mustIssues) ? entry.mustIssues : 0);
+  const verdicted = entries.filter(entry => !UNFINISHED.has(entry.stopReason));
+  const verdictedRuns = verdicted.length;
+  const unfinishedRuns = runs - verdictedRuns;
+  const passed = verdicted.filter(entry => entry.passed).length;
+  const firstDraftPassed = verdicted.filter(entry => entry.firstDraftPassed).length;
+  const bounces = verdicted.map(entry => typeof entry.bounces === 'number' && Number.isFinite(entry.bounces) ? entry.bounces : 0);
+  const revisions = verdicted.map(entry => typeof entry.revisions === 'number' && Number.isFinite(entry.revisions) ? entry.revisions : 0);
+  const reworkRounds = verdicted
+    .map(entry => entry.reworkRounds)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+  const mustIssues = verdicted.map(entry => typeof entry.mustIssues === 'number' && Number.isFinite(entry.mustIssues) ? entry.mustIssues : 0);
   const costs = entries
     .map(entry => entry.usage?.costUsd)
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0);
@@ -110,15 +132,16 @@ function aggregateMetrics(entries: LedgerEntry[]): ScorecardMetrics {
   }
   return {
     runs,
+    verdictedRuns,
     passed,
     unfinishedRuns,
-    firstDraftPassRate: runs ? roundMetric(firstDraftPassed / runs) : 0,
-    passRate: runs ? roundMetric(passed / runs) : 0,
-    passPowK: { '2': passPowK(passed, runs, 2), '3': passPowK(passed, runs, 3) },
+    firstDraftPassRate: verdictedRuns ? roundMetric(firstDraftPassed / verdictedRuns) : 0,
+    passRate: verdictedRuns ? roundMetric(passed / verdictedRuns) : 0,
+    passPowK: { '2': meanCasePassPowK(verdicted, 2), '3': meanCasePassPowK(verdicted, 3) },
     bounces: { p50: percentile(bounces, 50), p90: percentile(bounces, 90) },
     revisions: { p50: percentile(revisions, 50), p90: percentile(revisions, 90) },
-    reworkRounds: { p50: percentile(reworkRounds, 50), p90: percentile(reworkRounds, 90) },
-    mustIssues: { mean: runs ? roundMetric(mustIssues.reduce((sum, value) => sum + value, 0) / runs) : 0 },
+    reworkRounds: optionalQuantiles(reworkRounds),
+    mustIssues: { mean: verdictedRuns ? roundMetric(mustIssues.reduce((sum, value) => sum + value, 0) / verdictedRuns) : 0 },
     cost: optionalQuantiles(costs),
     durationMs: optionalQuantiles(durations),
     stopReasons,
@@ -134,20 +157,29 @@ function deduplicateLedger(entries: LedgerEntry[]): LedgerEntry[] {
 
 /**
  * Filter deduplicated ledger entries by `--since <ver>`:
- * - ISO date/timestamp prefix (YYYY-MM-DD...): keeps rows with `startedAt >= since`
- * - Commit SHA / prefix: keeps rows from the first matching commit onward in chronological ledger order
+ * - Valid ISO date/timestamp (YYYY-MM-DD or full ISO-8601): keeps rows whose completion/start (`finishedAt ?? startedAt`) >= threshold.
+ * - Hex commit SHA / prefix (4..40 hex chars): keeps rows from the first matching commit onward in chronological ledger order.
+ * Rejects malformed date/commit arguments instead of silently returning 0 rows.
  */
 function filterSince(entries: LedgerEntry[], since?: string): LedgerEntry[] {
   const token = since?.trim();
   if (!token) return entries;
-  if (ISO_PREFIX_RE.test(token)) {
-    const threshold = Date.parse(token);
-    return Number.isFinite(threshold)
-      ? entries.filter(entry => {
-        const ts = Date.parse(entry.startedAt);
-        return Number.isFinite(ts) ? ts >= threshold : entry.startedAt >= token;
-      })
-      : entries.filter(entry => entry.startedAt >= token);
+  const iso = ISO_DATE_RE.exec(token);
+  if (iso) {
+    const year = Number(iso[1]), month = Number(iso[2]), day = Number(iso[3]);
+    const parsedMs = Date.parse(token);
+    const check = new Date(Date.UTC(year, month - 1, day));
+    if (!Number.isFinite(parsedMs) || check.getUTCFullYear() !== year || check.getUTCMonth() + 1 !== month || check.getUTCDate() !== day) {
+      throw new Error(`Invalid --since ISO date/timestamp: ${token}`);
+    }
+    return entries.filter(entry => {
+      const effective = entry.finishedAt ?? entry.startedAt;
+      const ts = Date.parse(effective);
+      return Number.isFinite(ts) ? ts >= parsedMs : effective >= token;
+    });
+  }
+  if (!HEX_COMMIT_RE.test(token)) {
+    throw new Error(`Invalid --since value "${token}": expected ISO date (YYYY-MM-DD) or 4-40 char commit SHA prefix`);
   }
   const normalized = token.toLowerCase();
   const startIndex = entries.findIndex(entry => entry.role?.commit?.toLowerCase().startsWith(normalized));
@@ -203,7 +235,17 @@ export async function computeRoleScorecard(options: {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
     throw error;
   });
-  const entries = text.split('\n').filter(line => line.trim()).map(line => JSON.parse(line) as LedgerEntry);
+  const entries: LedgerEntry[] = [];
+  const rawLines = text.split('\n');
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i]!.trim();
+    if (!line) continue;
+    try {
+      entries.push(JSON.parse(line) as LedgerEntry);
+    } catch (error) {
+      throw new Error(`Invalid JSON in ${ledgerFile} at line ${i + 1}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   return buildScorecardFromEntries({ roleId, ledgerFile, entries, since: options.since });
 }
 
@@ -211,15 +253,15 @@ export function formatScorecardText(report: ScorecardReport): string {
   const pct = (value: number | null) => value === null ? 'n/a' : `${(value * 100).toFixed(1)}%`;
   const num = (value: number | null, suffix = '') => value === null ? 'n/a' : `${value}${suffix}`;
   const lines = [
-    `角色 ${report.roleId} 运行评分卡（observe-only，样本 ${report.totalEntries}${report.since ? `，since=${report.since}` : ''}）`,
-    `总计：通过 ${report.overall.passed}/${report.overall.runs}（${pct(report.overall.passRate)}），首稿通过 ${pct(report.overall.firstDraftPassRate)}，pass^2=${pct(report.overall.passPowK['2'])}，pass^3=${pct(report.overall.passPowK['3'])}`,
-    `  bounces p50/p90=${report.overall.bounces.p50}/${report.overall.bounces.p90}，revisions p50/p90=${report.overall.revisions.p50}/${report.overall.revisions.p90}，mustIssues mean=${report.overall.mustIssues.mean}`,
+    `角色 ${report.roleId} 运行评分卡（observe-only，样本 ${report.totalEntries}，已判 ${report.overall.verdictedRuns}，未完成 ${report.overall.unfinishedRuns}${report.since ? `，since=${report.since}` : ''}）`,
+    `总计：通过 ${report.overall.passed}/${report.overall.verdictedRuns}（${pct(report.overall.passRate)}），首稿通过 ${pct(report.overall.firstDraftPassRate)}，pass^2=${pct(report.overall.passPowK['2'])}，pass^3=${pct(report.overall.passPowK['3'])}`,
+    `  bounces p50/p90=${report.overall.bounces.p50}/${report.overall.bounces.p90}，revisions p50/p90=${report.overall.revisions.p50}/${report.overall.revisions.p90}，reworkRounds p50/p90=${num(report.overall.reworkRounds.p50)}/${num(report.overall.reworkRounds.p90)}（n=${report.overall.reworkRounds.samples}），mustIssues mean=${report.overall.mustIssues.mean}`,
     `  cost p50/p90=${num(report.overall.cost.p50, ' USD')}/${num(report.overall.cost.p90, ' USD')}（n=${report.overall.cost.samples}），durationMs p50/p90=${num(report.overall.durationMs.p50)}/${num(report.overall.durationMs.p90)}（n=${report.overall.durationMs.samples}）`,
   ];
   for (const group of report.groups) {
     const version = group.roleVersion === 'uncommitted' ? '未提交' : `${group.roleVersion.slice(0, 8)}${group.dirty ? '*' : ''}`;
     lines.push(
-      `  [${version} | ${group.route}] runs=${group.runs} pass=${pct(group.passRate)} firstDraft=${pct(group.firstDraftPassRate)} pass^2=${pct(group.passPowK['2'])} pass^3=${pct(group.passPowK['3'])} bounces=${group.bounces.p50}/${group.bounces.p90} revisions=${group.revisions.p50}/${group.revisions.p90} cost=${num(group.cost.p50)}/${num(group.cost.p90)}`,
+      `  [${version} | ${group.route}] runs=${group.runs} (verdicted=${group.verdictedRuns}) pass=${pct(group.passRate)} firstDraft=${pct(group.firstDraftPassRate)} pass^2=${pct(group.passPowK['2'])} pass^3=${pct(group.passPowK['3'])} bounces=${group.bounces.p50}/${group.bounces.p90} revisions=${group.revisions.p50}/${group.revisions.p90} cost=${num(group.cost.p50)}/${num(group.cost.p90)}`,
     );
   }
   return lines.join('\n');

@@ -74,12 +74,18 @@ test('scorecard reads legacy rows without metrics, deduplicates resumed runs, gr
   const entries: LedgerEntry[] = [
     // Legacy row (no route/usage/durationMs/env/reworkRounds)
     makeEntry({ startedAt: '2026-11-25T00:00:00.000Z', role: { commit: v1, dirty: false }, workDirectory: '/w1', passed: true, firstDraftPassed: true }),
-    // Resumed run on same workDirectory: earlier unfinished line must be superseded by later passed line
-    makeEntry({ startedAt: '2026-11-26T00:00:00.000Z', role: { commit: v2, dirty: false }, workDirectory: '/w2', passed: false, stopReason: 'not_completed', firstDraftPassed: false }),
+    // Resumed run started Nov 20, finished Nov 27: earlier unfinished line superseded, and --since 2026-11-27 includes it via finishedAt
+    makeEntry({ startedAt: '2026-11-20T00:00:00.000Z', role: { commit: v2, dirty: false }, workDirectory: '/w2', passed: false, stopReason: 'not_completed', firstDraftPassed: false }),
     makeEntry({
-      startedAt: '2026-11-26T00:00:00.000Z', role: { commit: v2, dirty: false }, workDirectory: '/w2',
+      startedAt: '2026-11-20T00:00:00.000Z', finishedAt: '2026-11-27T00:30:00.000Z', role: { commit: v2, dirty: false }, workDirectory: '/w2',
       passed: true, stopReason: 'passed', firstDraftPassed: true, bounces: 0, revisions: 0, reworkRounds: 0, mustIssues: 0,
       route: { provider: 'magpie', model: 'deepseek' }, usage: { promptTokens: 1000, completionTokens: 200, costUsd: 0.02 }, durationMs: 1200,
+    }),
+    // Unfinished host_error must NOT penalize verdicted passRate/firstDraftPassRate/pass^k
+    makeEntry({
+      startedAt: '2026-11-27T00:45:00.000Z', finishedAt: '2026-11-27T00:46:00.000Z', role: { commit: v2, dirty: false }, workDirectory: '/w-err',
+      passed: false, stopReason: 'host_error', firstDraftPassed: false, bounces: 0, revisions: 0, mustIssues: 0,
+      route: { provider: 'magpie', model: 'deepseek' }, durationMs: 500,
     }),
     makeEntry({
       startedAt: '2026-11-27T01:00:00.000Z', role: { commit: v2, dirty: false }, workDirectory: '/w3',
@@ -99,18 +105,22 @@ test('scorecard reads legacy rows without metrics, deduplicates resumed runs, gr
   ];
 
   const full = buildScorecardFromEntries({ roleId: 'demo-role', ledgerFile: '/ledger.jsonl', entries });
-  assert.equal(full.totalEntries, 5);
+  assert.equal(full.totalEntries, 6);
   assert.equal(full.groups.length, 3);
 
   const legacyGroup = full.groups.find(g => g.roleVersion === v1 && g.route === 'unknown')!;
   assert.equal(legacyGroup.runs, 1);
+  assert.equal(legacyGroup.verdictedRuns, 1);
   assert.equal(legacyGroup.passRate, 1);
   assert.equal(legacyGroup.passPowK['2'], null);
+  assert.deepEqual(legacyGroup.reworkRounds, { p50: null, p90: null, samples: 0 });
   assert.deepEqual(legacyGroup.cost, { p50: null, p90: null, samples: 0 });
   assert.deepEqual(legacyGroup.durationMs, { p50: null, p90: null, samples: 0 });
 
   const deepseekGroup = full.groups.find(g => g.roleVersion === v2 && g.route === 'magpie/deepseek')!;
-  assert.equal(deepseekGroup.runs, 3);
+  assert.equal(deepseekGroup.runs, 4);
+  assert.equal(deepseekGroup.verdictedRuns, 3);
+  assert.equal(deepseekGroup.unfinishedRuns, 1);
   assert.equal(deepseekGroup.passed, 2);
   assert.equal(deepseekGroup.firstDraftPassRate, Number((1 / 3).toFixed(6)));
   assert.equal(deepseekGroup.passRate, Number((2 / 3).toFixed(6)));
@@ -118,23 +128,34 @@ test('scorecard reads legacy rows without metrics, deduplicates resumed runs, gr
   assert.equal(deepseekGroup.passPowK['3'], 0);
   assert.deepEqual(deepseekGroup.bounces, { p50: 1, p90: 1.8 });
   assert.deepEqual(deepseekGroup.revisions, { p50: 0, p90: 0.8 });
+  assert.deepEqual(deepseekGroup.reworkRounds, { p50: 2, p90: 2, samples: 3 });
   assert.deepEqual(deepseekGroup.cost, { p50: 0.05, p90: 0.074, samples: 3 });
-  assert.deepEqual(deepseekGroup.durationMs, { p50: 3600, p90: 4560, samples: 3 });
-  assert.deepEqual(deepseekGroup.stopReasons, { passed: 2, max_bounces: 1 });
+  assert.deepEqual(deepseekGroup.durationMs, { p50: 2400, p90: 4440, samples: 4 });
+  assert.deepEqual(deepseekGroup.stopReasons, { passed: 2, max_bounces: 1, host_error: 1 });
   assert.equal(deepseekGroup.mustIssues.mean, Number((2 / 3).toFixed(6)));
 
   const sinceCommit = buildScorecardFromEntries({ roleId: 'demo-role', ledgerFile: '/ledger.jsonl', entries, since: '22222222' });
-  assert.equal(sinceCommit.totalEntries, 4);
+  assert.equal(sinceCommit.totalEntries, 5);
   assert.equal(sinceCommit.groups.some(g => g.roleVersion === v1), false);
 
   const sinceDate = buildScorecardFromEntries({ roleId: 'demo-role', ledgerFile: '/ledger.jsonl', entries, since: '2026-11-27' });
-  assert.equal(sinceDate.totalEntries, 3);
+  assert.equal(sinceDate.totalEntries, 5, 'resumed run finished on 2026-11-27 must be included');
 
   const sinceMissing = buildScorecardFromEntries({ roleId: 'demo-role', ledgerFile: '/ledger.jsonl', entries, since: 'deadbeef' });
   assert.equal(sinceMissing.totalEntries, 0);
   assert.deepEqual(sinceMissing.groups, []);
 
+  assert.throws(() => buildScorecardFromEntries({ roleId: 'demo-role', ledgerFile: '/ledger.jsonl', entries, since: '2026-99-99' }), /Invalid --since/);
+  assert.throws(() => buildScorecardFromEntries({ roleId: 'demo-role', ledgerFile: '/ledger.jsonl', entries, since: 'not-a-sha!' }), /Invalid --since/);
+
   assert.match(formatScorecardText(full), /运行评分卡（observe-only/);
+});
+
+test('computeRoleScorecard reports file path and line number on corrupted ledger JSON', async t => {
+  const f = await roleFixture(t);
+  await mkdir(join(f.workspace, 'demo-role'), { recursive: true });
+  await writeFile(join(f.workspace, 'demo-role', 'ledger.jsonl'), `${JSON.stringify(makeEntry())}\n{broken\n`);
+  await assert.rejects(() => computeRoleScorecard({ roleDirectory: f.role, workspace: f.workspace }), /ledger\.jsonl at line 2/);
 });
 
 test('CLI rsi scorecard --role --json works end-to-end and rsi gate output is unchanged by new ledger metrics', async t => {
