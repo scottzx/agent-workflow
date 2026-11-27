@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { promisify } from 'node:util';
 import { calibrateRole, calibrationPath, computeChecksDigest, computeRoleDigest, holdoutPath, loadCalibration, sampleKeyOf, type CalibrationCheckRunner } from '../src/rsi/calibrate.js';
 import { auditChecklistProvenance, effectiveEnforcementWithCoverage, parseChecklist } from '../src/rsi/checklist.js';
+import { defaultOutlineWorkflow, runRoundDag } from '../src/rsi/engine.js';
 import { checkGate, crEvalReportPath } from '../src/rsi/gate.js';
-import { computeCrEvalDigest } from '../src/rsi/pr-cr-eval.js';
+import { computeCrEvalDigest, loadCrEvalManifest, type CrReviewResult } from '../src/rsi/pr-cr-eval.js';
 import type { LedgerEntry } from '../src/rsi/outline-run.js';
+
+const execAsync = promisify(execFile);
 
 async function roleFixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), 'rsi-calibrate-'));
@@ -111,7 +115,7 @@ test('calibrateRole passes when positive samples are clean and a historical revi
   assert.equal(report.checksDigest, await computeChecksDigest(f.role));
   assert.equal(report.roleDigest, await computeRoleDigest(f.role));
   assert.equal(report.negativeRecall, 1);
-  assert.equal(report.holdout.frozen, true);
+  assert.equal(report.holdout.frozen, false, 'small sample set without explicit holdoutKeys does not claim frozen');
   assert.equal(report.holdout.passed, true);
   assert.equal(report.calibratedAt, '2026-11-26T00:00:00.000Z');
   assert.equal(report.positiveSamples, 1);
@@ -305,6 +309,18 @@ test('bidirectional L3 fails when checks are relaxed to catch nothing, and verif
   assert.equal(good.holdout.passed, true);
   assert.deepEqual(good.holdout.sampleKeys, [holdoutKey]);
 
+  // Deleting a frozen holdout sample's run.json must fail closed (never pass on empty intersection).
+  await rm(join(negDir, 'run.json'));
+  const missingHoldout = await calibrateRole({
+    roleDirectory: f.role,
+    workspace: f.workspace,
+    checkRunner: scriptedRunner(seen),
+  });
+  assert.equal(missingHoldout.passed, false, 'missing frozen holdout keys must fail closed');
+  assert.equal(missingHoldout.holdout.passed, false);
+  assert.deepEqual(missingHoldout.holdout.missingKeys, [holdoutKey]);
+  assert.match(missingHoldout.failureReasons.join('\n'), /holdout 样本缺失/);
+
   // Tampering with frozen holdout.json causes fail-closed failure.
   const rawHoldout = JSON.parse(await readFile(holdoutPath(f.workspace, 'demo-role'), 'utf8')) as { sampleKeys: string[] };
   rawHoldout.sampleKeys = [];
@@ -317,6 +333,90 @@ test('bidirectional L3 fails when checks are relaxed to catch nothing, and verif
   assert.equal(tampered.passed, false);
   assert.equal(tampered.holdout.tampered, true);
   assert.match(tampered.failureReasons.join('\n'), /holdout/);
+});
+
+test('production calibrateRole auto-detects new block checks missing source, downgrades 0-coverage checks into runRoundDag, and isolates --only', async t => {
+  const f = await roleFixture(t), commit1 = f.git('rev-parse', 'HEAD');
+  const posDir = await sampleDir(f.root, 'pos-prod', { fail: ['P16_NEW'] });
+  const negDir = await sampleDir(f.root, 'neg-prod', { fail: ['P15'] });
+  const negCopy = join(negDir, 'reviews', 'outline-r1.json');
+  await writeFile(negCopy, JSON.stringify({ fail: ['P15'] }));
+  await writeFile(join(negDir, 'run.json'), JSON.stringify({ rounds: [
+    { round: 1, review: { outlineCopy: negCopy, review: { verdict: 'revise', summary: '缺少链接' } } },
+  ] }));
+  await writeLedger(f.workspace, [
+    entry(commit1, { workDirectory: posDir, passed: true }),
+    entry(commit1, { workDirectory: negDir, passed: false, stopReason: 'stalled' }),
+  ]);
+
+  // M3: Add a new block check WITHOUT source (no existingItemIds passed) -> auto-detected from git baseline and fails!
+  const checklistPath = join(f.role, 'checklist.json');
+  const baseChecklist = JSON.parse(await readFile(checklistPath, 'utf8')) as { items: Record<string, unknown>[] };
+  await writeFile(checklistPath, JSON.stringify({
+    ...baseChecklist,
+    items: [
+      ...baseChecklist.items,
+      { id: 'P16_NEW', kind: 'program', severity: 'must', locked: false, rule: '新增无溯源规则' },
+    ],
+  }, null, 2));
+  const multiRunner: CalibrationCheckRunner = async input => {
+    const doc = JSON.parse(await readFile(input.artifactPath, 'utf8')) as { fail?: string[] };
+    const fail = new Set(doc.fail ?? []);
+    return ['P14', 'P15', 'P16_NEW'].map(itemId => ({ itemId, pass: !fail.has(itemId), evidence: [] }));
+  };
+  const noSourceReport = await calibrateRole({ roleDirectory: f.role, workspace: f.workspace, checkRunner: multiRunner });
+  assert.equal(noSourceReport.passed, false, 'new block check without source must fail in production path');
+  assert.deepEqual(noSourceReport.missingSource, ['P16_NEW']);
+
+  // M5: Add source to P16_NEW, still 0 negative coverage -> downgraded to observe in calibration AND in runRoundDag!
+  await writeFile(checklistPath, JSON.stringify({
+    ...baseChecklist,
+    items: [
+      ...baseChecklist.items,
+      { id: 'P16_NEW', kind: 'program', severity: 'must', locked: false, source: 'PR #26 CR-M1', rule: '有溯源但零负样本覆盖' },
+    ],
+  }, null, 2));
+  const downgradedReport = await calibrateRole({ roleDirectory: f.role, workspace: f.workspace, checkRunner: multiRunner });
+  assert.deepEqual(downgradedReport.missingSource, []);
+  assert.deepEqual(downgradedReport.downgradedToObserve, ['P16_NEW']);
+  assert.equal(downgradedReport.effectiveModes.P16_NEW, 'observe');
+  assert.equal(downgradedReport.falsePositives.length, 0, 'downgraded observe check does not trigger positive block false positive');
+  assert.equal(downgradedReport.passed, true);
+
+  // Wire effectiveModes into runRoundDag in formal mode: failing P16_NEW must NOT block!
+  const dagDir = join(f.root, 'dag-runtime');
+  const dag = await runRoundDag({
+    workflow: defaultOutlineWorkflow(),
+    round: 1,
+    workDirectory: dagDir,
+    mode: 'formal',
+    checklist: parseChecklist(JSON.parse(await readFile(checklistPath, 'utf8'))),
+    effectiveModes: downgradedReport.effectiveModes,
+    nodes: [{ id: 'check_new', type: 'program_check', checks: ['P16_NEW'] }],
+    handlersById: {
+      check_new: async () => ({ results: [{ itemId: 'P16_NEW', pass: false, evidence: ['zero-coverage rule failed'] }] }),
+    },
+  });
+  assert.equal(dag.blocked, false, 'downgraded zero-coverage check must run as observe (non-blocking) at runtime');
+
+  // M4: --only must NEVER overwrite official calibration.json, and checkGate must reject any report with `only`.
+  const officialBefore = await readFile(calibrationPath(f.workspace, 'demo-role'), 'utf8');
+  await calibrateRole({ roleDirectory: f.role, workspace: f.workspace, only: ['P14'], checkRunner: multiRunner });
+  assert.equal(await readFile(calibrationPath(f.workspace, 'demo-role'), 'utf8'), officialBefore, '--only must not overwrite calibration.json');
+
+  // Even if someone manually writes a report with `only` into calibration.json, checkGate rejects it.
+  f.git('add', '.'); f.git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'with P16_NEW');
+  const v2 = f.git('rev-parse', 'HEAD');
+  const fullV2 = await calibrateRole({ roleDirectory: f.role, workspace: f.workspace, checkRunner: multiRunner });
+  await writeFile(calibrationPath(f.workspace, 'demo-role'), JSON.stringify({ ...fullV2, only: ['P14'] }));
+  await writeLedger(f.workspace, [
+    entry(v2, { workDirectory: posDir, startedAt: '2026-11-01T00:00:00.000Z' }),
+    entry(v2, { workDirectory: posDir, startedAt: '2026-11-02T00:00:00.000Z' }),
+  ]);
+  const rejectedPartial = await checkGate({ roleDirectory: f.role, workspace: f.workspace });
+  assert.equal(rejectedPartial.ready, false);
+  assert.equal(rejectedPartial.calibration.status, 'failed');
+  assert.match(rejectedPartial.reasons.join('\n'), /--only/);
 });
 
 test('new block checks require source provenance and downgrade to observe when negative coverage is zero', () => {
@@ -375,7 +475,7 @@ test('editing ROLE.md or QA.md changes roleDigest and triggers recalibration in 
   assert.equal(gate.calibration.required, true);
 });
 
-test('checkGate works on pr-delivery without ENOENT /cases and wires eval-cr & roleDigest', async t => {
+test('checkGate works on pr-delivery without ENOENT /cases, wires real eval-cr CLI producer, and rejects forged booleans', async t => {
   const workspace = await mkdtemp(join(tmpdir(), 'rsi-gate-pr-delivery-'));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const repoRoot = join(import.meta.dirname, '../../..');
@@ -390,7 +490,7 @@ test('checkGate works on pr-delivery without ENOENT /cases and wires eval-cr & r
   assert.equal(withoutReport.crEval?.status, 'missing');
   assert.equal(withoutReport.ready, false);
 
-  // Writing a bound promotionReady eval-cr.json with matching evalDigest and roleDigest opens the gate (when clean).
+  // M2 anti-cheat: hand-writing { evalDigest, roleDigest, promotionReady: true } WITHOUT valid results MUST be rejected!
   const evalDigest = await computeCrEvalDigest(prDeliveryRole);
   const roleDigest = await computeRoleDigest(prDeliveryRole);
   await mkdir(join(workspace, 'pr-delivery'), { recursive: true });
@@ -399,19 +499,60 @@ test('checkGate works on pr-delivery without ENOENT /cases and wires eval-cr & r
     roleDigest,
     promotionReady: true,
   }));
-  const withReport = await checkGate({ roleDirectory: prDeliveryRole, workspace, repoRoot });
-  assert.equal(withReport.crEval?.status, 'passed');
-  assert.equal(withReport.crEval?.promotionReady, true);
-  if (!withReport.role.dirty) {
-    assert.equal(withReport.ready, true, withReport.reasons.join('\n'));
+  const forgedBoolean = await checkGate({ roleDirectory: prDeliveryRole, workspace, repoRoot });
+  assert.equal(forgedBoolean.ready, false, 'hand-written promotionReady boolean must never pass gate');
+  assert.equal(forgedBoolean.crEval?.status, 'failed');
+
+  // M1 real producer: run `acp-service rsi eval-cr --role ... --results ... --workspace ...` and verify checkGate re-scores it!
+  const manifest = await loadCrEvalManifest(prDeliveryRole);
+  const passingResults: CrReviewResult[] = manifest.cases.map(item => {
+    if (item.kind === 'positive') {
+      return { caseId: item.id, verdict: 'PASS', must: [] };
+    }
+    return {
+      caseId: item.id,
+      verdict: 'CHANGES_REQUESTED',
+      must: (item.requiredDefects ?? []).map(d => ({
+        id: d.id,
+        file: d.anyFilePatterns[0],
+        summary: `${d.anyFilePatterns[0]}: ${d.anyTextPatterns[0]}`,
+      })),
+    };
+  });
+  const resultsFile = join(workspace, 'results.json');
+  await writeFile(resultsFile, JSON.stringify(passingResults, null, 2));
+  const cli = join(repoRoot, 'packages/service/bin/acp-service.ts');
+  const { stdout } = await execAsync(
+    process.execPath,
+    ['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', prDeliveryRole, '--repo', repoRoot, '--results', resultsFile, '--workspace', workspace, '--json'],
+    { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
+  );
+  const cliOut = JSON.parse(stdout) as { ok: boolean; reportPath: string; roleDigest: string };
+  assert.equal(cliOut.ok, true);
+  assert.equal(cliOut.reportPath, crEvalReportPath(workspace, 'pr-delivery'));
+  assert.equal(cliOut.roleDigest, roleDigest);
+
+  const withRealReport = await checkGate({ roleDirectory: prDeliveryRole, workspace, repoRoot });
+  assert.equal(withRealReport.crEval?.status, 'passed');
+  assert.equal(withRealReport.crEval?.promotionReady, true);
+  if (!withRealReport.role.dirty) {
+    assert.equal(withRealReport.ready, true, withRealReport.reasons.join('\n'));
   }
 
-  // Stale roleDigest (e.g. ROLE.md edited) marks eval-cr stale.
-  await writeFile(crEvalReportPath(workspace, 'pr-delivery'), JSON.stringify({
-    evalDigest,
-    roleDigest: '0'.repeat(64),
-    promotionReady: true,
-  }));
+  // Tampering results inside eval-cr.json (e.g. changing negative case to PASS while leaving promotionReady: true) is caught by re-scoring!
+  const saved = JSON.parse(await readFile(crEvalReportPath(workspace, 'pr-delivery'), 'utf8')) as {
+    results: CrReviewResult[];
+    resultsDigest: string;
+    roleDigest: string;
+  };
+  const tamperedResults = saved.results.map((r, i) => (i === 0 ? { caseId: r.caseId, verdict: 'PASS' as const, must: [] } : r));
+  await writeFile(crEvalReportPath(workspace, 'pr-delivery'), JSON.stringify({ ...saved, results: tamperedResults }));
+  const tamperedGate = await checkGate({ roleDirectory: prDeliveryRole, workspace, repoRoot });
+  assert.equal(tamperedGate.ready, false);
+  assert.equal(tamperedGate.crEval?.status, 'failed');
+
+  // Stale roleDigest (e.g. ROLE.md or skills edited) marks eval-cr stale.
+  await writeFile(crEvalReportPath(workspace, 'pr-delivery'), JSON.stringify({ ...saved, roleDigest: '0'.repeat(64) }));
   const staleRole = await checkGate({ roleDirectory: prDeliveryRole, workspace, repoRoot });
   assert.equal(staleRole.crEval?.status, 'stale');
   assert.equal(staleRole.ready, false);

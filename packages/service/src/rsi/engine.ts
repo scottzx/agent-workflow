@@ -13,7 +13,7 @@ import { worktreeConfigSchema } from './worktree.js';
 
 const nodeSchema = z.object({
   id: z.string().min(1),
-  type: z.enum(['executor_turn', 'program_check', 'artifact_digest_check', 'ticket_apply_checks', 'qa_session_review', 'ticket_apply_review']),
+  type: z.enum(['executor_turn', 'program_check', 'artifact_digest_check', 'ticket_apply_checks', 'qa_session_review', 'ticket_apply_review', 'learnings_lookup']),
   dependsOn: z.array(z.string().min(1)).optional(),
   checks: z.array(z.string().min(1)).optional(),
   when: z.enum(['checks_passed', 'always']).optional(),
@@ -99,6 +99,8 @@ export interface RunRoundDagOptions {
   workDirectory: string;
   mode: RsiMode;
   checklist?: NormalizedChecklist;
+  /** Optional calibrated per-item enforcement overrides (e.g. zero-negative-coverage checks downgraded to `observe`). */
+  effectiveModes?: Readonly<Record<string, CheckEnforcement>>;
   /** Defaults to the workflow's nodes. Outline runs pass the check subgraph and drive QA outside. */
   nodes?: WorkflowNode[];
   handlersById?: Partial<Record<string, NodeHandler>>;
@@ -109,7 +111,7 @@ export interface RunRoundDagOptions {
   now?: () => Date;
 }
 
-const CHECK_NODE = new Set<WorkflowNode['type']>(['program_check', 'artifact_digest_check']);
+const CHECK_NODE = new Set<WorkflowNode['type']>(['program_check', 'artifact_digest_check', 'learnings_lookup']);
 
 export function defaultOutlineWorkflow(): Workflow {
   return workflowSchema.parse({
@@ -177,7 +179,16 @@ export function firstRoundSubmitGate(input: { requireTicketSubmit?: boolean; rou
   return { bounce: true, problems: [`还没有提交任务单（必填自检未打卡 ${pending.map(check => check.id).join('、')}）`] };
 }
 
-function enforcementFor(checklist: NormalizedChecklist | undefined, itemId: string, mode: RsiMode, enforceObserveAsBlock: boolean): CheckEnforcement {
+function enforcementFor(
+  checklist: NormalizedChecklist | undefined,
+  itemId: string,
+  mode: RsiMode,
+  enforceObserveAsBlock: boolean,
+  effectiveModes?: Readonly<Record<string, CheckEnforcement>>,
+): CheckEnforcement {
+  if (effectiveModes && Object.hasOwn(effectiveModes, itemId)) {
+    return effectiveModes[itemId]!;
+  }
   const item = checklist?.items.find(entry => entry.id === itemId);
   if (!item) return 'block';
   return effectiveEnforcement(item, mode, enforceObserveAsBlock);
@@ -301,7 +312,7 @@ export async function runRoundDag(options: RunRoundDagOptions): Promise<RoundDag
         let status: NodeStatus = result.status ?? 'completed';
         if (result.results && CHECK_NODE.has(node.type)) {
           const failed = result.results.filter(entry => !entry.pass);
-          const blocking = failed.filter(entry => enforcementFor(options.checklist, entry.itemId, options.mode, policy.enforceObserveAsBlock) === 'block');
+          const blocking = failed.filter(entry => enforcementFor(options.checklist, entry.itemId, options.mode, policy.enforceObserveAsBlock, options.effectiveModes) === 'block');
           if (blocking.length) status = 'failed';
           else if (failed.length) status = 'completed';
           else status = result.status === 'failed' ? 'failed' : 'completed';

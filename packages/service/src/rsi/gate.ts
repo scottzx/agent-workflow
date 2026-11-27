@@ -6,34 +6,62 @@
  * count starts again. Runs that never reached a verdict (the executor or QA task did not finish, e.g. the model
  * quota ran out, or the host itself failed) say nothing about the role and are left out.
  * Two further bars apply when the evidence exists: no self-check that disagreed with the program (L1), and a
- * current bidirectional replay calibration when this version's role directory (including ROLE.md/QA.md/checks)
+ * current bidirectional replay calibration when this version's role directory (including ROLE.md/QA.md/checks/skills)
  * differs from the previous passing version (L3).
  *
  * Roles without `cases/` that use `evals/manifest.json` (such as `pr-delivery`) do not throw ENOENT;
- * instead they verify `evals/manifest.json` commit ancestry and check the bound `eval-cr.json` report.
+ * instead they verify `evals/manifest.json` commit ancestry and re-score the bound `eval-cr.json` results in-process
+ * (never trusting a self-attested `promotionReady` boolean).
  */
 import { execFile } from 'node:child_process';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Ticket } from '../execution/ticket.js';
-import { computeChecksDigest, computeRoleDigest, loadCalibration } from './calibrate.js';
+import { assertSafeRoleWorkspaceId, computeChecksDigest, computeRoleDigest, loadCalibration } from './calibrate.js';
 import { type LedgerEntry, ledgerPath, roleVersion, type RoleVersion, type StopReason } from './outline-run.js';
-import { computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, verifyCrEvalCommits } from './pr-cr-eval.js';
+import {
+  coerceCrEvalResults,
+  computeCrEvalDigest,
+  crReviewResultSchema,
+  findRepoRoot,
+  loadCrEvalManifest,
+  scoreCrEvalSuite,
+  verifyCrEvalCommits,
+  type CrEvalScore,
+  type CrReviewResult,
+} from './pr-cr-eval.js';
 
 const execFileAsync = promisify(execFile);
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
 
-const savedCrEvalSchema = z.object({
+const savedCrEvalReportSchema = z.object({
+  schemaVersion: z.literal(1),
+  roleId: z.string().min(1),
   evalDigest: z.string().regex(/^[0-9a-f]{64}$/),
-  promotionReady: z.boolean(),
-  roleDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  roleDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  resultsDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  scoredAt: z.string().min(1),
+  results: z.array(crReviewResultSchema).min(1),
 }).passthrough();
+
+export interface SavedCrEvalReport {
+  schemaVersion: 1;
+  roleId: string;
+  evalDigest: string;
+  roleDigest: string;
+  resultsDigest: string;
+  scoredAt: string;
+  results: CrReviewResult[];
+  score: CrEvalScore;
+}
 
 export interface CrEvalGateSummary {
   present: boolean;
   evalDigest?: string;
+  roleDigest?: string;
   verified: boolean;
   checkedCommits: number;
   errors: string[];
@@ -65,7 +93,50 @@ export interface GateReport {
   crEval?: CrEvalGateSummary;
 }
 
-export const crEvalReportPath = (workspace: string, roleId: string) => path.join(path.resolve(workspace), roleId, 'eval-cr.json');
+export function crEvalReportPath(workspace: string, roleId: string): string {
+  assertSafeRoleWorkspaceId(roleId);
+  return path.join(path.resolve(workspace), roleId, 'eval-cr.json');
+}
+
+function digestCrResults(results: readonly CrReviewResult[]): string {
+  return createHash('sha256').update(JSON.stringify(results)).digest('hex');
+}
+
+/**
+ * Producer for `<workspace>/<roleId>/eval-cr.json` (called by `acp-service rsi eval-cr --results`).
+ * Stores the normalized `results` array + `evalDigest` + `roleDigest` + `resultsDigest` so `checkGate`
+ * can re-score the suite in-process instead of trusting a hand-written boolean.
+ */
+export async function writeCrEvalReport(options: {
+  roleDirectory: string;
+  workspace: string;
+  results: CrReviewResult[];
+  score: CrEvalScore;
+  now?: () => Date;
+}): Promise<{ path: string; report: SavedCrEvalReport }> {
+  const roleDirectory = path.resolve(options.roleDirectory);
+  const roleId = z.object({ id: z.string().min(1) }).passthrough().parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))).id;
+  assertSafeRoleWorkspaceId(roleId);
+  const [evalDigest, roleDigest] = await Promise.all([
+    computeCrEvalDigest(roleDirectory),
+    computeRoleDigest(roleDirectory),
+  ]);
+  const normalizedResults = options.results.map(item => crReviewResultSchema.parse(item));
+  const report: SavedCrEvalReport = {
+    schemaVersion: 1,
+    roleId,
+    evalDigest,
+    roleDigest,
+    resultsDigest: digestCrResults(normalizedResults),
+    scoredAt: (options.now ?? (() => new Date()))().toISOString(),
+    results: normalizedResults,
+    score: options.score,
+  };
+  const outPath = crEvalReportPath(options.workspace, roleId);
+  await mkdir(path.dirname(outPath), { recursive: true });
+  await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+  return { path: outPath, report };
+}
 
 export async function checkGate(options: {
   roleDirectory: string;
@@ -80,6 +151,7 @@ export async function checkGate(options: {
 }): Promise<GateReport> {
   const roleDirectory = path.resolve(options.roleDirectory), required = options.required ?? 2;
   const roleId = z.object({ id: z.string().min(1) }).passthrough().parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))).id;
+  assertSafeRoleWorkspaceId(roleId);
   const role = await roleVersion(roleDirectory);
   const text = await readFile(ledgerPath(options.workspace, roleId), 'utf8').catch(() => '');
   const lines = text.split('\n').filter(Boolean).map(line => JSON.parse(line) as LedgerEntry);
@@ -200,12 +272,13 @@ async function evalCrGate(input: {
     };
   }
   const reasons: string[] = [];
-  let evalDigest: string | undefined;
+  let manifest;
+  let evalDigest: string;
   let verified = false;
   let checkedCommits = 0;
   let errors: string[] = [];
   try {
-    const manifest = await loadCrEvalManifest(input.roleDirectory);
+    manifest = await loadCrEvalManifest(input.roleDirectory);
     evalDigest = await computeCrEvalDigest(input.roleDirectory);
     const repoRoot = input.repoRoot ? path.resolve(input.repoRoot) : await findRepoRoot(input.roleDirectory);
     const verification = await verifyCrEvalCommits(manifest, repoRoot);
@@ -225,51 +298,87 @@ async function evalCrGate(input: {
     };
   }
 
-  let saved: z.infer<typeof savedCrEvalSchema> | undefined;
+  const reportFile = crEvalReportPath(input.workspace, input.roleId);
+  let rawText: string;
   try {
-    const text = await readFile(crEvalReportPath(input.workspace, input.roleId), 'utf8');
-    saved = savedCrEvalSchema.parse(JSON.parse(text));
-  } catch {
-    saved = undefined;
+    rawText = await readFile(reportFile, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      reasons.push(`缺少绑定当前 evalDigest 的 CR 黄金回放结果，请运行 acp-service rsi eval-cr --role ${input.roleDirectory} --results <file> --workspace ${input.workspace}`);
+      return {
+        summary: { present: true, evalDigest, ...(input.roleDigest ? { roleDigest: input.roleDigest } : {}), verified, checkedCommits, errors, status: 'missing' },
+        reasons,
+      };
+    }
+    throw error;
   }
 
-  if (!saved) {
-    reasons.push(`缺少绑定当前 evalDigest 的 CR 黄金回放结果，请运行 acp-service rsi eval-cr --role ${input.roleDirectory} --results <file>`);
+  let saved: z.infer<typeof savedCrEvalReportSchema>;
+  try {
+    saved = savedCrEvalReportSchema.parse(JSON.parse(rawText));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    reasons.push(`CR 黄金回放报告格式无效（必须包含 evalDigest、roleDigest、resultsDigest 与完整 results，不采信手写布尔值）：${message}`);
     return {
-      summary: { present: true, evalDigest, verified, checkedCommits, errors, status: 'missing' },
+      summary: { present: true, evalDigest, ...(input.roleDigest ? { roleDigest: input.roleDigest } : {}), verified, checkedCommits, errors, status: 'failed', promotionReady: false },
       reasons,
     };
   }
-  const digestStale = saved.evalDigest !== evalDigest || (Boolean(saved.roleDigest) && Boolean(input.roleDigest) && saved.roleDigest !== input.roleDigest);
+
+  if (saved.roleId !== input.roleId || saved.resultsDigest !== digestCrResults(saved.results)) {
+    reasons.push('CR 黄金回放报告完整性校验失败（roleId 或 resultsDigest 不匹配），请重新运行 acp-service rsi eval-cr --results');
+    return {
+      summary: { present: true, evalDigest, ...(input.roleDigest ? { roleDigest: input.roleDigest } : {}), verified, checkedCommits, errors, status: 'failed', promotionReady: false },
+      reasons,
+    };
+  }
+
+  const digestStale = saved.evalDigest !== evalDigest || !input.roleDigest || saved.roleDigest !== input.roleDigest;
   if (digestStale) {
-    reasons.push('CR 黄金回放结果已过期（evalDigest 或角色目录摘要已变更，包括 ROLE.md/QA.md），请重新运行 acp-service rsi eval-cr');
+    reasons.push('CR 黄金回放结果已过期（evalDigest 或角色目录摘要 roleDigest 已变更，包括 ROLE.md/QA.md/skills），请重新运行 acp-service rsi eval-cr --results');
     return {
-      summary: { present: true, evalDigest, verified, checkedCommits, errors, status: 'stale', promotionReady: saved.promotionReady },
+      summary: { present: true, evalDigest, ...(input.roleDigest ? { roleDigest: input.roleDigest } : {}), verified, checkedCommits, errors, status: 'stale' },
       reasons,
     };
   }
-  if (!saved.promotionReady) {
-    reasons.push('CR 黄金回放未达到晋升门槛（promotionReady 为 false）');
+
+  // Re-score the stored CR review results in-process against the live manifest — never trust a stored boolean!
+  let rescored: CrEvalScore;
+  try {
+    rescored = scoreCrEvalSuite(manifest, coerceCrEvalResults(saved.results));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    reasons.push(`CR 黄金回放进程内重算打分失败：${message}`);
     return {
-      summary: { present: true, evalDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
+      summary: { present: true, evalDigest, roleDigest: input.roleDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
       reasons,
     };
   }
+
+  if (!rescored.promotionReady) {
+    reasons.push(`CR 黄金回放未达到晋升门槛（负样本召回 ${rescored.negativeRecall}，缺陷召回 ${rescored.defectRecall}，误报 ${rescored.falsePositives}，缺样本 ${rescored.missingCases.length}）`);
+    return {
+      summary: { present: true, evalDigest, roleDigest: input.roleDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
+      reasons,
+    };
+  }
+
   return {
     summary: {
       present: true,
       evalDigest,
+      roleDigest: input.roleDigest,
       verified,
       checkedCommits,
       errors,
       status: verified ? 'passed' : 'failed',
-      promotionReady: true,
+      promotionReady: verified && rescored.promotionReady,
     },
     reasons,
   };
 }
 
-/** Checks whether any file in the role directory (e.g. ROLE.md / QA.md / checks/) changed between two commits. */
+/** Checks whether any file in the role directory changed between two commits. Fails closed (true) on git errors. */
 async function roleDirectoryChangedBetween(roleDirectory: string, fromCommit: string, toCommit: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync('git', ['-C', roleDirectory, 'diff', '--name-only', fromCommit, toCommit, '--', '.'], {
@@ -277,14 +386,15 @@ async function roleDirectoryChangedBetween(roleDirectory: string, fromCommit: st
     });
     return stdout.trim().length > 0;
   } catch {
-    return false;
+    // Fail-closed: if git cannot prove the role directory is unchanged between distinct commits, require calibration.
+    return true;
   }
 }
 
 /**
  * L3: a clean bidirectional `calibration.json` bound to this commit, checks digest, and full role digest.
  * It is required when the caller asks, or when an older passing version had a different checks digest or
- * modified any role file (including `ROLE.md` / `QA.md`).
+ * modified any role file (including `ROLE.md` / `QA.md` / `skills/`).
  */
 async function calibrationGate(input: {
   roleDirectory: string;
@@ -320,8 +430,10 @@ async function calibrationGate(input: {
     || saved.checksDigest !== checksDigest
     || roleDigestMismatch
   );
+  const partialOnly = saved !== undefined && Boolean(saved.only?.length);
   const failed = saved !== undefined && !stale && (
-    !saved.passed
+    partialOnly
+    || !saved.passed
     || saved.falsePositives.length > 0
     || (saved.schemaVersion === 2 && saved.negativeSamples > 0 && (saved.negativeRecall ?? 0) <= 0)
     || (saved.schemaVersion === 2 && !saved.holdout.passed)
@@ -338,7 +450,9 @@ async function calibrationGate(input: {
   if (status === 'stale') {
     reason = '回放校准已过期（角色版本、checks 摘要或角色目录摘要与当前不一致），请重新运行 acp-service rsi calibrate';
   } else if (status === 'failed') {
-    if (saved && saved.falsePositives.length > 0) {
+    if (partialOnly) {
+      reason = '局部 --only 校准报告不能替代全量校准，请去掉 --only 重新运行 acp-service rsi calibrate';
+    } else if (saved && saved.falsePositives.length > 0) {
       reason = `回放校准未通过：历史正样本有 ${saved.falsePositives.length} 条误报，先修正检查再运行 acp-service rsi calibrate`;
     } else if (saved && saved.schemaVersion === 2 && saved.failureReasons.length > 0) {
       reason = `回放校准未通过：${saved.failureReasons.join('；')}，请修正检查再运行 acp-service rsi calibrate`;

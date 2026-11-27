@@ -225,9 +225,9 @@ export function auditChecklistProvenance(
   options: {
     mode?: RsiMode;
     enforceObserveAsBlock?: boolean;
-    /** Item ids that already existed in the previous version. Items not in this set are treated as newly added. */
+    /** Item ids that already existed in the previous version. Items not in this set (or unlocked items) are treated as newly added. */
     existingItemIds?: ReadonlySet<string>;
-    /** Negative sample hit counts per item id. When present, items with count 0 are downgraded to `observe`. */
+    /** Negative sample hit counts per item id. Newly added block checks with count 0 are downgraded to `observe`. */
     negativeCoverageByItem?: Readonly<Record<string, number>>;
   } = {},
 ): ProvenanceAuditResult {
@@ -238,10 +238,10 @@ export function auditChecklistProvenance(
   const effectiveModes: Record<string, CheckEnforcement> = {};
 
   for (const item of checklist.items) {
-    const isNew = options.existingItemIds ? !options.existingItemIds.has(item.id) : true;
+    const isNew = options.existingItemIds ? !options.existingItemIds.has(item.id) : !item.locked;
     const base = effectiveEnforcement(item, mode, enforceObserveAsBlock);
     const hasCoverageMap = options.negativeCoverageByItem !== undefined;
-    const coverage = hasCoverageMap ? (options.negativeCoverageByItem![item.id] ?? 0) : undefined;
+    const coverage = isNew && hasCoverageMap ? (options.negativeCoverageByItem![item.id] ?? 0) : undefined;
     if (isNew && item.kind === 'program' && base === 'block' && !item.source?.trim()) {
       missingSource.push(item.id);
     }

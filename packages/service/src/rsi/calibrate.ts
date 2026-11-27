@@ -5,22 +5,42 @@
  * Schema v2 (bidirectional L3):
  * - Positive samples must have 0 block false positives.
  * - Negative samples must achieve non-zero recall (relaxing checks so they catch nothing fails).
- * - Frozen holdout split (`holdout.json`) prevents overfitting/tuning on all historical samples.
- * - `roleDigest` covers the full role directory (`ROLE.md`, `QA.md`, `checklist.json`, `checks/`, etc.).
+ * - Frozen holdout split (`holdout.json`) prevents overfitting; missing frozen holdout keys fail closed.
+ * - Newly added `block` checks require `source` provenance; newly added `block` checks with 0 negative
+ *   coverage are downgraded to `observe` (both during calibration and exported via `effectiveModes`).
+ * - `--only` is diagnostic-only: it never overwrites `calibration.json` and is rejected by `checkGate`.
+ * - `roleDigest` covers the full role directory (`ROLE.md`, `QA.md`, `checklist.json`, `checks/`, `skills/`, `evals/`, etc.).
  * - Nothing under a historical work directory is written.
  */
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { z } from 'zod';
 import { checkResultSchema, type CheckResult } from '../execution/ticket.js';
-import { auditChecklistProvenance, effectiveEnforcement, loadChecklist, type NormalizedCheckItem } from './checklist.js';
+import {
+  auditChecklistProvenance,
+  effectiveEnforcement,
+  loadChecklist,
+  parseChecklist,
+  type CheckEnforcement,
+  type NormalizedCheckItem,
+} from './checklist.js';
 import { loadWorkflow } from './engine.js';
 import { type LedgerEntry, ledgerPath, type RoleVersion, roleVersion, type StopReason } from './outline-run.js';
 
+const execFileAsync = promisify(execFile);
 const UNFINISHED: StopReason[] = ['not_completed', 'review_failed', 'host_error'];
-const ROLE_DIGEST_FILES = ['profile.json', 'ROLE.md', 'QA.md', 'checklist.json', 'workflow.json', 'routing.json', 'evals/manifest.json'] as const;
+const SAFE_ROLE_ID = /^[A-Za-z0-9._-]+$/;
+const ROLE_DIGEST_TOP_FILES = ['profile.json', 'ROLE.md', 'QA.md', 'checklist.json', 'workflow.json', 'routing.json'] as const;
+const ROLE_DIGEST_SUBDIRS = ['checks', 'skills', 'evals'] as const;
+
+export function assertSafeRoleWorkspaceId(roleId: string): void {
+  if (!SAFE_ROLE_ID.test(roleId) || roleId === '.' || roleId === '..' || roleId.includes('..')) {
+    throw new Error(`Unsafe roleId for workspace path: ${roleId.slice(0, 64)}`);
+  }
+}
 
 /** One historical artifact after the current checks have been replayed on it. */
 export interface CalibrationSampleResult {
@@ -38,6 +58,7 @@ export interface CalibrationHoldoutSummary {
   ratio: number;
   digest: string;
   sampleKeys: string[];
+  missingKeys: string[];
   positiveSamples: number;
   negativeSamples: number;
   falsePositives: number;
@@ -67,10 +88,10 @@ export interface CalibrationReportV2 {
   role: RoleVersion;
   /** SHA-256 of `checklist.json` plus every regular file under `checks/`, in sorted path order. */
   checksDigest: string;
-  /** SHA-256 of the role directory including ROLE.md, QA.md, checklist.json, checks/, workflow.json, routing.json, evals/manifest.json. */
+  /** SHA-256 of the role directory including ROLE.md, QA.md, checklist.json, checks/, skills/, evals/, workflow.json, routing.json. */
   roleDigest: string;
   calibratedAt: string;
-  /** Set when the replay only scored these item ids. */
+  /** Set when the replay only scored these item ids (diagnostic-only; never written to calibration.json). */
   only?: string[];
   /** Historical accepted or passed artifacts that were replayed. */
   positiveSamples: number;
@@ -84,11 +105,13 @@ export interface CalibrationReportV2 {
   caughtHistoricalIssues: { runDir: string; round: number; artifactPath: string; caughtBy: string[]; qaSummary?: string }[];
   /** Newly added block checks missing required `source` provenance. */
   missingSource: string[];
-  /** Block program checks downgraded to `observe` due to 0 negative sample coverage or missing provenance. */
+  /** Newly added block program checks downgraded to `observe` due to 0 negative sample coverage or missing provenance. */
   downgradedToObserve: string[];
+  /** Effective enforcement map per checklist item id after applying provenance & negative-coverage downgrades. */
+  effectiveModes: Record<string, CheckEnforcement>;
   /** Human-readable reasons when `passed === false`. */
   failureReasons: string[];
-  /** True when positive false positives == 0, bidirectional negative recall holds, and frozen holdout passes. */
+  /** True when positive false positives == 0, bidirectional negative recall holds, provenance holds, and frozen holdout passes. */
   passed: boolean;
 }
 
@@ -108,6 +131,7 @@ const holdoutSummarySchema = z.object({
   ratio: z.number().min(0).max(1),
   digest: z.string().regex(/^[0-9a-f]{64}$/),
   sampleKeys: z.array(z.string()),
+  missingKeys: z.array(z.string()).default([]),
   positiveSamples: z.number().int().nonnegative(),
   negativeSamples: z.number().int().nonnegative(),
   falsePositives: z.number().int().nonnegative(),
@@ -146,6 +170,7 @@ const calibrationReportV2Schema = z.object({
   caughtHistoricalIssues: z.array(caughtIssueSchema),
   missingSource: z.array(z.string()),
   downgradedToObserve: z.array(z.string()),
+  effectiveModes: z.record(z.string(), z.enum(['block', 'observe', 'skip'])),
   failureReasons: z.array(z.string()),
   passed: z.boolean(),
 }).strict();
@@ -189,23 +214,30 @@ export interface CalibrateRoleOptions {
   roleDirectory: string;
   workspace: string;
   python?: string;
-  /** Score only these checklist item ids. Other failures are ignored. */
+  /** Score only these checklist item ids (diagnostic-only; never overwrites calibration.json). */
   only?: string[];
   /** Minimum negative recall threshold when negative samples exist (default requires > 0). */
   minNegativeRecall?: number;
   /** Fraction of historical samples frozen into the holdout split when creating a new holdout (default 0.2). */
   holdoutRatio?: number;
-  /** Explicit sample keys to freeze as holdout (mainly for deterministic tests or curated holdouts). */
+  /** Explicit sample keys to freeze as holdout (for curated holdouts or deterministic tests). */
   holdoutKeys?: string[];
-  /** Baseline checklist item ids from previous version; items outside this set must carry `source`. */
+  /** Baseline checklist item ids from previous version; omitted => auto-resolved from git history. */
   existingItemIds?: ReadonlySet<string>;
   now?: () => Date;
   /** Replaces the role's check script. Tests inject this; the default replays read-only. */
   checkRunner?: CalibrationCheckRunner;
 }
 
-export const calibrationPath = (workspace: string, roleId: string) => path.join(path.resolve(workspace), roleId, 'calibration.json');
-export const holdoutPath = (workspace: string, roleId: string) => path.join(path.resolve(workspace), roleId, 'holdout.json');
+export function calibrationPath(workspace: string, roleId: string): string {
+  assertSafeRoleWorkspaceId(roleId);
+  return path.join(path.resolve(workspace), roleId, 'calibration.json');
+}
+
+export function holdoutPath(workspace: string, roleId: string): string {
+  assertSafeRoleWorkspaceId(roleId);
+  return path.join(path.resolve(workspace), roleId, 'holdout.json');
+}
 
 /** Stable SHA-256 over `checklist.json` and every regular file in `checks/`. */
 export async function computeChecksDigest(roleDirectory: string): Promise<string> {
@@ -216,14 +248,16 @@ export async function computeChecksDigest(roleDirectory: string): Promise<string
   return digestFiles(root, files);
 }
 
-/** Stable SHA-256 over the role directory (`ROLE.md`, `QA.md`, `checklist.json`, `checks/`, `workflow.json`, `routing.json`, `profile.json`, `evals/manifest.json`). */
+/** Stable SHA-256 over the role directory (`ROLE.md`, `QA.md`, `checklist.json`, `checks/`, `skills/`, `evals/`, `workflow.json`, `routing.json`, `profile.json`). */
 export async function computeRoleDigest(roleDirectory: string): Promise<string> {
   const root = path.resolve(roleDirectory);
   const files: string[] = [];
-  for (const rel of ROLE_DIGEST_FILES) {
+  for (const rel of ROLE_DIGEST_TOP_FILES) {
     if (await isFile(path.join(root, rel))) files.push(rel);
   }
-  await collectFiles(path.join(root, 'checks'), root, files);
+  for (const dir of ROLE_DIGEST_SUBDIRS) {
+    await collectFiles(path.join(root, dir), root, files);
+  }
   const unique = [...new Set(files)].sort();
   return digestFiles(root, unique);
 }
@@ -254,7 +288,7 @@ async function collectFiles(directory: string, root: string, files: string[]): P
 }
 
 /** Reads a calibration report (v1 or v2). Missing or unreadable files yield undefined rather than throwing. */
-export async function loadCalibration(workspace: string, roleId: string): Promise<AnyCalibrationReport | undefined> {
+export async function loadCalibration(workspace: string, roleId: string): Promise<CalibrationReport | undefined> {
   try {
     const text = await readFile(calibrationPath(workspace, roleId), 'utf8');
     return anyCalibrationReportSchema.parse(JSON.parse(text));
@@ -269,12 +303,57 @@ interface ReplaySample {
   qaSummary?: string;
 }
 
+/**
+ * Produces a portable key for a replay sample (`kind:runId:round:relArtifact`),
+ * so frozen holdouts remain stable across workspace moves and worktrees.
+ */
 export function sampleKeyOf(sample: Pick<ReplaySample, 'kind' | 'runDir' | 'round' | 'artifactPath'>): string {
-  return `${sample.kind}:${sample.runDir}:${sample.round ?? ''}:${sample.artifactPath}`;
+  const runId = path.basename(path.resolve(sample.runDir));
+  const relArt = path.relative(path.resolve(sample.runDir), path.resolve(sample.artifactPath)).split(path.sep).join('/');
+  return `${sample.kind}:${runId}:${sample.round ?? ''}:${relArt}`;
 }
 
 function holdoutKeysDigest(keys: readonly string[]): string {
   return createHash('sha256').update(JSON.stringify([...keys].sort())).digest('hex');
+}
+
+/**
+ * Auto-discovers baseline checklist item ids from git history so newly added `block` checks
+ * are checked for required `source` provenance in production CLI runs (not just unit tests).
+ */
+async function resolveBaselineItemIds(roleDirectory: string, role: RoleVersion, ledger: readonly LedgerEntry[]): Promise<ReadonlySet<string> | undefined> {
+  try {
+    const { stdout: topRaw } = await execFileAsync('git', ['-C', roleDirectory, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    const repoTop = topRaw.trim();
+    if (!repoTop) return undefined;
+    const relChecklist = path.relative(repoTop, path.join(roleDirectory, 'checklist.json')).split(path.sep).join('/');
+
+    const candidates: string[] = [];
+    // If working tree has uncommitted edits, compare against HEAD first.
+    if (role.dirty && role.commit) candidates.push(role.commit);
+    // Previous passing ledger commit if distinct from current commit.
+    const prevPassing = [...ledger].reverse().find(e => e.passed && !UNFINISHED.includes(e.stopReason) && e.role.commit && e.role.commit !== role.commit);
+    if (prevPassing?.role.commit) candidates.push(prevPassing.role.commit);
+    // Previous git commit that touched checklist.json.
+    const { stdout: logOut } = await execFileAsync(
+      'git',
+      ['-C', repoTop, 'log', '-n', '2', '--format=%H', '--', relChecklist],
+      { encoding: 'utf8' },
+    );
+    const commits = logOut.trim().split(/\r?\n/).filter(Boolean);
+    if (commits.length >= 2) candidates.push(commits[1]!);
+
+    for (const commit of candidates) {
+      try {
+        const { stdout: rawChecklist } = await execFileAsync('git', ['-C', repoTop, 'show', `${commit}:${relChecklist}`], { encoding: 'utf8' });
+        const parsed = parseChecklist(JSON.parse(rawChecklist));
+        return new Set(parsed.items.map(item => item.id));
+      } catch { /* try next baseline candidate */ }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function resolveFrozenHoldout(options: {
@@ -283,8 +362,9 @@ async function resolveFrozenHoldout(options: {
   samples: readonly ReplaySample[];
   ratio: number;
   explicitKeys?: readonly string[];
+  readOnly: boolean;
   now: () => Date;
-}): Promise<{ sampleKeys: string[]; ratio: number; digest: string; tampered: boolean }> {
+}): Promise<{ frozen: boolean; sampleKeys: string[]; ratio: number; digest: string; tampered: boolean }> {
   const file = holdoutPath(options.workspace, options.roleId);
   let rawExisting: string | undefined;
   try {
@@ -298,11 +378,11 @@ async function resolveFrozenHoldout(options: {
       const parsed = holdoutManifestSchema.parse(JSON.parse(rawExisting));
       const expectedDigest = holdoutKeysDigest(parsed.sampleKeys);
       if (parsed.roleId !== options.roleId || parsed.digest !== expectedDigest) {
-        return { sampleKeys: parsed.sampleKeys, ratio: parsed.ratio, digest: parsed.digest, tampered: true };
+        return { frozen: true, sampleKeys: parsed.sampleKeys, ratio: parsed.ratio, digest: parsed.digest, tampered: true };
       }
-      return { sampleKeys: parsed.sampleKeys, ratio: parsed.ratio, digest: parsed.digest, tampered: false };
+      return { frozen: true, sampleKeys: parsed.sampleKeys, ratio: parsed.ratio, digest: parsed.digest, tampered: false };
     } catch {
-      return { sampleKeys: [], ratio: options.ratio, digest: holdoutKeysDigest([]), tampered: true };
+      return { frozen: true, sampleKeys: [], ratio: options.ratio, digest: holdoutKeysDigest([]), tampered: true };
     }
   }
 
@@ -323,7 +403,8 @@ async function resolveFrozenHoldout(options: {
   }
 
   const digest = holdoutKeysDigest(selected);
-  if (selected.length > 0 || options.explicitKeys !== undefined) {
+  const shouldFreeze = !options.readOnly && (selected.length > 0 || options.explicitKeys !== undefined);
+  if (shouldFreeze) {
     const manifest = {
       schemaVersion: 1 as const,
       roleId: options.roleId,
@@ -336,7 +417,7 @@ async function resolveFrozenHoldout(options: {
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   }
-  return { sampleKeys: selected, ratio: options.ratio, digest, tampered: false };
+  return { frozen: shouldFreeze, sampleKeys: selected, ratio: options.ratio, digest, tampered: false };
 }
 
 /**
@@ -344,6 +425,8 @@ async function resolveFrozenHoldout(options: {
  * Positive samples are finished runs with `passed: true`. Negative samples are rounds whose QA verdict
  * is `revise`. Runs that never reached a verdict are skipped, and each work directory is used once
  * (its latest ledger line).
+ *
+ * When `only` is provided, calibration is diagnostic-only and does NOT overwrite `calibration.json`.
  */
 export async function calibrateRole(options: CalibrateRoleOptions): Promise<CalibrationReportV2> {
   const roleDirectory = path.resolve(options.roleDirectory);
@@ -352,6 +435,8 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
   const only = options.only?.filter(Boolean);
   const onlySet = only?.length ? new Set(only) : undefined;
   const roleId = z.object({ id: z.string().min(1) }).passthrough().parse(JSON.parse(await readFile(path.join(roleDirectory, 'profile.json'), 'utf8'))).id;
+  assertSafeRoleWorkspaceId(roleId);
+
   const [role, checksDigest, roleDigest, checklist, workflow] = await Promise.all([
     roleVersion(roleDirectory), computeChecksDigest(roleDirectory), computeRoleDigest(roleDirectory), loadChecklist(roleDirectory), loadWorkflow(roleDirectory),
   ]);
@@ -361,6 +446,8 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
   const latest = lines.filter((entry, index) => !lines.slice(index + 1).some(later => later.workDirectory === entry.workDirectory));
   const runs = latest.filter(entry => !UNFINISHED.includes(entry.stopReason));
   const runner = options.checkRunner ?? defaultCheckRunner;
+
+  const baselineItemIds = options.existingItemIds ?? await resolveBaselineItemIds(roleDirectory, role, latest);
 
   const allSamples: ReplaySample[] = [];
   for (const run of runs) {
@@ -373,28 +460,53 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
     samples: allSamples,
     ratio: options.holdoutRatio ?? 0.2,
     ...(options.holdoutKeys ? { explicitKeys: options.holdoutKeys } : {}),
+    readOnly: Boolean(onlySet?.size),
     now,
   });
   const holdoutSet = new Set(holdoutInfo.sampleKeys);
 
-  const falsePositives: CalibrationReportV2['falsePositives'] = [];
-  const caughtHistoricalIssues: CalibrationReportV2['caughtHistoricalIssues'] = [];
+  // Pass 1: run checks once per sample and compute per-item negative sample coverage.
+  const evaluated: { sample: ReplaySample; key: string; results: CheckResult[] }[] = [];
   const negativeCoverageByItem: Record<string, number> = {};
+  const seenKeys = new Set<string>();
   let positiveSamples = 0, negativeSamples = 0;
-  let holdoutPos = 0, holdoutNeg = 0, holdoutFp = 0, holdoutCaught = 0;
 
   for (const sample of allSamples) {
     const key = sampleKeyOf(sample);
-    const inHoldout = holdoutSet.has(key);
-    if (sample.kind === 'positive') {
-      positiveSamples++;
-      if (inHoldout) holdoutPos++;
-    } else {
-      negativeSamples++;
-      if (inHoldout) holdoutNeg++;
-    }
+    seenKeys.add(key);
+    if (sample.kind === 'positive') positiveSamples++;
+    else negativeSamples++;
     const results = await runner({ roleDirectory, workDirectory: sample.runDir, artifactPath: sample.artifactPath, python, ...(onlySet ? { only: [...onlySet] } : {}) });
-    const failed = results.filter(result => failureCounts(result, sample.kind, known, enforce, onlySet));
+    evaluated.push({ sample, key, results });
+    if (sample.kind === 'negative') {
+      for (const result of results) {
+        if (!result.pass && (!onlySet || onlySet.has(result.itemId))) {
+          negativeCoverageByItem[result.itemId] = (negativeCoverageByItem[result.itemId] ?? 0) + 1;
+        }
+      }
+    }
+  }
+
+  // Audit newly added block checks for source provenance and zero negative coverage -> effectiveModes.
+  const provenance = auditChecklistProvenance(checklist, {
+    mode: 'formal',
+    enforceObserveAsBlock: enforce,
+    ...(baselineItemIds ? { existingItemIds: baselineItemIds } : {}),
+    negativeCoverageByItem,
+  });
+
+  // Pass 2: score false positives & caught defects using the real effectiveModes (downgraded checks act as observe!).
+  const falsePositives: CalibrationReportV2['falsePositives'] = [];
+  const caughtHistoricalIssues: CalibrationReportV2['caughtHistoricalIssues'] = [];
+  let holdoutPos = 0, holdoutNeg = 0, holdoutFp = 0, holdoutCaught = 0;
+
+  for (const { sample, key, results } of evaluated) {
+    const inHoldout = holdoutSet.has(key);
+    if (inHoldout) {
+      if (sample.kind === 'positive') holdoutPos++;
+      else holdoutNeg++;
+    }
+    const failed = results.filter(result => failureCounts(result, sample.kind, known, enforce, provenance.effectiveModes, onlySet));
     if (!failed.length) continue;
     const evidence = failed.map(result => ({ itemId: result.itemId, evidence: result.evidence }));
     const replay: CalibrationSampleResult = {
@@ -408,9 +520,6 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
       falsePositives.push({ runDir: replay.runDir, artifactPath: replay.artifactPath, failedChecks: replay.failedChecks, ...(replay.evidence !== undefined ? { evidence: replay.evidence } : {}) });
     } else {
       if (inHoldout) holdoutCaught++;
-      for (const itemId of replay.failedChecks) {
-        negativeCoverageByItem[itemId] = (negativeCoverageByItem[itemId] ?? 0) + 1;
-      }
       caughtHistoricalIssues.push({
         runDir: replay.runDir, round: replay.round ?? 0, artifactPath: replay.artifactPath, caughtBy: replay.failedChecks,
         ...(replay.qaSummary ? { qaSummary: replay.qaSummary } : {}),
@@ -418,6 +527,7 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
     }
   }
 
+  const missingKeys = holdoutInfo.sampleKeys.filter(key => !seenKeys.has(key));
   const negativeRecall = negativeSamples > 0 ? Number((caughtHistoricalIssues.length / negativeSamples).toFixed(4)) : null;
   const holdoutNegativeRecall = holdoutNeg > 0 ? Number((holdoutCaught / holdoutNeg).toFixed(4)) : null;
   const enforceBidirectional = !onlySet?.size || options.minNegativeRecall !== undefined;
@@ -432,14 +542,8 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
       ? (holdoutNegativeRecall ?? 0) < minRecall
       : holdoutCaught === 0
   );
-  const holdoutPassed = !holdoutInfo.tampered && holdoutFp === 0 && !holdoutRecallFailed;
-
-  const provenance = auditChecklistProvenance(checklist, {
-    mode: 'formal',
-    enforceObserveAsBlock: enforce,
-    ...(options.existingItemIds ? { existingItemIds: options.existingItemIds } : { existingItemIds: new Set(checklist.items.map(i => i.id)) }),
-    ...(negativeSamples > 0 ? { negativeCoverageByItem } : {}),
-  });
+  const holdoutMissingFailed = holdoutInfo.sampleKeys.length > 0 && missingKeys.length > 0;
+  const holdoutPassed = !holdoutInfo.tampered && !holdoutMissingFailed && holdoutFp === 0 && !holdoutRecallFailed;
 
   const failureReasons: string[] = [];
   if (falsePositives.length > 0) {
@@ -454,11 +558,13 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
   }
   if (holdoutInfo.tampered) {
     failureReasons.push('冻结 holdout 清单摘要校验失败（文件被篡改或损坏）');
+  } else if (holdoutMissingFailed) {
+    failureReasons.push(`冻结 holdout 样本缺失（${missingKeys.length}/${holdoutInfo.sampleKeys.length} 失配），拒绝空集或残缺通过`);
   } else if (!holdoutPassed) {
     if (holdoutFp > 0) failureReasons.push(`冻结 holdout 正样本存在 ${holdoutFp} 条误报`);
     if (holdoutRecallFailed) failureReasons.push(`冻结 holdout 负样本召回未达标（${holdoutNegativeRecall}）`);
   }
-  if (options.existingItemIds && provenance.missingSource.length > 0) {
+  if (provenance.missingSource.length > 0) {
     failureReasons.push(`新增 block 检查缺少必填 source 溯源：${provenance.missingSource.join('、')}`);
   }
 
@@ -474,10 +580,11 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
     negativeSamples,
     negativeRecall,
     holdout: {
-      frozen: true,
+      frozen: holdoutInfo.frozen,
       ratio: holdoutInfo.ratio,
       digest: holdoutInfo.digest,
       sampleKeys: holdoutInfo.sampleKeys,
+      missingKeys,
       positiveSamples: holdoutPos,
       negativeSamples: holdoutNeg,
       falsePositives: holdoutFp,
@@ -489,22 +596,36 @@ export async function calibrateRole(options: CalibrateRoleOptions): Promise<Cali
     caughtHistoricalIssues,
     missingSource: provenance.missingSource,
     downgradedToObserve: provenance.downgradedToObserve,
+    effectiveModes: provenance.effectiveModes,
     failureReasons,
     passed: failureReasons.length === 0,
   };
-  const file = calibrationPath(options.workspace, roleId);
-  await mkdir(path.dirname(file), { recursive: true });
-  await writeFile(file, JSON.stringify(report, null, 2) + '\n');
+
+  // Partial --only runs are diagnostic-only and must NEVER overwrite the official calibration.json.
+  if (!onlySet?.size) {
+    const file = calibrationPath(options.workspace, roleId);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, JSON.stringify(report, null, 2) + '\n');
+  }
   return report;
 }
 
-function failureCounts(result: CheckResult, kind: 'positive' | 'negative', known: Map<string, NormalizedCheckItem>, enforceObserveAsBlock: boolean, only?: Set<string>): boolean {
+function failureCounts(
+  result: CheckResult,
+  kind: 'positive' | 'negative',
+  known: Map<string, NormalizedCheckItem>,
+  enforceObserveAsBlock: boolean,
+  effectiveModes: Readonly<Record<string, CheckEnforcement>>,
+  only?: Set<string>,
+): boolean {
   if (result.pass) return false;
   if (only && !only.has(result.itemId)) return false;
   const item = known.get(result.itemId);
   // A result the checklist does not name (the checker crashed, or the outline was unreadable) fails closed.
   if (!item) return true;
-  const enforcement = effectiveEnforcement(item, 'formal', enforceObserveAsBlock);
+  const enforcement = Object.hasOwn(effectiveModes, item.id)
+    ? effectiveModes[item.id]!
+    : effectiveEnforcement(item, 'formal', enforceObserveAsBlock);
   if (enforcement === 'skip') return false;
   return kind === 'negative' || enforcement === 'block';
 }
