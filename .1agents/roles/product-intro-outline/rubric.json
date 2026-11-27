@@ -126,8 +126,9 @@
   "aggregation": {
     "method": "normalized_positive_sum",
     "passScore": 0.8,
-    "mustAllPass": ["R1", "R3", "R6", "R7"],
-    "note": "分母只算正权重之和；负向条目命中直接扣分。比现有 6 维 1–5 求和更抗漂移，因为每条只有 met/unmet。"
+    "mustAllPass": ["R1", "R3", "R6"],
+    "mustNotTrigger": ["R7"],
+    "note": "分母只算正权重之和；负向条目（R7/R8）命中直接扣分，且 R7 列入 mustNotTrigger（命中即判失败）。比现有 6 维 1–5 求和更抗漂移，因为每条只有 met/unmet。"
   },
   "pairwise": {
     "enabled": true,

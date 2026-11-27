@@ -4,6 +4,7 @@ Usage: check_pptx.py <deck.pptx>
 
 Emits a JSON array of strict CheckResult items ({itemId, pass, evidence}) on stdout
 and diagnostics on stderr. Works under `python3 -I` with zero third-party packages.
+Handles grouped shapes (`p:grpSp`) via affine child-to-parent coordinate transforms (`a:chOff`/`a:chExt` -> `a:off`/`a:ext`).
 """
 import json
 import math
@@ -27,6 +28,7 @@ NS = {
     'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
     'rel': 'http://schemas.openxmlformats.org/package/2006/relationships',
 }
+P_NS = f'{{{NS["p"]}}}'
 IGNORED_PLACEHOLDERS = {'ftr', 'sldNum', 'dt'}
 SLIDE_NUM_RE = re.compile(r'slide(\d+)\.xml$')
 
@@ -64,7 +66,10 @@ def resolve_slide_paths(zf: zipfile.ZipFile) -> tuple[float, float, list[str]]:
             rid = rel.attrib.get('Id')
             target = rel.attrib.get('Target')
             if rid and target:
-                rel_map[rid] = posixpath.normpath(posixpath.join('ppt', target.lstrip('/')))
+                if target.startswith('/'):
+                    rel_map[rid] = posixpath.normpath(target.lstrip('/'))
+                else:
+                    rel_map[rid] = posixpath.normpath(posixpath.join('ppt', target))
 
     ordered: list[str] = []
     sld_id_lst = pres_xml.find('p:sldIdLst', NS)
@@ -115,6 +120,84 @@ def estimate_text_height_pt(tx_body: ET.Element, box_width_pt: float) -> tuple[f
     return needed_pt, runs_info
 
 
+def read_xfrm_box(xfrm: ET.Element | None) -> tuple[float, float, float, float] | None:
+    if xfrm is None:
+        return None
+    off = xfrm.find('a:off', NS)
+    ext = xfrm.find('a:ext', NS)
+    if off is None or ext is None:
+        return None
+    x = emu_to_pt(off.attrib.get('x'))
+    y = emu_to_pt(off.attrib.get('y'))
+    w = emu_to_pt(ext.attrib.get('cx'))
+    h = emu_to_pt(ext.attrib.get('cy'))
+    if x is None or y is None or w is None or h is None:
+        return None
+    return x, y, w, h
+
+
+def apply_transform(box: tuple[float, float, float, float], tx: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Map local (x, y, w, h) into slide coordinates using affine transform (ox, oy, sx, sy)."""
+    x, y, w, h = box
+    ox, oy, sx, sy = tx
+    return ox + x * sx, oy + y * sy, w * sx, h * sy
+
+
+def compose_group_transform(grp_xfrm: ET.Element | None, parent_tx: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Compose a group's (off/ext, chOff/chExt) transform onto parent_tx = (ox, oy, sx, sy)."""
+    if grp_xfrm is None:
+        return parent_tx
+    grp_box = read_xfrm_box(grp_xfrm)
+    if grp_box is None:
+        return parent_tx
+    gx, gy, gw, gh = grp_box
+    ch_off = grp_xfrm.find('a:chOff', NS)
+    ch_ext = grp_xfrm.find('a:chExt', NS)
+    ch_x = emu_to_pt(ch_off.attrib.get('x')) if ch_off is not None else 0.0
+    ch_y = emu_to_pt(ch_off.attrib.get('y')) if ch_off is not None else 0.0
+    ch_w = emu_to_pt(ch_ext.attrib.get('cx')) if ch_ext is not None else gw
+    ch_h = emu_to_pt(ch_ext.attrib.get('cy')) if ch_ext is not None else gh
+    ch_x = 0.0 if ch_x is None else ch_x
+    ch_y = 0.0 if ch_y is None else ch_y
+    local_sx = (gw / ch_w) if (ch_w and ch_w > 0) else 1.0
+    local_sy = (gh / ch_h) if (ch_h and ch_h > 0) else 1.0
+    local_ox = gx - ch_x * local_sx
+    local_oy = gy - ch_y * local_sy
+    pox, poy, psx, psy = parent_tx
+    return pox + local_ox * psx, poy + local_oy * psy, psx * local_sx, psy * local_sy
+
+
+def walk_shapes(container: ET.Element, tx: tuple[float, float, float, float]):
+    """Yield (kind, element, slide_box) for shapes/pictures/graphicFrames in slide coordinates."""
+    for child in container:
+        tag = child.tag
+        if tag == f'{P_NS}grpSp':
+            grp_tx = compose_group_transform(child.find('p:grpSpPr/a:xfrm', NS), tx)
+            yield from walk_shapes(child, grp_tx)
+        elif tag == f'{P_NS}sp':
+            box = read_xfrm_box(child.find('p:spPr/a:xfrm', NS))
+            if box is not None:
+                yield 'sp', child, apply_transform(box, tx)
+        elif tag == f'{P_NS}pic':
+            box = read_xfrm_box(child.find('p:spPr/a:xfrm', NS))
+            if box is not None:
+                yield 'pic', child, apply_transform(box, tx)
+        elif tag == f'{P_NS}graphicFrame':
+            box = read_xfrm_box(child.find('p:xfrm', NS))
+            if box is not None:
+                yield 'graphicFrame', child, apply_transform(box, tx)
+
+
+def shape_name_for(kind: str, elem: ET.Element) -> str:
+    nv_path = {
+        'sp': 'p:nvSpPr/p:cNvPr',
+        'pic': 'p:nvPicPr/p:cNvPr',
+        'graphicFrame': 'p:nvGraphicFramePr/p:cNvPr',
+    }[kind]
+    c_nv_pr = elem.find(nv_path, NS)
+    return (c_nv_pr.attrib.get('name') if c_nv_pr is not None else None) or f'unnamed-{kind}'
+
+
 def inspect_pptx(pptx_path: Path) -> list[dict]:
     out_of_bounds: list[dict] = []
     overflow: list[dict] = []
@@ -125,27 +208,12 @@ def inspect_pptx(pptx_path: Path) -> list[dict]:
         slide_w, slide_h, slide_paths = resolve_slide_paths(zf)
         for slide_idx, slide_path in enumerate(slide_paths, start=1):
             slide_xml = ET.fromstring(zf.read(slide_path))
+            sp_tree = slide_xml.find('p:cSld/p:spTree', NS)
+            if sp_tree is None:
+                continue
             text_boxes: list[tuple[str, float, float, float, float]] = []
-            for sp in slide_xml.findall('.//p:sp', NS):
-                c_nv_pr = sp.find('p:nvSpPr/p:cNvPr', NS)
-                shape_name = (c_nv_pr.attrib.get('name') if c_nv_pr is not None else None) or 'unnamed-shape'
-                ph = sp.find('p:nvSpPr/p:nvPr/p:ph', NS)
-                ph_type = ph.attrib.get('type') if ph is not None else None
-
-                xfrm = sp.find('p:spPr/a:xfrm', NS)
-                if xfrm is None:
-                    continue
-                off = xfrm.find('a:off', NS)
-                ext = xfrm.find('a:ext', NS)
-                if off is None or ext is None:
-                    continue
-                x = emu_to_pt(off.attrib.get('x'))
-                y = emu_to_pt(off.attrib.get('y'))
-                w = emu_to_pt(ext.attrib.get('cx'))
-                h = emu_to_pt(ext.attrib.get('cy'))
-                if x is None or y is None or w is None or h is None:
-                    continue
-
+            for kind, elem, (x, y, w, h) in walk_shapes(sp_tree, (0.0, 0.0, 1.0, 1.0)):
+                shape_name = shape_name_for(kind, elem)
                 if x < -BOUNDS_TOLERANCE_PT or y < -BOUNDS_TOLERANCE_PT or x + w > slide_w + BOUNDS_TOLERANCE_PT or y + h > slide_h + BOUNDS_TOLERANCE_PT:
                     spill = max(0.0, -x, -y, (x + w) - slide_w, (y + h) - slide_h)
                     out_of_bounds.append({
@@ -156,7 +224,11 @@ def inspect_pptx(pptx_path: Path) -> list[dict]:
                         'spill_pt': round(spill, 1),
                     })
 
-                tx_body = sp.find('p:txBody', NS)
+                if kind != 'sp':
+                    continue
+                ph = elem.find('p:nvSpPr/p:nvPr/p:ph', NS)
+                ph_type = ph.attrib.get('type') if ph is not None else None
+                tx_body = elem.find('p:txBody', NS)
                 if tx_body is None:
                     continue
                 needed_pt, runs_info = estimate_text_height_pt(tx_body, w)

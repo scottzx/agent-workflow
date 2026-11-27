@@ -107,6 +107,7 @@ def lint_rubric(rubric_path: Path, schema_path: Path | None = None) -> list[dict
 
     criteria = data.get('criteria')
     seen_ids: set[str] = set()
+    weights_by_id: dict[str, float] = {}
     positive_weight_sum = 0.0
     if not isinstance(criteria, list) or not criteria:
         err('criteria', 'criteria must be a non-empty array')
@@ -139,8 +140,11 @@ def lint_rubric(rubric_path: Path, schema_path: Path | None = None) -> list[dict
             weight = crit.get('weight')
             if not is_number(weight):
                 err(f'{base}/weight', 'weight must be a number')
-            elif weight > 0:
-                positive_weight_sum += float(weight)
+            else:
+                if isinstance(cid, str) and CRITERION_ID.fullmatch(cid):
+                    weights_by_id[cid] = float(weight)
+                if weight > 0:
+                    positive_weight_sum += float(weight)
 
             scale = crit.get('scale')
             if not isinstance(scale, dict) or scale.get('type') not in {'binary', 'ordinal'}:
@@ -185,6 +189,13 @@ def lint_rubric(rubric_path: Path, schema_path: Path | None = None) -> list[dict
         for mid in agg.get('mustAllPass', []) if isinstance(agg.get('mustAllPass'), list) else []:
             if mid not in seen_ids:
                 err('aggregation/mustAllPass', f'unknown criterion id in mustAllPass: {mid}')
+            elif weights_by_id.get(mid, 0.0) <= 0:
+                err('aggregation/mustAllPass', f'negative/zero-weight criterion {mid} cannot be in mustAllPass (use mustNotTrigger for penalty criteria)')
+        for mid in agg.get('mustNotTrigger', []) if isinstance(agg.get('mustNotTrigger'), list) else []:
+            if mid not in seen_ids:
+                err('aggregation/mustNotTrigger', f'unknown criterion id in mustNotTrigger: {mid}')
+            elif weights_by_id.get(mid, 0.0) >= 0:
+                err('aggregation/mustNotTrigger', f'non-negative criterion {mid} cannot be in mustNotTrigger')
 
     cal = data.get('calibration')
     if not isinstance(cal, dict):

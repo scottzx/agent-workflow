@@ -176,8 +176,9 @@
   "aggregation": {
     "method": "normalized_positive_sum",
     "passScore": 0.8,
-    "mustAllPass": ["V1", "V2", "V3", "V9"],
-    "note": "程序层（V1–V4）先跑，任一不过直接打回执行者，不进入 VLM 评判，省 token 也避免 VLM 去猜像素。"
+    "mustAllPass": ["V1", "V2", "V3"],
+    "mustNotTrigger": ["V11"],
+    "note": "程序层（V1–V4）先跑，任一不过直接打回执行者，不进入 VLM 评判，省 token 也避免 VLM 去猜像素；负向 V11 列入 mustNotTrigger。"
   },
   "pairwise": {
     "enabled": true,

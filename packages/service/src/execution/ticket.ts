@@ -124,7 +124,10 @@ export function applyChecks(ticket: Ticket, results: CheckResult[], options?: { 
   for (const result of results) {
     const item = ticket.items.find(entry => entry.source === 'program' && entry.checkId === result.itemId && entry.state !== 'verified');
     if (result.pass) { if (item) settle(item, 'verified', `${result.itemId} 通过`); continue; }
-    if (isObserve(result.itemId)) continue;
+    if (isObserve(result.itemId)) {
+      if (item) settle(item, 'withdrawn', `${result.itemId} 当前为 observe，不阻断`);
+      continue;
+    }
     const finding = selfProgramConflict(ticket, result);
     if (item) {
       item.evidence = result.evidence;
@@ -321,7 +324,7 @@ const selfCheckSchema = executorBase.extend({ checkId: id, status: z.enum(['pass
 export const TICKET_METHODS = {
   ticket_get: { description: '读取执行者任务上的任务单（意见、状态、轮次、提议、历史）。每次改动都在 execution_events 里留有 ticket.* 事件。', parameters: z.toJSONSchema(jobSchema) },
   ticket_open: { description: '宿主：在执行者任务上开任务单，一个任务一张。exportPath 为只读导出的绝对路径，之后每次改动都会重写。可选 artifacts 与 selfChecks，自检项初始为 pending。', parameters: z.toJSONSchema(openSchema) },
-  ticket_checks: { description: '宿主：执行者交稿后合并本轮程序检查结果。未通过的项成为或重开意见，通过的核实；执行者曾把同一项自检为 pass 时写入 self_vs_program 对校分歧。全部通过则进入审阅。', parameters: z.toJSONSchema(checksSchema) },
+  ticket_checks: { description: '宿主：执行者交稿后合并本轮程序检查结果。未通过的阻断项成为或重开意见，通过的核实；执行者曾把同一阻断项自检为 pass 时写入 self_vs_program 对校分歧。observeItemIds 中的观察项失败仅记录在 ticket.checked 事件，不开 must 意见且不阻断进入审阅。全部阻断项通过则进入审阅。', parameters: z.toJSONSchema(checksSchema) },
   ticket_review: { description: '宿主：审阅中合并质检结果（previous 按意见编号 fixed/partly/not_fixed/withdrawn、新意见、selfCheckAudit 对校、去重后的提议），记录质检任务 qaJobId。质检自己不能改任务单。', parameters: z.toJSONSchema(reviewSchema) },
   ticket_revise: { description: '宿主：把任务单打回执行者，进入下一轮修改，并把 recheckOnRevision 的自检项重置为 pending。', parameters: z.toJSONSchema(reviseSchema) },
   ticket_show: { description: '执行者：用正在执行的 jobId、attemptId 和 sessionId 读取自己的任务单；命令行只给 jobId，via 为 cli，按该任务当前这一轮执行。', parameters: z.toJSONSchema(executorSchema) },

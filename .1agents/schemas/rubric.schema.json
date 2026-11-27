@@ -129,7 +129,16 @@
       "properties": {
         "method": { "enum": ["normalized_positive_sum", "weighted_mean", "per_criterion_gate"] },
         "passScore": { "type": "number", "minimum": 0, "maximum": 1 },
-        "mustAllPass": { "type": "array", "items": { "type": "string" } },
+        "mustAllPass": {
+          "description": "Positive-weight (weight > 0) criterion IDs that must all pass/be met; negative penalty criteria are forbidden here.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mustNotTrigger": {
+          "description": "Negative-weight penalty (weight < 0) criterion IDs that must remain unmet; triggering any entry fails the rubric.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "note": { "type": "string" }
       }
     },
@@ -153,7 +162,11 @@
       "required": ["goldSet", "minSamples", "metrics", "bands"],
       "properties": {
         "goldSet": { "type": "string", "description": "path under the role dir, e.g. cases/calibration/gold.jsonl" },
-        "minSamples": { "type": "integer", "minimum": 5 },
+        "minSamples": {
+          "description": "Minimum gold-set sample count to run calibration (auto-blocking promotion separately requires n >= 40 and alpha >= 0.8).",
+          "type": "integer",
+          "minimum": 5
+        },
         "metrics": { "type": "array", "items": { "enum": ["cohen_kappa", "krippendorff_alpha", "spearman_rho", "raw_agreement"] }, "minItems": 1 },
         "bands": {
           "type": "object",
