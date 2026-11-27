@@ -221,6 +221,11 @@ test('a subscriber notice names the failure of a failed task', () => {
   assert.match(text, /category=quota/);
   assert.match(formatSubscriberNoticeSummary({ role: 'coordinator', event: 'terminal', originSessionId: 'origin-a', jobId: 'job-a',
     status: 'failed', error }), /quota/);
-  const completed = formatSubscriberNoticeSummary({ role: 'coordinator', event: 'terminal', originSessionId: 'origin-a', jobId: 'job-a', status: 'completed' });
-  assert.ok(!completed.includes('quota'));
+  const completed = formatSubscriberNoticeSummary({ role: 'coordinator', event: 'terminal', originSessionId: 'origin-a', jobId: 'job-a', status: 'completed', error });
+  assert.ok(!completed.includes('quota'), 'a completed subscriber notice suppresses stale failure metadata');
+  const completedBody = formatSubscriberNotice({ role: 'coordinator', event: 'terminal', originSessionId: 'origin-a', jobId: 'job-a', status: 'completed', error });
+  assert.ok(!completedBody.includes('失败原因：'));
+  // Control characters including NEL (U+0085) are collapsed cleanly.
+  const nel = safeErrorSummary({ category: 'quota', message: 'A\u0085B\u2028C', retryable: false });
+  assert.equal(nel?.message, 'A B C');
 });

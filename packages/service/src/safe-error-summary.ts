@@ -27,7 +27,7 @@ const origins: ReadonlySet<string> = new Set<SafeErrorOrigin>([
 const identifier = /^[A-Za-z0-9._:-]{1,64}$/u;
 
 /** Control characters and line breaks never belong in a rendered field. */
-const control = /[\u0000-\u001f\u007f]+/gu;
+const control = /[\u0000-\u001f\u007f\u0085\u2028\u2029]+/gu;
 
 /** Strip control characters, collapse whitespace and bound the length of a rendered text. */
 export function safeErrorText(value: unknown, limit = 512): string {

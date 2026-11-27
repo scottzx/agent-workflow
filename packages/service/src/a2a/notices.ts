@@ -250,9 +250,11 @@ export function formatSubscriberNoticeSummary(notice: SubscriberNotice): string 
   return line.length <= 120 ? line : `${line.slice(0, 119)}…`;
 }
 
+const subscriberFailedStatuses = new Set(['failed', 'canceled', 'rejected', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
+
 /** A subscriber sees the cause of a failed task, and only of a failed task. */
 function subscriberFailure(notice: SubscriberNotice): SafeErrorSummary | undefined {
-  if (notice.event !== 'terminal') return undefined;
+  if (notice.event !== 'terminal' || !subscriberFailedStatuses.has(notice.status)) return undefined;
   return noticeErrorSummary(notice.error);
 }
 

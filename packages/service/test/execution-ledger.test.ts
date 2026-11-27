@@ -261,17 +261,27 @@ test('restart only quarantines dispatching attempts; prepared and accepted facts
   assert.equal(restored.events('root').length, events);
 });
 
-test('a failure fact survives a failed round and is cleared when the round is not failed', () => {
+test('a failure fact survives conflicting observations on a failed round and clears on a real non-failed transition', () => {
   const { ledger } = fixture();
-  const attempt = running(ledger);
+  const failedAttempt = running(ledger);
   const error = { category: 'quota', message: 'Provider quota exhausted.', retryable: false, providerCode: 'quota_exhausted' } as const;
-  ledger.observe(attempt.attempt.attemptId, { executionStatus: 'failed', error });
-  assert.deepEqual(ledger.getAttempt(attempt.attempt.attemptId).error, error);
-  assert.deepEqual(ledger.get('root', attempt.job.jobId).error, error);
-  ledger.observe(attempt.attempt.attemptId, { executionStatus: 'working' });
-  assert.equal(ledger.getAttempt(attempt.attempt.attemptId).error, undefined, 'a working round carries no failure fact');
-  assert.equal(ledger.get('root', attempt.job.jobId).error, undefined);
-  ledger.observe(attempt.attempt.attemptId, { executionStatus: 'failed', error });
-  ledger.observe(attempt.attempt.attemptId, { executionStatus: 'completed' });
-  assert.equal(ledger.getAttempt(attempt.attempt.attemptId).error, undefined, 'a completed round carries no failure fact');
+  ledger.observe(failedAttempt.attempt.attemptId, { executionStatus: 'failed', error });
+  assert.deepEqual(ledger.getAttempt(failedAttempt.attempt.attemptId).error, error);
+  assert.deepEqual(ledger.get('root', failedAttempt.job.jobId).error, error);
+  // Conflicting observations (failed -> working / completed) keep status=failed and must not wipe attempt.error.
+  ledger.observe(failedAttempt.attempt.attemptId, { executionStatus: 'working' });
+  assert.equal(ledger.getAttempt(failedAttempt.attempt.attemptId).executionStatus, 'failed');
+  assert.deepEqual(ledger.getAttempt(failedAttempt.attempt.attemptId).error, error);
+  ledger.observe(failedAttempt.attempt.attemptId, { executionStatus: 'completed' });
+  assert.equal(ledger.getAttempt(failedAttempt.attempt.attemptId).executionStatus, 'failed');
+  assert.deepEqual(ledger.getAttempt(failedAttempt.attempt.attemptId).error, error);
+
+  // A non-terminal round that carries an error fact clears it on a clean transition to a non-failed status.
+  const recovering = running(ledger);
+  ledger.observe(recovering.attempt.attemptId, { error });
+  assert.deepEqual(ledger.getAttempt(recovering.attempt.attemptId).error, error);
+  ledger.observe(recovering.attempt.attemptId, { executionStatus: 'completed' });
+  assert.equal(ledger.getAttempt(recovering.attempt.attemptId).executionStatus, 'completed');
+  assert.equal(ledger.getAttempt(recovering.attempt.attemptId).error, undefined);
+  assert.equal(ledger.get('root', recovering.job.jobId).error, undefined);
 });
