@@ -1428,7 +1428,11 @@ export class AcpClient {
     capabilities: ClientCapabilities;
   }): Promise<{ initializeMs: number; authenticateMs: number; descendantsMs: number }> {
     try {
-      const { initialized: initResult, initializeMs, authenticateMs } = await Promise.race([
+      const {
+        initialized: initResult,
+        initializeMs,
+        authenticateMs,
+      } = await Promise.race([
         this.initializeProtocolConnection(params.connection, params.launch, params.capabilities),
         params.startupFailure.promise,
       ]);
