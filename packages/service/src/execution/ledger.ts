@@ -364,7 +364,7 @@ export class JobLedger {
     if (input.diagnostic !== undefined && !conflict) attempt.diagnostic = input.diagnostic;
     if (input.error !== undefined && !conflict) attempt.error = clone(input.error);
     // A non-conflicting transition into a non-failed status carries no failure facts.
-    if (!conflict && input.executionStatus !== undefined && !failedExecutionStatuses.has(input.executionStatus)) attempt.error = undefined;
+    if (!conflict && input.executionStatus !== undefined && !failedExecutionStatuses.has(input.executionStatus)) delete attempt.error;
     attempt.stale = input.stale ?? false; attempt.checkedAt = timestamp; attempt.updatedAt = timestamp;
     if (!conflict && (input.resultSummary !== undefined || input.structuredResultRef !== undefined || input.resultDigest !== undefined
       || input.artifactLinks !== undefined || input.resultArtifacts !== undefined || input.resultAvailable !== undefined || input.resultRevision !== undefined)) {
