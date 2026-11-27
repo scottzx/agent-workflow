@@ -203,10 +203,10 @@ async function check(work: string, python: string, jobId: string): Promise<{ res
 
 /** Non-resume runs allocate an exclusive work directory so runs started within the same second never share run-state.json or clientRequestId. */
 async function allocateWorkDirectory(roleRoot: string, caseId: string, stamp: string): Promise<{ work: string; runStamp: string }> {
-  await mkdir(roleRoot, { recursive: true });
   for (let suffix = 1; suffix <= 1000; suffix++) {
     const runStamp = suffix === 1 ? stamp : `${stamp}-${suffix}`;
     const work = path.join(roleRoot, `${caseId}-${runStamp}`);
+    await mkdir(path.dirname(work), { recursive: true });
     try {
       await mkdir(work);
       return { work, runStamp };
@@ -215,7 +215,7 @@ async function allocateWorkDirectory(roleRoot: string, caseId: string, stamp: st
       throw error;
     }
   }
-  throw new Error(`Could not allocate a unique work directory for ${caseId}-${stamp}`);
+  throw new Error(`Could not allocate a unique work directory under ${roleRoot} for ${caseId}-${stamp}`);
 }
 
 export async function runOutlineCase(options: OutlineRunOptions): Promise<OutlineRunReport> {

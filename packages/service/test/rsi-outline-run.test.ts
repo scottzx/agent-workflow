@@ -468,7 +468,53 @@ test('runs started within the same second allocate distinct work directories and
   assert.notEqual(first.workDirectory, second.workDirectory);
   assert.match(first.workDirectory, /demo-20261127T000000Z$/);
   assert.match(second.workDirectory, /demo-20261127T000000Z-2$/);
+  assert.ok(seenRequestIds.length >= 4, `expected at least 4 clientRequestIds across 2 runs, got ${seenRequestIds.length}`);
   assert.equal(new Set(seenRequestIds).size, seenRequestIds.length, 'same-second runs must not reuse clientRequestId values');
+});
+
+test('a cached l1_crosscheck still applies ticket_checks when a resumed ticket is awaiting checks', async t => {
+  const f = await fixture(t), gw = ticketGateway(), workspace = join(f.root, 'runs');
+  let work = '';
+  // First run: executor times out in round 1 before checks run, leaving ticket stopped from drafting.
+  const stopped = await timedOut(f, gw, { qa: {} }, async (method, params: any) => {
+    if (method === 'execution_submit') { work = params.input.cwd; return { jobId: 'job-1' }; }
+    return method === 'execution_unwatch' ? {} : { executionStatus: 'working' };
+  });
+  assert.equal(stopped.stopReason, 'not_completed');
+  // Seed a clean passing outline and run round 1's DAG into run-state.json as if l1_crosscheck had already been cached
+  // before the gateway ticket received ticket_checks (ticket is still stopped from drafting).
+  await writeFile(join(work, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+  const { runRoundDag, loadWorkflow } = await import('../src/rsi/engine.js');
+  const { loadChecklist } = await import('../src/rsi/checklist.js');
+  const wf = await loadWorkflow(f.role);
+  const cl = await loadChecklist(f.role);
+  const checkOut = spawnSync(PYTHON, ['-I', join(work, 'checks', 'check_outline.py'), join(work, 'outline.json'), join(work, 'features.json'), join(work, 'project')], { encoding: 'utf8' });
+  const checkResults = JSON.parse(checkOut.stdout) as { itemId: string; pass: boolean; evidence: unknown[] }[];
+  await runRoundDag({
+    workflow: wf, round: 1, workDirectory: work, mode: 'trial', checklist: cl,
+    nodes: wf.nodes.filter(node => node.type === 'program_check' || node.type === 'artifact_digest_check' || node.type === 'ticket_apply_checks'),
+    precompleted: [{ round: 1, nodeId: 'produce', inputDigest: 'produce', status: 'completed',
+      startedAt: '2026-11-27T00:00:00.000Z', finishedAt: '2026-11-27T00:00:00.000Z', output: { executionStatus: 'completed' } }],
+    handlersByType: {
+      program_check: async ctx => ({ results: checkResults.filter(r => ctx.checkIds.includes(r.itemId)) }),
+      artifact_digest_check: async () => ({ results: [] }),
+      ticket_apply_checks: async () => ({ status: 'completed' as const, output: { programPassed: true } }),
+    },
+  });
+  // Resume: even though l1_crosscheck hits cache in run-state.json, ticket is reopened to drafting, so ticket_checks MUST run before QA review.
+  const report = await runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace,
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, qa: {}, resume: work,
+    invoke: gw.invoke(async (method, params: any) => {
+      if (method === 'execution_submit' && params.title.startsWith('质检')) {
+        await writeFile(join(work, 'reviews', 'review-r1.json'), JSON.stringify({
+          verdict: 'pass', summary: '通过', scores: { 吸引力: 4, 具体: 4, 受众: 4, 结构: 4, 可信: 4, 行动: 4 }, issues: [],
+        }));
+        return { jobId: 'qa-1' };
+      }
+      return { executionStatus: 'completed' };
+    }) });
+  assert.equal(report.passed, true);
+  assert.equal(gw.ledger.events('rsi-test', gw.job('job-1')).filter(e => e.type === 'ticket.checked').length, 1);
 });
 
 test('the gate opens only after consecutive clean passes on the committed role version, and a test run needs a committed role', async t => {

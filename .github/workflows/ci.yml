@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run_all: ${{ steps.detect.outputs.run_all }}
+      run_docs: ${{ steps.detect.outputs.run_docs }}
       run_runtime: ${{ steps.detect.outputs.run_runtime }}
       run_service: ${{ steps.detect.outputs.run_service }}
       run_dsh: ${{ steps.detect.outputs.run_dsh }}
@@ -29,6 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           run_all=false
+          run_docs=false
           run_runtime=false
           run_service=false
           run_dsh=false
@@ -36,7 +38,7 @@ jobs:
           if [ "$EVENT_NAME" != "pull_request" ] || [ -z "$BASE_SHA" ] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
             run_all=true
           else
-            changed=$(git diff --name-only "${BASE_SHA}..HEAD")
+            changed=$(git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}..HEAD")
             echo "Changed files:"
             echo "$changed"
             if [ -z "$changed" ]; then
@@ -45,13 +47,16 @@ jobs:
               while IFS= read -r file; do
                 [ -z "$file" ] && continue
                 case "$file" in
-                  package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.github/workflows/ci.yml|scripts/*|tsconfig*.json)
+                  package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.github/workflows/*|scripts/*|tsconfig*.json)
                     run_all=true
                     ;;
                   packages/runtime/*)
                     run_runtime=true
                     run_service=true
                     run_dsh=true
+                    ;;
+                  examples/flows/*)
+                    run_runtime=true
                     ;;
                   packages/service/*|packages/file-preview/*|packages/chat-view/*)
                     run_service=true
@@ -64,11 +69,17 @@ jobs:
                     run_dsh=true
                     ;;
                 esac
+                case "$file" in
+                  docs/*|site/*|examples/flows/*|packages/runtime/*|*.md)
+                    run_docs=true
+                    ;;
+                esac
               done <<< "$changed"
             fi
           fi
 
           if [ "$run_all" = "true" ]; then
+            run_docs=true
             run_runtime=true
             run_service=true
             run_dsh=true
@@ -76,11 +87,27 @@ jobs:
 
           {
             echo "run_all=$run_all"
+            echo "run_docs=$run_docs"
             echo "run_runtime=$run_runtime"
             echo "run_service=$run_service"
             echo "run_dsh=$run_dsh"
           } >> "$GITHUB_OUTPUT"
-          echo "Scopes: run_all=$run_all run_runtime=$run_runtime run_service=$run_service run_dsh=$run_dsh"
+          echo "Scopes: run_all=$run_all run_docs=$run_docs run_runtime=$run_runtime run_service=$run_service run_dsh=$run_dsh"
+
+  docs-check:
+    needs: changes
+    if: needs.changes.outputs.run_docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @scottzx/1acp check:docs
 
   runtime-build:
     needs: changes
@@ -101,7 +128,6 @@ jobs:
       - run: pnpm --filter @scottzx/1acp build
       - run: pnpm --filter @scottzx/1acp viewer:typecheck
       - run: pnpm --filter @scottzx/1acp viewer:build
-      - run: pnpm --filter @scottzx/1acp check:docs
       - run: pnpm --filter @scottzx/1acp build:test
       - name: Archive runtime tests with executable permissions
         run: tar -czf runtime-tests.tgz -C packages/runtime dist dist-test
@@ -127,7 +153,9 @@ jobs:
       # acp-service embeds packages/runtime/dist during build, and the workbench page bundles file-preview + chat-view.
       - run: pnpm --filter @scottzx/1acp build
       - run: pnpm --filter @1agents/file-preview build
+      - run: pnpm --filter @1agents/file-preview test
       - run: pnpm --filter @1agents/chat-view build
+      - run: pnpm --filter @1agents/chat-view test
       - run: pnpm --filter @1agents/acp-service build
       - run: pnpm --filter @1agents/acp-service typecheck
       - name: Archive service build with executable permissions
@@ -289,13 +317,18 @@ jobs:
 
   ci-status:
     if: always()
-    needs: [changes, runtime-build, runtime-tests, service-build, service-test, dsh-plugin]
+    needs: [changes, docs-check, runtime-build, runtime-tests, service-build, service-test, dsh-plugin]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Verify required job outcomes
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          RUN_DOCS: ${{ needs.changes.outputs.run_docs }}
+          RUN_RUNTIME: ${{ needs.changes.outputs.run_runtime }}
+          RUN_SERVICE: ${{ needs.changes.outputs.run_service }}
+          RUN_DSH: ${{ needs.changes.outputs.run_dsh }}
+          DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
           RUNTIME_BUILD_RESULT: ${{ needs.runtime-build.result }}
           RUNTIME_TESTS_RESULT: ${{ needs.runtime-tests.result }}
           SERVICE_BUILD_RESULT: ${{ needs.service-build.result }}
@@ -303,12 +336,37 @@ jobs:
           DSH_PLUGIN_RESULT: ${{ needs.dsh-plugin.result }}
         run: |
           set -euo pipefail
-          echo "Job outcomes: changes=$CHANGES_RESULT runtime-build=$RUNTIME_BUILD_RESULT runtime-tests=$RUNTIME_TESTS_RESULT service-build=$SERVICE_BUILD_RESULT service-test=$SERVICE_TEST_RESULT dsh-plugin=$DSH_PLUGIN_RESULT"
+          echo "Scopes: run_docs=$RUN_DOCS run_runtime=$RUN_RUNTIME run_service=$RUN_SERVICE run_dsh=$RUN_DSH"
+          echo "Job outcomes: changes=$CHANGES_RESULT docs-check=$DOCS_CHECK_RESULT runtime-build=$RUNTIME_BUILD_RESULT runtime-tests=$RUNTIME_TESTS_RESULT service-build=$SERVICE_BUILD_RESULT service-test=$SERVICE_TEST_RESULT dsh-plugin=$DSH_PLUGIN_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "changes job did not succeed: $CHANGES_RESULT" >&2
             exit 1
           fi
+          require_success() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "Required job $name did not succeed: $result" >&2
+              exit 1
+            fi
+          }
+          if [ "$RUN_DOCS" = "true" ]; then
+            require_success "docs-check" "$DOCS_CHECK_RESULT"
+          fi
+          if [ "$RUN_RUNTIME" = "true" ]; then
+            require_success "runtime-build" "$RUNTIME_BUILD_RESULT"
+            require_success "runtime-tests" "$RUNTIME_TESTS_RESULT"
+          fi
+          if [ "$RUN_SERVICE" = "true" ]; then
+            require_success "service-build" "$SERVICE_BUILD_RESULT"
+            require_success "service-test" "$SERVICE_TEST_RESULT"
+          fi
+          if [ "$RUN_DSH" = "true" ]; then
+            require_success "service-build" "$SERVICE_BUILD_RESULT"
+            require_success "dsh-plugin" "$DSH_PLUGIN_RESULT"
+          fi
           for pair in \
+            "docs-check:$DOCS_CHECK_RESULT" \
             "runtime-build:$RUNTIME_BUILD_RESULT" \
             "runtime-tests:$RUNTIME_TESTS_RESULT" \
             "service-build:$SERVICE_BUILD_RESULT" \
