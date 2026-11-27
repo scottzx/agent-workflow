@@ -10,6 +10,30 @@ import path from 'node:path';
 import { z } from 'zod';
 import type { JobLedger } from './ledger.js';
 
+export const GOVERNANCE_PROPOSAL_KINDS = ['eval_change', 'permission_escalation', 'promote_formal'] as const;
+export type GovernanceProposalKind = (typeof GOVERNANCE_PROPOSAL_KINDS)[number];
+export const LEGACY_PROPOSAL_KINDS = ['check', 'role', 'qa', 'locked'] as const;
+export const ALL_PROPOSAL_KINDS = [...LEGACY_PROPOSAL_KINDS, ...GOVERNANCE_PROPOSAL_KINDS] as const;
+export type ProposalKind = (typeof ALL_PROPOSAL_KINDS)[number];
+
+export function isGovernanceProposalKind(kind: string): kind is GovernanceProposalKind {
+  return (GOVERNANCE_PROPOSAL_KINDS as readonly string[]).includes(kind);
+}
+
+const reviewProposalSchema = z.object({
+  kind: z.enum(ALL_PROPOSAL_KINDS),
+  text: z.string().trim().min(1).max(2000),
+  evidence: z.string().trim().min(1).max(4000).optional(),
+}).strict().superRefine((proposal, ctx) => {
+  if (isGovernanceProposalKind(proposal.kind) && !proposal.evidence) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['evidence'],
+      message: `Governance proposal (${proposal.kind}) requires non-empty evidence`,
+    });
+  }
+});
+
 export const checkResultSchema = z.object({ itemId: z.string(), pass: z.boolean(), evidence: z.array(z.unknown()) }).strict();
 export const qualityReviewSchema = z.object({
   verdict: z.enum(['pass', 'revise']),
@@ -20,8 +44,8 @@ export const qualityReviewSchema = z.object({
   /** On a re-review: QA's verdict on each ticket item the executor handled, by item id. */
   previous: z.array(z.object({ id: z.string().trim().min(1).max(40), status: z.enum(['fixed', 'partly', 'not_fixed', 'withdrawn']),
     note: z.string().trim().max(2000).optional() }).strict()).max(30).optional(),
-  /** Changes to the role itself: a program check, the executor's or QA's instructions, or a locked item only a person can change. */
-  proposals: z.array(z.object({ kind: z.enum(['check', 'role', 'qa', 'locked']), text: z.string().trim().min(1).max(2000) }).strict()).max(10).optional(),
+  /** Role/governance proposals: two-key governance kinds (`eval_change` / `permission_escalation` / `promote_formal`) require `evidence` and single-item human settlement. */
+  proposals: z.array(reviewProposalSchema).max(10).optional(),
   /** QA's L2 audit of the executor's self-checks, one entry per checklist id. */
   selfCheckAudit: z.array(z.object({ id: z.string().trim().min(1).max(80), verdict: z.enum(['agree', 'disagree']),
     note: z.string().trim().max(2000).optional() }).strict()).max(50).optional(),
@@ -54,7 +78,7 @@ export interface TicketItem {
   suggestion?: string; checkId?: string; evidence?: unknown[]; state: ItemState; log: TicketLog[]; crossCheck?: CrossCheckFinding;
 }
 export interface TicketProposal {
-  id: string; kind: NonNullable<QualityReview['proposals']>[number]['kind']; text: string; raisedInRound: number;
+  id: string; kind: ProposalKind; text: string; evidence?: string; raisedInRound: number;
   state: 'open' | 'accepted' | 'rejected' | 'done'; note?: string; by?: ProposalSettler;
 }
 export interface Ticket {
@@ -194,8 +218,18 @@ export function applyReview(ticket: Ticket, review: QualityReview, qaJobId?: str
   (review.proposals ?? []).forEach((proposal, index) => {
     if (ticket.proposals.some(known => known.kind === proposal.kind && known.text === proposal.text)) return;
     const id = `R${round}-${index + 1}`;
-    ticket.proposals.push({ id, kind: proposal.kind, text: proposal.text, raisedInRound: round, state: 'open' });
-    changes.push({ type: 'ticket.proposal_raised', data: { actor: 'qa', round, proposalId: id, kind: proposal.kind, text: proposal.text, ...qa } });
+    ticket.proposals.push({
+      id,
+      kind: proposal.kind,
+      text: proposal.text,
+      ...(proposal.evidence ? { evidence: proposal.evidence } : {}),
+      raisedInRound: round,
+      state: 'open',
+    });
+    changes.push({
+      type: 'ticket.proposal_raised',
+      data: { actor: 'qa', round, proposalId: id, kind: proposal.kind, text: proposal.text, ...(proposal.evidence ? { evidence: proposal.evidence } : {}), ...qa },
+    });
   });
   ticket.history.push({ round, by: 'qa', action: 'reviewed', verdict: review.verdict, scores: review.scores, summary: review.summary });
   changes.push({ type: 'ticket.reviewed', data: { actor: 'qa', round, verdict: review.verdict, scores: review.scores, summary: review.summary, ...qa } });
@@ -251,14 +285,48 @@ export function submitTicket(ticket: Ticket): TicketChange[] {
   return [{ type: 'ticket.submitted', data: { actor: 'executor', round: ticket.round } }];
 }
 
-/** Person or coach: what became of a proposal. Allowed after the run ends, which is when the coach reads them. */
+/** Coach or host: raise a scoped two-key governance proposal (`eval_change` / `permission_escalation` / `promote_formal`) with mandatory evidence. */
+export function raiseGovernanceProposal(
+  ticket: Ticket,
+  input: { kind: GovernanceProposalKind; text: string; evidence: string; actor?: TicketActor },
+): TicketChange[] {
+  if (!isGovernanceProposalKind(input.kind)) {
+    fail(`治理提议类型必须是 ${GOVERNANCE_PROPOSAL_KINDS.join(' / ')} 之一`);
+  }
+  const text = input.text.trim();
+  const evidence = input.evidence.trim();
+  if (!text) fail('治理提议说明 text 不能为空');
+  if (!evidence) fail(`治理提议（${input.kind}）必须填写可核验 evidence`);
+  if (ticket.proposals.some(known => known.kind === input.kind && known.text === text && known.state === 'open')) {
+    return [];
+  }
+  const id = `G${ticket.round}-${ticket.proposals.length + 1}`;
+  const actor = input.actor ?? 'coach';
+  ticket.proposals.push({ id, kind: input.kind, text, evidence, raisedInRound: ticket.round, state: 'open' });
+  return [{ type: 'ticket.proposal_raised', data: { actor, round: ticket.round, proposalId: id, kind: input.kind, text, evidence } }];
+}
+
+/** Person or coach: what became of a single proposal. Batch settlement is rejected; governance proposals require a person settler and non-empty evidence. */
 export function setProposal(ticket: Ticket, proposalId: string, state: 'accepted' | 'rejected' | 'done', note?: string,
   by: ProposalSettler = { kind: 'person' }): TicketChange[] {
-  const proposal = ticket.proposals.find(entry => entry.id === proposalId) ?? fail(`任务单上没有提议 ${proposalId}`);
+  if (typeof proposalId !== 'string') fail('禁止批量结算提议：proposalId 必须是单条字符串编号');
+  const trimmedId = proposalId.trim();
+  if (!trimmedId || /[,;|\s*]/.test(trimmedId) || trimmedId.toLowerCase() === 'all') {
+    fail(`禁止批量结算提议（${trimmedId || '空编号'}）：每次只能逐条裁决单条 proposalId`);
+  }
+  const proposal = ticket.proposals.find(entry => entry.id === trimmedId) ?? fail(`任务单上没有提议 ${trimmedId}`);
+  if (isGovernanceProposalKind(proposal.kind)) {
+    if (by.kind !== 'person') {
+      fail(`治理提议 ${trimmedId}（${proposal.kind}）必须由人（person）双钥匙裁决，教练不可自批`);
+    }
+    if ((state === 'accepted' || state === 'done') && !proposal.evidence?.trim()) {
+      fail(`治理提议 ${trimmedId}（${proposal.kind}）缺少可核验 evidence，不能标为 ${state}`);
+    }
+  }
   proposal.state = state; proposal.by = by;
   if (note) proposal.note = note;
   const { kind, ...who } = by;
-  return [{ type: 'ticket.proposal_marked', data: { actor: kind, round: ticket.round, proposalId, state, ...(note ? { note } : {}), ...who } }];
+  return [{ type: 'ticket.proposal_marked', data: { actor: kind, round: ticket.round, proposalId: trimmedId, state, ...(note ? { note } : {}), ...who } }];
 }
 
 /** The read-only copy; the ledger stays the record, so a copy that cannot be written does not undo the change. */

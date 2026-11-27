@@ -10,6 +10,7 @@ import type { CaseFact, CaseReceipt } from './externals.js';
 import type { AcpTaskSummary, WorkbenchSnapshot, WorkbenchSource } from './workbench.js';
 import { legalNextForJob } from './workbench.js';
 import { projectApprovals, type ApprovalItem } from './approvals-view.js';
+import type { ProposalKind } from './ticket.js';
 
 export interface WorkbenchCaseSummary {
   caseId: string;
@@ -83,7 +84,7 @@ export interface WorkbenchInboxItem {
   canDecide: boolean;
   channel?: 'trial' | 'formal' | 'standalone';
   proposalId?: string;
-  proposalKind?: 'locked' | 'check' | 'role' | 'qa';
+  proposalKind?: ProposalKind;
   text?: string;
   roleId?: string;
 }
