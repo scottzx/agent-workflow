@@ -118,6 +118,141 @@ test('markdown verdict forms fail closed unless exactly one legal verdict is pre
   assert.deepEqual(firstLine.must, []);
 });
 
+test('a bold MUST without a hash heading cannot silently pass a real blocker', async () => {
+  const manifest = await loadCrEvalManifest(roleDir);
+  const variants = ['**MUST**', '__MUST__', '**2. MUST**', '**MUST（阻塞缺陷）**', '**MUST:**', '**MUST**：'];
+  for (const header of variants) {
+    const review = parseMarkdownCrReport('pr12-pos-relpath-fix', [
+      'VERDICT: PASS', '', header, '',
+      '- **[M1]** `packages/service/src/a2a/result-metadata.ts` 绝对路径把 `.1agents/worktrees` 内正常文件误判为敏感。',
+    ].join('\n'));
+    assert.equal(review.verdict, 'PASS', header);
+    assert.equal(review.must.length, 1, header);
+    assert.equal(review.must[0]?.id, 'M1', header);
+    assert.equal(review.must[0]?.file, 'packages/service/src/a2a/result-metadata.ts', header);
+    const scored = scoreCrEvalSuite(manifest, replace(manifest, 'pr12-pos-relpath-fix', review));
+    assert.equal(scored.caseResults.find(item => item.caseId === 'pr12-pos-relpath-fix')?.falsePositive, true, header);
+    assert.equal(scored.promotionReady, false, header);
+  }
+});
+
+test('bold or bare MUST stops at SHOULD and still matches the required defect', async () => {
+  const manifest = await loadCrEvalManifest(roleDir);
+  const bold = parseMarkdownCrReport('pr11-neg-non-atomic-notify', [
+    '**VERDICT**: CHANGES_REQUESTED', '',
+    '**MUST**', '',
+    '- **[M1]** `packages/service/src/a2a/gateway.ts` notifySessions 在 ledger.prepare 落盘之后才订阅，失败会半持久化。', '',
+    '**SHOULD**', '',
+    '- 可以补注释，但不要把 README.md 的 schemaVersion 不兼容算进必须项。', '',
+    '**VERIFIED_CHECKS**', '',
+    '已核对 packages/service/src/a2a/job-directory.ts 的 runtime/jobs，这不是这一条 MUST。',
+  ].join('\n'));
+  assert.equal(bold.verdict, 'CHANGES_REQUESTED');
+  assert.equal(bold.must.length, 1);
+  assert.match(bold.must[0]?.summary ?? '', /gateway\.ts/);
+  assert.match(bold.must[0]?.summary ?? '', /半持久化/);
+  assert.doesNotMatch(bold.must[0]?.summary ?? '', /schemaVersion|runtime\/jobs/);
+  assert.equal(bold.should?.length, 1);
+  assert.match(bold.should?.[0]?.summary ?? '', /schemaVersion/);
+  const boldScore = scoreCrEvalSuite(manifest, replace(manifest, 'pr11-neg-non-atomic-notify', bold));
+  assert.deepEqual(boldScore.caseResults.find(item => item.caseId === 'pr11-neg-non-atomic-notify')?.missedDefects, []);
+
+  const bare = parseMarkdownCrReport('pr12-neg-worktree-abs-path', [
+    'VERDICT: CHANGES_REQUESTED', '',
+    'MUST:',
+    '- **[M1]** `packages/service/src/a2a/result-metadata.ts` 绝对路径把 `.1agents/worktrees` 内正常文件误判为敏感。', '',
+    'MUST：',
+    '- **[M2]** 这条空节头后面的重复项应该并进 MUST，而不是被丢掉。', '',
+    '__SHOULD__', '',
+    '建议补一条回归。', '',
+    '**结论**', '',
+    'packages/service/src/a2a/job-directory.ts 的 runtime/jobs 不要并进上面的 MUST。',
+  ].join('\n'));
+  assert.equal(bare.must.length, 2);
+  assert.equal(bare.must[0]?.file, 'packages/service/src/a2a/result-metadata.ts');
+  assert.doesNotMatch(bare.must.map(item => item.summary).join('\n'), /runtime\/jobs/);
+  assert.equal(bare.should?.length, 1);
+  const bareScore = scoreCrEvalSuite(manifest, replace(manifest, 'pr12-neg-worktree-abs-path', bare));
+  assert.deepEqual(bareScore.caseResults.find(item => item.caseId === 'pr12-neg-worktree-abs-path')?.missedDefects, []);
+});
+
+test('a bold empty MUST still normalizes to no findings', async () => {
+  const manifest = await loadCrEvalManifest(roleDir);
+  const review = parseMarkdownCrReport('pr14-pos-verified-worktree-fix', [
+    '**VERDICT**', '', '**PASS**', '',
+    '正文里写无 MUST、0 MUST 也不能再变出一条缺陷。', '',
+    '**MUST**', '', '**无。**',
+  ].join('\n'));
+  assert.equal(review.verdict, 'PASS');
+  assert.deepEqual(review.must, []);
+  const scored = scoreCrEvalSuite(manifest, replace(manifest, 'pr14-pos-verified-worktree-fix', review));
+  assert.equal(scored.caseResults.find(item => item.caseId === 'pr14-pos-verified-worktree-fix')?.falsePositive, false);
+  assert.equal(scored.promotionReady, true);
+});
+
+test('an inline MUST line and a bare blocker marker are not zero findings', async () => {
+  const manifest = await loadCrEvalManifest(roleDir);
+  const inline = parseMarkdownCrReport('pr11-neg-non-atomic-notify', [
+    'VERDICT: CHANGES_REQUESTED',
+    '**MUST**: `packages/service/src/a2a/gateway.ts` 在 ledger.prepare 落盘之后订阅，形成半持久化。',
+    'MUST: `packages/service/src/a2a/notifications.ts` 重放漏订也要留在这一节。',
+  ].join('\n'));
+  assert.equal(inline.verdict, 'CHANGES_REQUESTED');
+  assert.equal(inline.must.length, 2);
+  assert.match(inline.must.map(item => item.summary).join('\n'), /gateway\.ts/);
+  assert.match(inline.must.map(item => item.summary).join('\n'), /notifications\.ts/);
+  assert.match(inline.must.map(item => item.summary).join('\n'), /半持久化/);
+  const inlineScore = scoreCrEvalSuite(manifest, replace(manifest, 'pr11-neg-non-atomic-notify', inline));
+  assert.deepEqual(inlineScore.caseResults.find(item => item.caseId === 'pr11-neg-non-atomic-notify')?.missedDefects, []);
+
+  const loose = parseMarkdownCrReport('pr12-pos-relpath-fix', [
+    'VERDICT: PASS', '',
+    '没有 MUST 节头，但下面这条不是“无 MUST”。', '',
+    '**[M1]** `packages/service/src/a2a/result-metadata.ts` 绝对路径仍会误判 `.1agents/worktrees`。', '',
+    '### M2', '',
+    '`packages/service/src/a2a/result-metadata.ts` 另一处绝对路径误判。',
+  ].join('\n'));
+  assert.equal(loose.verdict, 'PASS');
+  assert.equal(loose.must.length, 2);
+  assert.deepEqual(loose.must.map(item => item.id), ['M1', 'M2']);
+  const looseScore = scoreCrEvalSuite(manifest, replace(manifest, 'pr12-pos-relpath-fix', loose));
+  assert.equal(looseScore.caseResults.find(item => item.caseId === 'pr12-pos-relpath-fix')?.falsePositive, true);
+
+  const prose = parseMarkdownCrReport('pr14-pos-verified-worktree-fix', [
+    'VERDICT: PASS', '',
+    '本次无 MUST，0 MUST，没有阻塞项。审查时如果看到 MUST: 先写入再校验就退回。', '',
+    '**SHOULD**', '',
+    '- **[M1]** 这条放在建议里，不能当成阻塞项。',
+  ].join('\n'));
+  assert.equal(prose.verdict, 'PASS');
+  assert.deepEqual(prose.must, []);
+  assert.equal(prose.should?.length, 1);
+});
+
+test('a fenced bold MUST does not create a phantom finding', () => {
+  const fenced = parseMarkdownCrReport('pr14-pos-verified-worktree-fix', [
+    'VERDICT: PASS', '',
+    '```md',
+    '**MUST**',
+    '### M1 phantom',
+    '- **[M1]** `packages/service/src/a2a/gateway.ts` ledger.prepare 半持久化',
+    '```', '',
+    '正文说无 MUST。',
+  ].join('\n'));
+  assert.equal(fenced.verdict, 'PASS');
+  assert.deepEqual(fenced.must, []);
+  const closed = parseMarkdownCrReport('pos', [
+    '## VERDICT', '', 'PASS', '',
+    '```',
+    '**MUST**',
+    'MUST: `gateway.ts` 这是示例，不是缺陷。',
+    '```', '',
+    '**MUST**', '', '**无。**',
+  ].join('\n'));
+  assert.equal(closed.verdict, 'PASS');
+  assert.deepEqual(closed.must, []);
+});
+
 test('bold empty MUST and fenced sample headings do not create findings', () => {
   const pass = parseMarkdownCrReport('pr14-pos-verified-worktree-fix', [
     '## 1. VERDICT: `PASS`', '', '## 2. MUST（阻塞缺陷）', '', '**无。**', '',
