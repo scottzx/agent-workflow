@@ -850,6 +850,7 @@ export function scoreCrEvalSuite(
   results: CrReviewResult[],
   options?: {
     humanCalibration?: CrHumanCalibrationFile | readonly CrHumanCalibrationSample[];
+    requireHumanCalibration?: boolean;
     minKappa?: number;
     minOverlap?: number;
   },
@@ -892,6 +893,18 @@ export function scoreCrEvalSuite(
       minKappa: options.minKappa ?? declaredMin ?? POLICY_MIN_CR_JUDGE_KAPPA,
       ...(options.minOverlap !== undefined ? { minOverlap: options.minOverlap } : {}),
     });
+  } else if (options?.requireHumanCalibration) {
+    const minKappa = options.minKappa ?? POLICY_MIN_CR_JUDGE_KAPPA;
+    judgeCalibration = {
+      minKappa,
+      overlapCases: 0,
+      tiedHumanCases: 0,
+      agreement: null,
+      kappa: null,
+      passed: false,
+      disagreements: [],
+      reason: '缺少人工抽样校准记录（evals/human-calibration.json），无法证明评委一致性，强制禁止晋升',
+    };
   }
 
   const negativeCases = parsed.cases.filter(item => item.kind === 'negative').length;

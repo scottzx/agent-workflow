@@ -309,7 +309,10 @@ async function runEvalCr(argv: string[]): Promise<void> {
   const humanCalibration = values['human-calibration']
     ? await loadCrHumanCalibrationFile(resolve(values['human-calibration']), manifest.roleId)
     : await loadRoleHumanCalibration(roleDirectory, manifest.roleId);
-  const score = scoreCrEvalSuite(manifest, normalizedResults, humanCalibration ? { humanCalibration } : undefined);
+  const score = scoreCrEvalSuite(manifest, normalizedResults, {
+    ...(humanCalibration ? { humanCalibration } : {}),
+    requireHumanCalibration: true,
+  });
   const evalWorkspace = values.workspace ? resolve(values.workspace) : resolve(repoRoot, '.1agents', 'runtime', 'rsi');
   const written = await writeCrEvalReport({
     roleDirectory,

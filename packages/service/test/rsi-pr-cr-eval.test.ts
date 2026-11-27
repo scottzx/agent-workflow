@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile, cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import test from 'node:test';
@@ -676,4 +676,28 @@ test('judge agreement calibration (Cohen kappa < 0.8 forces promotionReady=false
   const body = JSON.parse(res.stdout) as { promotionReady: boolean; judgeCalibration?: { kappa: number; passed: boolean } };
   assert.equal(body.promotionReady, false);
   assert.equal(body.judgeCalibration?.passed, false);
+
+  // 5. M1 regression: deleting evals/human-calibration.json MUST fail closed (cannot bypass kappa gate by deleting asset).
+  const roleCopy = join(dir, 'role-no-cal');
+  const wsNoCal = join(dir, 'ws-no-cal');
+  await cp(roleDir, roleCopy, { recursive: true });
+  await rm(join(roleCopy, 'evals', 'human-calibration.json'));
+  const noCalCli = await spawn([
+    '--import', 'tsx', cli, 'rsi', 'eval-cr',
+    '--role', roleCopy, '--repo', repoRoot,
+    '--results', passFile,
+    '--workspace', wsNoCal,
+    '--json',
+  ]);
+  assert.equal(noCalCli.status, 1, 'missing human-calibration.json must exit 1');
+  const noCalBody = JSON.parse(noCalCli.stdout) as { promotionReady: boolean; judgeCalibration?: { passed: boolean; kappa: number | null } };
+  assert.equal(noCalBody.promotionReady, false);
+  assert.equal(noCalBody.judgeCalibration?.passed, false);
+  assert.equal(noCalBody.judgeCalibration?.kappa, null);
+
+  const { checkGate } = await import('../src/rsi/gate.js');
+  const noCalGate = await checkGate({ roleDirectory: roleCopy, workspace: wsNoCal, repoRoot });
+  assert.equal(noCalGate.crEval?.status, 'failed');
+  assert.equal(noCalGate.crEval?.promotionReady, false);
+  assert.ok(noCalGate.reasons.some(r => r.includes('人工校准')));
 });

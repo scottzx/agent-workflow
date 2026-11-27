@@ -358,7 +358,10 @@ async function evalCrGate(input: {
   let rescored: CrEvalScore;
   try {
     const humanCalibration = await loadRoleHumanCalibration(input.roleDirectory, input.roleId);
-    rescored = scoreCrEvalSuite(manifest, coerceCrEvalResults(saved.results), humanCalibration ? { humanCalibration } : undefined);
+    rescored = scoreCrEvalSuite(manifest, coerceCrEvalResults(saved.results), {
+      ...(humanCalibration ? { humanCalibration } : {}),
+      requireHumanCalibration: true,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     reasons.push(`CR 黄金回放进程内重算打分失败：${message}`);
