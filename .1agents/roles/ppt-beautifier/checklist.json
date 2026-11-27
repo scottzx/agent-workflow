@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 2,
+  "roleId": "ppt-beautifier",
+  "artifacts": ["deck.pptx"],
+  "items": [
+    {
+      "id": "V1",
+      "kind": "program",
+      "severity": "must",
+      "locked": false,
+      "rule": "所有形状包围盒都落在幻灯片画布内（允许 1pt 容差）",
+      "runner": { "id": "check_pptx", "cmd": ["python3", "-I", "checks/check_pptx.py", "deck.pptx"] },
+      "modePolicy": { "trial": "observe", "formal": "block" }
+    },
+    {
+      "id": "V2",
+      "kind": "program",
+      "severity": "must",
+      "locked": false,
+      "rule": "估算文本需求高度不超过文本框高度 ×1.1（无溢出截断）",
+      "runner": { "id": "check_pptx", "cmd": ["python3", "-I", "checks/check_pptx.py", "deck.pptx"] },
+      "modePolicy": { "trial": "observe", "formal": "block" }
+    },
+    {
+      "id": "V3",
+      "kind": "program",
+      "severity": "must",
+      "locked": false,
+      "rule": "除页码与脚注占位符外，正文字号不小于 12pt",
+      "runner": { "id": "check_pptx", "cmd": ["python3", "-I", "checks/check_pptx.py", "deck.pptx"] },
+      "modePolicy": { "trial": "observe", "formal": "block" }
+    },
+    {
+      "id": "V4",
+      "kind": "program",
+      "severity": "must",
+      "locked": false,
+      "rule": "同页任意两个含文本形状的包围盒 IoU 不超过 0.15（不互相压盖）",
+      "runner": { "id": "check_pptx", "cmd": ["python3", "-I", "checks/check_pptx.py", "deck.pptx"] },
+      "modePolicy": { "trial": "observe", "formal": "block" }
+    }
+  ]
+}

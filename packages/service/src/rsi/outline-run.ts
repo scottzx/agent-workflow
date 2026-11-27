@@ -13,7 +13,7 @@ import { appendFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import path from 'node:path';
 import { z } from 'zod';
 import { checkResultSchema, pendingItems, qualityReviewSchema, type QualityReview, type CheckResult, type Ticket, unsettledMust } from '../execution/ticket.js';
-import { loadChecklist, renderExecutorChecklistPrompt, renderQaChecklistPrompt, toTicketSelfChecks } from './checklist.js';
+import { effectiveEnforcement, loadChecklist, renderExecutorChecklistPrompt, renderQaChecklistPrompt, toTicketSelfChecks } from './checklist.js';
 import { firstRoundSubmitGate, loadWorkflow, runRoundDag } from './engine.js';
 
 const caseSchema = z.object({
@@ -260,6 +260,9 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
     await cp(path.join(roleDirectory, 'workflow.json'), path.join(work, 'workflow.json')).catch(error => {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     });
+    await cp(path.join(roleDirectory, 'rubric.json'), path.join(work, 'rubric.json')).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    });
     await cp(path.join(roleDirectory, 'checks'), path.join(work, 'checks'), { recursive: true });
     await cp(path.join(caseDirectory, kase.features), path.join(work, 'features.json'));
   }
@@ -361,16 +364,21 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const steps = ticketSteps(jobId, options.cli);
   const rounds: OutlineRound[] = prior ? [...prior.rounds] : [];
   // Where a resumed run picks up: the round its host never finished waiting on, or the review QA did not finish.
+  const enforcementOf = (itemId: string) => {
+    const item = checklist.items.find(entry => entry.id === itemId);
+    return item ? effectiveEnforcement(item, mode, policy.enforceObserveAsBlock) : 'block';
+  };
+  const isBlockingFailure = (result: CheckResult) => !result.pass && enforcementOf(result.itemId) === 'block';
   let startRound = 1, resumingReview = false;
   if (prior) {
     const last = rounds.at(-1);
     if (!last || ticket.round > last.round) startRound = ticket.round;
     else if (last.executionStatus !== 'completed') { rounds.pop(); startRound = last.round; }
-    else if (options.qa && last.results.every(result => result.pass) && !last.review?.review) { rounds.pop(); startRound = last.round; resumingReview = true; }
+    else if (options.qa && !last.results.some(isBlockingFailure) && !last.review?.review) { rounds.pop(); startRound = last.round; resumingReview = true; }
     else throw new Error(`That run stopped between steps of round ${last.round}; start a new one`);
   }
   const reviews = rounds.flatMap(round => round.review?.review && round.review.review.verdict !== 'pass' ? [round.review.review] : []);
-  let bounces = rounds.filter(round => round.ticketErrors || (round.executionStatus === 'completed' && round.results.some(result => !result.pass))).length;
+  let bounces = rounds.filter(round => round.ticketErrors || (round.executionStatus === 'completed' && round.results.some(isBlockingFailure))).length;
   let revisions = reviews.length, stopReason: StopReason = 'passed';
   // The stopped ticket refused whatever this round's executor tried to mark, so a missing submission is not its miss.
   const excusedRound = prior && !resumingReview ? startRound : undefined;
@@ -426,7 +434,11 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       }
     }
     const checked = executionStatus === 'completed' ? await check(work, python, jobId) : { results: [] };
-    const results = checked.results, programPassed = executionStatus === 'completed' && results.every(result => result.pass);
+    const results = checked.results;
+    const blockingFailures = results.filter(isBlockingFailure);
+    const observeItemIds = results.filter(result => enforcementOf(result.itemId) === 'observe').map(result => result.itemId);
+    const programPassed = executionStatus === 'completed' && blockingFailures.length === 0;
+    const ticketChecksPayload = { results, ...(observeItemIds.length ? { observeItemIds } : {}) };
     if (executionStatus === 'completed') {
       // produce already finished above. The check layer is the micro-DAG: schema, then rules ∥ digest, then L1.
       const dag = await runRoundDag({
@@ -438,7 +450,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
           program_check: async ctx => ({ results: results.filter(result => ctx.checkIds.includes(result.itemId) || (ctx.node.id === 'check_schema' && result.itemId === 'P0')) }),
           artifact_digest_check: async () => ({ results: results.filter(result => result.itemId === 'D1') }),
           ticket_apply_checks: async () => {
-            if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
+            if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', ticketChecksPayload);
             return { status: 'completed' as const, output: { programPassed } };
           },
         },
@@ -446,12 +458,12 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
       const applied = dag.records.find(record => record.nodeId === 'l1_crosscheck');
       const ticketAwaitingChecks = ticket.status === 'drafting' || ticket.status === 'ready_for_review';
       if (!applied || applied.status !== 'completed' || (applied.cached && ticketAwaitingChecks)) {
-        if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
+        if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', ticketChecksPayload);
       }
     }
     const record: OutlineRound = { round, jobId, executionStatus, passed: programPassed, results, ...(checked.outlineSha256 ? { outlineSha256: checked.outlineSha256 } : {}) };
     rounds.push(record);
-    log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${results.filter(r => !r.pass).map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
+    log(`第 ${round} 轮：${programPassed ? '程序检查通过' : executionStatus === 'completed' ? `未通过 ${blockingFailures.map(r => r.itemId).join('、')}` : `执行未完成（${executionStatus}）`}`);
     if (executionStatus !== 'completed') { stopReason = 'not_completed'; break; }
     let feedback: (ticket: Ticket) => string, note: string;
     if (!programPassed) {
@@ -493,7 +505,7 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   try { checksDigest = await (await import('./calibrate.js')).computeChecksDigest(roleDirectory); }
   catch { checksDigest = undefined; }
   const entry: LedgerEntry = { startedAt, phase, caseId: kase.id, caseKind: kase.kind, role, passed, stopReason,
-    firstDraftPassed: first?.executionStatus === 'completed' && first.results.every(result => result.pass), bounces, revisions,
+    firstDraftPassed: first?.executionStatus === 'completed' && !first.results.some(isBlockingFailure), bounces, revisions,
     scores: rounds.flatMap(r => r.review?.review ? [r.review.review.scores] : []),
     mustIssues: unsettledMust(ticket).length, proposals: ticket.proposals.map(({ kind, text }) => ({ kind, text })), workDirectory: work, ticketPath,
     jobId, originSessionId: options.originSessionId, ...(checksDigest ? { checksDigest } : {}) };

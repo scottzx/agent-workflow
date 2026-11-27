@@ -9,7 +9,8 @@
 ```text
 1acp/.1agents/
   README.md                     # Git：目录与维护约定
-  roles/ppt-beautifier/          # Git：角色说明、技能引用和版本策略
+  schemas/rubric.schema.json     # Git：角色 Rubric 评分细则共享 Schema
+  roles/ppt-beautifier/          # Git：角色说明、技能引用、检查脚本和版本策略
   roles/wechat-stock-replenisher/ # Git：AP感应式角色说明及声明示例
   config/
     project-discovery.example.json # Git：可选项目探查配置示例
@@ -26,7 +27,7 @@
     project-discovery/discovery.json # 目录候选快照、探查模式与诊断
 ```
 
-Git 只跟踪角色声明、说明及示例配置。技能包、缓存、素材、任务数据、产物、状态和本机私密配置不提交。共享宿主安装包、登录凭据、全局模型配置及原生 DSH/Codex 会话库仍由宿主管理；本目录保存项目的会话关联、任务回执和产物，其角色绑定指向上述目录。
+Git 只跟踪角色声明、共享 Schema（`schemas/`）、说明及示例配置。技能包、缓存、素材、任务数据、产物、状态和本机私密配置不提交。共享宿主安装包、登录凭据、全局模型配置及原生 DSH/Codex 会话库仍由宿主管理；本目录保存项目的会话关联、任务回执和产物，其角色绑定指向上述目录。
 
 [公众号补库专员](roles/wechat-stock-replenisher/ROLE.md)是AP流程角色，使用 `role.example.json` 描述规则和依赖；它不是网络模型角色的原生 `profile.json`，不参与该格式的自动探查或A2A目标注册。生产接点已补齐，每30分钟读取真实工作台并按10/15规则补候补内容池；具体启用和验收状态见[实施记录](../docs/wechat-stock-replenishment-implementation-20261023.md)，不以声明文件代替运行证据。
 

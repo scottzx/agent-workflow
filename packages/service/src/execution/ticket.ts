@@ -108,10 +108,12 @@ function selfProgramConflict(ticket: Ticket, result: CheckResult): CrossCheckFin
   return { kind: 'self_vs_program', checkId: result.itemId, claimedState: 'pass', ...(sc.note ? { claimedNote: sc.note } : {}), actualVerdict: 'fail' };
 }
 
-/** Host: failed checks become or reopen program items, items whose check now passes are verified; all passing moves the ticket to review. */
-export function applyChecks(ticket: Ticket, results: CheckResult[]): TicketChange[] {
+/** Host: failed blocking checks become or reopen program items, items whose check now passes are verified; all blocking checks passing moves the ticket to review. Observe-only failures are recorded on the check event without raising must items or blocking review. */
+export function applyChecks(ticket: Ticket, results: CheckResult[], options?: { observeItemIds?: ReadonlySet<string> | readonly string[] }): TicketChange[] {
   expect(ticket, ['drafting', 'ready_for_review'], '只有执行者交稿后才能合并程序检查');
   const round = ticket.round, changes: TicketChange[] = [];
+  const observeSet = options?.observeItemIds ? new Set(options.observeItemIds) : undefined;
+  const isObserve = (itemId: string) => Boolean(observeSet?.has(itemId));
   const settle = (item: TicketItem, state: ItemState, note: string) => {
     item.state = state; item.log.push({ round, by: 'host', action: state, note });
     changes.push({ type: 'ticket.item_settled', data: { actor: 'host', round, itemId: item.id, state, note } });
@@ -121,9 +123,10 @@ export function applyChecks(ticket: Ticket, results: CheckResult[]): TicketChang
   };
   for (const result of results) {
     const item = ticket.items.find(entry => entry.source === 'program' && entry.checkId === result.itemId && entry.state !== 'verified');
+    if (result.pass) { if (item) settle(item, 'verified', `${result.itemId} 通过`); continue; }
+    if (isObserve(result.itemId)) continue;
     const finding = selfProgramConflict(ticket, result);
-    if (result.pass) { if (item) settle(item, 'verified', `${result.itemId} 通过`); }
-    else if (item) {
+    if (item) {
       item.evidence = result.evidence;
       if (finding) item.crossCheck = finding;
       const reopened = item.state !== 'open';
@@ -139,9 +142,10 @@ export function applyChecks(ticket: Ticket, results: CheckResult[]): TicketChang
       if (finding) mismatch(raised.id, finding);
     }
   }
-  const failed = results.filter(result => !result.pass).map(result => result.itemId);
+  const failed = results.filter(result => !result.pass && !isObserve(result.itemId)).map(result => result.itemId);
+  const observeFailed = results.filter(result => !result.pass && isObserve(result.itemId)).map(result => result.itemId);
   if (!failed.length) ticket.status = 'in_review';
-  changes.push({ type: 'ticket.checked', data: { actor: 'host', round, passed: !failed.length, failed, status: ticket.status } });
+  changes.push({ type: 'ticket.checked', data: { actor: 'host', round, passed: !failed.length, failed, ...(observeFailed.length ? { observeFailed } : {}), status: ticket.status } });
   return changes;
 }
 
@@ -294,7 +298,7 @@ const openSchema = jobSchema.extend({ roleId: id, caseId: id,
 const settlerSchema = z.object({
   kind: z.enum(['person', 'coach']), agent: id.optional(), sessionId: id.optional(), via: z.enum(['page', 'relay']).optional(),
 }).strict().refine(by => by.kind === 'coach' || (!by.agent && !by.sessionId), 'Only a coach names an agent session');
-const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200) }).strict();
+const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(200), observeItemIds: z.array(id).max(200).optional() }).strict();
 const reviewSchema = jobSchema.extend({ review: qualityReviewSchema, qaJobId: id.optional() }).strict();
 const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).optional() }).strict();
 const reopenSchema = reviseSchema;
@@ -362,7 +366,7 @@ export function invokeTicket(ledger: JobLedger, method: string, params: unknown)
       writeExport(ticket);
       return ticket;
     }
-    case 'ticket_checks': { const input = checksSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyChecks(ticket, input.results)); }
+    case 'ticket_checks': { const input = checksSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyChecks(ticket, input.results, input.observeItemIds ? { observeItemIds: input.observeItemIds } : undefined)); }
     case 'ticket_review': { const input = reviewSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyReview(ticket, input.review, input.qaJobId)); }
     case 'ticket_revise': { const input = reviseSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => startRevision(ticket, input.note)); }
     case 'ticket_proposal': { const input = proposalSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => setProposal(ticket, input.proposalId, input.state, input.note, input.by)); }

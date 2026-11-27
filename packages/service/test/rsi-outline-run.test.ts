@@ -800,3 +800,92 @@ test('a run the training stopped by its own rules does not resume', async t => {
   await assert.rejects(runOutlineCase({ roleDirectory: f.role, caseId: 'demo', projectPath: '/nowhere', workspace: join(f.root, 'runs'), targetId: 'dsh-host', agentPreset: 'standard',
     originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, resume: work, invoke: gw.invoke(async () => ({})) }), /training's rules/);
 });
+
+test('work directory copies rubric.json, check_outline dispatches P16 rubric_lint in isolated work/, and trial observe vs formal block behave dually', async t => {
+  const f = await fixture(t);
+
+  // 1) Clean run copies rubric.json into work/ and P16 passes in isolated work/.
+  const gwClean = ticketGateway();
+  let cleanWork = '';
+  const cleanReport = await runOutlineCase({
+    roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-clean'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, mode: 'trial',
+    invoke: gwClean.invoke(async (method, params: any) => {
+      if (method === 'execution_submit') {
+        cleanWork = params.input.cwd;
+        await writeFile(join(cleanWork, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        return { jobId: 'job-r1-clean' };
+      }
+      return { executionStatus: 'completed' };
+    }),
+  });
+  assert.equal(cleanReport.passed, true);
+  assert.ok(await stat(join(cleanWork, 'rubric.json')), 'work/rubric.json must be copied from role directory');
+  assert.equal(cleanReport.rounds[0]!.results.find(r => r.itemId === 'P16')?.pass, true);
+
+  // Anti-cheat in copied work/: corrupting work/rubric.json fails P16; removing rubric_lint dispatch from work/checks/check_outline.py stops catching it.
+  await writeFile(join(cleanWork, 'rubric.json'), JSON.stringify({ schemaVersion: 1, roleId: 'broken', artifacts: [], criteria: [] }));
+  const brokenRun = spawnSync(PYTHON, ['-I', join(cleanWork, 'checks', 'check_outline.py'), join(cleanWork, 'outline.json'), join(cleanWork, 'features.json'), join(cleanWork, 'project')], { cwd: cleanWork, encoding: 'utf8' });
+  const brokenResults = JSON.parse(brokenRun.stdout) as { itemId: string; pass: boolean; evidence: unknown[] }[];
+  assert.equal(brokenResults.find(r => r.itemId === 'P16')?.pass, false, 'defective work/rubric.json must fail P16');
+  const scriptPath = join(cleanWork, 'checks', 'check_outline.py');
+  const originalScript = await readFile(scriptPath, 'utf8');
+  await writeFile(scriptPath, originalScript.replace('    results.append(run_rubric_lint(ROLE))\n', ''));
+  const undispatchedRun = spawnSync(PYTHON, ['-I', scriptPath, join(cleanWork, 'outline.json'), join(cleanWork, 'features.json'), join(cleanWork, 'project')], { cwd: cleanWork, encoding: 'utf8' });
+  const undispatchedResults = JSON.parse(undispatchedRun.stdout) as { itemId: string; pass: boolean }[];
+  assert.equal(undispatchedResults.some(r => r.itemId === 'P16'), false, 'removing rubric_lint dispatch must stop catching defective rubric.json');
+
+  // 2) Dual test: corrupt role/rubric.json -> trial (observe) passes without sendBack or must ticket item; formal (block) bounces and raises must P1-P16.
+  await writeFile(join(f.role, 'rubric.json'), JSON.stringify({ schemaVersion: 1, roleId: 'product-intro-outline', artifacts: [], criteria: [] }));
+
+  const gwTrial = ticketGateway();
+  let trialWork = '';
+  const trialCalls: string[] = [];
+  const trialReport = await runOutlineCase({
+    roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-trial'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, mode: 'trial',
+    invoke: gwTrial.invoke(async (method, params: any) => {
+      trialCalls.push(method);
+      if (method === 'execution_submit') {
+        trialWork = params.input.cwd;
+        await writeFile(join(trialWork, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        return { jobId: 'job-r1-trial' };
+      }
+      return { executionStatus: 'completed' };
+    }),
+  });
+  assert.equal(trialReport.passed, true, 'trial mode must not block on observe-only P16 failure');
+  assert.equal(trialReport.rounds.length, 1);
+  assert.equal(trialReport.rounds[0]!.results.find(r => r.itemId === 'P16')?.pass, false);
+  assert.equal(trialCalls.includes('execution_continue'), false, 'trial mode must not sendBack on P16 failure');
+  const trialTicket = await readTicket(trialWork);
+  assert.equal(trialTicket.items.some(item => item.severity === 'must'), false, 'trial mode must not open a must item for observe-only P16');
+
+  const gwFormal = ticketGateway();
+  let formalWork = '';
+  const formalCalls: string[] = [];
+  const formalReport = await runOutlineCase({
+    roleDirectory: f.role, caseId: 'demo', projectPath: f.project, workspace: join(f.root, 'runs-formal'),
+    targetId: 'dsh-host', agentPreset: 'standard', originSessionId: 'rsi-test', python: PYTHON, pollMs: 1, mode: 'formal', maxBounces: 1,
+    invoke: gwFormal.invoke(async (method, params: any) => {
+      formalCalls.push(method);
+      if (method === 'execution_submit') {
+        formalWork = params.input.cwd;
+        await writeFile(join(formalWork, 'outline.json'), JSON.stringify(outline('example/demo', f.commit)));
+        return { jobId: 'job-r1-formal' };
+      }
+      if (method === 'execution_continue') {
+        handleTicket(gwFormal.round('job-r1-formal'), '尝试修复 rubric');
+        return { jobId: 'job-r1-formal' };
+      }
+      return { executionStatus: 'completed' };
+    }),
+  });
+  assert.equal(formalReport.passed, false, 'formal mode must block on P16 failure');
+  assert.equal(formalReport.stopReason, 'max_bounces');
+  assert.equal(formalCalls.includes('execution_continue'), true, 'formal mode must sendBack on P16 failure');
+  const formalTicket = await readTicket(formalWork);
+  const p16Item = formalTicket.items.find(item => item.checkId === 'P16');
+  assert.ok(p16Item, 'formal mode must raise P16 ticket item');
+  assert.equal(p16Item.severity, 'must');
+});

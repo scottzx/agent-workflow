@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "entry": "produce",
+  "nodes": [
+    { "id": "produce", "type": "executor_turn", "requireTicketSubmit": false },
+    { "id": "check_pptx", "type": "program_check", "checks": ["V1..V4"], "dependsOn": ["produce"] },
+    { "id": "l1_crosscheck", "type": "ticket_apply_checks", "dependsOn": ["check_pptx"] },
+    { "id": "qa_review", "type": "qa_session_review", "dependsOn": ["l1_crosscheck"], "when": "checks_passed" },
+    { "id": "l2_crosscheck", "type": "ticket_apply_review", "dependsOn": ["qa_review"] }
+  ],
+  "cycles": {
+    "programBounce": { "from": "l1_crosscheck", "to": "produce", "when": "block_failed" },
+    "qaRevise": { "from": "l2_crosscheck", "to": "produce", "when": "verdict_revise" }
+  },
+  "policies": {
+    "trial": {
+      "maxProgramBounces": 1,
+      "maxQaRevisions": 3,
+      "enforceObserveAsBlock": false,
+      "requireQa": false,
+      "collectProposals": true,
+      "allowExternalHandoff": false
+    },
+    "formal": {
+      "maxProgramBounces": 2,
+      "maxQaRevisions": 2,
+      "enforceObserveAsBlock": true,
+      "requireQa": true,
+      "collectProposals": false,
+      "allowExternalHandoff": true
+    }
+  }
+}

@@ -72,4 +72,22 @@
 
 `previous` 只在复审时写。
 
+## Observe 期 Rubric 附加字段（可选，不改变既有 `scores` 判定）
+
+在 `rubric.json` 处于 observe 观察期时，可在上述 JSON 根对象中**额外附带** `rubric` 字段（通过 `qualityReviewSchema` 透传，不替代现有 6 维 `scores` 与 `verdict` 规则）：
+
+```json
+{
+  "rubric": {
+    "roleId": "product-intro-outline",
+    "items": [
+      { "id": "R1", "met": true, "evidence": "README.md:1-12 支持该要点" },
+      { "id": "R2", "score": 2, "evidence": "sections/positioning/slides/0/points/0 给出具体场景与结果" }
+    ]
+  }
+}
+```
+
+每条 `rubric.items[]` 必须先给 `path:line` 或大纲路径原文证据再判分，仅供后续 `calibrate --rubric` 校准统计，不单独改写本轮 `verdict`。
+
 不修改大纲、任务单或其他任何文件，不安装依赖，不申请更高的权限。写完立即结束。
