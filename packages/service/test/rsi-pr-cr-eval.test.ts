@@ -6,8 +6,8 @@ import { join, relative, resolve } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import {
-  coerceCrEvalResults, computeCrEvalDigest, crEvalCaseSchema, crEvalManifestSchema, findRepoRoot, loadCrEvalManifest,
-  parseMarkdownCrReport, scoreCrEvalSuite, verifyCrEvalCommits,
+  coerceCrEvalResults, computeCrEvalDigest, computeManifestSnapshotDigest, crEvalCaseSchema, crEvalManifestSchema, findRepoRoot,
+  lintCrEvalManifest, loadCrEvalManifest, parseMarkdownCrReport, scoreCrEvalSuite, verifyCrEvalCommits,
   type CrEvalCase, type CrEvalManifest, type CrReviewResult,
 } from '../src/rsi/pr-cr-eval.js';
 
@@ -46,21 +46,26 @@ function replace(manifest: CrEvalManifest, caseId: string, review: CrReviewResul
   return manifest.cases.map(item => item.id === caseId ? review : structured(item));
 }
 
-test('manifest matches the nine historical PR ranges and their commits are ancestors', async () => {
+test('manifest matches >=20 historical PR ranges with ~3:2 class balance, frozen snapshotDigest, and valid commit ancestry', async () => {
   const manifest = await loadCrEvalManifest(roleDir);
   assert.equal(manifest.roleId, 'pr-delivery');
-  assert.deepEqual(manifest.cases.map(item => item.id), [
-    'pr11-neg-non-atomic-notify', 'pr11-pos-atomic-notify',
-    'pr12-neg-sandbox-and-inherit', 'pr12-neg-worktree-abs-path', 'pr12-pos-relpath-fix',
-    'pr13-neg-schema-symlink-ignore', 'pr13-pos-projection-hardened',
-    'pr14-neg-forged-git-and-config', 'pr14-pos-verified-worktree-fix',
-  ]);
-  assert.equal(manifest.cases.filter(item => item.kind === 'negative').length, 5);
-  assert.equal(manifest.cases.filter(item => item.kind === 'positive').length, 4);
+  assert.ok(manifest.cases.length >= 20, `expected >= 20 cases, got ${manifest.cases.length}`);
+  const negCount = manifest.cases.filter(item => item.kind === 'negative').length;
+  const posCount = manifest.cases.filter(item => item.kind === 'positive').length;
+  assert.ok(negCount >= 12 && posCount >= 8, `unexpected balance neg=${negCount} pos=${posCount}`);
+  const prs = new Set(manifest.cases.map(item => item.pr));
+  for (const requiredPr of [11, 12, 13, 14, 15, 18, 19, 20, 22, 23]) {
+    assert.ok(prs.has(requiredPr), `missing PR #${requiredPr} coverage`);
+  }
+  assert.equal(manifest.snapshotDigest, computeManifestSnapshotDigest(manifest));
   const verification = await verifyCrEvalCommits(manifest, repoRoot);
   assert.deepEqual(verification.errors, []);
   assert.equal(verification.ok, true);
-  assert.equal(verification.checkedCommits, 18);
+  assert.equal(verification.checkedCommits, manifest.cases.length * 2);
+  const lint = await lintCrEvalManifest(manifest, { repoRoot });
+  assert.deepEqual(lint.issues, []);
+  assert.equal(lint.ok, true);
+  assert.equal(lint.snapshotFrozen, true);
   const digest = await computeCrEvalDigest(roleDir);
   assert.match(digest, /^[0-9a-f]{64}$/);
   assert.equal(await computeCrEvalDigest(roleDir), digest);
@@ -69,15 +74,18 @@ test('manifest matches the nine historical PR ranges and their commits are ances
 
 test('a clean structured report and a DeepSeek markdown report are promotion ready', async () => {
   const manifest = await loadCrEvalManifest(roleDir);
+  const expectedNeg = manifest.cases.filter(item => item.kind === 'negative').length;
+  const expectedPos = manifest.cases.filter(item => item.kind === 'positive').length;
+  const expectedDefects = manifest.cases.reduce((sum, item) => sum + (item.requiredDefects?.length ?? 0), 0);
   const structuredScore = scoreCrEvalSuite(manifest, manifest.cases.map(structured));
   assert.equal(structuredScore.passed, true);
   assert.equal(structuredScore.promotionReady, true);
   assert.equal(structuredScore.negativeRecall, 1);
   assert.equal(structuredScore.defectRecall, 1);
   assert.equal(structuredScore.falsePositiveRate, 0);
-  assert.equal(structuredScore.negativeCaught, 5);
-  assert.equal(structuredScore.positivePassed, 4);
-  assert.equal(structuredScore.totalDefects, 9);
+  assert.equal(structuredScore.negativeCaught, expectedNeg);
+  assert.equal(structuredScore.positivePassed, expectedPos);
+  assert.equal(structuredScore.totalDefects, expectedDefects);
   assert.deepEqual(structuredScore.missingCases, []);
   const fromMarkdown = scoreCrEvalSuite(manifest, manifest.cases.map(item => parseMarkdownCrReport(item.id, deepSeek(item))));
   assert.equal(fromMarkdown.promotionReady, true);
@@ -329,7 +337,7 @@ test('a positive CHANGES_REQUESTED or a PASS that still has MUST is a false posi
   }));
   assert.equal(requested.passed, false);
   assert.equal(requested.falsePositives, 1);
-  assert.equal(requested.falsePositiveRate, 0.25);
+  assert.equal(requested.falsePositiveRate, 1 / manifest.cases.filter(item => item.kind === 'positive').length);
   assert.equal(requested.caseResults.find(item => item.caseId === 'pr12-pos-relpath-fix')?.falsePositive, true);
   const dirtyPass = scoreCrEvalSuite(manifest, replace(manifest, 'pr14-pos-verified-worktree-fix', {
     caseId: 'pr14-pos-verified-worktree-fix', verdict: 'PASS',
@@ -450,8 +458,8 @@ test('eval-cr CLI and run-l3-eval.mjs agree on verify-only, pass, and fail', { t
     assert.equal(body.mode, check.mode, check.label);
     if (check.mode === 'verify-only') {
       assert.equal(body.ok, true, check.label);
-      assert.equal(body.checkedCommits, 18, check.label);
-      assert.equal(body.totalCases, 9, check.label);
+      assert.equal(body.checkedCommits, manifest.cases.length * 2, check.label);
+      assert.equal(body.totalCases, manifest.cases.length, check.label);
     } else {
       assert.equal(body.promotionReady, check.promotionReady, check.label);
       assert.equal(body.ok, check.promotionReady, check.label);
@@ -487,4 +495,84 @@ test('run-l3-eval resolves relative role, repo and results from the caller cwd',
   assert.equal(body.repoRoot, repoRoot);
   assert.equal(body.promotionReady, true);
   assert.equal(body.ok, true);
+});
+
+test('lintCrEvalManifest enforces minCases, class balance, dedup, defect discrimination, git diff match, and snapshotDigest freeze', async t => {
+  const manifest = await loadCrEvalManifest(roleDir);
+
+  // 1. Tampering any case breaks snapshotDigest in both lintCrEvalManifest and loadCrEvalManifest.
+  const tampered: CrEvalManifest = structuredClone(manifest);
+  tampered.cases[0]!.summary = `${tampered.cases[0]!.summary} (tampered)`;
+  const tamperLint = await lintCrEvalManifest(tampered);
+  assert.equal(tamperLint.ok, false);
+  assert.ok(tamperLint.issues.some(i => i.code === 'snapshot_digest_mismatch'));
+
+  const tmpRole = await mkdtemp(join(tmpdir(), 'cr-eval-tamper-'));
+  t.after(() => rm(tmpRole, { recursive: true, force: true }));
+  await mkdir(join(tmpRole, 'evals'), { recursive: true });
+  await writeFile(join(tmpRole, 'profile.json'), '{"id":"pr-delivery"}\n');
+  await writeFile(join(tmpRole, 'evals', 'manifest.json'), JSON.stringify(tampered, null, 2));
+  await assert.rejects(loadCrEvalManifest(tmpRole), /snapshotDigest mismatch/);
+
+  // 2. Missing snapshotDigest fails lint.
+  const { snapshotDigest: _omit, ...unfrozen } = structuredClone(manifest);
+  const unfrozenLint = await lintCrEvalManifest(unfrozen as CrEvalManifest);
+  assert.equal(unfrozenLint.ok, false);
+  assert.ok(unfrozenLint.issues.some(i => i.code === 'snapshot_digest_missing'));
+
+  // 3. Class imbalance + minCases + duplicate commit pair + duplicate defect id + weak patterns + unmatched git diff file pattern.
+  const brokenCases: CrEvalCase[] = [
+    structuredClone(manifest.cases[0]!),
+    {
+      ...structuredClone(manifest.cases[0]!),
+      id: 'dup-commit-pair',
+      requiredDefects: [
+        {
+          id: manifest.cases[0]!.requiredDefects![0]!.id,
+          description: 'duplicate defect id + weak patterns',
+          anyFilePatterns: ['src'],
+          anyTextPatterns: ['bug', 'x'],
+        },
+        {
+          id: 'unmatched-file-pattern-defect',
+          description: 'file pattern absent from real git diff',
+          anyFilePatterns: ['packages/service/src/nonexistent-file-for-diff.ts'],
+          anyTextPatterns: ['nonexistent-pattern-token'],
+        },
+      ],
+    },
+  ];
+  const brokenManifest: CrEvalManifest = {
+    schemaVersion: 1,
+    roleId: 'pr-delivery',
+    cases: brokenCases,
+  };
+  brokenManifest.snapshotDigest = computeManifestSnapshotDigest(brokenManifest);
+  const brokenLint = await lintCrEvalManifest(brokenManifest, { repoRoot });
+  assert.equal(brokenLint.ok, false);
+  const codes = new Set(brokenLint.issues.map(i => i.code));
+  assert.ok(codes.has('min_cases'));
+  assert.ok(codes.has('class_balance'));
+  assert.ok(codes.has('duplicate_commit_pair'));
+  assert.ok(codes.has('duplicate_defect_id'));
+  assert.ok(codes.has('weak_file_pattern'));
+  assert.ok(codes.has('weak_text_pattern'));
+  assert.ok(codes.has('unmatched_diff_file_pattern'));
+
+  // 4. CLI and run-l3-eval --lint pass on real manifest and reject --lint + --results.
+  const cliLint = await spawn(['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--repo', repoRoot, '--lint', '--json']);
+  assert.equal(cliLint.status, 0, `${cliLint.stderr}\n${cliLint.stdout}`);
+  const cliBody = JSON.parse(cliLint.stdout) as { mode: string; ok: boolean; snapshotFrozen: boolean; totalCases: number };
+  assert.equal(cliBody.mode, 'lint');
+  assert.equal(cliBody.ok, true);
+  assert.equal(cliBody.snapshotFrozen, true);
+  assert.ok(cliBody.totalCases >= 20);
+
+  const scriptLint = await spawn([script, '--role-dir', roleDir, '--repo', repoRoot, '--lint', '--json']);
+  assert.equal(scriptLint.status, 0, `${scriptLint.stderr}\n${scriptLint.stdout}`);
+  assert.equal((JSON.parse(scriptLint.stdout) as { ok: boolean }).ok, true);
+
+  const conflict = await spawn(['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--lint', '--results', 'dummy.json']);
+  assert.equal(conflict.status, 1);
+  assert.match(`${conflict.stderr}\n${conflict.stdout}`, /cannot be combined/);
 });

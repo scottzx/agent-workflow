@@ -18,7 +18,7 @@ const callerCwd = process.cwd();
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`Usage: node .1agents/roles/pr-delivery/checks/run-l3-eval.mjs --role-dir DIR [--repo DIR] [--results FILE] [--json]
+  console.log(`Usage: node .1agents/roles/pr-delivery/checks/run-l3-eval.mjs --role-dir DIR [--repo DIR] [--results FILE] [--workspace DIR] [--lint] [--json]
 
 Forwards to acp-service rsi eval-cr. Relative paths are resolved from the current directory.
 Exit code is the scorer's exit code.`);
@@ -29,10 +29,12 @@ let roleDir;
 let repo;
 let results;
 let workspace;
+let lint = false;
 let json = false;
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
   if (arg === '--json') { json = true; continue; }
+  if (arg === '--lint') { lint = true; continue; }
   const taken = valueOf(arg, index);
   if (taken.name === '--role-dir' || taken.name === '--role') roleDir = taken.value;
   else if (taken.name === '--repo') repo = taken.value;
@@ -53,6 +55,7 @@ const forwarded = ['rsi', 'eval-cr', '--role', absolute(roleDir)];
 if (repo) forwarded.push('--repo', absolute(repo));
 if (results) forwarded.push('--results', absolute(results));
 if (workspace) forwarded.push('--workspace', absolute(workspace));
+if (lint) forwarded.push('--lint');
 if (json) forwarded.push('--json');
 
 const distCli = join(serviceDir, 'dist/bin/acp-service.js');
@@ -60,7 +63,7 @@ const distRsi = join(serviceDir, 'dist/bin/rsi.js');
 const distEval = join(serviceDir, 'dist/src/rsi/pr-cr-eval.js');
 const compiled = existsSync(distCli) && existsSync(distRsi) && existsSync(distEval)
   && readFileSync(distRsi, 'utf8').includes('eval-cr')
-  && readFileSync(distEval, 'utf8').includes('scoreCrEvalSuite');
+  && readFileSync(distEval, 'utf8').includes('lintCrEvalManifest');
 const nodeArgs = compiled
   ? [distCli, ...forwarded]
   : ['--import', 'tsx', join(serviceDir, 'bin/acp-service.ts'), ...forwarded];

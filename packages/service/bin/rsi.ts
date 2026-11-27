@@ -7,7 +7,16 @@ import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate, writeCrEvalReport } from '../src/rsi/gate.js';
 import { formatLearningsLookupText, lookupLearnings } from '../src/rsi/learnings-lookup.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
-import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
+import {
+  coerceCrEvalResults,
+  computeCrEvalDigest,
+  findRepoRoot,
+  formatCrEvalLintText,
+  lintCrEvalManifest,
+  loadCrEvalManifest,
+  scoreCrEvalSuite,
+  verifyCrEvalCommits,
+} from '../src/rsi/pr-cr-eval.js';
 import { calibrateRubric, formatRubricCalibrationText, rubricCalibrationPath } from '../src/rsi/rubric.js';
 import { computeRoleScorecard, formatScorecardText } from '../src/rsi/scorecard.js';
 import { stampActor } from './ticket.js';
@@ -18,7 +27,7 @@ const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [o
        acp-service rsi calibrate --rubric --role DIR --judgments FILE [--workspace DIR] [--json]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
        acp-service rsi lookup --paths FILE1,FILE2 [--repo DIR] [--limit N] [--json]
-       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--workspace DIR] [--json]
+       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--workspace DIR] [--lint] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
 executor, runs the role's program checks and sends failures back to the same session.
@@ -240,13 +249,23 @@ async function runEvalCr(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' },
     workspace: { type: 'string' },
+    lint: { type: 'boolean', default: false },
     json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
+  if (values.lint && values.results) throw new Error('--lint cannot be combined with --results');
   const roleDirectory = resolve(values.role);
   const manifest = await loadCrEvalManifest(roleDirectory);
   const evalDigest = await computeCrEvalDigest(roleDirectory);
   const repoRoot = values.repo ? resolve(values.repo) : await findRepoRoot(roleDirectory);
+  if (values.lint) {
+    const lint = await lintCrEvalManifest(manifest, { repoRoot });
+    const report = { mode: 'lint' as const, evalDigest, repoRoot, ...lint };
+    if (values.json) console.log(JSON.stringify(report));
+    else console.log(formatCrEvalLintText(lint));
+    if (!lint.ok) process.exitCode = 1;
+    return;
+  }
   const verification = await verifyCrEvalCommits(manifest, repoRoot);
   const negativeCases = manifest.cases.filter(item => item.kind === 'negative').length;
   const positiveCases = manifest.cases.filter(item => item.kind === 'positive').length;
