@@ -201,6 +201,23 @@ async function check(work: string, python: string, jobId: string): Promise<{ res
   return { results, outlineSha256 };
 }
 
+/** Non-resume runs allocate an exclusive work directory so runs started within the same second never share run-state.json or clientRequestId. */
+async function allocateWorkDirectory(roleRoot: string, caseId: string, stamp: string): Promise<{ work: string; runStamp: string }> {
+  for (let suffix = 1; suffix <= 1000; suffix++) {
+    const runStamp = suffix === 1 ? stamp : `${stamp}-${suffix}`;
+    const work = path.join(roleRoot, `${caseId}-${runStamp}`);
+    await mkdir(path.dirname(work), { recursive: true });
+    try {
+      await mkdir(work);
+      return { work, runStamp };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  throw new Error(`Could not allocate a unique work directory under ${roleRoot} for ${caseId}-${stamp}`);
+}
+
 export async function runOutlineCase(options: OutlineRunOptions): Promise<OutlineRunReport> {
   const log = options.log ?? (() => {}), now = options.now ?? (() => new Date());
   const pollMs = options.pollMs ?? 10_000, timeoutMs = options.timeoutMs ?? 60 * 60_000;
@@ -227,15 +244,17 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
   const produce = workflow.nodes.find(node => node.id === workflow.entry) ?? workflow.nodes.find(node => node.type === 'executor_turn');
   const requireTicketSubmit = produce?.requireTicketSubmit === true;
 
-  const stamp = startedAt.replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-  const work = options.resume ? path.resolve(options.resume) : path.join(path.resolve(options.workspace), roleId, `${kase.id}-${stamp}`);
+  const baseStamp = startedAt.replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
   if (prior) {
     if (prior.roleId !== roleId || prior.caseId !== kase.id || prior.phase !== phase) throw new Error(`That run is ${prior.roleId} / ${prior.caseId} in phase ${prior.phase}`);
     if (prior.passed) throw new Error('That run already passed');
     if (!RESUMABLE.includes(prior.stopReason)) throw new Error(`That run stopped by the training's rules (${prior.stopReason}); start a new one to try again`);
     if (prior.role.commit !== role.commit || prior.role.dirty !== role.dirty) throw new Error(`The role changed since that run (${prior.role.commit?.slice(0, 8)}); start a new one`);
-  } else {
-    await mkdir(work, { recursive: true });
+  }
+  const allocated = prior ? undefined : await allocateWorkDirectory(path.join(path.resolve(options.workspace), roleId), kase.id, baseStamp);
+  const work = prior ? path.resolve(options.resume!) : allocated!.work;
+  const stamp = allocated?.runStamp ?? (path.basename(work).startsWith(`${kase.id}-`) ? path.basename(work).slice(kase.id.length + 1) : baseStamp);
+  if (!prior) {
     await exportProject(path.resolve(options.projectPath), kase.input.commit, path.join(work, 'project'), kase.input.exclude);
     await cp(path.join(roleDirectory, 'checklist.json'), path.join(work, 'checklist.json'));
     await cp(path.join(roleDirectory, 'workflow.json'), path.join(work, 'workflow.json')).catch(error => {
@@ -425,7 +444,8 @@ export async function runOutlineCase(options: OutlineRunOptions): Promise<Outlin
         },
       });
       const applied = dag.records.find(record => record.nodeId === 'l1_crosscheck');
-      if (!applied || applied.status !== 'completed') {
+      const ticketAwaitingChecks = ticket.status === 'drafting' || ticket.status === 'ready_for_review';
+      if (!applied || applied.status !== 'completed' || (applied.cached && ticketAwaitingChecks)) {
         if (!reviewOnly || ticket.status !== 'in_review') ticket = await ticketCall('ticket_checks', { results });
       }
     }
