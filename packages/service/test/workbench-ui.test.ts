@@ -117,7 +117,10 @@ test('the workbench entry is code-split and only hashed chunks are immutable', a
   for (const pane of ['.acp-workbench-table', '.acp-detail', '.acp-approval-queue', '.acp-approval-detail', '.acp-agent-list', '.acp-agent-detail']) {
     assert.match(cssText, new RegExp(`\\.acp-workbench:not\\(\\.is-full-detail\\)\\s+\\${pane}[^{]*\\{[^}]*min-height:\\s*0;[^}]*overflow-y:\\s*auto;[^}]*overscroll-behavior:\\s*contain;`));
   }
-  assert.match(cssText, /@media \(max-width: 768px\)\s*\{[\s\S]*\.acp-workbench:not\(\.is-full-detail\)\s*\{[^}]*height:\s*auto;[^}]*display:\s*block;[^}]*overflow:\s*visible;/);
+  // Keeping agent detail pinned to column 2 prevents empty-list hiding from squeezing the detail pane into the narrow list track on desktop, while mobile resets it to auto.
+  assert.match(cssText, /\.acp-workbench:not\(\.is-full-detail\)\s+\.acp-agent-detail\s*\{[^}]*grid-column:\s*2;/);
+  assert.match(cssText, /\.acp-case-panel\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/);
+  assert.match(cssText, /@media \(max-width: 768px\)\s*\{[\s\S]*\.acp-workbench:not\(\.is-full-detail\)\s*\{[^}]*height:\s*auto;[^}]*display:\s*block;[^}]*overflow:\s*visible;[\s\S]*\.acp-workbench:not\(\.is-full-detail\)\s+\.acp-agent-detail\s*\{[^}]*grid-column:\s*auto;/);
   const session = await fetch(`${base}/workbench/ui/api/session`);
   assert.equal(session.headers.get('cache-control'), 'no-store');
 

@@ -452,7 +452,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .acp-workbench:not(.is-full-detail) .acp-approval-detail,
 .acp-workbench:not(.is-full-detail) .acp-agent-list,
 .acp-workbench:not(.is-full-detail) .acp-agent-detail { min-height: 0; min-width: 0; overflow-y: auto; overscroll-behavior: contain; }
-.acp-workbench:not(.is-full-detail) .acp-workbench-table { overflow-x: auto; }
+.acp-workbench:not(.is-full-detail) .acp-agent-detail { grid-column: 2; }
 .acp-workbench:not(.is-full-detail) .acp-approval-queue,
 .acp-workbench:not(.is-full-detail) .acp-agent-list { overflow-x: hidden; }
 /* Agent markdown sits on the section's text edge. The file-preview CSS is appended after this file, so the
@@ -842,6 +842,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .acp-workbench:not(.is-full-detail) .acp-detail,
   .acp-workbench:not(.is-full-detail) .acp-approval-detail,
   .acp-workbench:not(.is-full-detail) .acp-agent-detail { overflow-y: visible; overscroll-behavior: auto; max-height: none; }
+  .acp-workbench:not(.is-full-detail) .acp-agent-detail { grid-column: auto; }
   .acp-workbench:not(.is-full-detail) .acp-workbench-table { overflow-x: visible; }
   .acp-workbench:not(.is-full-detail) .acp-approval-queue,
   .acp-workbench:not(.is-full-detail) .acp-agent-list { overflow: hidden; overscroll-behavior: auto; }
