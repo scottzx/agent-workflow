@@ -291,9 +291,37 @@ test('two-key ticket proposals scope to eval_change / permission_escalation / pr
   });
   assert.equal(settledTicket.proposals[0]!.state, 'accepted');
   assert.equal(settledTicket.proposals[0]!.by?.kind, 'person');
+
+  // S2: QA review path (`ticket_review`) preserves governance proposal `evidence` into ticket & approvals.
+  invokeTicket(ledger, 'ticket_checks', { originSessionId: 'root', jobId: prepared.job.jobId, results: [] });
+  const reviewedTicket = invokeTicket(ledger, 'ticket_review', {
+    originSessionId: 'root',
+    jobId: prepared.job.jobId,
+    review: {
+      verdict: 'pass',
+      summary: 'ok',
+      scores: { 吸引力: 5 },
+      issues: [],
+      proposals: [{ kind: 'eval_change', text: 'add regression case', evidence: 'commit a1b2c3d4 verified' }],
+    },
+  });
+  const qaGovProposal = reviewedTicket.proposals.find(p => p.kind === 'eval_change');
+  assert.ok(qaGovProposal);
+  assert.equal(qaGovProposal.evidence, 'commit a1b2c3d4 verified');
 });
 
 test('AssetLifecycleStore binds digest/rollback to real disk files, enforces OS 0o444 immutability, detects corrupt snapshots, and integrates with roles lifecycle CLI', async t => {
+  // Isolate ambient coach harness env vars (e.g. DSH_SESSION_ID when tests run inside DSH!) so person CLI steps are deterministic.
+  const coachEnvKeys = ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'DSH_SESSION_ID', 'ONEAGENTS_SESSION_ID', 'CODEX_THREAD_ID'] as const;
+  const savedEnv = Object.fromEntries(coachEnvKeys.map(k => [k, process.env[k]]));
+  for (const k of coachEnvKeys) delete process.env[k];
+  t.after(() => {
+    for (const k of coachEnvKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
   const dir = await mkdtemp(join(tmpdir(), 'asset-lifecycle-disk-'));
   const roleDir = join(dir, 'role');
   const storeDir = join(dir, 'store');
@@ -359,7 +387,6 @@ test('AssetLifecycleStore binds digest/rollback to real disk files, enforces OS 
   ]);
 
   // Simulate DSH coach trying to promote via CLI -> rejected with APPROVAL_REQUIRED!
-  const prevDsh = process.env.DSH_SESSION_ID;
   process.env.DSH_SESSION_ID = 'dsh-coach-99';
   try {
     await assert.rejects(
@@ -373,8 +400,7 @@ test('AssetLifecycleStore binds digest/rollback to real disk files, enforces OS 
       (err: unknown) => err instanceof AssetLifecycleError && err.code === 'APPROVAL_REQUIRED',
     );
   } finally {
-    if (prevDsh === undefined) delete process.env.DSH_SESSION_ID;
-    else process.env.DSH_SESSION_ID = prevDsh;
+    delete process.env.DSH_SESSION_ID;
   }
 
   // Person promotes v2 via CLI, then rolls back to v1 restoring the real disk file!

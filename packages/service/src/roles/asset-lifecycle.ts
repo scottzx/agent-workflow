@@ -411,16 +411,19 @@ export class AssetLifecycleStore {
 
     const snapshotPath = this.formalSnapshotPath(input.kind, input.id, candidate.digest);
     await mkdir(path.dirname(snapshotPath), { recursive: true });
-    // If an identical immutable snapshot already exists, verify its digest rather than overwriting.
+    // If an identical immutable snapshot already exists, verify its digest and converge 0o444 permissions.
     const existingSnap = await stat(snapshotPath).then(s => s.isFile(), () => false);
     if (existingSnap) {
       const snapBytes = await readFile(snapshotPath);
       if (computeAssetDigest(snapBytes) !== candidate.digest) {
         throw new AssetLifecycleError('SNAPSHOT_CORRUPT', `Existing formal snapshot at ${snapshotPath} is corrupt`);
       }
-    } else {
-      await writeFile(snapshotPath, bytes);
       await chmod(snapshotPath, 0o444);
+    } else {
+      const tmpSnap = path.join(path.dirname(snapshotPath), `.${path.basename(snapshotPath)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+      await writeFile(tmpSnap, bytes, { mode: 0o444 });
+      await chmod(tmpSnap, 0o444);
+      await rename(tmpSnap, snapshotPath);
     }
 
     const formalRecord: AssetRecord = assetRecordSchema.parse({
