@@ -57,6 +57,11 @@ export interface BusinessAcceptance {
   /** Absent on records written before acceptances named who decided. */
   decidedBy?: LedgerActor;
 }
+export interface AttemptRoutingRecord {
+  selected: { provider: string; model: string; deliveryMode?: string; readOnly?: boolean; family?: string };
+  fallbacks: { from: string; to: string; trigger: string; elapsedMs: number }[];
+  elapsedMs: number;
+}
 export interface LedgerAttempt {
   attemptId: string; jobId: string; operation: string; clientRequestId?: string; requestDigest: string;
   targetId: string; targetConfigVersion?: number; connectionId?: string; connectionVersion?: number;
@@ -64,6 +69,8 @@ export interface LedgerAttempt {
   backendRunRef?: BackendRunRef; submissionStatus: SubmissionStatus; executionStatus: ExecutionStatus;
   providerState?: string; phase?: string; cancellationRequestedAt?: string; checkedAt?: string; stale: boolean;
   createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult; resultHistory?: LedgerResult[];
+  /** Actual selected model route and dispatch-boundary fallback trail for this attempt. */
+  routing?: AttemptRoutingRecord;
   /** The whitelisted failure facts of this round. Absent while the round has not failed. */
   error?: SafeErrorSummary;
   /** The origin stopped waiting on this round before it ended (it timed out, or the caller itself failed); it may still run or have finished unseen. */
@@ -115,6 +122,8 @@ export interface LedgerObservation {
   executionStatus?: ExecutionStatus; providerState?: string; phase?: string; checkedAt?: string; stale?: boolean;
   resultSummary?: string; structuredResultRef?: unknown; resultDigest?: string; resultRevision?: string;
   artifactLinks?: unknown[]; resultArtifacts?: unknown[]; resultAvailable?: boolean; diagnostic?: string;
+  /** Actual selected route & fallback trail recorded at dispatch acceptance. */
+  routing?: AttemptRoutingRecord;
   /** The whitelisted failure facts of a failed round. */
   error?: SafeErrorSummary;
 }
@@ -327,7 +336,7 @@ export class JobLedger {
       }
       attempt.backendRunRef = { ...attempt.backendRunRef, ...clone(backendRunRef) }; attempt.submissionStatus = 'accepted';
       this.applyObservation(attempt, { ...observation, executionStatus: observation.executionStatus ?? (attempt.executionStatus === 'not_started' ? 'submitted' : attempt.executionStatus) });
-      this.event(state, state.jobs[attempt.jobId]!, attemptId, 'attempt.accepted', { backendRunRef: attempt.backendRunRef }); return attempt;
+      this.event(state, state.jobs[attempt.jobId]!, attemptId, 'attempt.accepted', { backendRunRef: attempt.backendRunRef, ...(attempt.routing ? { routing: attempt.routing } : {}) }); return attempt;
     });
   }
   knownNotSubmitted(attemptId: string, input: { executionStatus: 'failed' | 'rejected' | 'canceled'; diagnostic?: string }): LedgerAttempt {
@@ -362,6 +371,7 @@ export class JobLedger {
     if (input.providerState !== undefined && !conflict) attempt.providerState = input.providerState;
     if (input.phase !== undefined && !conflict) attempt.phase = input.phase;
     if (input.diagnostic !== undefined && !conflict) attempt.diagnostic = input.diagnostic;
+    if (input.routing !== undefined && !conflict) attempt.routing = clone(input.routing);
     if (input.error !== undefined && !conflict) attempt.error = clone(input.error);
     // A non-conflicting transition into a non-failed status carries no failure facts.
     if (!conflict && input.executionStatus !== undefined && !failedExecutionStatuses.has(input.executionStatus)) delete attempt.error;

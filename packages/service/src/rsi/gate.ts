@@ -20,7 +20,8 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Ticket } from '../execution/ticket.js';
-import { assertSafeRoleWorkspaceId, computeChecksDigest, computeRoleDigest, loadCalibration } from './calibrate.js';
+import { normalizeRoleRouting } from '../roles/routing.js';
+import { assertSafeRoleWorkspaceId, computeChecksDigest, computeRoleDigest, crEvalReportPath, loadCalibration } from './calibrate.js';
 import { type LedgerEntry, ledgerPath, roleVersion, type RoleVersion, type StopReason } from './outline-run.js';
 import {
   coerceCrEvalResults,
@@ -117,10 +118,7 @@ export interface GateReport {
   };
 }
 
-export function crEvalReportPath(workspace: string, roleId: string): string {
-  assertSafeRoleWorkspaceId(roleId);
-  return path.join(path.resolve(workspace), roleId, 'eval-cr.json');
-}
+export { crEvalReportPath };
 
 function digestCrResults(results: readonly CrReviewResult[]): string {
   return createHash('sha256').update(JSON.stringify(results)).digest('hex');
@@ -394,6 +392,30 @@ async function evalCrGate(input: {
       summary: { present: true, evalDigest, roleDigest: input.roleDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
       reasons,
     };
+  }
+
+  // If the role defines routing.json, enforce routing v2 cross-family invariants & canary minCases in the same gate.
+  const routingFile = path.join(input.roleDirectory, 'routing.json');
+  try {
+    const rawRouting = JSON.parse(await readFile(routingFile, 'utf8')) as unknown;
+    const normalizedRouting = normalizeRoleRouting(rawRouting);
+    const minCases = normalizedRouting.canary?.minCases;
+    if (normalizedRouting.canary?.required !== false && minCases !== undefined && manifest.cases.length < minCases) {
+      reasons.push(`routing.json canary 要求至少 ${minCases} 条黄金样本，当前 manifest 仅有 ${manifest.cases.length} 条`);
+      return {
+        summary: { present: true, evalDigest, roleDigest: input.roleDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
+        reasons,
+      };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      const message = error instanceof Error ? error.message : String(error);
+      reasons.push(`routing.json 路由约束校验失败：${message}`);
+      return {
+        summary: { present: true, evalDigest, roleDigest: input.roleDigest, verified, checkedCommits, errors, status: 'failed', promotionReady: false },
+        reasons,
+      };
+    }
   }
 
   if (!rescored.promotionReady) {

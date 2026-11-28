@@ -8,7 +8,7 @@ export { FileA2AStore } from './store.js';
 export type { A2ABackend, A2ACloseResult, A2APrepareInput, A2ARunResult, A2ASessionStatus, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport, A2ARoleSkills } from './types.js';
 export { bindA2AExecution, currentA2AExecution, unbindA2AExecution } from './execution-binding.js';
 export type { A2AExecutionRef } from './execution-binding.js';
-export { a2aRoleSkillsSchema } from './types.js';
+export { A2ADispatchRejectedError, a2aRoleSkillsSchema } from './types.js';
 export type { A2AExecutionOptions } from './executor.js';
 export { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema, A2APreflightError, runA2APreflight } from './preflight.js';
 export { a2aModelCatalogSchema } from './model-catalog.js';

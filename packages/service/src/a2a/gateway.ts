@@ -11,6 +11,7 @@ import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, type 
 import { reportAndHoldRegistration, reportToAgent } from '@1agents/dreammate-node/client';
 import { z } from 'zod';
 import { FileA2AStore } from './store.js';
+import { A2ADispatchRejectedError } from './types.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
 import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
@@ -30,7 +31,7 @@ import { CapacityQueue } from '../capacity-queue.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
-import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
+import { JobLedger, type AttemptRoutingRecord, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { invokeTicket, reopenForContinue, TicketError, TICKET_METHODS } from '../execution/ticket.js';
 import { continueByConvention, decideHandoff, HANDOFF_METHODS, invokeHandoff, offerConvention, proposeByFact, type Handoff, type HandoffSnapshot } from '../execution/handoff.js';
 import { rolePublicationDirectory } from '../execution/spaces.js';
@@ -49,6 +50,22 @@ import { agentNamePattern, listAgentFiles } from '../execution/agent-files.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
+import { assertSafeRoleId } from '../roles/role-rules.js';
+import {
+  assertCrossModelFamily,
+  classifyFallbackTrigger,
+  DEFAULT_MAX_FALLBACK_DURATION_MS,
+  endpointKey,
+  extractModelFamily,
+  FALLBACK_TRIGGER_KINDS,
+  normalizeRoleRouting,
+  routingEndpointSchema,
+  routingSlotV2Schema,
+  selectDispatchCandidate,
+  type FallbackTriggerKind,
+  type RoutingEndpoint,
+  type RoutingSlotV2,
+} from '../roles/routing.js';
 export type { RemoteAgentNotice } from './notices.js';
 
 const string = z.string().trim().min(1).max(512);
@@ -166,7 +183,7 @@ const executionPendingApprovalsSchema = z.object({
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   ...DISCOVERY_METHODS,
-  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。可选 notifySessions 登记该任务或所属 case 的只读订阅。', parameters: z.toJSONSchema(executionSubmitSchema) },
+  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。支持 input.routingSlot("worker"|"reviewer") 与 input.routingRoleId（或 roleId）自动读取 .1agents/roles/<roleId>/routing.json v2（或显式 input.routingFallback），并在派单边界自动回退及按 input.peerJobId 校验异模型族硬约束。可选 notifySessions 登记该任务或所属 case 的只读订阅。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
   execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
@@ -232,6 +249,8 @@ interface Job {
   processReleased?: true | 'pending';
   /** Resolved for this round. A later continue or message inherits it when the caller does not say otherwise. */
   deliveryMode?: DeliveryMode;
+  /** Actual selected route & fallback trail recorded at dispatch acceptance. */
+  routing?: AttemptRoutingRecord;
 }
 
 export class WorkbenchArtifactError extends Error {
@@ -445,6 +464,7 @@ export class RemoteAgentGateway {
       ...(report ? { reportProgress: { stage: report.stage, phase: report.phase, reportPath: report.reportPath, fileCheck: report.fileCheck, humanReview: report.humanReviews.at(-1) } } : {}),
       ...(this.state.executionCancellations?.[attempt.attemptId] ? { cancellation: structuredClone(this.state.executionCancellations[attempt.attemptId]) } : {}), attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
       backendRunRef: attempt.backendRunRef, phase: attempt.phase, stale: attempt.stale,
+      ...(attempt.routing ? { routing: structuredClone(attempt.routing) } : {}),
       resultSummary: view.result?.resultSummary, artifactLinks: view.result?.artifactLinks ?? [],
       resultDigest: view.result?.resultDigest, resultRevision: view.result?.resultRevision ?? view.resultRevision,
       ...(raw ? { remote: raw.remote, taskId: raw.taskId, contextId: raw.contextId,
@@ -645,6 +665,144 @@ export class RemoteAgentGateway {
     const reportRequest = input.input.reportReview;
     if (reportRequest !== undefined && (options.jobId || resolved.target.kind !== 'agent_host' || !this.config.reportReview || !this.config.workbench)) throw new Error('Report review requires a new temporary agent_host task and configured report/workbench policy');
     if (reportRequest !== undefined) reportReviewInputSchema.parse(reportRequest);
+
+    // Pre-validate routingFallback / routingSlot / peerJobId / cross-model-family BEFORE ledger.prepare
+    // so invalid routing inputs NEVER persist an orphan attempt or submission_unknown state.
+    const preFields = resolved.input;
+    const preExplicitRoutingSlot = preFields.routingSlot !== undefined
+      ? z.enum(['worker', 'reviewer']).parse(preFields.routingSlot)
+      : undefined;
+    const preExplicitPeerJobId = preFields.peerJobId !== undefined ? string.parse(preFields.peerJobId) : undefined;
+    const preExplicitRoutingRole = preFields.routingRoleId !== undefined ? string.parse(preFields.routingRoleId) : undefined;
+    // A pinned provider/model route and a routing slot are two different routing decisions: honouring one
+    // and silently dropping the other would report a route that never ran. Conflicts fail closed here,
+    // before ledger.prepare, so an inconsistent request never persists an orphan attempt.
+    const preBoundProvider = resolved.target.binding.provider;
+    const preBoundModel = resolved.target.binding.model;
+    const hasPinnedRoute = preFields.provider !== undefined || preFields.model !== undefined
+      || preBoundProvider !== undefined || preBoundModel !== undefined;
+    if (preFields.routingFallback !== undefined && hasPinnedRoute) {
+      throw new Error('routingFallback conflicts with an explicit or target-bound provider/model route');
+    }
+    if ((preExplicitRoutingSlot !== undefined || preExplicitRoutingRole !== undefined) && hasPinnedRoute) {
+      throw new Error('routingSlot/routingRoleId conflicts with an explicit or target-bound provider/model route');
+    }
+    // A pinned route with a named peer is still a cross-model dispatch: the peer's recorded route must be
+    // from another model family, or the reviewer and worker would be judged by the same model family.
+    if (hasPinnedRoute && preFields.routingFallback === undefined && preExplicitRoutingSlot === undefined
+      && preExplicitRoutingRole === undefined && preExplicitPeerJobId !== undefined) {
+      const pinnedProvider = preFields.provider ?? preBoundProvider;
+      const pinnedModel = preFields.model ?? preBoundModel;
+      if (pinnedProvider !== undefined && pinnedModel !== undefined) {
+        const peerEndpoint = this.resolvePeerActualEndpoint(input.originSessionId, preExplicitPeerJobId, true);
+        assertCrossModelFamily(peerEndpoint!, { provider: String(pinnedProvider), model: String(pinnedModel) });
+      }
+    }
+    const routingFallbackSchema = z.object({
+      slot: routingSlotV2Schema,
+      peerActualEndpoint: routingEndpointSchema.optional(),
+      peerJobId: string.optional(),
+    }).strict();
+    let preRoutingPolicy: { slot: RoutingSlotV2; peerActualEndpoint?: RoutingEndpoint } | undefined;
+    let preRoutingDeliveryMode: DeliveryMode | undefined;
+
+    if (preFields.routingFallback !== undefined) {
+      const parsedFallback = routingFallbackSchema.parse(preFields.routingFallback);
+      const fallbackCandidates = [parsedFallback.slot.primary, ...parsedFallback.slot.fallbacks];
+      for (const ep of fallbackCandidates) extractModelFamily(ep);
+      let peerEndpoint = parsedFallback.peerActualEndpoint;
+      if (peerEndpoint) extractModelFamily(peerEndpoint);
+      // A read-only slot is a reviewer slot: the hard cross-model-family invariant needs the actual
+      // worker route, so the parent job is a legitimate peer source there and nowhere else.
+      const declaresReadOnly = fallbackCandidates.some(candidate => candidate.readOnly === true);
+      const peerJobLookupId = parsedFallback.peerJobId ?? preExplicitPeerJobId
+        ?? (declaresReadOnly ? input.parentJobRef?.jobId : undefined);
+      if (peerJobLookupId) {
+        const recordedPeer = this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, true)!;
+        // The ledger record is the authority. A caller-declared peerActualEndpoint must not hide a
+        // different actual route, or the declared peer family could fake a passing invariant.
+        if (peerEndpoint) {
+          const declaredFamily = extractModelFamily(peerEndpoint);
+          const recordedFamily = extractModelFamily(recordedPeer);
+          if (declaredFamily !== recordedFamily) {
+            throw new Error(`routingFallback peerActualEndpoint does not match the peer's recorded actual route (declared family "${declaredFamily}" vs recorded family "${recordedFamily}")`);
+          }
+        }
+        peerEndpoint = recordedPeer;
+      }
+      // Refuse an unverifiable read-only slot BEFORE ledger.prepare (0 orphan jobs) instead of
+      // dispatching it with the invariant silently skipped.
+      if (declaresReadOnly && !peerEndpoint) {
+        throw new Error('routingFallback readOnly endpoints require peerActualEndpoint, peerJobId, or parentJobRef.jobId to verify the cross-model-family invariant');
+      }
+      preRoutingPolicy = { slot: parsedFallback.slot, ...(peerEndpoint ? { peerActualEndpoint: peerEndpoint } : {}) };
+    } else if (preFields.provider === undefined && preFields.model === undefined && resolved.target.binding.provider === undefined && resolved.target.binding.model === undefined) {
+      const inferredSlot: 'worker' | 'reviewer' | undefined = preExplicitRoutingSlot
+        ?? (input.purpose === 'worker' || input.purpose === 'implement'
+          ? 'worker'
+          : (input.purpose === 'reviewer' || input.purpose === 'review' || input.purpose === 'cr' ? 'reviewer' : undefined));
+      if (inferredSlot) {
+        const preBoundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
+        const preExplicitRole = resolved.target.kind === 'agent_host' && preFields.roleId !== undefined ? string.parse(preFields.roleId) : undefined;
+        const preRoleId = preExplicitRoutingRole ?? preBoundRole ?? preExplicitRole;
+        if (preRoleId) assertSafeRoleId(preRoleId);
+        const routingPath = preRoleId && resolved.cwd
+          ? path.join(resolved.cwd, '.1agents', 'roles', preRoleId, 'routing.json')
+          : undefined;
+        const hasRoutingFile = Boolean(routingPath && existsSync(routingPath));
+        // S4: an explicit slot on an ACP preset cannot be honoured; ignoring it would report a
+        // routing decision that never happened. Refuse before ledger.prepare like routingFallback does.
+        if (preExplicitRoutingSlot && isAcpAgentPreset(resolved.agentPreset)) {
+          throw new Error(`routingSlot "${preExplicitRoutingSlot}" applies only to standard presets`);
+        }
+        if (preExplicitRoutingSlot && !hasRoutingFile) {
+          throw new Error(`routingSlot "${preExplicitRoutingSlot}" requires a valid routingRoleId/roleId and routing.json (${routingPath ?? 'missing roleId/cwd'})`);
+        }
+        if (hasRoutingFile && routingPath && !isAcpAgentPreset(resolved.agentPreset)) {
+          const normalizedRouting = normalizeRoleRouting(JSON.parse(readFileSync(routingPath, 'utf8')));
+          const slot = normalizedRouting[inferredSlot];
+          const peerJobLookupId = preExplicitPeerJobId
+            ?? (inferredSlot === 'reviewer' ? input.parentJobRef?.jobId : undefined);
+          // M1: a reviewer slot without the actual worker route cannot prove the cross-model-family
+          // invariant. Missing peer identity or a peer without a recorded route must both fail closed.
+          if (inferredSlot === 'reviewer' && !peerJobLookupId) {
+            throw new Error('reviewer routing slot requires peerJobId or parentJobRef.jobId to verify the cross-model-family invariant');
+          }
+          const peerEndpoint = peerJobLookupId
+            ? this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, inferredSlot === 'reviewer' || Boolean(preExplicitPeerJobId))
+            : undefined;
+          preRoutingPolicy = { slot, ...(peerEndpoint ? { peerActualEndpoint: peerEndpoint } : {}) };
+        }
+      }
+    }
+
+    if (preRoutingPolicy) {
+      if (isAcpAgentPreset(resolved.agentPreset)) {
+        throw new Error('routingFallback applies only to standard presets');
+      }
+      const initialPick = selectDispatchCandidate({
+        slot: preRoutingPolicy.slot,
+        attemptedKeys: new Set(),
+        ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
+      });
+      preRoutingDeliveryMode = initialPick.endpoint.deliveryMode;
+      const preContractDeliveryMode = preFields.resultContract && typeof preFields.resultContract === 'object'
+        ? (preFields.resultContract as { deliveryMode?: unknown }).deliveryMode
+        : undefined;
+      // readOnly belongs to the whole slot, not only to the candidate picked first: any read-only
+      // candidate in the fallback chain forces "none", or the hop that runs would write.
+      const declaresReadOnly = [preRoutingPolicy.slot.primary, ...preRoutingPolicy.slot.fallbacks]
+        .some(candidate => candidate.readOnly === true);
+      if (declaresReadOnly) {
+        if (preFields.deliveryMode !== undefined && preFields.deliveryMode !== 'none') {
+          throw new Error(`Read-only routing slot requires deliveryMode "none" (got "${String(preFields.deliveryMode)}")`);
+        }
+        if (preContractDeliveryMode !== undefined && preContractDeliveryMode !== 'none') {
+          throw new Error(`Read-only routing slot requires resultContract.deliveryMode "none" (got "${String(preContractDeliveryMode)}")`);
+        }
+      }
+    }
+
     const development = this.developmentFor(resolved.target, options.jobId);
     const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(development ? { development } : {}), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
@@ -657,6 +815,7 @@ export class RemoteAgentGateway {
     this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: job.jobId, caseId: job.caseId ?? input.caseId });
     if (input.handoffId) this.noteHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
     let sent = false;
+    let allRejectedPreTask = false;
     try {
       if (reportRequest !== undefined) {
         const { reportReview: _review, ...authorInput } = resolved.input;
@@ -694,24 +853,30 @@ export class RemoteAgentGateway {
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
       const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
       const explicitMode = fields.deliveryMode !== undefined || declaredResult?.deliveryMode !== undefined;
-      const mode = requestedDeliveryMode(fields.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
-      const includeMode = mode !== 'artifacts' || explicitMode;
-      const contractBase = (): A2AResultContract | undefined => {
-        if (!declaredResult && !includeMode) return undefined;
-        return { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: mode } : {}) };
-      };
+      const mode = requestedDeliveryMode(fields.deliveryMode ?? preRoutingDeliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
       // artifacts and workspace_files get <cwd>/.1agents/jobs/<jobId> unless the caller already named a location.
       // The directory stays inside cwd; .gitignore keeps it out of git status. none and workspace_git do not
       // invent one; an explicit jobDirectory or manifest is kept. The host creates a default directory at preflight.
       const located = resolved.cwd ? resolveDefaultJobDirectory(resolved.cwd, job.jobId) : undefined;
-      const autoLocate = (mode === 'artifacts' || mode === 'workspace_files')
-        && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && Boolean(located);
-      let artifacts = autoLocate && located
-        ? { directory: located, manifest: path.posix.join(located, `manifest-${attempt.attemptId}.json`) } : undefined;
-      let requirements = artifacts ? { ...sandboxed, jobDirectory: artifacts.directory } : sandboxed;
-      let resultContract = artifacts
-        ? { ...(contractBase() ?? { jobId: job.jobId }), artifactManifestPath: artifacts.manifest }
-        : contractBase();
+      // Every hop of a routing slot carries its own delivery mode: the instructions, the result contract, the
+      // manifest path and the recorded `routing.selected.deliveryMode` must describe the candidate that ran.
+      let admittedSpaces: Pick<z.output<typeof a2aPreflightRequirementsSchema>, 'artifactSpace' | 'rolePublication'> = {};
+      let allowJobDirectory = true;
+      const hopContextFor = (hopMode: DeliveryMode, options: { jobDirectory?: boolean } = {}) => {
+        const allowDirectory = options.jobDirectory ?? allowJobDirectory;
+        const wantsDirectory = allowDirectory && (hopMode === 'artifacts' || hopMode === 'workspace_files');
+        const hopArtifacts = wantsDirectory && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && located
+          ? { directory: located, manifest: path.posix.join(located, `manifest-${attempt.attemptId}.json`) } : undefined;
+        const includeMode = hopMode !== 'artifacts' || explicitMode || preRoutingPolicy !== undefined;
+        const base: A2AResultContract | undefined = !declaredResult && !includeMode ? undefined
+          : { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: hopMode } : {}) };
+        const hopRequirements = sandboxed === undefined && hopArtifacts === undefined && Object.keys(admittedSpaces).length === 0 ? undefined
+          : { ...sandboxed, ...(hopArtifacts ? { jobDirectory: hopArtifacts.directory } : {}), ...admittedSpaces };
+        return { mode: hopMode, artifacts: hopArtifacts, requirements: hopRequirements,
+          resultContract: hopArtifacts ? { ...(base ?? { jobId: job.jobId }), artifactManifestPath: hopArtifacts.manifest } : base };
+      };
+      let dispatchHop = hopContextFor(mode);
+      let { artifacts, requirements, resultContract } = dispatchHop;
       const boundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
       try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
@@ -719,7 +884,9 @@ export class RemoteAgentGateway {
         // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
         // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
         if (!artifacts) throw error;
-        artifacts = undefined; requirements = sandboxed; resultContract = contractBase();
+        allowJobDirectory = false;
+        dispatchHop = hopContextFor(mode);
+        ({ artifacts, requirements, resultContract } = dispatchHop);
         await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       }
       const publicationRole = boundRole ?? explicitRole ?? job.roleId;
@@ -729,7 +896,9 @@ export class RemoteAgentGateway {
       if (Object.keys(optional).length && resolved.cwd) {
         try {
           await this.checkDispatch(resolved.remote, resolved.cwd, { ...requirements, ...optional }, resolved.endpoint);
-          requirements = { ...requirements, ...optional };
+          admittedSpaces = optional;
+          dispatchHop = hopContextFor(mode);
+          ({ artifacts, requirements, resultContract } = dispatchHop);
         } catch (error) {
           // A refused shared space must not block the task's own directory, but it must not vanish
           // either: without the admission the agent cannot write there, and the caller would see a
@@ -742,6 +911,27 @@ export class RemoteAgentGateway {
           console.error(`[a2a-gateway] ${which} refused for job ${job.jobId}: ${detail}`);
         }
       }
+      // Admit every possible hop before the first send: a fallback candidate with its own delivery mode
+      // must not be dispatched against a job directory the host never accepted.
+      const hopContexts = new Map<DeliveryMode, typeof dispatchHop>([[mode, dispatchHop]]);
+      if (preRoutingPolicy) {
+        const hopModes = new Set([preRoutingPolicy.slot.primary, ...preRoutingPolicy.slot.fallbacks]
+          .map(candidate => requestedDeliveryMode(fields.deliveryMode ?? candidate.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode)));
+        for (const hopMode of hopModes) {
+          if (hopContexts.has(hopMode)) continue;
+          let candidateHop = hopContextFor(hopMode);
+          if (candidateHop.artifacts && resolved.cwd) {
+            try { await this.checkDispatch(resolved.remote, resolved.cwd, candidateHop.requirements, resolved.endpoint); }
+            catch (error) {
+              // Mirror the primary hop: an explicitly declared location must fail dispatch,
+              // while the invented default directory degrades to "no artifacts" for this hop only.
+              if (declaredResult?.artifactManifestPath || declaredRequirements?.jobDirectory) throw error;
+              candidateHop = hopContextFor(hopMode, { jobDirectory: false });
+            }
+          }
+          hopContexts.set(hopMode, candidateHop);
+        }
+      }
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
       const fresh = this.targets.resolve(input.targetId, input.input);
@@ -752,32 +942,165 @@ export class RemoteAgentGateway {
       catch (error) { if (!(error instanceof TicketError)) throw error; }
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
-      const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
-        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
-          + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest ?? resultContract?.artifactManifestPath)
-          + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
-            artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
-          + snapshotInstructions(input.input?.handoffSnapshot) }] },
-        metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
-          ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
-          ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
-          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}), ...(provider ? { provider, model } : {}),
-          execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
-        configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
-          authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
-      if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
+
+      const sendWithRoute = async (routeProvider: string | undefined, routeModel: string | undefined, messageId: string, hop: typeof dispatchHop, readOnly?: boolean) => {
+        const res = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId, role: 'ROLE_USER',
+          ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
+            + deliveryInstructions(hop.mode, hop.artifacts?.directory, hop.artifacts?.manifest ?? hop.resultContract?.artifactManifestPath)
+            + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
+              artifactSpace: hop.requirements?.artifactSpace, rolePublication: hop.requirements?.rolePublication, deliveryMode: hop.mode, hasTicket })
+            + snapshotInstructions(input.input?.handoffSnapshot)
+            + (readOnly ? '\n\n[Routing constraint: read-only review route; do not modify repository files, commit, or push.]' : '') }] },
+          metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
+            ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
+            ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
+            ...(hop.requirements ? { preflight: hop.requirements } : {}), ...(hop.resultContract ? { resultContract: hop.resultContract } : {}),
+            ...(routeProvider && routeModel ? { provider: routeProvider, model: routeModel } : {}),
+            execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
+          configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
+            authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
+        if (!('id' in res)) throw new Error('Remote did not return an A2A Task');
+        return res;
+      };
+
+      const dispatchStartedAt = this.now();
+      let task: Task;
+      let selectedRoute: RoutingEndpoint | undefined;
+      let selectedHop: typeof dispatchHop | undefined;
+      const fallbackEvents: { from: string; to: string; trigger: FallbackTriggerKind; elapsedMs: number }[] = [];
+
+      if (preRoutingPolicy) {
+        const attemptedKeys = new Set<string>();
+        const maxDurationMs = preRoutingPolicy.slot.maxFallbackDurationMs ?? DEFAULT_MAX_FALLBACK_DURATION_MS;
+        const allowedTriggers = preRoutingPolicy.slot.fallbackOn ?? [...FALLBACK_TRIGGER_KINDS];
+        let lastError: unknown;
+        let acceptedTask: Task | undefined;
+        let sawPreTaskRejection = false;
+        let hadAmbiguousDispatch = false;
+
+        for (;;) {
+          const picked = selectDispatchCandidate({
+            slot: preRoutingPolicy.slot,
+            attemptedKeys,
+            ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
+          });
+          const candidate = picked.endpoint;
+          // The winning candidate's own deliveryMode governs this hop, even when it is a fallback
+          // whose mode differs from the primary's.
+          const candidateMode = requestedDeliveryMode(fields.deliveryMode ?? candidate.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
+          const candidateHop = hopContexts.get(candidateMode) ?? hopContextFor(candidateMode);
+          attemptedKeys.add(endpointKey(candidate));
+          const msgId = attemptedKeys.size === 1 ? attempt.attemptId : `${attempt.attemptId}-fb${attemptedKeys.size - 1}`;
+          try {
+            const candidateTask = await sendWithRoute(candidate.provider, candidate.model, msgId, candidateHop, candidate.readOnly);
+            const dispatchFailure = failureOf(candidateTask);
+            const trigger = dispatchFailure ? classifyFallbackTrigger(dispatchFailure, allowedTriggers) : undefined;
+            if (!trigger) {
+              acceptedTask = candidateTask;
+              selectedRoute = candidate;
+              selectedHop = candidateHop;
+              break;
+            }
+            hadAmbiguousDispatch = true;
+            lastError = new Error(`Dispatch failed on ${candidate.provider}/${candidate.model} (${trigger}): ${dispatchFailure?.message ?? 'rejected'}`);
+            const elapsedMs = this.now() - dispatchStartedAt;
+            if (elapsedMs > maxDurationMs) throw lastError;
+            const peek = selectDispatchCandidate({
+              slot: preRoutingPolicy.slot,
+              attemptedKeys,
+              ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
+            });
+            fallbackEvents.push({
+              from: `${candidate.provider}/${candidate.model}`,
+              to: `${peek.endpoint.provider}/${peek.endpoint.model}`,
+              trigger,
+              elapsedMs,
+            });
+          } catch (dispatchError) {
+            if (dispatchError instanceof A2ADispatchRejectedError) {
+              sawPreTaskRejection = true;
+            } else {
+              hadAmbiguousDispatch = true;
+            }
+            allRejectedPreTask = sawPreTaskRejection && !hadAmbiguousDispatch;
+            const trigger = classifyFallbackTrigger(dispatchError, allowedTriggers);
+            if (!trigger) throw dispatchError;
+            lastError = dispatchError;
+            const elapsedMs = this.now() - dispatchStartedAt;
+            if (elapsedMs > maxDurationMs) throw dispatchError;
+            const peek = selectDispatchCandidate({
+              slot: preRoutingPolicy.slot,
+              attemptedKeys,
+              ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
+            });
+            fallbackEvents.push({
+              from: `${candidate.provider}/${candidate.model}`,
+              to: `${peek.endpoint.provider}/${peek.endpoint.model}`,
+              trigger,
+              elapsedMs,
+            });
+          }
+        }
+        if (!acceptedTask) throw lastError ?? new Error('Routing fallback failed without accepted task');
+        task = acceptedTask;
+      } else {
+        try {
+          task = await sendWithRoute(provider, model, attempt.attemptId, dispatchHop);
+        } catch (error) {
+          if (error instanceof A2ADispatchRejectedError) allRejectedPreTask = true;
+          throw error;
+        }
+      }
+
+      // The recorded delivery mode is the mode the accepted hop actually ran with.
+      const dispatchedMode = selectedHop?.mode ?? dispatchHop.mode;
+      const routingRecord: AttemptRoutingRecord | undefined = selectedRoute
+        ? { selected: { ...selectedRoute, deliveryMode: dispatchedMode }, fallbacks: fallbackEvents, elapsedMs: this.now() - dispatchStartedAt }
+        : (provider && model ? { selected: { provider, model, deliveryMode: dispatchedMode }, fallbacks: [], elapsedMs: this.now() - dispatchStartedAt } : undefined);
+
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
-        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: mode });
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: dispatchedMode,
+        ...(routingRecord ? { routing: routingRecord } : {}) });
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
-      if (sent) this.ledger.markUnknown(attempt.attemptId, diagnostic);
+      if (sent && !allRejectedPreTask) this.ledger.markUnknown(attempt.attemptId, diagnostic);
       else if (this.ledger.getAttempt(attempt.attemptId).submissionStatus !== 'known_not_submitted')
         this.ledger.knownNotSubmitted(attempt.attemptId, { executionStatus: 'rejected', diagnostic });
       return { ...this.ledgerView(input.originSessionId, job.jobId), error: diagnostic };
     }
+  }
+  private resolvePeerActualEndpoint(originSessionId: string, peerJobId: string, required: boolean): RoutingEndpoint | undefined {
+    const peer = this.ledger.get(originSessionId, peerJobId);
+    const ordered = [...peer.attempts].reverse();
+    const withRoute = ordered.find(a => a.routing?.selected);
+    if (withRoute?.routing?.selected) {
+      return {
+        provider: withRoute.routing.selected.provider,
+        model: withRoute.routing.selected.model,
+        deliveryMode: deliveryModeSchema.safeParse(withRoute.routing.selected.deliveryMode).data ?? 'workspace_git',
+        ...(withRoute.routing.selected.readOnly !== undefined ? { readOnly: withRoute.routing.selected.readOnly } : {}),
+        ...(withRoute.routing.selected.family ? { family: withRoute.routing.selected.family } : {}),
+      };
+    }
+    const withInputModel = ordered.find(a => {
+      const inp = a.input as Record<string, unknown> | undefined;
+      return typeof inp?.provider === 'string' && typeof inp?.model === 'string';
+    });
+    if (withInputModel) {
+      const inp = withInputModel.input as Record<string, unknown>;
+      return {
+        provider: String(inp.provider),
+        model: String(inp.model),
+        deliveryMode: deliveryModeSchema.safeParse(inp.deliveryMode).data ?? 'workspace_git',
+      };
+    }
+    if (required) {
+      throw new Error(`Peer job ${peerJobId} has no recorded actual model route; cannot verify cross-model-family invariant`);
+    }
+    return undefined;
   }
   private childView(origin: string, jobId: string): PptDeliveryChild {
     return this.ledgerView(origin, jobId) as PptDeliveryChild;
@@ -1255,7 +1578,20 @@ export class RemoteAgentGateway {
         const controller = new AbortController();
         this.controllers.add(controller);
         const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000), ...(init?.signal ? [init.signal] : [])]);
-        try { return await fetch(input, { ...init, signal, redirect: 'error' }); }
+        try {
+          const response = await fetch(input, { ...init, signal, redirect: 'error' });
+          if (response.headers.get('x-1agents-dispatch-rejected') === '1') {
+            const payload = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; category?: unknown };
+            const validCategories = new Set(['quota', 'rate_limit', 'http_429', 'http_5xx', 'timeout', 'auth']);
+            const category = typeof payload.category === 'string' && validCategories.has(payload.category)
+              ? (payload.category as 'quota' | 'rate_limit' | 'http_429' | 'http_5xx' | 'timeout' | 'auth')
+              : (response.status === 429 ? 'http_429' : response.status >= 500 ? 'http_5xx' : 'auth');
+            const code = typeof payload.code === 'string' && payload.code ? payload.code : `HTTP_${response.status}`;
+            const message = typeof payload.error === 'string' && payload.error ? payload.error : `HTTP ${response.status} dispatch rejected`;
+            throw new A2ADispatchRejectedError(response.status, code, category, message);
+          }
+          return response;
+        }
         finally { this.controllers.delete(controller); }
       };
       pending = new ClientFactory({ transports: [new JsonRpcTransportFactory({ fetchImpl })],
@@ -1465,7 +1801,7 @@ export class RemoteAgentGateway {
           ...(failure ? { error: noticeErrorSummary(failure) } : {}), createdAt: new Date().toISOString() } });
     }
     if (job.attemptId) {
-      const observed = { ...this.resultObservation(task), stale: false };
+      const observed = { ...this.resultObservation(task), stale: false, ...(job.routing ? { routing: job.routing } : {}) };
       if (this.ledger.getAttempt(job.attemptId).submissionStatus !== 'accepted') this.ledger.accept(job.attemptId,
         { provider: 'a2a', remote: job.remote, endpoint: job.remoteEndpoint, taskId: task.id, contextId: task.contextId, sessionId: task.metadata?.['1agents']?.sessionId }, observed);
       else this.ledger.observe(job.attemptId, observed);
@@ -1656,15 +1992,18 @@ export class RemoteAgentGateway {
           input: attempt.input as Record<string, unknown>, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy },
           { jobId: job.jobId, deliveryRecovery: delivery, deliveryRecoveryInput: recoveryInput, requestDigestInput: input.input });
       }
-      const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
-      if (!previous) throw new Error('Continue is unsupported for this provider');
+      const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId)
+        ?? [...job.attempts].reverse().map(a => this.state.jobs.find(item => item.attemptId === a.attemptId)).find(Boolean);
+      if (!previous && !(attempt.submissionStatus === 'known_not_submitted' && attempt.targetSnapshot.provider === 'a2a')) {
+        throw new Error('Continue is unsupported for this provider');
+      }
       // A round queued behind a running one could not surface the running round's approvals, and the two would wait on each other.
-      if (job.inFlightAttemptIds.length) await this.refresh(previous);
+      if (previous && job.inFlightAttemptIds.length) await this.refresh(previous);
       const current = this.ledger.get(input.originSessionId, job.jobId);
       if (current.attempts.some(item => current.inFlightAttemptIds.includes(item.attemptId) && item.executionStatus !== 'input_required'))
         throw new Error('Job still has a running round; wait for it to end or cancel it before continuing');
       const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
-        input: { ...(attempt.input as Record<string, unknown>), ...continueInput }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: continueInput });
+        input: { ...(attempt.input as Record<string, unknown>), ...continueInput }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, ...(previous ? { previous } : {}), requestDigestInput: continueInput });
       reopenForContinue(this.ledger, input.originSessionId, job.jobId);
       return submitted;
     }

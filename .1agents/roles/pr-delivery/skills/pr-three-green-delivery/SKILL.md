@@ -20,7 +20,7 @@ DSH 目录只展示 `name` 和 `description`。可选路由字段的源码键是
 2. 把真源投影到该 worktree（`.agents/skills/`、`.claude/skills` 软链、`AGENTS.local.md`）。投影已被 `.gitignore` 挡住。没有 `.git` 的目录不要投影。
 3. `l1_gate`：`node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <worktree>`。退出码不是 0 就停，不要用口头说明代替 JSON 摘要。
 4. `draft_pr`：L1 通过之后才开 Draft PR。不要把投影文件、任务目录或凭据放进提交。
-5. `cross_model_cr`：审查模型是 `magpie` / `group/deepseek-v4.1`，只读。实现模型不得自评通过。
+5. `cross_model_cr`：审查模型按 `routing.json`（v2：`primary + fallbacks[]`，向后兼容 v1）选路，默认 `magpie` / `group/deepseek-v4.1`，只读。通过 `execution_submit` 传入 `input.routingRoleId: "pr-delivery"` 与 `input.routingSlot: "worker" | "reviewer"`（审查节点同时传 `input.peerJobId: <workerJobId>`），网关会自动加载 `routing.json`、注入对应 `deliveryMode`（worker=`workspace_git`，reviewer=`none` + `readOnly: true`）、在派单边界遇 `quota/rate_limit/429/5xx/timeout` 60 秒内自动切换备用模型并落账实际执行路由，同时硬校验 `family(reviewer) !== family(actualWorker)`。实现模型不得自评通过。
 6. 返工走 `workflow.json` 的 `qaRevise` / `programBounce`，回到 `implement` 后重新跑 L1。不要为了变绿删测试或放宽断言。
 7. `ready_for_human`：自检、L1、异模型 CR、CI 都绿之后，才请人做一次验收。
 

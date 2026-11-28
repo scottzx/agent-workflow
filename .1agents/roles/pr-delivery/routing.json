@@ -1,14 +1,57 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "worker": {
-    "provider": "magpie-responses",
-    "model": "grok/grok-4.7@500k",
-    "deliveryMode": "workspace_git"
+    "primary": {
+      "provider": "magpie-responses",
+      "model": "grok/grok-4.7@500k",
+      "deliveryMode": "workspace_git",
+      "family": "grok"
+    },
+    "fallbacks": [
+      {
+        "provider": "magpie-responses",
+        "model": "openai/gpt-5.2-codex",
+        "deliveryMode": "workspace_git",
+        "family": "openai"
+      },
+      {
+        "provider": "magpie",
+        "model": "anthropic/claude-sonnet-4.5",
+        "deliveryMode": "workspace_git",
+        "family": "claude"
+      }
+    ],
+    "fallbackOn": ["quota", "rate_limit", "http_429", "http_5xx", "timeout"],
+    "maxFallbackDurationMs": 60000
   },
   "reviewer": {
-    "provider": "magpie",
-    "model": "group/deepseek-v4.1",
-    "deliveryMode": "none",
-    "readOnly": true
+    "primary": {
+      "provider": "magpie",
+      "model": "group/deepseek-v4.1",
+      "deliveryMode": "none",
+      "readOnly": true,
+      "family": "deepseek"
+    },
+    "fallbacks": [
+      {
+        "provider": "magpie",
+        "model": "google/gemini-2.5-pro",
+        "deliveryMode": "none",
+        "readOnly": true,
+        "family": "gemini"
+      },
+      {
+        "provider": "magpie",
+        "model": "anthropic/claude-opus-4.5",
+        "deliveryMode": "none",
+        "readOnly": true,
+        "family": "claude"
+      }
+    ],
+    "fallbackOn": ["quota", "rate_limit", "http_429", "http_5xx", "timeout"],
+    "maxFallbackDurationMs": 60000
+  },
+  "canary": {
+    "required": true
   }
 }
