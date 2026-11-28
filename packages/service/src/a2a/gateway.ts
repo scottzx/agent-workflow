@@ -52,6 +52,7 @@ import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverab
 import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
 import { assertSafeRoleId } from '../roles/role-rules.js';
 import {
+  assertCrossModelFamily,
   classifyFallbackTrigger,
   DEFAULT_MAX_FALLBACK_DURATION_MS,
   endpointKey,
@@ -672,6 +673,31 @@ export class RemoteAgentGateway {
       ? z.enum(['worker', 'reviewer']).parse(preFields.routingSlot)
       : undefined;
     const preExplicitPeerJobId = preFields.peerJobId !== undefined ? string.parse(preFields.peerJobId) : undefined;
+    const preExplicitRoutingRole = preFields.routingRoleId !== undefined ? string.parse(preFields.routingRoleId) : undefined;
+    // A pinned provider/model route and a routing slot are two different routing decisions: honouring one
+    // and silently dropping the other would report a route that never ran. Conflicts fail closed here,
+    // before ledger.prepare, so an inconsistent request never persists an orphan attempt.
+    const preBoundProvider = resolved.target.binding.provider;
+    const preBoundModel = resolved.target.binding.model;
+    const hasPinnedRoute = preFields.provider !== undefined || preFields.model !== undefined
+      || preBoundProvider !== undefined || preBoundModel !== undefined;
+    if (preFields.routingFallback !== undefined && hasPinnedRoute) {
+      throw new Error('routingFallback conflicts with an explicit or target-bound provider/model route');
+    }
+    if ((preExplicitRoutingSlot !== undefined || preExplicitRoutingRole !== undefined) && hasPinnedRoute) {
+      throw new Error('routingSlot/routingRoleId conflicts with an explicit or target-bound provider/model route');
+    }
+    // A pinned route with a named peer is still a cross-model dispatch: the peer's recorded route must be
+    // from another model family, or the reviewer and worker would be judged by the same model family.
+    if (hasPinnedRoute && preFields.routingFallback === undefined && preExplicitRoutingSlot === undefined
+      && preExplicitRoutingRole === undefined && preExplicitPeerJobId !== undefined) {
+      const pinnedProvider = preFields.provider ?? preBoundProvider;
+      const pinnedModel = preFields.model ?? preBoundModel;
+      if (pinnedProvider !== undefined && pinnedModel !== undefined) {
+        const peerEndpoint = this.resolvePeerActualEndpoint(input.originSessionId, preExplicitPeerJobId, true);
+        assertCrossModelFamily(peerEndpoint!, { provider: String(pinnedProvider), model: String(pinnedModel) });
+      }
+    }
     const routingFallbackSchema = z.object({
       slot: routingSlotV2Schema,
       peerActualEndpoint: routingEndpointSchema.optional(),
@@ -691,8 +717,18 @@ export class RemoteAgentGateway {
       const declaresReadOnly = fallbackCandidates.some(candidate => candidate.readOnly === true);
       const peerJobLookupId = parsedFallback.peerJobId ?? preExplicitPeerJobId
         ?? (declaresReadOnly ? input.parentJobRef?.jobId : undefined);
-      if (!peerEndpoint && peerJobLookupId) {
-        peerEndpoint = this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, true);
+      if (peerJobLookupId) {
+        const recordedPeer = this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, true)!;
+        // The ledger record is the authority. A caller-declared peerActualEndpoint must not hide a
+        // different actual route, or the declared peer family could fake a passing invariant.
+        if (peerEndpoint) {
+          const declaredFamily = extractModelFamily(peerEndpoint);
+          const recordedFamily = extractModelFamily(recordedPeer);
+          if (declaredFamily !== recordedFamily) {
+            throw new Error(`routingFallback peerActualEndpoint does not match the peer's recorded actual route (declared family "${declaredFamily}" vs recorded family "${recordedFamily}")`);
+          }
+        }
+        peerEndpoint = recordedPeer;
       }
       // Refuse an unverifiable read-only slot BEFORE ledger.prepare (0 orphan jobs) instead of
       // dispatching it with the invariant silently skipped.
@@ -707,9 +743,8 @@ export class RemoteAgentGateway {
           : (input.purpose === 'reviewer' || input.purpose === 'review' || input.purpose === 'cr' ? 'reviewer' : undefined));
       if (inferredSlot) {
         const preBoundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
-        const preRoutingRole = preFields.routingRoleId !== undefined ? string.parse(preFields.routingRoleId) : undefined;
         const preExplicitRole = resolved.target.kind === 'agent_host' && preFields.roleId !== undefined ? string.parse(preFields.roleId) : undefined;
-        const preRoleId = preRoutingRole ?? preBoundRole ?? preExplicitRole;
+        const preRoleId = preExplicitRoutingRole ?? preBoundRole ?? preExplicitRole;
         if (preRoleId) assertSafeRoleId(preRoleId);
         const routingPath = preRoleId && resolved.cwd
           ? path.join(resolved.cwd, '.1agents', 'roles', preRoleId, 'routing.json')

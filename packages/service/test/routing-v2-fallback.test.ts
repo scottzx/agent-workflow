@@ -672,6 +672,100 @@ test('M1/S1/S4: unverifiable reviewer peer, readOnly slot modes and explicit rou
   assert.equal(persisted.routing?.selected.deliveryMode, 'none', 'execution_get must report the accepted hop deliveryMode');
 });
 
+test('M1/S3 Round 5: a pinned provider/model route conflicts with routing inputs, and a declared peer must match the ledger', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'routing-v2-pinned-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const workDir = join(dir, 'work');
+  await mkdir(join(workDir, '.1agents', 'roles', 'pr-delivery'), { recursive: true });
+  await cp(join(prDeliveryRoleDir, 'routing.json'), join(workDir, '.1agents', 'roles', 'pr-delivery', 'routing.json'));
+  const backend = new RouteAwareBackend();
+  const a2a = await startA2A(backend, join(dir, 'remote-a2a'));
+  t.after(() => a2a.close());
+  const gateway = new RemoteAgentGateway({
+    stateDirectory: join(dir, 'gateway'),
+    remotes: { drill: { url: a2a.url, token: 'remote-secret-token' } },
+    pollIntervalMs: 50,
+    capacityDirectory: testCapacity(dir).directory,
+  });
+  t.after(() => gateway.close());
+  const submit = (input: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    gateway.invoke('execution_submit', { originSessionId: 'origin-pinned', targetId: 'legacy:drill', input, ...extra });
+  const jobCount = async () => ((await gateway.invoke('execution_list', { originSessionId: 'origin-pinned' }) as { jobs: unknown[] }).jobs).length;
+
+  // M1: an explicit routingSlot plus an explicit provider/model route is two decisions; refuse it.
+  assert.equal(await jobCount(), 0);
+  await assert.rejects(
+    submit({ cwd: workDir, routingRoleId: 'pr-delivery', routingSlot: 'reviewer', provider: 'deepseek', model: 'deepseek-v4',
+      prompt: 'Slot plus pinned route', agentPreset: 'standard' }),
+    /routingSlot\/routingRoleId conflicts with an explicit or target-bound provider\/model route/,
+  );
+  assert.equal(await jobCount(), 0, 'an explicit routingSlot with a pinned route must leave 0 orphan jobs');
+
+  // M1: routingRoleId alone is the same routing decision.
+  await assert.rejects(
+    submit({ cwd: workDir, routingRoleId: 'pr-delivery', provider: 'deepseek', model: 'deepseek-v4',
+      prompt: 'Routing role plus pinned route', agentPreset: 'standard' }),
+    /routingSlot\/routingRoleId conflicts with an explicit or target-bound provider\/model route/,
+  );
+  assert.equal(await jobCount(), 0, 'an explicit routingRoleId with a pinned route must leave 0 orphan jobs');
+
+  // M1: routingFallback plus an explicit provider/model route.
+  await assert.rejects(
+    submit({ cwd: workDir, provider: 'deepseek', model: 'deepseek-v4', prompt: 'Fallback plus pinned route', agentPreset: 'standard',
+      routingFallback: { slot: { primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' }, fallbacks: [] } } }),
+    /routingFallback conflicts with an explicit or target-bound provider\/model route/,
+  );
+  assert.equal(await jobCount(), 0, 'routingFallback with an explicit route must leave 0 orphan jobs');
+
+  // M1: the same conflict holds when the target itself binds provider/model (a path agent).
+  await gateway.invoke('execution_target_create', { targetId: 'pinned-host', kind: 'agent_host', name: 'Pinned host', connectionId: 'remote:drill',
+    binding: { cwd: workDir, agentPreset: 'standard', agentFile: join(workDir, 'agents', 'pinned.md'), provider: 'deepseek', model: 'deepseek-v4' } });
+  await assert.rejects(
+    gateway.invoke('execution_submit', { originSessionId: 'origin-pinned', targetId: 'pinned-host',
+      input: { prompt: 'Fallback on a pinned target',
+        routingFallback: { slot: { primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' }, fallbacks: [] } } } }),
+    /routingFallback conflicts with an explicit or target-bound provider\/model route/,
+  );
+  assert.equal(await jobCount(), 0, 'routingFallback on a target-bound route must leave 0 orphan jobs');
+
+  // M1: an explicit route with a named peer must still prove the cross-model-family invariant.
+  const peer = await submit({ cwd: workDir, provider: 'openai', model: 'gpt-5.2-codex', prompt: 'Pinned worker route', agentPreset: 'standard' }) as {
+    jobId: string; routing?: { selected: { model: string } };
+  };
+  assert.equal(peer.routing?.selected.model, 'gpt-5.2-codex');
+  const afterPeer = await jobCount();
+  await assert.rejects(
+    submit({ cwd: workDir, provider: 'openai', model: 'gpt-5.2', peerJobId: peer.jobId, prompt: 'Same-family pinned review', agentPreset: 'standard' }),
+    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'SAME_MODEL_FAMILY',
+  );
+  assert.equal(await jobCount(), afterPeer, 'a same-family pinned peer must leave 0 orphan jobs');
+  const crossFamily = await submit({ cwd: workDir, provider: 'deepseek', model: 'deepseek-v4', peerJobId: peer.jobId,
+    prompt: 'Cross-family pinned review', agentPreset: 'standard' }) as { jobId: string; routing?: { selected: { model: string } } };
+  assert.ok(crossFamily.jobId);
+  assert.equal(crossFamily.routing?.selected.model, 'deepseek-v4', 'a cross-family pinned peer is dispatched as declared');
+  const afterCrossFamily = await jobCount();
+
+  // S3: a declared peerActualEndpoint must agree with the peer's recorded route, or it can fake the invariant.
+  await assert.rejects(
+    submit({ cwd: workDir, prompt: 'Forged peer family', agentPreset: 'standard',
+      routingFallback: {
+        slot: { primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' }, fallbacks: [] },
+        peerActualEndpoint: { provider: 'magpie', model: 'google/gemini-2.5-pro', deliveryMode: 'workspace_git' },
+        peerJobId: peer.jobId,
+      } }),
+    /does not match the peer's recorded actual route/,
+  );
+  assert.equal(await jobCount(), afterCrossFamily, 'a forged peer endpoint must leave 0 orphan jobs');
+  const honestPeer = await submit({ cwd: workDir, prompt: 'Honest peer family', agentPreset: 'standard',
+    routingFallback: {
+      slot: { primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' }, fallbacks: [] },
+      peerActualEndpoint: { provider: 'magpie', model: 'openai/gpt-5.2', deliveryMode: 'workspace_git' },
+      peerJobId: peer.jobId,
+    } }) as { jobId: string; routing?: { selected: { model: string } } };
+  assert.ok(honestPeer.jobId, 'a declared peer endpoint that matches the ledger record is accepted');
+  assert.equal(honestPeer.routing?.selected.model, 'grok/grok-4.7@500k');
+});
+
 test('S3: X-1Agents-Dispatch-Rejected and preTaskRejected are reported for admission rejections only', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'routing-v2-pretask-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
