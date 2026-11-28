@@ -151,3 +151,75 @@ test('resolveA2AToken and resolveA2AWorkbench load 0600 secret files and reject 
   chmodSync(gwFile, 0o640);
   await assert.rejects(resolveA2AWorkbench({ url: 'http://127.0.0.1:36814' }, gwFile), /must not be accessible/);
 });
+
+test('prepare enforces sandboxMode read-only through the host permission presets and fails closed without them', async t => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-sandbox-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  // 1. The host exposes permissionPresets: the preset is installed on this agent's session before any prompt.
+  const enforced = currentDsh(cwd);
+  const calls = [];
+  enforced.ctx.permissionPresets = { set: (session, preset) => { calls.push([session, preset]); } };
+  const backend = new DshA2ABackend(enforced.ctx);
+  const target = await backend.prepare({ sessionId: 'stored', sandboxMode: 'read-only' });
+  assert.equal(target.sessionId, 'stored');
+  assert.equal(calls.length, 1, 'exactly one permission preset call');
+  assert.equal(calls[0][1], 'read-only');
+  assert.deepEqual(calls[0][0], { id: 'stored', header: { id: 'stored', cwd, agentPreset: 'standard' } },
+    'the preset applies to the prepared agent session');
+
+  // 2. A host without permission presets refuses instead of silently running writable work.
+  const absent = currentDsh(cwd);
+  delete absent.ctx.permissionPresets;
+  await assert.rejects(
+    new DshA2ABackend(absent.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE' && /read-only sandbox/.test(error.message),
+    'a missing permissionPresets service must fail closed',
+  );
+
+  // 3. A preset call that throws also fails closed, with the host error kept as the cause.
+  const broken = currentDsh(cwd);
+  const hostError = new Error('permission preset service is unavailable');
+  broken.ctx.permissionPresets = { set: () => { throw hostError; } };
+  await assert.rejects(
+    new DshA2ABackend(broken.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE' && error.cause === hostError,
+    'a refused preset must not be downgraded to workspace-write',
+  );
+
+  // 4. Without sandboxMode nothing is touched: a writable task keeps its host default.
+  const untouched = currentDsh(cwd);
+  const untouchedCalls = [];
+  untouched.ctx.permissionPresets = { set: (session, preset) => { untouchedCalls.push([session, preset]); } };
+  await new DshA2ABackend(untouched.ctx).prepare({ sessionId: 'stored' });
+  assert.deepEqual(untouchedCalls, [], 'a task without sandboxMode never changes permissions');
+});
+
+test('a brand-new read-only session also gets the preset, and a refused preset prevents the session from running', async t => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-sandbox-new-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const f = currentDsh(cwd);
+  const freshSession = { id: 'fresh', header: { id: 'fresh', cwd, agentPreset: 'standard' } };
+  const freshAgent = { id: 'fresh', session: freshSession };
+  const calls = [];
+  f.ctx.permissionPresets = { set: (session, preset) => { calls.push([session, preset]); } };
+  f.ctx.sessionController.create = async () => ({ sessionId: 'fresh', agentPreset: 'standard' });
+  const resolve = f.ctx.sessionController.resolveAgent;
+  f.ctx.sessionController.resolveAgent = async id => id === 'fresh' ? { agent: freshAgent } : resolve(id);
+
+  const target = await new DshA2ABackend(f.ctx).prepare({ cwd, agentPreset: 'standard', sandboxMode: 'read-only' });
+  assert.equal(target.sessionId, 'fresh');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], freshSession);
+  assert.equal(calls[0][1], 'read-only');
+
+  // The same new-session path fails closed when the host cannot set the preset.
+  const g = currentDsh(cwd);
+  g.ctx.sessionController.create = async () => ({ sessionId: 'fresh', agentPreset: 'standard' });
+  const resolveFresh = g.ctx.sessionController.resolveAgent;
+  g.ctx.sessionController.resolveAgent = async id => id === 'fresh' ? { agent: freshAgent } : resolveFresh(id);
+  await assert.rejects(
+    new DshA2ABackend(g.ctx).prepare({ cwd, agentPreset: 'standard', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE',
+  );
+});

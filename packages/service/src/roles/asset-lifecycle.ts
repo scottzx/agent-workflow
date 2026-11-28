@@ -16,15 +16,27 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import type { ActorKind, LifecycleMode } from '@1agents/dreammate-network';
 import { z } from 'zod';
 
 export const ASSET_KINDS = ['preset', 'check', 'rubric', 'dag'] as const;
 export type AssetKind = (typeof ASSET_KINDS)[number];
 
+/**
+ * `trial / formal` is the DreamMate Network L0 `LifecycleMode` vocabulary (L0 0.6.0, protocol §15):
+ * 1acp keeps its own export names and runtime semantics, but does not keep a second copy of the words.
+ */
 export const ASSET_LIFECYCLES = ['trial', 'formal'] as const;
-export type AssetLifecycle = (typeof ASSET_LIFECYCLES)[number];
+export type AssetLifecycle = LifecycleMode;
+/** 1acp only ever acts as these three; L0 `ActorKind` additionally has `qa` / `host` / `application`. */
+export type LifecycleActor = Extract<ActorKind, 'person' | 'coach' | 'executor'>;
 
-export type LifecycleActor = 'person' | 'coach' | 'executor';
+/** Compile-time proof that both sides name the same set of lifecycles, so neither drifts silently. */
+type AssertSame<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+const assetLifecycleVocabularyIsL0: AssertSame<(typeof ASSET_LIFECYCLES)[number], LifecycleMode> = true;
+const assetLifecycleIsL0: AssertSame<AssetLifecycle, LifecycleMode> = true;
+const lifecycleActorIsL0Subset: AssertSame<LifecycleActor, Extract<ActorKind, LifecycleActor>> = true;
+void assetLifecycleVocabularyIsL0; void assetLifecycleIsL0; void lifecycleActorIsL0Subset;
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const SHA256 = /^[0-9a-f]{64}$/;

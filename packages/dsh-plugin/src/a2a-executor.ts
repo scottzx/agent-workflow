@@ -20,11 +20,14 @@ export interface SessionControl {
   status(sessionId: string): Promise<{ attached: boolean; activeTurn: boolean; lastUsedAt?: string }>;
 }
 
-function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT' | 'MODEL_UNAVAILABLE' | 'MODEL_SELECTION_UNSUPPORTED' | 'UNKNOWN_MODEL_OR_GROUP', message: string): Error {
+function sessionError(code: 'SESSION_NOT_FOUND' | 'SESSION_DELETED' | 'SESSION_CONFLICT' | 'MODEL_UNAVAILABLE' | 'MODEL_SELECTION_UNSUPPORTED' | 'UNKNOWN_MODEL_OR_GROUP' | 'SANDBOX_UNAVAILABLE', message: string): Error {
   const error = new Error(message) as Error & { code: string };
   error.code = code;
   return error;
 }
+
+/** The host service that owns OS-level permission presets. Reached structurally so no new hard dependency is added. */
+interface PermissionPresetsHost { set?: (session: unknown, preset: string) => unknown }
 
 /** One provider/model pair the host can record. Routing groups use the same shape as concrete models. */
 interface ModelRoute { provider: string; model: string }
@@ -329,6 +332,8 @@ export class DshA2ABackend implements A2ABackend {
       if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw sessionError('SESSION_CONFLICT', 'Existing session cwd conflicts');
       signal?.throwIfAborted();
       if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw sessionError('SESSION_CONFLICT', 'Existing session preset conflicts');
+      await this.enforceSandbox(input, agent);
+      signal?.throwIfAborted();
       const allowUnresolved = input.provider === undefined ? false : await this.requireModel(input, agentPreset, signal);
       const selected = await this.selectModel(input, input.sessionId as SessionId, signal, allowUnresolved);
       return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight, ...selected };
@@ -344,6 +349,8 @@ export class DshA2ABackend implements A2ABackend {
     signal?.throwIfAborted();
     const agent = await this.agent(created.sessionId);
     signal?.throwIfAborted();
+    await this.enforceSandbox(input, agent);
+    signal?.throwIfAborted();
     const selected = await this.selectModel(input, created.sessionId, signal, allowUnresolved);
     return {
       sessionId: created.sessionId,
@@ -352,6 +359,34 @@ export class DshA2ABackend implements A2ABackend {
       preflight,
       ...selected,
     };
+  }
+
+  /**
+   * Enforce `sandboxMode: 'read-only'` through the host's OS-level permission presets.
+   *
+   * Fail-closed by design: this backend never silently keeps a writable session. If the host does not
+   * expose `permissionPresets.set`, or the preset call throws, the task is refused outright rather
+   * than run with `workspace-write` while the caller believes it is read-only.
+   * @param input Remote host requirements for this task.
+   * @param agent The DSH agent whose session the preset applies to.
+   */
+  private async enforceSandbox(input: A2APrepareInput, agent: Agent): Promise<void> {
+    if (input.sandboxMode !== 'read-only') return;
+    // Structural access: a host without permission presets stays loadable, but cannot run read-only work.
+    const record = this.ctx as unknown as {
+      permissionPresets?: PermissionPresetsHost;
+      get?: (name: string) => unknown;
+    };
+    const host = record.permissionPresets ?? (record.get?.('permissionPresets') as PermissionPresetsHost | undefined);
+    const set = host?.set;
+    if (typeof set !== 'function') {
+      throw sessionError('SANDBOX_UNAVAILABLE', 'The DSH host cannot enforce a read-only sandbox; refusing to start a read-only task');
+    }
+    try {
+      await set.call(host, agent.session, 'read-only');
+    } catch (error) {
+      throw Object.assign(sessionError('SANDBOX_UNAVAILABLE', 'The DSH host refused the read-only permission preset; refusing to start a read-only task'), { cause: error });
+    }
   }
 
   /**

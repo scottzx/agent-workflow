@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
-import { deliverSessionMessage, SessionDeliveryError, sessionNoticeSchema, type SessionDeliveryMode, type SessionHost, type SessionNoticeMeta } from './session-hosts.js';
+import { deliverSessionMessage, messageCorrelationSchema, SessionDeliveryError, sessionNoticeSchema, type MessageCorrelation, type SessionDeliveryMode, type SessionHost, type SessionNoticeMeta } from './session-hosts.js';
 
 const id = z.string().trim().min(1).max(512);
 const deliveryModeSchema = z.enum(['queue', 'steer']);
@@ -51,6 +51,8 @@ export const sessionSendSchema = sessionMessageSchema.extend({
   text: z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim())),
   mode: deliveryModeSchema.optional(),
   notice: sessionNoticeSchema.optional(),
+  /** Optional L0 `MessageCorrelation` tags; older saved deliveries simply do not have them. */
+  correlation: messageCorrelationSchema.optional(),
 }).strict();
 export const sessionResolveSchema = sessionMessageSchema.extend({ accepted: z.boolean(), note: id, hostReceiptId: id.optional() }).strict();
 
@@ -91,6 +93,7 @@ export interface SessionDeliveryReceipt extends SessionBinding {
   fromSessionId?: string;
   mode?: SessionDeliveryMode;
   notice?: SessionNoticeMeta;
+  correlation?: MessageCorrelation;
   status: SessionDeliveryStatus;
   attempts: number;
   updatedAt: string;
@@ -105,6 +108,7 @@ const deliveryStatusSchema = z.enum(['pending', 'dispatching', 'retrying', 'acce
 const bindingSchema = sessionBindSchema.extend({ createdAt: id, hostFingerprint: id }).strict();
 const deliverySchema = bindingSchema.extend({
   messageId: id, fromSessionId: id.optional(), text: sessionSendSchema.shape.text, mode: deliveryModeSchema.optional(), notice: sessionNoticeSchema.optional(),
+  correlation: messageCorrelationSchema.optional(),
   status: deliveryStatusSchema,
   attempts: z.number().int().nonnegative(), updatedAt: id,
   nextAttemptAt: id.optional(), hostReceiptId: id.optional(), error: id.optional(),
@@ -121,6 +125,7 @@ const targetDeliverySchema = z.object({
   text: sessionSendSchema.shape.text,
   mode: deliveryModeSchema.optional(),
   notice: sessionNoticeSchema.optional(),
+  correlation: messageCorrelationSchema.optional(),
   status: deliveryStatusSchema,
   attempts: z.number().int().nonnegative(),
   createdAt: id,
@@ -147,6 +152,7 @@ export interface TargetDeliveryReceipt {
   fromSessionId?: string;
   mode?: SessionDeliveryMode;
   notice?: SessionNoticeMeta;
+  correlation?: MessageCorrelation;
   status: SessionDeliveryStatus;
   attempts: number;
   createdAt: string;
@@ -166,6 +172,7 @@ export interface TargetEnqueueInput {
   text: string;
   mode?: SessionDeliveryMode;
   notice?: SessionNoticeMeta;
+  correlation?: MessageCorrelation;
 }
 
 /** Credentials may rotate; a host alias must never silently redirect saved messages. */
@@ -291,7 +298,9 @@ export class SessionDelivery {
     const previous = this.state.deliveries.find(value => value.originSessionId === input.originSessionId && value.messageId === input.messageId);
     if (previous) {
       const sameNotice = JSON.stringify(previous.notice ?? null) === JSON.stringify(input.notice ?? null);
-      if (previous.text !== input.text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice
+      // The context tags are part of the payload: reusing an id for another context is a different message.
+      const sameCorrelation = JSON.stringify(previous.correlation ?? null) === JSON.stringify(input.correlation ?? null);
+      if (previous.text !== input.text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice || !sameCorrelation
         || previous.fromSessionId !== input.fromSessionId) {
         throw new Error('Message ID was already used for different content');
       }
@@ -307,6 +316,7 @@ export class SessionDelivery {
       text: input.text,
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.notice ? { notice: input.notice } : {}),
+      ...(input.correlation ? { correlation: input.correlation } : {}),
       createdAt: now,
       updatedAt: now,
       attempts: 0,
@@ -348,7 +358,8 @@ export class SessionDelivery {
     const previous = this.state.targetDeliveries.find(value => value.targetKey === targetKey && value.messageId === input.messageId);
     if (previous) {
       const sameNotice = JSON.stringify(previous.notice ?? null) === JSON.stringify(input.notice ?? null);
-      if (previous.text !== text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice
+      const sameCorrelation = JSON.stringify(previous.correlation ?? null) === JSON.stringify(input.correlation ?? null);
+      if (previous.text !== text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice || !sameCorrelation
         || previous.host !== input.host || previous.sessionId !== input.sessionId
         || previous.fromSessionId !== input.fromSessionId) {
         throw new Error('Message ID was already used for different content');
@@ -366,6 +377,7 @@ export class SessionDelivery {
       text,
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.notice ? { notice: input.notice } : {}),
+      ...(input.correlation ? { correlation: input.correlation } : {}),
       createdAt: now,
       updatedAt: now,
       attempts: 0,
@@ -521,6 +533,8 @@ export class SessionDelivery {
         ...(mode === 'steer' ? { mode } : {}),
         ...(notice ? { notice } : {}),
         ...(batch.length === 1 && batch[0]!.fromSessionId ? { fromSessionId: batch[0]!.fromSessionId } : {}),
+        // A merged segment carries several contexts, so only a single message can name one honestly.
+        ...(batch.length === 1 && batch[0]!.correlation ? { correlation: batch[0]!.correlation } : {}),
       }, this.controller.signal);
       const updatedAt = new Date().toISOString();
       for (const entry of batch) {

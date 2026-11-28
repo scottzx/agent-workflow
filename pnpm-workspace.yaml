@@ -6,6 +6,7 @@ minimumReleaseAgeExclude:
   # Exact first-party releases verified by the coordinated release, not all recent dependencies.
   - "@1agents/dreammate-node@0.15.0"
   - "@1agents/dreammate-network@0.5.0"
+  - "@1agents/dreammate-network@0.6.0"
   - "@openclaw/fs-safe@0.18.1"
   - "@openclaw/fs-safe-darwin-arm64@0.18.1"
   - "@openclaw/fs-safe-darwin-x64@0.18.1"

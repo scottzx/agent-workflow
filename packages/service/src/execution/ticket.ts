@@ -7,11 +7,17 @@
  */
 import { rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import type { GovernanceProposalKind as L0GovernanceProposalKind } from '@1agents/dreammate-network';
 import { z } from 'zod';
 import type { JobLedger } from './ledger.js';
 
-export const GOVERNANCE_PROPOSAL_KINDS = ['eval_change', 'permission_escalation', 'promote_formal'] as const;
-export type GovernanceProposalKind = (typeof GOVERNANCE_PROPOSAL_KINDS)[number];
+/**
+ * The three two-key governance kinds are the DreamMate Network L0 `GovernanceProposalKind` vocabulary
+ * (L0 0.6.0, protocol §15). 1acp keeps its own export name and its legacy kinds alongside it, but the
+ * three governance words come from L0 instead of being written a second time.
+ */
+export const GOVERNANCE_PROPOSAL_KINDS: readonly L0GovernanceProposalKind[] = ['eval_change', 'permission_escalation', 'promote_formal'];
+export type GovernanceProposalKind = L0GovernanceProposalKind;
 export const LEGACY_PROPOSAL_KINDS = ['check', 'role', 'qa', 'locked'] as const;
 export const ALL_PROPOSAL_KINDS = [...LEGACY_PROPOSAL_KINDS, ...GOVERNANCE_PROPOSAL_KINDS] as const;
 export type ProposalKind = (typeof ALL_PROPOSAL_KINDS)[number];

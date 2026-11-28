@@ -85,6 +85,12 @@ export interface A2APrepareInput {
   /** Standard presets only, passed together. Omitted keeps the session's current or host-default model. */
   provider?: string;
   model?: string;
+  /**
+   * Host-enforced read-only sandbox. Only a `readOnly: true` routing candidate sets it, and the host
+   * must refuse the task when it cannot enforce it. There is deliberately no other value: a remote
+   * client must never be able to widen its own permissions through this field.
+   */
+  sandboxMode?: 'read-only';
 }
 
 /** A single DSH turn's output, without transport or host dependencies. */
