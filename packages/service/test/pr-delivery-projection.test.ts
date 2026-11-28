@@ -117,12 +117,12 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
 
   const routing = JSON.parse(await readFile(join(roleDir, 'routing.json'), 'utf8'));
   assert.equal(routing.schemaVersion, 2);
-  assert.equal(routing.worker.primary.provider, 'magpie-responses');
-  assert.equal(routing.worker.primary.model, 'grok/grok-4.7@500k');
+  assert.equal(routing.worker.primary.provider, 'magpie');
+  assert.equal(routing.worker.primary.model, 'group/deepseek-v4.1');
   assert.equal(routing.worker.primary.deliveryMode, 'workspace_git');
   assert.ok(Array.isArray(routing.worker.fallbacks) && routing.worker.fallbacks.length >= 1);
   assert.equal(routing.reviewer.primary.provider, 'magpie');
-  assert.equal(routing.reviewer.primary.model, 'group/deepseek-v4.1');
+  assert.equal(routing.reviewer.primary.model, 'minimax-cn/MiniMax-M3.1-Flash');
   assert.equal(routing.reviewer.primary.readOnly, true);
   assert.equal(routing.reviewer.primary.deliveryMode, 'none');
   assert.ok(Array.isArray(routing.reviewer.fallbacks) && routing.reviewer.fallbacks.length >= 1);

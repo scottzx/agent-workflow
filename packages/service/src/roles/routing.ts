@@ -94,6 +94,7 @@ export function inferModelFamilyFromModel(model: string): string {
     [/\bgpt\b|gpt-|openai|codex|\bo[134]\b/, 'openai'],
     [/\bgemini\b|gemini|google/, 'gemini'],
     [/\bqwen\b|qwen/, 'qwen'],
+    [/\bminimax\b|minimax/, 'minimax'],
     [/\bllama\b|llama|meta/, 'llama'],
     [/\bglm\b|glm-/, 'glm'],
     [/\bkimi\b|moonshot/, 'kimi'],

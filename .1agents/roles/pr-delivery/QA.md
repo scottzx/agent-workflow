@@ -56,3 +56,12 @@
 - `## MUST`：没有阻塞项时只写 `无`。每条阻塞项单独一条 `### M1 ...` 或 `- **[M1]** ...`，写明文件路径和复现或机制。一条缺陷对应一条 MUST，不要把多条缺陷揉成一段。
 - `## SHOULD`：非阻塞建议。可以写 `无`。
 - `## VERIFIED_CHECKS`：已独立核验的事实。未关闭的阻塞项仍要写在 `## MUST`，不要挪到这一节。
+
+## 观察期多维 Rubric 评分（observe-only）
+
+这一节只是 trial 观察期的可选补充，不改变上面的红线、三绿门槛和 L3 评分器的格式契约。
+
+- 除必需的 `## VERDICT` / `## MUST` / `## SHOULD` / `## VERIFIED_CHECKS` 外，可以在报告末尾附加一个可选的 `## RUBRIC_OBSERVE` 块，对照 `.1agents/roles/pr-delivery/rubric.json` 给 C1–C6 打分并引证。
+- 每条按 `C1 met=1 evidence=<path:line 或引文> — 一句话理由` 写；C1/C2/C3/C5/C6 为二元，C4 用 0/1/2 三档（0 破坏兼容 / 1 兼容但有耦合 / 2 解耦且兼容）；C6 是负向条目，`met=1` 表示命中（凭据泄露、AOCI 块改写、投影或考卷进入提交、越权改文件），命中直接扣 4 分。
+- 聚合口径与 `rubric.json` 一致：`normalized_positive_sum`，`passScore` 0.8，`mustAllPass` 为 C1/C2/C3，`mustNotTrigger` 为 C6。所有条目 `gate.mode` 均为 `observe`：只并行观察与校准，不产生阻断、不替代 `checks/l1-gate.mjs`，也不改变 `## VERDICT` 的取值。
+- 不写这个块不算不合规；写了却缺 `path:line` 或引文时，只把该观察项记为未通过，同样不影响 `## VERDICT`。
