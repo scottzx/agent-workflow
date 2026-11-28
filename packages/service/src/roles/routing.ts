@@ -65,6 +65,7 @@ export const roleRoutingSchema = z.union([roleRoutingV1Schema, roleRoutingV2Sche
 export type RoleRouting = z.infer<typeof roleRoutingSchema>;
 
 export type RoutingErrorCode =
+  | 'INVALID_MODEL_FAMILY'
   | 'SAME_MODEL_FAMILY'
   | 'NO_ELIGIBLE_FALLBACK'
   | 'FALLBACK_BUDGET_EXCEEDED'
@@ -78,12 +79,11 @@ export class RoutingInvariantError extends Error {
 }
 
 /**
- * Normalize model family so cross-model CR invariant cannot be bypassed by provider aliases
- * (e.g. `group/deepseek-v4.1` and `deepseek/deepseek-r1` both normalize to `deepseek`).
+ * Infer model family strictly from the model identifier so provider aliases
+ * (e.g. `group/deepseek-v4.1` and `deepseek/deepseek-r1`) normalize identically.
  */
-export function extractModelFamily(endpoint: Pick<RoutingEndpoint, 'provider' | 'model' | 'family'>): string {
-  if (endpoint.family?.trim()) return endpoint.family.trim().toLowerCase();
-  const raw = endpoint.model.trim().toLowerCase();
+export function inferModelFamilyFromModel(model: string): string {
+  const raw = model.trim().toLowerCase();
   const known: [RegExp, string][] = [
     [/\bdeepseek\b|deepseek/, 'deepseek'],
     [/\bgrok\b|grok/, 'grok'],
@@ -103,6 +103,25 @@ export function extractModelFamily(endpoint: Pick<RoutingEndpoint, 'provider' | 
   return head.split(/[-_@:]/)[0] || raw;
 }
 
+/**
+ * Derive model family from `endpoint.model` as the single source of truth.
+ * If an optional `endpoint.family` is declared, it acts strictly as an assertion and
+ * MUST match the inferred model family; any mismatch fails closed with `INVALID_MODEL_FAMILY`.
+ */
+export function extractModelFamily(endpoint: Pick<RoutingEndpoint, 'provider' | 'model' | 'family'>): string {
+  const inferred = inferModelFamilyFromModel(endpoint.model);
+  if (endpoint.family?.trim()) {
+    const declared = endpoint.family.trim().toLowerCase();
+    if (declared !== inferred) {
+      throw new RoutingInvariantError(
+        'INVALID_MODEL_FAMILY',
+        `Declared family "${declared}" for ${endpoint.provider}/${endpoint.model} contradicts inferred model family "${inferred}"`,
+      );
+    }
+  }
+  return inferred;
+}
+
 /** Hard invariant: reviewer model family MUST differ from actual worker model family. */
 export function assertCrossModelFamily(
   worker: Pick<RoutingEndpoint, 'provider' | 'model' | 'family'>,
@@ -118,7 +137,7 @@ export function assertCrossModelFamily(
   }
 }
 
-/** Normalize Routing v1 or v2 into canonical v2 form and validate the primary cross-family invariant. */
+/** Normalize Routing v1 or v2 into canonical v2 form and validate every endpoint family + primary cross-family invariant. */
 export function normalizeRoleRouting(raw: unknown): RoleRoutingV2 {
   const parsed = roleRoutingSchema.parse(raw);
   const normalized: RoleRoutingV2 = parsed.schemaVersion === 2
@@ -139,6 +158,14 @@ export function normalizeRoleRouting(raw: unknown): RoleRoutingV2 {
         },
         canary: { required: true },
       };
+  for (const ep of [
+    normalized.worker.primary,
+    ...normalized.worker.fallbacks,
+    normalized.reviewer.primary,
+    ...normalized.reviewer.fallbacks,
+  ]) {
+    extractModelFamily(ep);
+  }
   assertCrossModelFamily(normalized.worker.primary, normalized.reviewer.primary);
   return normalized;
 }
@@ -174,30 +201,37 @@ export function classifyFallbackTrigger(
     || category === 'invalid_request'
     || category === 'validation'
     || status === 400 || status === 401 || status === 403 || status === 404
-    || code === 'AUTH' || code === 'HTTP_401' || code === 'HTTP_403' || code === 'HTTP_400'
-    || /\b(?:http[_\s-]*)?40[0134]\b/i.test(message)
+    || code === 'AUTH' || code === 'HTTP_401' || code === 'HTTP_403' || code === 'HTTP_400' || code === 'HTTP_404'
+    || /\bHTTP[_\s-]+40[0134]\b/i.test(message)
   ) {
     return undefined;
   }
 
-  if (status === 429 || code === 'HTTP_429' || detailCode === 'HTTP_429' || /\b(?:http[_\s-]*)?429\b/i.test(message)) {
+  // Prefer structured status/code/category signals; only inspect message for explicit HTTP/transport error signatures
+  // so mid-execution semantic validation text mentioning words like "quota" or "rate limit" never triggers fallback.
+  if (status === 429 || code === 'HTTP_429' || detailCode === 'HTTP_429' || /\bHTTP[_\s-]+429\b|\bstatus[:\s=]+429\b/i.test(message)) {
     if (allowed.has('http_429')) return 'http_429';
     if (allowed.has('rate_limit')) return 'rate_limit';
   }
-  if (category === 'quota' || code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || detailCode === 'QUOTA' || detailCode === 'ACCOUNT_QUOTA' || /\bquota\b/i.test(message)) {
+  if (category === 'quota' || code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || code === 'INSUFFICIENT_QUOTA'
+    || detailCode === 'QUOTA' || detailCode === 'ACCOUNT_QUOTA' || detailCode === 'INSUFFICIENT_QUOTA'
+    || /\b(?:ACCOUNT_QUOTA|INSUFFICIENT_QUOTA)\b/.test(message)) {
     if (allowed.has('quota')) return 'quota';
   }
-  if (category === 'rate_limit' || code === 'RATE_LIMIT' || detailCode === 'RATE_LIMIT' || /\brate[_\s-]?limit/i.test(message)) {
+  if (category === 'rate_limit' || code === 'RATE_LIMIT' || code === 'RATE_LIMIT_EXCEEDED' || code === 'TOO_MANY_REQUESTS'
+    || detailCode === 'RATE_LIMIT' || detailCode === 'RATE_LIMIT_EXCEEDED'
+    || /\b(?:RATE_LIMIT_EXCEEDED|TOO_MANY_REQUESTS)\b/.test(message)) {
     if (allowed.has('rate_limit')) return 'rate_limit';
   }
   if ((status !== undefined && status >= 500 && status <= 599)
     || (code && /^HTTP_5\d\d$/.test(code))
     || (detailCode && /^HTTP_5\d\d$/.test(detailCode))
-    || /\b(?:http[_\s-]*)?5(?:0[0-9]|1[0-1])\b/i.test(message)) {
+    || /\bHTTP[_\s-]+5(?:0[0-9]|1[0-1])\b|\bstatus[:\s=]+5(?:0[0-9]|1[0-1])\b/i.test(message)) {
     if (allowed.has('http_5xx')) return 'http_5xx';
   }
-  if (category === 'timeout' || code === 'TIMEOUT' || code === 'ETIMEDOUT' || code === 'ABORT_ERR' || code === 'HTTP_408' || code === 'HTTP_504'
-    || /\b(?:timed?\s*out|etimedout|timeout|econnreset)\b/i.test(message)) {
+  if (category === 'timeout' || code === 'TIMEOUT' || code === 'ETIMEDOUT' || code === 'ABORT_ERR' || code === 'ECONNRESET' || code === 'HTTP_408' || code === 'HTTP_504'
+    || detailCode === 'TIMEOUT' || detailCode === 'ETIMEDOUT'
+    || /\b(?:ETIMEDOUT|ECONNRESET|ECONNREFUSED|ABORT_ERR|request timed out|socket hang up)\b/i.test(message)) {
     if (allowed.has('timeout')) return 'timeout';
   }
   return undefined;

@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { RemoteAgentGateway } from '../src/a2a/gateway.js';
 import { createA2AServer } from '../src/a2a/server.js';
-import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
+import { A2ADispatchRejectedError, type A2ABackend, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '../src/a2a/types.js';
 import {
   assertCrossModelFamily,
   classifyFallbackTrigger,
@@ -17,19 +17,44 @@ import {
   selectDispatchCandidate,
   verifyRoutingCanaryGate,
 } from '../src/roles/routing.js';
-import { writeCrEvalReport } from '../src/rsi/gate.js';
+import { checkGate, writeCrEvalReport } from '../src/rsi/gate.js';
 import { loadCrEvalManifest, scoreCrEvalSuite, type CrEvalCase, type CrReviewResult } from '../src/rsi/pr-cr-eval.js';
 
 const repoRoot = resolve(import.meta.dirname, '../../..');
 const prDeliveryRoleDir = join(repoRoot, '.1agents/roles/pr-delivery');
 
-class SimpleBackend implements A2ABackend {
-  readonly seenRoutes: { provider?: string; model?: string; prompt: string }[] = [];
-  async prepare(input: A2APrepareInput): Promise<A2ATarget> {
-    return { sessionId: input.sessionId ?? `sess-${Math.random().toString(36).slice(2)}`, cwd: input.cwd!, agentPreset: input.agentPreset };
+class RouteAwareBackend implements A2ABackend {
+  readonly checkedRoutes: { provider?: string; model?: string }[] = [];
+  readonly executedRoutes: { provider?: string; model?: string; prompt: string }[] = [];
+  rejectMode: 'quota_429' | 'http_503' | 'auth_401' | 'none' = 'none';
+  rejectModel = 'grok/grok-4.7@500k';
+
+  async checkRouteAvailability(input: { provider?: string; model?: string }): Promise<void> {
+    this.checkedRoutes.push({ provider: input.provider, model: input.model });
+    if (input.model !== this.rejectModel || this.rejectMode === 'none') return;
+    if (this.rejectMode === 'quota_429') {
+      throw new A2ADispatchRejectedError(429, 'ACCOUNT_QUOTA', 'quota', `HTTP 429 ACCOUNT_QUOTA exhausted on ${input.model}`);
+    }
+    if (this.rejectMode === 'http_503') {
+      throw new A2ADispatchRejectedError(503, 'HTTP_503', 'http_5xx', `HTTP 503 Service Unavailable on ${input.model}`);
+    }
+    if (this.rejectMode === 'auth_401') {
+      throw new A2ADispatchRejectedError(401, 'HTTP_401', 'http_429', 'HTTP 401 Unauthorized');
+    }
   }
+
+  async prepare(input: A2APrepareInput): Promise<A2ATarget> {
+    return {
+      sessionId: input.sessionId ?? `sess-${Math.random().toString(36).slice(2)}`,
+      cwd: input.cwd!,
+      agentPreset: input.agentPreset,
+      provider: input.provider,
+      model: input.model,
+    };
+  }
+
   async run(target: A2ATarget, prompt: string): Promise<A2ARunResult> {
-    this.seenRoutes.push({ provider: target.provider, model: target.model, prompt });
+    this.executedRoutes.push({ provider: target.provider, model: target.model, prompt });
     return { outcome: 'completed', text: `completed on ${target.model ?? 'default'}` };
   }
 }
@@ -58,8 +83,7 @@ function passingResultFor(kase: CrEvalCase): CrReviewResult {
   };
 }
 
-test('routing v2 schema, model family normalization, cross-family hard invariant, and fallback trigger classification', async () => {
-  // Real pr-delivery routing.json loads as v2 with primary + fallbacks[].
+test('routing v2 schema, model family single-source assertion (M3), cross-family invariant, and strict fallback classification (S3)', async () => {
   const raw = JSON.parse(await readFile(join(prDeliveryRoleDir, 'routing.json'), 'utf8')) as unknown;
   const normalized = normalizeRoleRouting(raw);
   assert.equal(normalized.schemaVersion, 2);
@@ -76,6 +100,33 @@ test('routing v2 schema, model family normalization, cross-family hard invariant
   });
   assert.equal(v1.worker.primary.model, 'grok/grok-4.7@500k');
   assert.deepEqual(v1.worker.fallbacks, []);
+
+  // M3: Forged `family` field contradicting `model` MUST fail closed with INVALID_MODEL_FAMILY!
+  assert.throws(
+    () => extractModelFamily({ provider: 'magpie', model: 'anthropic/claude-sonnet-4.5', family: 'grok' }),
+    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'INVALID_MODEL_FAMILY',
+  );
+  assert.throws(
+    () => assertCrossModelFamily(
+      { provider: 'magpie', model: 'anthropic/claude-sonnet-4.5', family: 'grok' },
+      { provider: 'magpie', model: 'anthropic/claude-opus-4.5', family: 'deepseek' },
+    ),
+    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'INVALID_MODEL_FAMILY',
+  );
+  assert.throws(
+    () => normalizeRoleRouting({
+      schemaVersion: 2,
+      worker: {
+        primary: { provider: 'magpie', model: 'anthropic/claude-sonnet-4.5', deliveryMode: 'workspace_git', family: 'grok' },
+        fallbacks: [],
+      },
+      reviewer: {
+        primary: { provider: 'magpie', model: 'anthropic/claude-opus-4.5', deliveryMode: 'none', readOnly: true, family: 'deepseek' },
+        fallbacks: [],
+      },
+    }),
+    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'INVALID_MODEL_FAMILY',
+  );
 
   // Model family extraction defeats provider/group aliases.
   assert.equal(extractModelFamily({ provider: 'magpie', model: 'group/deepseek-v4.1' }), 'deepseek');
@@ -105,22 +156,7 @@ test('routing v2 schema, model family normalization, cross-family hard invariant
   assert.equal(picked.endpoint.model, 'google/gemini-2.5-pro');
   assert.equal(picked.skippedSameFamily.length, 1);
 
-  // If ONLY same-family candidates exist, fail closed with SAME_MODEL_FAMILY.
-  assert.throws(
-    () => selectDispatchCandidate({
-      slot: {
-        primary: { provider: 'magpie', model: 'anthropic/claude-opus-4.5', deliveryMode: 'none', readOnly: true },
-        fallbacks: [],
-        fallbackOn: ['http_429'],
-        maxFallbackDurationMs: 60_000,
-      },
-      attemptedKeys: new Set(),
-      peerActualEndpoint: { provider: 'magpie', model: 'anthropic/claude-sonnet-4.5' },
-    }),
-    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'SAME_MODEL_FAMILY',
-  );
-
-  // Trigger classification: 429 / quota / rate_limit / 5xx / timeout trigger; auth / 401 / 400 / semantic do NOT.
+  // S3: Strict classification — structured/transport errors trigger; semantic text containing "quota" does NOT!
   assert.equal(classifyFallbackTrigger({ status: 429, message: 'Too Many Requests' }), 'http_429');
   assert.equal(classifyFallbackTrigger({ category: 'quota', message: 'quota exhausted' }), 'quota');
   assert.equal(classifyFallbackTrigger({ category: 'rate_limit', message: 'slow down' }), 'rate_limit');
@@ -130,64 +166,34 @@ test('routing v2 schema, model family normalization, cross-family hard invariant
   assert.equal(classifyFallbackTrigger({ status: 401, category: 'auth', message: 'Unauthorized' }), undefined);
   assert.equal(classifyFallbackTrigger({ status: 400, message: 'Bad Request' }), undefined);
   assert.equal(classifyFallbackTrigger(new Error('TypeError: undefined is not a function')), undefined);
+  assert.equal(
+    classifyFallbackTrigger({ message: 'validation failed: analysis quota of statements exceeded' }),
+    undefined,
+    'free-text semantic validation mentioning "quota" must NOT trigger dispatch fallback',
+  );
 });
 
-test('429 injection drill on gateway auto-switches at dispatch boundary in <60s and continues on the exact same jobId', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'routing-v2-429-drill-'));
+test('real createA2AServer 429/quota admission rejection + production routingSlot auto-load + ledger route persistence + peerJobId cross-family + zero-orphan pre-validation (M1/M2/M4/M5)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'routing-v2-e2e-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const remoteStateDir = join(dir, 'remote-a2a');
   const gatewayStateDir = join(dir, 'gateway');
   const workDir = join(dir, 'work');
-  await mkdir(workDir, { recursive: true });
+  // Put real pr-delivery routing.json inside workDir/.1agents/roles/pr-delivery/routing.json!
+  await mkdir(join(workDir, '.1agents', 'roles', 'pr-delivery'), { recursive: true });
+  await cp(join(prDeliveryRoleDir, 'routing.json'), join(workDir, '.1agents', 'roles', 'pr-delivery', 'routing.json'));
 
-  const backend = new SimpleBackend();
+  const backend = new RouteAwareBackend();
   const capacity = testCapacity(dir);
   let a2a: Awaited<ReturnType<typeof createA2AServer>>;
-  const attemptedModels: string[] = [];
-  let injectStatus: number | undefined = 429;
-  const proxyServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.url === '/.well-known/agent-card.json') {
       a2a.cardHandler(req, res);
       return;
     }
-    const chunks: Buffer[] = [];
-    req.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    req.on('end', () => {
-      const bodyBuf = Buffer.concat(chunks);
-      const bodyStr = bodyBuf.toString('utf8');
-      if (req.method === 'POST' && bodyStr) {
-        try {
-          const rpc = JSON.parse(bodyStr) as {
-            method?: string;
-            params?: {
-              metadata?: { '1agents'?: { model?: string } };
-              message?: { metadata?: { '1agents'?: { model?: string } } };
-            };
-          };
-          const model = rpc.params?.metadata?.['1agents']?.model ?? rpc.params?.message?.metadata?.['1agents']?.model;
-          if (model) {
-            attemptedModels.push(model);
-            if (model === 'grok/grok-4.7@500k' && injectStatus) {
-              res.writeHead(injectStatus, { 'Content-Type': 'application/json' });
-              const reason = injectStatus === 429 ? 'rate limit exceeded' : 'Unauthorized';
-              res.end(JSON.stringify({
-                jsonrpc: '2.0',
-                error: { code: -32000, message: `HTTP ${injectStatus} ${reason} on ${model}` },
-              }));
-              return;
-            }
-          }
-        } catch {
-          // non-JSON request
-        }
-      }
-      const forwarded = Object.assign(req, {
-        async *[Symbol.asyncIterator]() { if (bodyBuf.length) yield bodyBuf; },
-      });
-      void a2a.handler(forwarded, res);
-    });
+    void a2a.handler(req, res);
   });
-  const remoteUrl = await listen(proxyServer);
+  const remoteUrl = await listen(server);
   a2a = await createA2AServer({
     backend,
     capacity,
@@ -198,7 +204,7 @@ test('429 injection drill on gateway auto-switches at dispatch boundary in <60s 
   });
   t.after(async () => {
     await a2a.close();
-    await stop(proxyServer);
+    await stop(server);
   });
 
   const gateway = new RemoteAgentGateway({
@@ -209,70 +215,145 @@ test('429 injection drill on gateway auto-switches at dispatch boundary in <60s 
   });
   t.after(() => gateway.close());
 
-  const routing = normalizeRoleRouting(JSON.parse(await readFile(join(prDeliveryRoleDir, 'routing.json'), 'utf8')));
+  // M4: Invalid routingFallback (missing deliveryMode) MUST fail BEFORE ledger.prepare -> 0 orphan jobs!
+  await assert.rejects(
+    gateway.invoke('execution_submit', {
+      originSessionId: 'origin-drill',
+      targetId: 'legacy:drill',
+      input: {
+        cwd: workDir,
+        prompt: 'Bad routing slot',
+        agentPreset: 'standard',
+        routingFallback: {
+          slot: {
+            primary: { provider: 'magpie', model: 'grok/grok-4.7@500k' }, // missing deliveryMode
+            fallbacks: [],
+          },
+        },
+      },
+    }),
+  );
+  const afterInvalid = await gateway.invoke('execution_list', { originSessionId: 'origin-drill' }) as { jobs: unknown[] };
+  assert.equal(afterInvalid.jobs.length, 0, 'invalid routingFallback must NOT leave an orphan/unknown attempt in the ledger');
+
+  // M1 + M5: Production dispatch via `routingRoleId: 'pr-delivery'` + `routingSlot: 'worker'` (NO manual routingFallback!)
+  // Real createA2AServer rejects grok with HTTP 429 ACCOUNT_QUOTA -> auto-switches to openai/gpt-5.2-codex in <60s!
+  backend.rejectMode = 'quota_429';
+  backend.rejectModel = 'grok/grok-4.7@500k';
   const startedAt = Date.now();
-  const submitted = await gateway.invoke('execution_submit', {
+  const workerSubmitted = await gateway.invoke('execution_submit', {
     originSessionId: 'origin-drill',
     targetId: 'legacy:drill',
     input: {
       cwd: workDir,
+      routingRoleId: 'pr-delivery',
+      routingSlot: 'worker',
       prompt: 'Run PR implementation drill',
       agentPreset: 'standard',
-      routingFallback: {
-        slot: routing.worker,
-        peerActualEndpoint: routing.reviewer.primary,
-      },
     },
   }) as {
     jobId: string;
     attemptId: string;
-    executionStatus: string;
-    routing?: { selected: { model: string }; fallbacks: { from: string; to: string; trigger: string; elapsedMs: number }[]; elapsedMs: number };
+    routing?: { selected: { model: string; deliveryMode?: string }; fallbacks: { from: string; to: string; trigger: string; elapsedMs: number }[]; elapsedMs: number };
   };
-  const totalElapsedMs = Date.now() - startedAt;
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(workerSubmitted.jobId);
+  assert.ok(elapsedMs < 60_000, `429 fallback took ${elapsedMs}ms, must be < 60000ms`);
+  assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['grok/grok-4.7@500k', 'openai/gpt-5.2-codex']);
+  assert.equal(workerSubmitted.routing?.selected.model, 'openai/gpt-5.2-codex');
+  assert.equal(workerSubmitted.routing?.selected.deliveryMode, 'workspace_git');
+  assert.equal(workerSubmitted.routing?.fallbacks.length, 1);
+  assert.equal(workerSubmitted.routing?.fallbacks[0]?.trigger, 'http_429');
 
-  assert.ok(submitted.jobId, 'must return a durable jobId');
-  assert.ok(totalElapsedMs < 60_000, `429 fallback took ${totalElapsedMs}ms, must be < 60000ms`);
-  assert.deepEqual(attemptedModels, ['grok/grok-4.7@500k', 'openai/gpt-5.2-codex']);
-  assert.equal(submitted.routing?.selected.model, 'openai/gpt-5.2-codex');
-  assert.equal(submitted.routing?.fallbacks.length, 1);
-  assert.equal(submitted.routing?.fallbacks[0]?.trigger, 'http_429');
-
-  // Wait for completion and verify execution_continue keeps the EXACT SAME jobId!
+  // M2 + S2: execution_get durably returns actual executed route from ledger (NOT primary!)
+  let workerView: { executionStatus: string; routing?: { selected: { model: string } } } | undefined;
   for (let i = 0; i < 40; i += 1) {
-    const view = await gateway.invoke('execution_get', { originSessionId: 'origin-drill', jobId: submitted.jobId }) as { executionStatus: string };
-    if (view.executionStatus === 'completed') break;
+    workerView = await gateway.invoke('execution_get', { originSessionId: 'origin-drill', jobId: workerSubmitted.jobId }) as {
+      executionStatus: string;
+      routing?: { selected: { model: string } };
+    };
+    if (workerView.executionStatus === 'completed') break;
     await new Promise(r => setTimeout(r, 50));
   }
+  assert.equal(workerView?.routing?.selected.model, 'openai/gpt-5.2-codex', 'ledger execution_get must persist actual executed model');
+
+  // Continuation preserves exact same jobId!
   const continued = await gateway.invoke('execution_continue', {
     originSessionId: 'origin-drill',
-    jobId: submitted.jobId,
+    jobId: workerSubmitted.jobId,
     input: { prompt: 'Follow-up turn on same jobId' },
   }) as { jobId: string; attemptId: string };
-  assert.equal(continued.jobId, submitted.jobId, 'continuation must preserve the exact same jobId');
-  assert.notEqual(continued.attemptId, submitted.attemptId);
+  assert.equal(continued.jobId, workerSubmitted.jobId);
+  assert.notEqual(continued.attemptId, workerSubmitted.attemptId);
+
+  // M2: Dispatch reviewer via `routingSlot: 'reviewer'` + `peerJobId: workerSubmitted.jobId`
+  // Gateway reads Worker's actual route (`openai/gpt-5.2-codex`) from ledger; reviewer picks deepseek with deliveryMode='none' + readOnly=true!
+  backend.checkedRoutes.length = 0;
+  backend.rejectMode = 'none';
+  const reviewerSubmitted = await gateway.invoke('execution_submit', {
+    originSessionId: 'origin-drill',
+    targetId: 'legacy:drill',
+    input: {
+      cwd: workDir,
+      routingRoleId: 'pr-delivery',
+      routingSlot: 'reviewer',
+      peerJobId: workerSubmitted.jobId,
+      prompt: 'Run independent read-only CR',
+      agentPreset: 'standard',
+    },
+  }) as {
+    jobId: string;
+    routing?: { selected: { model: string; deliveryMode?: string; readOnly?: boolean } };
+  };
+  assert.equal(reviewerSubmitted.routing?.selected.model, 'group/deepseek-v4.1');
+  assert.equal(reviewerSubmitted.routing?.selected.deliveryMode, 'none');
+  assert.equal(reviewerSubmitted.routing?.selected.readOnly, true);
+
+  // M2 + M4: If a reviewer slot ONLY offers candidates from the SAME model family as the actual worker in ledger,
+  // dispatch MUST fail closed BEFORE ledger.prepare with SAME_MODEL_FAMILY and leave ZERO orphan jobs!
+  const countBeforeSameFamily = (await gateway.invoke('execution_list', { originSessionId: 'origin-drill' }) as { jobs: unknown[] }).jobs.length;
+  await assert.rejects(
+    gateway.invoke('execution_submit', {
+      originSessionId: 'origin-drill',
+      targetId: 'legacy:drill',
+      input: {
+        cwd: workDir,
+        prompt: 'Same-family reviewer must fail closed',
+        agentPreset: 'standard',
+        routingFallback: {
+          slot: {
+            primary: { provider: 'magpie', model: 'openai/gpt-5.2', deliveryMode: 'none', readOnly: true },
+            fallbacks: [],
+          },
+          peerJobId: workerSubmitted.jobId, // actual worker ran openai/gpt-5.2-codex!
+        },
+      },
+    }),
+    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'SAME_MODEL_FAMILY',
+  );
+  const countAfterSameFamily = (await gateway.invoke('execution_list', { originSessionId: 'origin-drill' }) as { jobs: unknown[] }).jobs.length;
+  assert.equal(countAfterSameFamily, countBeforeSameFamily, 'SAME_MODEL_FAMILY failure must leave 0 orphan jobs');
 
   // Non-fallback HTTP 401 auth error must NOT switch to fallback!
-  attemptedModels.length = 0;
-  injectStatus = 401;
+  backend.checkedRoutes.length = 0;
+  backend.rejectMode = 'auth_401';
+  backend.rejectModel = 'grok/grok-4.7@500k';
   const authFailed = await gateway.invoke('execution_submit', {
     originSessionId: 'origin-drill',
     targetId: 'legacy:drill',
     input: {
       cwd: workDir,
+      routingRoleId: 'pr-delivery',
+      routingSlot: 'worker',
       prompt: 'Auth failure must not fallback',
       agentPreset: 'standard',
-      routingFallback: {
-        slot: routing.worker,
-        peerActualEndpoint: routing.reviewer.primary,
-      },
     },
   }) as { error?: string };
   assert.ok(authFailed.error, '401 must fail dispatch');
-  assert.deepEqual(attemptedModels, ['grok/grok-4.7@500k'], '401 auth failure must NOT try fallback candidates');
+  assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['grok/grok-4.7@500k'], '401 auth failure must NOT try fallback candidates');
 });
 
-test('verifyRoutingCanaryGate blocks formal promotion when routing.json changes without fresh golden eval and passes after canary eval', async t => {
+test('verifyRoutingCanaryGate & checkGate enforce routing.json v2 invariants and digest-bound golden eval', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'routing-v2-canary-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const roleCopy = join(dir, 'pr-delivery');
@@ -285,7 +366,7 @@ test('verifyRoutingCanaryGate blocks formal promotion when routing.json changes 
   assert.equal(missing.ok, false);
   assert.ok(missing.reasons.some(r => r.includes('缺少绑定当前 routing.json')));
 
-  // 2. Write fresh golden eval report bound to current routing.json -> canary gate passes!
+  // 2. Write fresh golden eval report bound to current routing.json -> both verifyRoutingCanaryGate and checkGate pass!
   const manifest = await loadCrEvalManifest(roleCopy);
   const results = manifest.cases.map(passingResultFor);
   const score = scoreCrEvalSuite(manifest, results);
@@ -295,13 +376,22 @@ test('verifyRoutingCanaryGate blocks formal promotion when routing.json changes 
   assert.equal(passed.ok, true, passed.reasons.join('; '));
   assert.equal(passed.promotionReady, true);
 
-  // 3. Modifying routing.json invalidates evalDigest/roleDigest -> canary gate blocks until re-run!
+  // 3. Modifying routing.json invalidates evalDigest/roleDigest -> canary gate & checkGate block until re-run!
   const routingFile = join(roleCopy, 'routing.json');
-  const mutated = JSON.parse(await readFile(routingFile, 'utf8')) as { worker: { fallbacks: unknown[] } };
+  const mutated = JSON.parse(await readFile(routingFile, 'utf8')) as { worker: { fallbacks: unknown[] }; canary?: { required?: boolean; minCases?: number } };
   mutated.worker.fallbacks.pop();
   await writeFile(routingFile, JSON.stringify(mutated, null, 2));
 
   const stale = await verifyRoutingCanaryGate({ roleDirectory: roleCopy, workspace, repoRoot });
   assert.equal(stale.ok, false);
   assert.ok(stale.reasons.some(r => r.includes('已过期')));
+
+  // 4. S1: checkGate rejects routing.json with canary.minCases > manifest.cases.length!
+  mutated.canary = { required: true, minCases: 999 };
+  await writeFile(routingFile, JSON.stringify(mutated, null, 2));
+  const refreshedScore = scoreCrEvalSuite(manifest, results);
+  await writeCrEvalReport({ roleDirectory: roleCopy, workspace, results, score: refreshedScore });
+  const gateMinCases = await checkGate({ roleDirectory: roleCopy, workspace, repoRoot });
+  assert.equal(gateMinCases.crEval?.status, 'failed');
+  assert.ok(gateMinCases.reasons.some(r => r.includes('canary 要求至少 999 条黄金样本')));
 });
