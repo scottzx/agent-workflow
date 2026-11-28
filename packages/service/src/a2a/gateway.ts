@@ -731,6 +731,9 @@ export class RemoteAgentGateway {
       });
       const parsedMode = deliveryModeSchema.safeParse(initialPick.endpoint.deliveryMode);
       if (parsedMode.success) preRoutingDeliveryMode = parsedMode.data;
+      if (initialPick.endpoint.readOnly === true && preFields.deliveryMode !== undefined && preFields.deliveryMode !== 'none') {
+        throw new Error(`Read-only routing slot requires deliveryMode "none" (got "${String(preFields.deliveryMode)}")`);
+      }
     }
 
     const development = this.developmentFor(resolved.target, options.jobId);
@@ -932,7 +935,7 @@ export class RemoteAgentGateway {
       }
 
       const routingRecord: AttemptRoutingRecord | undefined = selectedRoute
-        ? { selected: selectedRoute, fallbacks: fallbackEvents, elapsedMs: this.now() - dispatchStartedAt }
+        ? { selected: { ...selectedRoute, deliveryMode: mode }, fallbacks: fallbackEvents, elapsedMs: this.now() - dispatchStartedAt }
         : (provider && model ? { selected: { provider, model, deliveryMode: mode }, fallbacks: [], elapsedMs: this.now() - dispatchStartedAt } : undefined);
 
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,

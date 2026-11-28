@@ -47,6 +47,30 @@ test('model catalog keeps routing groups and drops provider failure text', () =>
   assert.equal(JSON.stringify(catalog).includes('secret upstream'), false);
 });
 
+test('DshA2ABackend.checkRouteAvailability rejects failing or quota-exhausted providers with sanitized HTTP 429/503', async t => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-route-avail-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const f = currentDsh(cwd);
+  f.ctx.sessionController.modelCatalog = async () => ({
+    default: { provider: 'magpie', model: 'group/daily-choice' },
+    groups: [{ id: 'magpie', name: 'Magpie', models: [{ id: 'group/daily-choice', name: 'Daily' }] }],
+    failures: [
+      { id: 'broken', name: 'Broken', message: 'secret upstream detail' },
+      { id: 'grok-upstream', name: 'Grok', status: 429, code: 'ACCOUNT_QUOTA', message: 'secret quota token xyz' },
+    ],
+  });
+  const backend = new DshA2ABackend(f.ctx);
+  await backend.checkRouteAvailability({ provider: 'magpie', model: 'group/daily-choice', agentPreset: 'standard' });
+  await assert.rejects(
+    backend.checkRouteAvailability({ provider: 'broken', model: 'any-model', agentPreset: 'standard' }),
+    error => error.status === 503 && error.code === 'HTTP_503' && !/secret upstream detail/.test(error.message),
+  );
+  await assert.rejects(
+    backend.checkRouteAvailability({ provider: 'grok-upstream', model: 'grok/grok-4.7@500k', agentPreset: 'standard' }),
+    error => error.status === 429 && error.code === 'ACCOUNT_QUOTA' && error.category === 'quota' && !/secret quota token/.test(error.message),
+  );
+});
+
 test('inspectSession reads a stored header without sessionController.inspect and releases the observation', async t => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-current-')));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));

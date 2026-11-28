@@ -6,7 +6,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
-import { A2APreflightError, bindA2AExecution, runA2APreflight, unbindA2AExecution, type A2ABackend, type A2AExecutionRef, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
+import { A2ADispatchRejectedError, A2APreflightError, bindA2AExecution, runA2APreflight, unbindA2AExecution, type A2ABackend, type A2AExecutionRef, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
 import { nativeTurnSafeError } from './native-failure.js';
 import { modelSelectionOf } from './preset-route.js';
@@ -250,6 +250,41 @@ export class DshA2ABackend implements A2ABackend {
   /** Standard routes currently advertised by this host. Does not create a session. */
   async modelCatalog() {
     return projectModelCatalog(await this.ctx.sessionController.modelCatalog());
+  }
+
+  /**
+   * Dispatch-boundary route availability check backed by DSH's live model catalog.
+   * Rejects failing/rate-limited/quota-exhausted providers with sanitized HTTP 429/503 before allocating a Task.
+   */
+  async checkRouteAvailability(input: { provider?: string; model?: string; agentPreset?: string }): Promise<void> {
+    if (!input.provider || !input.model || input.agentPreset?.startsWith('oneagents-acp-')) return;
+    if (typeof this.ctx.sessionController?.modelCatalog !== 'function') return;
+    let raw: unknown;
+    try { raw = await this.ctx.sessionController.modelCatalog(); } catch { return; }
+    if (!raw || typeof raw !== 'object') return;
+    const record = raw as { failures?: unknown; value?: { failures?: unknown } };
+    const rawFailures = Array.isArray(record.failures)
+      ? record.failures
+      : (Array.isArray(record.value?.failures) ? record.value.failures : []);
+    const matched = rawFailures.find((item): item is Record<string, unknown> =>
+      Boolean(item && typeof item === 'object' && (item as { id?: unknown }).id === input.provider));
+    if (!matched) return;
+    const status = typeof matched.status === 'number'
+      ? matched.status
+      : (typeof matched.statusCode === 'number' ? matched.statusCode : undefined);
+    const code = typeof matched.code === 'string' ? matched.code.toUpperCase() : '';
+    const rawMessage = typeof matched.message === 'string' ? matched.message : '';
+    if (status === 429 || code === 'HTTP_429' || code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || code === 'RATE_LIMIT'
+      || /\b(?:429|quota|rate[_\s-]?limit)\b/i.test(rawMessage)) {
+      const isQuota = code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || /\bquota\b/i.test(rawMessage);
+      throw new A2ADispatchRejectedError(
+        429,
+        isQuota ? 'ACCOUNT_QUOTA' : 'HTTP_429',
+        isQuota ? 'quota' : 'http_429',
+        `Provider "${input.provider}" is rate-limited or out of quota in host model catalog`,
+      );
+    }
+    throw new A2ADispatchRejectedError(503, 'HTTP_503', 'http_5xx', `Provider "${input.provider}" is unavailable in host model catalog`);
   }
 
   /** Create a new session or restore an explicitly addressed session without changing its workspace or preset.

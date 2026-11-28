@@ -10,7 +10,6 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { computeRoleDigest } from '../rsi/calibrate.js';
-import { crEvalReportPath } from '../rsi/gate.js';
 import {
   coerceCrEvalResults,
   computeCrEvalDigest,
@@ -186,11 +185,15 @@ export function classifyFallbackTrigger(
 ): FallbackTriggerKind | undefined {
   const allowed = new Set(allowedTriggers);
   const record = failure && typeof failure === 'object' ? (failure as Record<string, unknown>) : undefined;
+  const name = typeof record?.name === 'string'
+    ? record.name
+    : (failure instanceof Error ? failure.name : undefined);
   const status = typeof record?.status === 'number'
     ? record.status
     : (typeof record?.statusCode === 'number' ? record.statusCode : undefined);
   const category = typeof record?.category === 'string' ? record.category.toLowerCase() : undefined;
   const code = typeof record?.code === 'string' ? record.code.toUpperCase() : undefined;
+  const numericCode = typeof record?.code === 'number' ? record.code : undefined;
   const detailCode = typeof record?.detailCode === 'string' ? record.detailCode.toUpperCase() : undefined;
   const message = failure instanceof Error
     ? failure.message
@@ -230,9 +233,10 @@ export function classifyFallbackTrigger(
     || /\bHTTP[_\s-]+5(?:0[0-9]|1[0-1])\b|\bstatus[:\s=]+5(?:0[0-9]|1[0-1])\b/i.test(message)) {
     if (allowed.has('http_5xx')) return 'http_5xx';
   }
-  if (category === 'timeout' || code === 'TIMEOUT' || code === 'ETIMEDOUT' || code === 'ABORT_ERR' || code === 'ECONNRESET' || code === 'HTTP_408' || code === 'HTTP_504'
+  if (category === 'timeout' || name === 'TimeoutError' || name === 'AbortError' || numericCode === 23
+    || code === 'TIMEOUT' || code === 'ETIMEDOUT' || code === 'ABORT_ERR' || code === 'ECONNRESET' || code === 'HTTP_408' || code === 'HTTP_504'
     || detailCode === 'TIMEOUT' || detailCode === 'ETIMEDOUT'
-    || /\b(?:ETIMEDOUT|ECONNRESET|ECONNREFUSED|ABORT_ERR|request timed out|socket hang up)\b/i.test(message)) {
+    || /\b(?:aborted due to timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ABORT_ERR|request timed out|socket hang up)\b/i.test(message)) {
     if (allowed.has('timeout')) return 'timeout';
   }
   return undefined;
@@ -320,7 +324,7 @@ export async function verifyRoutingCanaryGate(options: {
       reasons.push('修改 routing.json 晋升 formal 前须先通过 canary 黄金回放（未提供 canaryResults 或 workspace）');
       return { ok: false, roleId: manifest.roleId, routingDigest, evalDigest, roleDigest, promotionReady: false, reasons };
     }
-    const reportFile = crEvalReportPath(options.workspace, manifest.roleId);
+    const reportFile = path.join(path.resolve(options.workspace), manifest.roleId, 'eval-cr.json');
     try {
       const saved = JSON.parse(await readFile(reportFile, 'utf8')) as {
         evalDigest?: string;

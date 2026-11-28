@@ -26,8 +26,13 @@ const prDeliveryRoleDir = join(repoRoot, '.1agents/roles/pr-delivery');
 class RouteAwareBackend implements A2ABackend {
   readonly checkedRoutes: { provider?: string; model?: string }[] = [];
   readonly executedRoutes: { provider?: string; model?: string; prompt: string }[] = [];
-  rejectMode: 'quota_429' | 'http_503' | 'auth_401' | 'none' = 'none';
+  rejectMode: 'quota_429' | 'http_503' | 'hang_timeout' | 'auth_401' | 'none' = 'none';
   rejectModel = 'grok/grok-4.7@500k';
+  private readonly hangResolvers: (() => void)[] = [];
+
+  releaseHangs(): void {
+    while (this.hangResolvers.length) this.hangResolvers.pop()!();
+  }
 
   async checkRouteAvailability(input: { provider?: string; model?: string }): Promise<void> {
     this.checkedRoutes.push({ provider: input.provider, model: input.model });
@@ -37,6 +42,12 @@ class RouteAwareBackend implements A2ABackend {
     }
     if (this.rejectMode === 'http_503') {
       throw new A2ADispatchRejectedError(503, 'HTTP_503', 'http_5xx', `HTTP 503 Service Unavailable on ${input.model}`);
+    }
+    if (this.rejectMode === 'hang_timeout') {
+      await new Promise<void>(resolve => {
+        this.hangResolvers.push(resolve);
+      });
+      return;
     }
     if (this.rejectMode === 'auth_401') {
       throw new A2ADispatchRejectedError(401, 'HTTP_401', 'http_429', 'HTTP 401 Unauthorized');
@@ -156,13 +167,18 @@ test('routing v2 schema, model family single-source assertion (M3), cross-family
   assert.equal(picked.endpoint.model, 'google/gemini-2.5-pro');
   assert.equal(picked.skippedSameFamily.length, 1);
 
-  // S3: Strict classification — structured/transport errors trigger; semantic text containing "quota" does NOT!
+  // S3 + M1: Strict classification — structured/transport errors & real DOMException TimeoutError trigger; semantic text containing "quota" does NOT!
   assert.equal(classifyFallbackTrigger({ status: 429, message: 'Too Many Requests' }), 'http_429');
   assert.equal(classifyFallbackTrigger({ category: 'quota', message: 'quota exhausted' }), 'quota');
   assert.equal(classifyFallbackTrigger({ category: 'rate_limit', message: 'slow down' }), 'rate_limit');
   assert.equal(classifyFallbackTrigger({ status: 503, message: 'Service Unavailable' }), 'http_5xx');
   assert.equal(classifyFallbackTrigger(new Error('HTTP 504 Gateway Timeout')), 'http_5xx');
   assert.equal(classifyFallbackTrigger({ category: 'timeout', message: 'ETIMEDOUT' }), 'timeout');
+  assert.equal(
+    classifyFallbackTrigger(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
+    'timeout',
+    'real AbortSignal.timeout DOMException TimeoutError must trigger timeout fallback',
+  );
   assert.equal(classifyFallbackTrigger({ status: 401, category: 'auth', message: 'Unauthorized' }), undefined);
   assert.equal(classifyFallbackTrigger({ status: 400, message: 'Bad Request' }), undefined);
   assert.equal(classifyFallbackTrigger(new Error('TypeError: undefined is not a function')), undefined);
@@ -203,6 +219,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
     defaultAgentPreset: 'standard',
   });
   t.after(async () => {
+    backend.releaseHangs();
     await a2a.close();
     await stop(server);
   });
@@ -351,6 +368,50 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   }) as { error?: string };
   assert.ok(authFailed.error, '401 must fail dispatch');
   assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['grok/grok-4.7@500k'], '401 auth failure must NOT try fallback candidates');
+
+  // S1: Conflicting deliveryMode on read-only reviewer slot MUST fail closed before prepare!
+  await assert.rejects(
+    gateway.invoke('execution_submit', {
+      originSessionId: 'origin-drill',
+      targetId: 'legacy:drill',
+      input: {
+        cwd: workDir,
+        routingRoleId: 'pr-delivery',
+        routingSlot: 'reviewer',
+        peerJobId: workerSubmitted.jobId,
+        deliveryMode: 'workspace_git',
+        prompt: 'Conflicting deliveryMode must fail',
+        agentPreset: 'standard',
+      },
+    }),
+    /Read-only routing slot requires deliveryMode "none"/,
+  );
+
+  // M1: Real HTTP transport timeout (AbortSignal.timeout 10s DOMException TimeoutError) MUST switch to fallback within <60s!
+  backend.checkedRoutes.length = 0;
+  backend.rejectMode = 'hang_timeout';
+  backend.rejectModel = 'grok/grok-4.7@500k';
+  const timeoutStart = Date.now();
+  const timeoutSwitched = await gateway.invoke('execution_submit', {
+    originSessionId: 'origin-drill',
+    targetId: 'legacy:drill',
+    input: {
+      cwd: workDir,
+      routingRoleId: 'pr-delivery',
+      routingSlot: 'worker',
+      prompt: 'Real timeout hang must auto-switch to fallback',
+      agentPreset: 'standard',
+    },
+  }) as {
+    jobId: string;
+    routing?: { selected: { model: string }; fallbacks: { trigger: string }[] };
+  };
+  backend.releaseHangs();
+  const timeoutElapsedMs = Date.now() - timeoutStart;
+  assert.ok(timeoutElapsedMs < 60_000, `timeout fallback took ${timeoutElapsedMs}ms`);
+  assert.equal(timeoutSwitched.routing?.selected.model, 'openai/gpt-5.2-codex');
+  assert.equal(timeoutSwitched.routing?.fallbacks.length, 1);
+  assert.equal(timeoutSwitched.routing?.fallbacks[0]?.trigger, 'timeout');
 });
 
 test('verifyRoutingCanaryGate & checkGate enforce routing.json v2 invariants and digest-bound golden eval', async t => {
