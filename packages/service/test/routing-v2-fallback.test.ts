@@ -28,6 +28,8 @@ class RouteAwareBackend implements A2ABackend {
   readonly executedRoutes: { provider?: string; model?: string; prompt: string }[] = [];
   rejectMode: 'quota_429' | 'http_503' | 'hang_timeout' | 'auth_401' | 'none' = 'none';
   rejectModel = 'grok/grok-4.7@500k';
+  /** Throws after Task allocation, from prepare or run, to prove the rejection label cannot leak past admission. */
+  allocationFailure: 'none' | 'prepare' | 'run' = 'none';
   private readonly hangResolvers: (() => void)[] = [];
 
   releaseHangs(): void {
@@ -55,6 +57,7 @@ class RouteAwareBackend implements A2ABackend {
   }
 
   async prepare(input: A2APrepareInput): Promise<A2ATarget> {
+    if (this.allocationFailure === 'prepare') throw postAllocationRejection('prepare');
     return {
       sessionId: input.sessionId ?? `sess-${Math.random().toString(36).slice(2)}`,
       cwd: input.cwd!,
@@ -66,8 +69,13 @@ class RouteAwareBackend implements A2ABackend {
 
   async run(target: A2ATarget, prompt: string): Promise<A2ARunResult> {
     this.executedRoutes.push({ provider: target.provider, model: target.model, prompt });
+    if (this.allocationFailure === 'run') throw postAllocationRejection('run');
     return { outcome: 'completed', text: `completed on ${target.model ?? 'default'}` };
   }
+}
+
+function postAllocationRejection(stage: 'prepare' | 'run'): A2ADispatchRejectedError {
+  return new A2ADispatchRejectedError(429, 'ACCOUNT_QUOTA', 'quota', `HTTP 429 ACCOUNT_QUOTA after Task allocation (${stage})`);
 }
 
 async function listen(server: Server): Promise<string> {
@@ -81,6 +89,37 @@ async function stop(server: Server): Promise<void> {
   const done = new Promise<void>(r => server.close(() => r()));
   server.closeAllConnections();
   await done;
+}
+
+interface ObservedResponse { status?: number; headers: Record<string, string>; body?: string }
+
+/** A real A2A host that records the exact status, headers and body of every response it writes. */
+async function startA2A(backend: RouteAwareBackend, stateDirectory: string): Promise<{
+  url: string; server: Server; observed: ObservedResponse[]; close: () => Promise<void>;
+}> {
+  const observed: ObservedResponse[] = [];
+  let a2a: Awaited<ReturnType<typeof createA2AServer>>;
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const record: ObservedResponse = { headers: {} };
+    observed.push(record);
+    const writeHead = res.writeHead.bind(res);
+    const end = res.end.bind(res);
+    res.writeHead = ((status: number, headers?: Record<string, string>) => {
+      record.status = status;
+      record.headers = headers ?? {};
+      return writeHead(status, headers as never);
+    }) as typeof res.writeHead;
+    res.end = ((chunk?: unknown, ...rest: unknown[]) => {
+      if (typeof chunk === 'string') record.body = chunk;
+      return (end as unknown as (...args: unknown[]) => ServerResponse)(chunk, ...rest);
+    }) as typeof res.end;
+    if (req.url === '/.well-known/agent-card.json') { a2a.cardHandler(req, res); return; }
+    void a2a.handler(req, res);
+  });
+  const url = await listen(server);
+  a2a = await createA2AServer({ backend, capacity: testCapacity(join(stateDirectory, '..')),
+    publicUrl: url, stateDirectory, token: 'remote-secret-token', defaultAgentPreset: 'standard' });
+  return { url, server, observed, close: async () => { await a2a.close(); await stop(server); } };
 }
 
 function passingResultFor(kase: CrEvalCase): CrReviewResult {
@@ -137,6 +176,29 @@ test('routing v2 schema, model family single-source assertion (M3), cross-family
       },
     }),
     (err: unknown) => err instanceof RoutingInvariantError && err.code === 'INVALID_MODEL_FAMILY',
+  );
+
+  // S2: a misspelled deliveryMode must fail closed while normalizing, never silently degrade to "artifacts".
+  assert.throws(
+    () => normalizeRoleRouting({
+      schemaVersion: 2,
+      worker: {
+        primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'readonly' },
+        fallbacks: [],
+      },
+      reviewer: { primary: { provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'none', readOnly: true }, fallbacks: [] },
+    }),
+    /deliveryMode/,
+    'a misspelled deliveryMode must be rejected by the routing schema',
+  );
+  assert.throws(
+    () => normalizeRoleRouting({
+      schemaVersion: 1,
+      worker: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace-git' },
+      reviewer: { provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'none', readOnly: true },
+    }),
+    /deliveryMode/,
+    'routing v1 endpoints must use the same strict deliveryMode enum',
   );
 
   // Model family extraction defeats provider/group aliases.
@@ -486,6 +548,184 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
     ['openai/gpt-5.2-codex'],
     'abandoned timed-out primary request must NEVER execute concurrently with the fallback route',
   );
+});
+
+test('M1/S1/S4: unverifiable reviewer peer, readOnly slot modes and explicit routingSlot on ACP presets fail closed before ledger.prepare', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'routing-v2-guards-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const workDir = join(dir, 'work');
+  await mkdir(join(workDir, '.1agents', 'roles', 'pr-delivery'), { recursive: true });
+  await cp(join(prDeliveryRoleDir, 'routing.json'), join(workDir, '.1agents', 'roles', 'pr-delivery', 'routing.json'));
+  const backend = new RouteAwareBackend();
+  const a2a = await startA2A(backend, join(dir, 'remote-a2a'));
+  t.after(() => a2a.close());
+  const gateway = new RemoteAgentGateway({
+    stateDirectory: join(dir, 'gateway'),
+    remotes: { drill: { url: a2a.url, token: 'remote-secret-token' } },
+    pollIntervalMs: 50,
+    capacityDirectory: testCapacity(dir).directory,
+  });
+  t.after(() => gateway.close());
+  const submit = (input: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    gateway.invoke('execution_submit', { originSessionId: 'origin-guard', targetId: 'legacy:drill', input, ...extra });
+  const jobCount = async () => ((await gateway.invoke('execution_list', { originSessionId: 'origin-guard' }) as { jobs: unknown[] }).jobs).length;
+
+  // M1: an explicit reviewer slot without a peer identity cannot prove the cross-model-family invariant.
+  assert.equal(await jobCount(), 0);
+  await assert.rejects(
+    submit({ cwd: workDir, routingRoleId: 'pr-delivery', routingSlot: 'reviewer', prompt: 'Independent CR without a peer', agentPreset: 'standard' }),
+    /reviewer routing slot requires peerJobId or parentJobRef\.jobId/,
+  );
+  assert.equal(await jobCount(), 0, 'a reviewer slot without peer identity must leave 0 orphan jobs');
+
+  // M1: the same rule holds when the reviewer slot is inferred from `purpose`.
+  await assert.rejects(
+    submit({ cwd: workDir, routingRoleId: 'pr-delivery', prompt: 'Purpose-inferred CR without a peer', agentPreset: 'standard' },
+      { purpose: 'review' }),
+    /reviewer routing slot requires peerJobId or parentJobRef\.jobId/,
+  );
+  assert.equal(await jobCount(), 0, 'a purpose-inferred reviewer slot without peer identity must leave 0 orphan jobs');
+
+  // M1: a parent job that never recorded an actual route cannot stand in for the peer either.
+  const plain = await submit({ cwd: workDir, prompt: 'Plain dispatch without a model route', agentPreset: 'standard' }) as { jobId: string };
+  assert.ok(plain.jobId);
+  const afterPlain = await jobCount();
+  await assert.rejects(
+    submit({ cwd: workDir, routingRoleId: 'pr-delivery', routingSlot: 'reviewer', prompt: 'CR against a routeless parent', agentPreset: 'standard' },
+      { parentJobRef: { sourceId: gateway.ledger.sourceId, jobId: plain.jobId } }),
+    /has no recorded actual model route/,
+  );
+  assert.equal(await jobCount(), afterPlain, 'a parent without a recorded route must leave 0 orphan jobs');
+
+  // M1: an explicit readOnly routingFallback without any peer source is refused before prepare too.
+  await assert.rejects(
+    submit({
+      cwd: workDir, prompt: 'Read-only fallback without a peer route', agentPreset: 'standard',
+      routingFallback: { slot: { primary: { provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'none', readOnly: true }, fallbacks: [] } },
+    }),
+    /routingFallback readOnly endpoints require peerActualEndpoint, peerJobId, or parentJobRef\.jobId/,
+  );
+  assert.equal(await jobCount(), afterPlain, 'an unverifiable read-only fallback must leave 0 orphan jobs');
+
+  // S4: an explicit routingSlot on an ACP preset is a routing decision that cannot be honoured.
+  await assert.rejects(
+    submit({ cwd: workDir, routingRoleId: 'pr-delivery', routingSlot: 'worker', prompt: 'ACP preset cannot route', agentPreset: 'oneagents-acp-grok-build' }),
+    /routingSlot "worker" applies only to standard presets/,
+  );
+  assert.equal(await jobCount(), afterPlain, 'an explicit routingSlot on an ACP preset must leave 0 orphan jobs');
+
+  // S1: readOnly is a property of the whole slot — a read-only *fallback* alone forces deliveryMode "none".
+  await assert.rejects(
+    submit({
+      cwd: workDir, prompt: 'Read-only fallback with a writing delivery mode', agentPreset: 'standard', deliveryMode: 'workspace_git',
+      routingFallback: {
+        slot: {
+          primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' },
+          fallbacks: [{ provider: 'magpie', model: 'google/gemini-2.5-pro', deliveryMode: 'none', readOnly: true }],
+        },
+        peerActualEndpoint: { provider: 'magpie', model: 'openai/gpt-5.2', deliveryMode: 'workspace_git' },
+      },
+    }),
+    /Read-only routing slot requires deliveryMode "none"/,
+  );
+  await assert.rejects(
+    submit({
+      cwd: workDir, prompt: 'Read-only fallback with a writing result contract', agentPreset: 'standard',
+      resultContract: { jobId: 'job-guard-ro', deliveryMode: 'workspace_files' },
+      routingFallback: {
+        slot: {
+          primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' },
+          fallbacks: [{ provider: 'magpie', model: 'google/gemini-2.5-pro', deliveryMode: 'none', readOnly: true }],
+        },
+        peerActualEndpoint: { provider: 'magpie', model: 'openai/gpt-5.2', deliveryMode: 'workspace_git' },
+      },
+    }),
+    /Read-only routing slot requires resultContract\.deliveryMode "none"/,
+  );
+  assert.equal(await jobCount(), afterPlain, 'readOnly deliveryMode conflicts must leave 0 orphan jobs');
+
+  // S1: the accepted fallback's own deliveryMode governs the hop that runs, not the primary's.
+  backend.rejectMode = 'quota_429';
+  backend.rejectModel = 'grok/grok-4.7@500k';
+  const mixed = await submit({
+    cwd: workDir, prompt: 'Mixed delivery-mode slot', agentPreset: 'standard',
+    routingFallback: {
+      slot: {
+        primary: { provider: 'magpie', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' },
+        fallbacks: [{ provider: 'magpie', model: 'openai/gpt-5.2-codex', deliveryMode: 'none' }],
+      },
+    },
+  }) as { jobId: string; routing?: { selected: { model: string; deliveryMode?: string }; fallbacks: { trigger: string }[] } };
+  backend.rejectMode = 'none';
+  assert.equal(mixed.routing?.selected.model, 'openai/gpt-5.2-codex');
+  assert.equal(mixed.routing?.selected.deliveryMode, 'none', 'the ledger must record the accepted hop deliveryMode, not the primary one');
+  assert.equal(mixed.routing?.fallbacks[0]?.trigger, 'http_429');
+  const delivered = backend.executedRoutes.find(route => route.model === 'openai/gpt-5.2-codex');
+  assert.ok(delivered, 'the accepted fallback hop must actually run');
+  assert.equal(
+    delivered!.prompt.includes('[代码交付约定]'), false,
+    'a "none" hop must not receive the primary hop workspace_git delivery contract',
+  );
+  const persisted = await gateway.invoke('execution_get', { originSessionId: 'origin-guard', jobId: mixed.jobId }) as {
+    routing?: { selected: { model: string; deliveryMode?: string } };
+  };
+  assert.equal(persisted.routing?.selected.deliveryMode, 'none', 'execution_get must report the accepted hop deliveryMode');
+});
+
+test('S3: X-1Agents-Dispatch-Rejected and preTaskRejected are reported for admission rejections only', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'routing-v2-pretask-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const backend = new RouteAwareBackend();
+  const a2a = await startA2A(backend, join(dir, 'remote-a2a'));
+  t.after(() => a2a.close());
+  const gateway = new RemoteAgentGateway({
+    stateDirectory: join(dir, 'gateway'),
+    remotes: { drill: { url: a2a.url, token: 'remote-secret-token' } },
+    pollIntervalMs: 50,
+    capacityDirectory: testCapacity(dir).directory,
+  });
+  t.after(() => gateway.close());
+  const workDir = join(dir, 'work');
+  await mkdir(workDir, { recursive: true });
+  const submit = (input: Record<string, unknown>) => gateway.invoke('execution_submit', { originSessionId: 'origin-pretask', targetId: 'legacy:drill', input });
+
+  // A rejection raised after the Task is allocated is an ambiguous dispatch, never a pre-Task rejection.
+  for (const stage of ['prepare', 'run'] as const) {
+    backend.allocationFailure = stage;
+    a2a.observed.length = 0;
+    const submitted = await submit({ cwd: workDir, prompt: `Post-allocation ${stage} rejection`, agentPreset: 'standard' }) as {
+      jobId: string; executionStatus: string; unresolvedAttemptIds?: string[]; error?: string;
+    };
+    backend.allocationFailure = 'none';
+    const leaked = a2a.observed.filter(response => response.headers['X-1Agents-Dispatch-Rejected'] === '1');
+    assert.equal(leaked.length, 0, `a post-allocation ${stage} rejection must not send X-1Agents-Dispatch-Rejected`);
+    assert.equal(
+      a2a.observed.some(response => response.body?.includes('preTaskRejected')), false,
+      `a post-allocation ${stage} rejection must not claim preTaskRejected`,
+    );
+    let view = submitted;
+    for (let i = 0; i < 40 && view.executionStatus !== 'failed' && view.executionStatus !== 'rejected'; i += 1) {
+      await new Promise(r => setTimeout(r, 50));
+      view = await gateway.invoke('execution_get', { originSessionId: 'origin-pretask', jobId: submitted.jobId }) as typeof submitted;
+    }
+    assert.equal(view.executionStatus, 'failed', `the ${stage} rejection happened after the Task existed, so the round must be a committed failure`);
+    assert.equal(view.unresolvedAttemptIds?.length ?? 0, 0, `a ${stage} rejection must not leave an unresolved attempt behind`);
+  }
+
+  // The legitimate admission path still reports the pre-Task contract, so the gateway can prove known_not_submitted.
+  backend.rejectMode = 'quota_429';
+  backend.rejectModel = '*';
+  a2a.observed.length = 0;
+  const admissionRejected = await submit({ cwd: workDir, prompt: 'Admission rejection before any Task', agentPreset: 'standard' }) as {
+    jobId: string; executionStatus: string; unresolvedAttemptIds?: string[]; error?: string;
+  };
+  backend.rejectMode = 'none';
+  const labelled = a2a.observed.filter(response => response.headers['X-1Agents-Dispatch-Rejected'] === '1');
+  assert.ok(labelled.length > 0, 'an admission-stage rejection must still carry X-1Agents-Dispatch-Rejected');
+  assert.equal(labelled.every(response => response.body?.includes('"preTaskRejected":true')), true,
+    'an admission-stage rejection must still claim preTaskRejected');
+  assert.equal(admissionRejected.executionStatus, 'rejected', 'a pre-Task admission rejection is known_not_submitted');
+  assert.equal(admissionRejected.unresolvedAttemptIds?.length ?? 0, 0);
 });
 
 test('verifyRoutingCanaryGate & checkGate enforce routing.json v2 invariants and digest-bound golden eval', async t => {

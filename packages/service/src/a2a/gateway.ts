@@ -682,12 +682,22 @@ export class RemoteAgentGateway {
 
     if (preFields.routingFallback !== undefined) {
       const parsedFallback = routingFallbackSchema.parse(preFields.routingFallback);
-      for (const ep of [parsedFallback.slot.primary, ...parsedFallback.slot.fallbacks]) extractModelFamily(ep);
+      const fallbackCandidates = [parsedFallback.slot.primary, ...parsedFallback.slot.fallbacks];
+      for (const ep of fallbackCandidates) extractModelFamily(ep);
       let peerEndpoint = parsedFallback.peerActualEndpoint;
       if (peerEndpoint) extractModelFamily(peerEndpoint);
-      const peerJobLookupId = parsedFallback.peerJobId ?? preExplicitPeerJobId;
+      // A read-only slot is a reviewer slot: the hard cross-model-family invariant needs the actual
+      // worker route, so the parent job is a legitimate peer source there and nowhere else.
+      const declaresReadOnly = fallbackCandidates.some(candidate => candidate.readOnly === true);
+      const peerJobLookupId = parsedFallback.peerJobId ?? preExplicitPeerJobId
+        ?? (declaresReadOnly ? input.parentJobRef?.jobId : undefined);
       if (!peerEndpoint && peerJobLookupId) {
         peerEndpoint = this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, true);
+      }
+      // Refuse an unverifiable read-only slot BEFORE ledger.prepare (0 orphan jobs) instead of
+      // dispatching it with the invariant silently skipped.
+      if (declaresReadOnly && !peerEndpoint) {
+        throw new Error('routingFallback readOnly endpoints require peerActualEndpoint, peerJobId, or parentJobRef.jobId to verify the cross-model-family invariant');
       }
       preRoutingPolicy = { slot: parsedFallback.slot, ...(peerEndpoint ? { peerActualEndpoint: peerEndpoint } : {}) };
     } else if (preFields.provider === undefined && preFields.model === undefined && resolved.target.binding.provider === undefined && resolved.target.binding.model === undefined) {
@@ -705,6 +715,11 @@ export class RemoteAgentGateway {
           ? path.join(resolved.cwd, '.1agents', 'roles', preRoleId, 'routing.json')
           : undefined;
         const hasRoutingFile = Boolean(routingPath && existsSync(routingPath));
+        // S4: an explicit slot on an ACP preset cannot be honoured; ignoring it would report a
+        // routing decision that never happened. Refuse before ledger.prepare like routingFallback does.
+        if (preExplicitRoutingSlot && isAcpAgentPreset(resolved.agentPreset)) {
+          throw new Error(`routingSlot "${preExplicitRoutingSlot}" applies only to standard presets`);
+        }
         if (preExplicitRoutingSlot && !hasRoutingFile) {
           throw new Error(`routingSlot "${preExplicitRoutingSlot}" requires a valid routingRoleId/roleId and routing.json (${routingPath ?? 'missing roleId/cwd'})`);
         }
@@ -713,8 +728,13 @@ export class RemoteAgentGateway {
           const slot = normalizedRouting[inferredSlot];
           const peerJobLookupId = preExplicitPeerJobId
             ?? (inferredSlot === 'reviewer' ? input.parentJobRef?.jobId : undefined);
+          // M1: a reviewer slot without the actual worker route cannot prove the cross-model-family
+          // invariant. Missing peer identity or a peer without a recorded route must both fail closed.
+          if (inferredSlot === 'reviewer' && !peerJobLookupId) {
+            throw new Error('reviewer routing slot requires peerJobId or parentJobRef.jobId to verify the cross-model-family invariant');
+          }
           const peerEndpoint = peerJobLookupId
-            ? this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, Boolean(preExplicitPeerJobId))
+            ? this.resolvePeerActualEndpoint(input.originSessionId, peerJobLookupId, inferredSlot === 'reviewer' || Boolean(preExplicitPeerJobId))
             : undefined;
           preRoutingPolicy = { slot, ...(peerEndpoint ? { peerActualEndpoint: peerEndpoint } : {}) };
         }
@@ -730,12 +750,15 @@ export class RemoteAgentGateway {
         attemptedKeys: new Set(),
         ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
       });
-      const parsedMode = deliveryModeSchema.safeParse(initialPick.endpoint.deliveryMode);
-      if (parsedMode.success) preRoutingDeliveryMode = parsedMode.data;
+      preRoutingDeliveryMode = initialPick.endpoint.deliveryMode;
       const preContractDeliveryMode = preFields.resultContract && typeof preFields.resultContract === 'object'
         ? (preFields.resultContract as { deliveryMode?: unknown }).deliveryMode
         : undefined;
-      if (initialPick.endpoint.readOnly === true) {
+      // readOnly belongs to the whole slot, not only to the candidate picked first: any read-only
+      // candidate in the fallback chain forces "none", or the hop that runs would write.
+      const declaresReadOnly = [preRoutingPolicy.slot.primary, ...preRoutingPolicy.slot.fallbacks]
+        .some(candidate => candidate.readOnly === true);
+      if (declaresReadOnly) {
         if (preFields.deliveryMode !== undefined && preFields.deliveryMode !== 'none') {
           throw new Error(`Read-only routing slot requires deliveryMode "none" (got "${String(preFields.deliveryMode)}")`);
         }
@@ -796,23 +819,29 @@ export class RemoteAgentGateway {
       const declaredResult = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
       const explicitMode = fields.deliveryMode !== undefined || declaredResult?.deliveryMode !== undefined;
       const mode = requestedDeliveryMode(fields.deliveryMode ?? preRoutingDeliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
-      const includeMode = mode !== 'artifacts' || explicitMode || preRoutingDeliveryMode !== undefined;
-      const contractBase = (): A2AResultContract | undefined => {
-        if (!declaredResult && !includeMode) return undefined;
-        return { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: mode } : {}) };
-      };
       // artifacts and workspace_files get <cwd>/.1agents/jobs/<jobId> unless the caller already named a location.
       // The directory stays inside cwd; .gitignore keeps it out of git status. none and workspace_git do not
       // invent one; an explicit jobDirectory or manifest is kept. The host creates a default directory at preflight.
       const located = resolved.cwd ? resolveDefaultJobDirectory(resolved.cwd, job.jobId) : undefined;
-      const autoLocate = (mode === 'artifacts' || mode === 'workspace_files')
-        && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && Boolean(located);
-      let artifacts = autoLocate && located
-        ? { directory: located, manifest: path.posix.join(located, `manifest-${attempt.attemptId}.json`) } : undefined;
-      let requirements = artifacts ? { ...sandboxed, jobDirectory: artifacts.directory } : sandboxed;
-      let resultContract = artifacts
-        ? { ...(contractBase() ?? { jobId: job.jobId }), artifactManifestPath: artifacts.manifest }
-        : contractBase();
+      // Every hop of a routing slot carries its own delivery mode: the instructions, the result contract, the
+      // manifest path and the recorded `routing.selected.deliveryMode` must describe the candidate that ran.
+      let admittedSpaces: Pick<z.output<typeof a2aPreflightRequirementsSchema>, 'artifactSpace' | 'rolePublication'> = {};
+      let allowJobDirectory = true;
+      const hopContextFor = (hopMode: DeliveryMode, options: { jobDirectory?: boolean } = {}) => {
+        const allowDirectory = options.jobDirectory ?? allowJobDirectory;
+        const wantsDirectory = allowDirectory && (hopMode === 'artifacts' || hopMode === 'workspace_files');
+        const hopArtifacts = wantsDirectory && !declaredResult?.artifactManifestPath && !declaredRequirements?.jobDirectory && located
+          ? { directory: located, manifest: path.posix.join(located, `manifest-${attempt.attemptId}.json`) } : undefined;
+        const includeMode = hopMode !== 'artifacts' || explicitMode || preRoutingPolicy !== undefined;
+        const base: A2AResultContract | undefined = !declaredResult && !includeMode ? undefined
+          : { ...(declaredResult ?? { jobId: job.jobId }), ...(includeMode ? { deliveryMode: hopMode } : {}) };
+        const hopRequirements = sandboxed === undefined && hopArtifacts === undefined && Object.keys(admittedSpaces).length === 0 ? undefined
+          : { ...sandboxed, ...(hopArtifacts ? { jobDirectory: hopArtifacts.directory } : {}), ...admittedSpaces };
+        return { mode: hopMode, artifacts: hopArtifacts, requirements: hopRequirements,
+          resultContract: hopArtifacts ? { ...(base ?? { jobId: job.jobId }), artifactManifestPath: hopArtifacts.manifest } : base };
+      };
+      let dispatchHop = hopContextFor(mode);
+      let { artifacts, requirements, resultContract } = dispatchHop;
       const boundRole = resolved.target.binding.loadRole ? resolved.target.binding.roleId : undefined;
       const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
       try { await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint); }
@@ -820,7 +849,9 @@ export class RemoteAgentGateway {
         // The default directory is best effort: a host that predates it (or lacks preflight) must still run the task,
         // just without artifacts. Whatever the caller declared is checked again below and still fails dispatch.
         if (!artifacts) throw error;
-        artifacts = undefined; requirements = sandboxed; resultContract = contractBase();
+        allowJobDirectory = false;
+        dispatchHop = hopContextFor(mode);
+        ({ artifacts, requirements, resultContract } = dispatchHop);
         await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       }
       const publicationRole = boundRole ?? explicitRole ?? job.roleId;
@@ -830,7 +861,9 @@ export class RemoteAgentGateway {
       if (Object.keys(optional).length && resolved.cwd) {
         try {
           await this.checkDispatch(resolved.remote, resolved.cwd, { ...requirements, ...optional }, resolved.endpoint);
-          requirements = { ...requirements, ...optional };
+          admittedSpaces = optional;
+          dispatchHop = hopContextFor(mode);
+          ({ artifacts, requirements, resultContract } = dispatchHop);
         } catch (error) {
           // A refused shared space must not block the task's own directory, but it must not vanish
           // either: without the admission the agent cannot write there, and the caller would see a
@@ -843,6 +876,27 @@ export class RemoteAgentGateway {
           console.error(`[a2a-gateway] ${which} refused for job ${job.jobId}: ${detail}`);
         }
       }
+      // Admit every possible hop before the first send: a fallback candidate with its own delivery mode
+      // must not be dispatched against a job directory the host never accepted.
+      const hopContexts = new Map<DeliveryMode, typeof dispatchHop>([[mode, dispatchHop]]);
+      if (preRoutingPolicy) {
+        const hopModes = new Set([preRoutingPolicy.slot.primary, ...preRoutingPolicy.slot.fallbacks]
+          .map(candidate => requestedDeliveryMode(fields.deliveryMode ?? candidate.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode)));
+        for (const hopMode of hopModes) {
+          if (hopContexts.has(hopMode)) continue;
+          let candidateHop = hopContextFor(hopMode);
+          if (candidateHop.artifacts && resolved.cwd) {
+            try { await this.checkDispatch(resolved.remote, resolved.cwd, candidateHop.requirements, resolved.endpoint); }
+            catch (error) {
+              // Mirror the primary hop: an explicitly declared location must fail dispatch,
+              // while the invented default directory degrades to "no artifacts" for this hop only.
+              if (declaredResult?.artifactManifestPath || declaredRequirements?.jobDirectory) throw error;
+              candidateHop = hopContextFor(hopMode, { jobDirectory: false });
+            }
+          }
+          hopContexts.set(hopMode, candidateHop);
+        }
+      }
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
       const fresh = this.targets.resolve(input.targetId, input.input);
@@ -853,20 +907,19 @@ export class RemoteAgentGateway {
       catch (error) { if (!(error instanceof TicketError)) throw error; }
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const lifecycle = this.jobLifecycle(fields.lifecycle, options.previous?.lifecycle);
-      const routingPolicy = preRoutingPolicy;
 
-      const sendWithRoute = async (routeProvider: string | undefined, routeModel: string | undefined, messageId: string, readOnly?: boolean) => {
+      const sendWithRoute = async (routeProvider: string | undefined, routeModel: string | undefined, messageId: string, hop: typeof dispatchHop, readOnly?: boolean) => {
         const res = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId, role: 'ROLE_USER',
           ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt)
-            + deliveryInstructions(mode, artifacts?.directory, artifacts?.manifest ?? resultContract?.artifactManifestPath)
+            + deliveryInstructions(hop.mode, hop.artifacts?.directory, hop.artifacts?.manifest ?? hop.resultContract?.artifactManifestPath)
             + spaceInstructions({ originSessionId: input.originSessionId, jobId: job.jobId, attemptId: attempt.attemptId, caseId: job.caseId,
-              artifactSpace: requirements?.artifactSpace, rolePublication: requirements?.rolePublication, deliveryMode: mode, hasTicket })
+              artifactSpace: hop.requirements?.artifactSpace, rolePublication: hop.requirements?.rolePublication, deliveryMode: hop.mode, hasTicket })
             + snapshotInstructions(input.input?.handoffSnapshot)
             + (readOnly ? '\n\n[Routing constraint: read-only review route; do not modify repository files, commit, or push.]' : '') }] },
           metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}),
             ...(resolved.target.binding.agentFile ? { agentFile: resolved.target.binding.agentFile } : {}) } : {}),
             ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
-            ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}),
+            ...(hop.requirements ? { preflight: hop.requirements } : {}), ...(hop.resultContract ? { resultContract: hop.resultContract } : {}),
             ...(routeProvider && routeModel ? { provider: routeProvider, model: routeModel } : {}),
             execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
           configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
@@ -878,12 +931,13 @@ export class RemoteAgentGateway {
       const dispatchStartedAt = this.now();
       let task: Task;
       let selectedRoute: RoutingEndpoint | undefined;
+      let selectedHop: typeof dispatchHop | undefined;
       const fallbackEvents: { from: string; to: string; trigger: FallbackTriggerKind; elapsedMs: number }[] = [];
 
-      if (routingPolicy) {
+      if (preRoutingPolicy) {
         const attemptedKeys = new Set<string>();
-        const maxDurationMs = routingPolicy.slot.maxFallbackDurationMs ?? DEFAULT_MAX_FALLBACK_DURATION_MS;
-        const allowedTriggers = routingPolicy.slot.fallbackOn ?? [...FALLBACK_TRIGGER_KINDS];
+        const maxDurationMs = preRoutingPolicy.slot.maxFallbackDurationMs ?? DEFAULT_MAX_FALLBACK_DURATION_MS;
+        const allowedTriggers = preRoutingPolicy.slot.fallbackOn ?? [...FALLBACK_TRIGGER_KINDS];
         let lastError: unknown;
         let acceptedTask: Task | undefined;
         let sawPreTaskRejection = false;
@@ -891,20 +945,25 @@ export class RemoteAgentGateway {
 
         for (;;) {
           const picked = selectDispatchCandidate({
-            slot: routingPolicy.slot,
+            slot: preRoutingPolicy.slot,
             attemptedKeys,
-            ...(routingPolicy.peerActualEndpoint ? { peerActualEndpoint: routingPolicy.peerActualEndpoint } : {}),
+            ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
           });
           const candidate = picked.endpoint;
+          // The winning candidate's own deliveryMode governs this hop, even when it is a fallback
+          // whose mode differs from the primary's.
+          const candidateMode = requestedDeliveryMode(fields.deliveryMode ?? candidate.deliveryMode, declaredResult?.deliveryMode, options.previous?.deliveryMode);
+          const candidateHop = hopContexts.get(candidateMode) ?? hopContextFor(candidateMode);
           attemptedKeys.add(endpointKey(candidate));
           const msgId = attemptedKeys.size === 1 ? attempt.attemptId : `${attempt.attemptId}-fb${attemptedKeys.size - 1}`;
           try {
-            const candidateTask = await sendWithRoute(candidate.provider, candidate.model, msgId, candidate.readOnly);
+            const candidateTask = await sendWithRoute(candidate.provider, candidate.model, msgId, candidateHop, candidate.readOnly);
             const dispatchFailure = failureOf(candidateTask);
             const trigger = dispatchFailure ? classifyFallbackTrigger(dispatchFailure, allowedTriggers) : undefined;
             if (!trigger) {
               acceptedTask = candidateTask;
               selectedRoute = candidate;
+              selectedHop = candidateHop;
               break;
             }
             hadAmbiguousDispatch = true;
@@ -912,9 +971,9 @@ export class RemoteAgentGateway {
             const elapsedMs = this.now() - dispatchStartedAt;
             if (elapsedMs > maxDurationMs) throw lastError;
             const peek = selectDispatchCandidate({
-              slot: routingPolicy.slot,
+              slot: preRoutingPolicy.slot,
               attemptedKeys,
-              ...(routingPolicy.peerActualEndpoint ? { peerActualEndpoint: routingPolicy.peerActualEndpoint } : {}),
+              ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
             });
             fallbackEvents.push({
               from: `${candidate.provider}/${candidate.model}`,
@@ -935,9 +994,9 @@ export class RemoteAgentGateway {
             const elapsedMs = this.now() - dispatchStartedAt;
             if (elapsedMs > maxDurationMs) throw dispatchError;
             const peek = selectDispatchCandidate({
-              slot: routingPolicy.slot,
+              slot: preRoutingPolicy.slot,
               attemptedKeys,
-              ...(routingPolicy.peerActualEndpoint ? { peerActualEndpoint: routingPolicy.peerActualEndpoint } : {}),
+              ...(preRoutingPolicy.peerActualEndpoint ? { peerActualEndpoint: preRoutingPolicy.peerActualEndpoint } : {}),
             });
             fallbackEvents.push({
               from: `${candidate.provider}/${candidate.model}`,
@@ -951,21 +1010,23 @@ export class RemoteAgentGateway {
         task = acceptedTask;
       } else {
         try {
-          task = await sendWithRoute(provider, model, attempt.attemptId);
+          task = await sendWithRoute(provider, model, attempt.attemptId, dispatchHop);
         } catch (error) {
           if (error instanceof A2ADispatchRejectedError) allRejectedPreTask = true;
           throw error;
         }
       }
 
+      // The recorded delivery mode is the mode the accepted hop actually ran with.
+      const dispatchedMode = selectedHop?.mode ?? dispatchHop.mode;
       const routingRecord: AttemptRoutingRecord | undefined = selectedRoute
-        ? { selected: { ...selectedRoute, deliveryMode: mode }, fallbacks: fallbackEvents, elapsedMs: this.now() - dispatchStartedAt }
-        : (provider && model ? { selected: { provider, model, deliveryMode: mode }, fallbacks: [], elapsedMs: this.now() - dispatchStartedAt } : undefined);
+        ? { selected: { ...selectedRoute, deliveryMode: dispatchedMode }, fallbacks: fallbackEvents, elapsedMs: this.now() - dispatchStartedAt }
+        : (provider && model ? { selected: { provider, model, deliveryMode: dispatchedMode }, fallbacks: [], elapsedMs: this.now() - dispatchStartedAt } : undefined);
 
       this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
         agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
         notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
-        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: mode,
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId, ...(lifecycle ? { lifecycle } : {}), deliveryMode: dispatchedMode,
         ...(routingRecord ? { routing: routingRecord } : {}) });
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
@@ -984,7 +1045,7 @@ export class RemoteAgentGateway {
       return {
         provider: withRoute.routing.selected.provider,
         model: withRoute.routing.selected.model,
-        deliveryMode: withRoute.routing.selected.deliveryMode ?? 'workspace_git',
+        deliveryMode: deliveryModeSchema.safeParse(withRoute.routing.selected.deliveryMode).data ?? 'workspace_git',
         ...(withRoute.routing.selected.readOnly !== undefined ? { readOnly: withRoute.routing.selected.readOnly } : {}),
         ...(withRoute.routing.selected.family ? { family: withRoute.routing.selected.family } : {}),
       };
@@ -998,7 +1059,7 @@ export class RemoteAgentGateway {
       return {
         provider: String(inp.provider),
         model: String(inp.model),
-        deliveryMode: typeof inp.deliveryMode === 'string' ? inp.deliveryMode : 'workspace_git',
+        deliveryMode: deliveryModeSchema.safeParse(inp.deliveryMode).data ?? 'workspace_git',
       };
     }
     if (required) {

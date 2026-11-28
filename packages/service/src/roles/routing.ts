@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
+import { deliveryModeSchema } from '../a2a/job-directory.js';
 import { computeRoleDigest, crEvalReportPath } from '../rsi/calibrate.js';
 import {
   coerceCrEvalResults,
@@ -29,7 +30,9 @@ export const DEFAULT_MAX_FALLBACK_DURATION_MS = 60_000;
 export const routingEndpointSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1),
-  deliveryMode: z.string().min(1),
+  // A real DeliveryMode, not any non-empty string: a typo such as "readonly" must fail closed
+  // while routing.json is normalized instead of silently degrading to "artifacts" at dispatch.
+  deliveryMode: deliveryModeSchema,
   readOnly: z.boolean().optional(),
   family: z.string().min(1).optional(),
 }).strict();

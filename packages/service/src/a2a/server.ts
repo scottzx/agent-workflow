@@ -365,6 +365,9 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
     }
     res.setHeader('A2A-Version', '1.0');
     let id: string | number | null = null;
+    // Only a rejection raised while admitting the request — before transport.handle allocates a Task —
+    // may be reported as a pre-Task rejection. Everything after that point is an ambiguous dispatch.
+    let inPreTaskAdmission = false;
     try {
       const version = req.headers['a2a-version'];
       validateVersion(typeof version === 'string' ? version : '0.3', card, 'JSONRPC');
@@ -410,6 +413,7 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
           if (rpcMethod === 'message/send' || rpcMethod === 'SendMessage' || rpcMethod === 'message/stream' || rpcMethod === 'SendStreamingMessage') {
             const params = decoded.params as Record<string, unknown> | undefined;
             const meta = (params?.metadata as Record<string, unknown> | undefined)?.['1agents'] as Record<string, unknown> | undefined;
+            inPreTaskAdmission = true;
             await options.backend.checkRouteAvailability({
               ...(typeof meta?.provider === 'string' ? { provider: meta.provider } : {}),
               ...(typeof meta?.model === 'string' ? { model: meta.model } : {}),
@@ -417,6 +421,8 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
               ...(typeof meta?.cwd === 'string' ? { cwd: meta.cwd } : {}),
               signal: admissionAbort.signal,
             });
+            // Admission is over: no later error may wear the pre-Task label.
+            inPreTaskAdmission = false;
           }
         }
         if (isClientGone()) {
@@ -452,7 +458,7 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
       }
     } catch (error) {
       if (stopped || res.destroyed || res.writableEnded || Boolean(req.socket?.destroyed)) return;
-      if (error instanceof A2ADispatchRejectedError && !res.headersSent) {
+      if (inPreTaskAdmission && error instanceof A2ADispatchRejectedError && !res.headersSent) {
         res.writeHead(error.status, {
           'Content-Type': 'application/json',
           'Cache-Control': 'no-store',
