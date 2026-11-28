@@ -14,6 +14,8 @@ import {
   formatCrEvalLintText,
   lintCrEvalManifest,
   loadCrEvalManifest,
+  loadCrHumanCalibrationFile,
+  loadRoleHumanCalibration,
   scoreCrEvalSuite,
   verifyCrEvalCommits,
 } from '../src/rsi/pr-cr-eval.js';
@@ -255,12 +257,14 @@ async function runLookup(argv: string[]): Promise<void> {
 async function runEvalCr(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' },
+    'human-calibration': { type: 'string' },
     workspace: { type: 'string' },
     lint: { type: 'boolean', default: false },
     json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
   if (values.lint && values.results) throw new Error('--lint cannot be combined with --results');
+  if (values.lint && values['human-calibration']) throw new Error('--lint cannot be combined with --human-calibration');
   const roleDirectory = resolve(values.role);
   const manifest = await loadCrEvalManifest(roleDirectory);
   const evalDigest = await computeCrEvalDigest(roleDirectory);
@@ -277,6 +281,7 @@ async function runEvalCr(argv: string[]): Promise<void> {
   const negativeCases = manifest.cases.filter(item => item.kind === 'negative').length;
   const positiveCases = manifest.cases.filter(item => item.kind === 'positive').length;
   if (!values.results) {
+    if (values['human-calibration']) throw new Error('--human-calibration requires --results');
     const report = {
       mode: 'verify-only' as const, roleId: manifest.roleId, evalDigest, repoRoot,
       ok: verification.ok, checkedCommits: verification.checkedCommits, errors: verification.errors,
@@ -308,7 +313,13 @@ async function runEvalCr(argv: string[]): Promise<void> {
   try { raw = JSON.parse(text.replace(/^\uFEFF/, '')); }
   catch { throw new Error(`results file is not valid JSON: ${values.results}`); }
   const normalizedResults = coerceCrEvalResults(raw);
-  const score = scoreCrEvalSuite(manifest, normalizedResults);
+  const humanCalibration = values['human-calibration']
+    ? await loadCrHumanCalibrationFile(resolve(values['human-calibration']), manifest.roleId)
+    : await loadRoleHumanCalibration(roleDirectory, manifest.roleId);
+  const score = scoreCrEvalSuite(manifest, normalizedResults, {
+    ...(humanCalibration ? { humanCalibration } : {}),
+    requireHumanCalibration: true,
+  });
   const evalWorkspace = values.workspace ? resolve(values.workspace) : resolve(repoRoot, '.1agents', 'runtime', 'rsi');
   const written = await writeCrEvalReport({
     roleDirectory,
