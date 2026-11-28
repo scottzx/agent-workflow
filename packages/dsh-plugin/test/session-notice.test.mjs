@@ -131,17 +131,43 @@ test('deliver endpoint steers ContextFormed notice, deduplicates retries, suppor
   assert.equal(resCrossOrigin.status, 403);
 });
 
-function noticeContext(t) {
+/** Mirrors DSH: queued messages and their content blocks are deep-frozen, so mutation throws. */
+function freezeMessage(message) {
+  const content = Array.isArray(message.content)
+    ? Object.freeze(message.content.map(block => Object.freeze({ ...block })))
+    : message.content;
+  return Object.freeze({
+    ...message,
+    ...(content === undefined ? {} : { content }),
+    ...(message.source && typeof message.source === 'object' ? { source: Object.freeze({ ...message.source }) } : {}),
+  });
+}
+
+function noticeContext(t, options = {}) {
   const steered = [];
   const followed = [];
   const events = [];
-  const state = { flushed: 0 };
+  const state = { flushed: 0, replaced: [] };
+  const replaceMode = options.replace ?? 'accept';
   const agent = {
     id: 'session-origin',
-    inbox: { nextTurn: [], nextStep: [] },
+    inbox: {
+      nextTurn: [],
+      nextStep: [],
+      ...(replaceMode === 'missing' ? {} : {
+        replace(messageId, next) {
+          if (replaceMode === 'reject') return false;
+          const index = agent.inbox.nextTurn.findIndex(item => item.id === messageId);
+          if (index < 0) return false;
+          agent.inbox.nextTurn[index] = freezeMessage(next);
+          state.replaced.push({ messageId, next });
+          return true;
+        },
+      }),
+    },
     session: { snapshotEvents: () => events },
-    steer(msg) { steered.push(msg); agent.inbox.nextStep.push(msg); },
-    followup(msg) { followed.push(msg); agent.inbox.nextTurn.push(msg); },
+    steer(msg) { steered.push(msg); agent.inbox.nextStep.push(freezeMessage(msg)); },
+    followup(msg) { followed.push(msg); agent.inbox.nextTurn.push(freezeMessage(msg)); },
   };
   const ctx = {
     sessionController: { async resolveAgent(id) { return id === 'session-origin' ? { agent } : { error: { code: 'session/not-found', message: 'missing' } }; } },
@@ -176,6 +202,9 @@ test('queue deliveries merge into the pending 1agents-acp inbox tail instead of 
   assert.equal(followed.length, 1, 'the first queue message still uses agent.followup');
   assert.equal(state.flushed, 1);
   assert.equal(agent.inbox.nextTurn.length, 1);
+  const original = agent.inbox.nextTurn[0];
+  assert.ok(Object.isFrozen(original) && Object.isFrozen(original.content), 'the host queue is deep-frozen');
+  const originalText = textOf(original);
 
   const second = deliveryEnvelope('queue-req-2', {
     mode: 'queue', form: 'notice', text: '第二条队列通知', summary: '任务二完成', fromSessionId: 'sender-b',
@@ -186,6 +215,10 @@ test('queue deliveries merge into the pending 1agents-acp inbox tail instead of 
   assert.equal(agent.inbox.nextTurn.length, 1);
 
   const merged = agent.inbox.nextTurn[0];
+  assert.notEqual(merged, original, 'the host message is replaced through inbox.replace, never mutated');
+  assert.equal(state.replaced.length, 1, 'exactly one host replace call performed the merge');
+  assert.equal(state.replaced[0].messageId, 'queue-req-1');
+  assert.equal(textOf(original), originalText, 'the original frozen message is untouched');
   assert.equal(merged.id, 'queue-req-1');
   const mergedText = textOf(merged);
   assert.match(mergedText, /^\[队列合并 · 共 2 条消息\]/);
@@ -245,4 +278,55 @@ test('an invalid fromSessionId is rejected before the delivery reaches the agent
   assert.equal(followed.length, 0);
   assert.equal(steered.length, 0);
   assert.equal(agent.inbox.nextTurn.length, 0);
+});
+
+test('a rejected inbox.replace falls back to agent.followup instead of losing the queued message', async t => {
+  const { agent, followed, state, ctx } = noticeContext(t, { replace: 'reject' });
+  const base = await startServer(t, ctx);
+  const post = body => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  assert.equal((await post(deliveryEnvelope('reject-req-1', { mode: 'queue', form: 'relay', text: '第一条' }))).status, 200);
+  const first = agent.inbox.nextTurn[0];
+  assert.equal((await post(deliveryEnvelope('reject-req-2', { mode: 'queue', form: 'relay', text: '第二条' }))).status, 200);
+  assert.equal(state.replaced.length, 0, 'a refused swap must not report a merge');
+  assert.equal(followed.length, 2, 'the new message is queued as its own turn');
+  assert.equal(agent.inbox.nextTurn.length, 2);
+  assert.equal(textOf(agent.inbox.nextTurn[0]), '第一条');
+  assert.equal(agent.inbox.nextTurn[0], first, 'the consumed or rejected tail is left untouched');
+  assert.equal(agent.inbox.nextTurn[1].id, 'reject-req-2');
+});
+
+test('an inbox without replace keeps the old followup path', async t => {
+  const { agent, followed, ctx } = noticeContext(t, { replace: 'missing' });
+  assert.equal(typeof agent.inbox.replace, 'undefined');
+  const base = await startServer(t, ctx);
+  const post = body => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  await post(deliveryEnvelope('old-req-1', { mode: 'queue', form: 'relay', text: '第一条' }));
+  await post(deliveryEnvelope('old-req-2', { mode: 'queue', form: 'relay', text: '第二条' }));
+  assert.equal(followed.length, 2);
+  assert.equal(agent.inbox.nextTurn.length, 2);
+});
+
+test('a merge that would exceed MAX_TEXT_BYTES is refused: the tail stays intact and the new message is queued separately', async t => {
+  const { agent, followed, state, ctx } = noticeContext(t);
+  const base = await startServer(t, ctx);
+  const post = body => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const big = 'a'.repeat(200 * 1024);
+  assert.equal((await post(deliveryEnvelope('big-req-1', { mode: 'queue', form: 'notice', text: big, summary: '大消息 1' }))).status, 200);
+  const tail = agent.inbox.nextTurn[0];
+  const tailText = textOf(tail);
+  assert.equal(tailText.length, big.length);
+  assert.equal((await post(deliveryEnvelope('big-req-2', { mode: 'queue', form: 'notice', text: big, summary: '大消息 2' }))).status, 200);
+  assert.equal(state.replaced.length, 0, 'an over-limit merge must not reach inbox.replace');
+  assert.equal(followed.length, 2, 'the over-limit message becomes its own queued turn');
+  assert.equal(agent.inbox.nextTurn.length, 2);
+  assert.equal(agent.inbox.nextTurn[0], tail, 'the pending tail is unchanged');
+  assert.equal(textOf(agent.inbox.nextTurn[0]), tailText);
+  assert.equal(agent.inbox.nextTurn[1].id, 'big-req-2');
+  assert.equal(textOf(agent.inbox.nextTurn[1]).length, big.length);
 });

@@ -14,7 +14,7 @@ import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createA2AApprovalMcpHandler } from '../src/a2a/approval-mcp.js';
 import { RemoteAgentGateway, type A2AGatewayConfig } from '../src/a2a/gateway.js';
-import { SessionDelivery } from '../src/a2a/session-delivery.js';
+import { formatMergedBatchText, MAX_BATCH_BYTES, SessionDelivery } from '../src/a2a/session-delivery.js';
 import { sessionHostSchema } from '../src/a2a/session-hosts.js';
 
 interface HostCall {
@@ -180,11 +180,48 @@ test('an unknown queue head blocks later messages and is never merged with them'
   assert.equal(sessions.get({ originSessionId: origin, messageId: 'later-2' }).hostReceiptId, merged.rpcId);
 });
 
+test('merge budget is the exact formatted UTF-8 size, so long attribution fields cannot slip an over-limit batch through', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'session-coalesce-budget-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const host = await recordingHost(t);
+  const sessions = new SessionDelivery(root, { dsh: sessionHostSchema.parse({ kind: 'dsh', url: host.url }) });
+  t.after(() => sessions.close());
+  const origin = 'owner-origin';
+  sessions.bind({ originSessionId: origin, host: 'dsh', sessionId: 'owner-session' });
+  // Sender/message IDs at their legal maximum make framing hundreds of bytes per segment.
+  const from = 's'.repeat(512);
+  const messageIds = Array.from({ length: 4 }, (_, index) => `${'m'.repeat(510)}${index}`);
+  const text = 'a'.repeat(50_800);
+  for (const messageId of messageIds) sessions.enqueue({ originSessionId: origin, messageId, fromSessionId: from, text });
+  const createdAt = new Date().toISOString();
+  const entries = messageIds.map(messageId => ({ messageId, fromSessionId: from, createdAt, text }));
+  // The removed fixed 320-byte-per-message estimate would have allowed one merged body…
+  assert.ok(Buffer.byteLength(text, 'utf8') * entries.length + 320 * entries.length <= MAX_BATCH_BYTES, 'the old estimate stays under the cap');
+  // …while the real formatted body is over it, so the batch must stop before the last message.
+  assert.ok(Buffer.byteLength(formatMergedBatchText(entries), 'utf8') > MAX_BATCH_BYTES, 'the real formatted body exceeds the cap');
+  for (let index = 0; index < 3; index++) await sessions.reconcile();
+  assert.equal(host.calls.length, 2, 'the over-limit body is split across two admissions');
+  for (const call of host.calls) {
+    assert.ok(Buffer.byteLength(call.text, 'utf8') <= MAX_BATCH_BYTES, 'no admission may exceed the merge budget');
+    assert.doesNotMatch(call.text, /共 4 条消息/);
+  }
+  assert.match(host.calls[0]!.text, /^\[队列合并 · 共 3 条消息\]/);
+  assert.equal(host.calls[1]!.text, text);
+  const delivered = host.calls.map(call => call.rpcId);
+  for (const messageId of messageIds) {
+    const receipt = sessions.get({ originSessionId: origin, messageId });
+    assert.equal(receipt.status, 'accepted');
+    assert.equal(receipt.attempts, 1);
+    assert.ok(delivered.includes(receipt.hostReceiptId!), 'every message is delivered once');
+  }
+});
+
 function gatewayConfig(root: string): A2AGatewayConfig {
   return {
     stateDirectory: root, port: 0, remotes: {}, pollIntervalMs: 60_000,
     sessionHosts: {
       'dsh-local': { kind: 'dsh', url: 'http://127.0.0.1:9', timeoutMs: 500 },
+      'dsh-alt': { kind: 'dsh', url: 'http://127.0.0.1:9', timeoutMs: 500 },
       codex: { kind: 'codex', executable: 'codex', timeoutMs: 500 },
     },
   };
@@ -197,6 +234,11 @@ test('session_message_send queues on the owner FIFO when bound, on its own targe
   t.after(() => gateway.close());
   await gateway.invoke('session_bind', { originSessionId: 'owner-origin', host: 'dsh-local', sessionId: 'owner-session' });
 
+  const totalOwned = () => gateway.sessions.summary().deliveries.total;
+  const total = (): number => {
+    const summary = gateway.sessions.summary();
+    return summary.deliveries.total + summary.subscriberDeliveries.total;
+  };
   const owned = await gateway.invoke('session_message_send', {
     fromSessionId: 'sender-a', toSessionId: 'owner-session', text: 'owner bound message', summary: '来自 sender-a',
   }) as any;
@@ -225,10 +267,24 @@ test('session_message_send queues on the owner FIFO when bound, on its own targe
   assert.match(storedTargeted!.text, /msg_from_session_id: sender-b/);
   assert.deepEqual(storedTargeted!.notice, { form: 'notice', summary: '来自 sender-b 的留言' });
 
-  const total = () => {
-    const summary = gateway.sessions.summary();
-    return summary.deliveries.total + summary.subscriberDeliveries.total;
-  };
+  const beforeAmbiguity = totalOwned();
+  const beforeAmbiguous = total();
+  await gateway.invoke('session_bind', { originSessionId: 'shared-a', host: 'dsh-local', sessionId: 'shared-session' });
+  await gateway.invoke('session_bind', { originSessionId: 'shared-b', host: 'dsh-alt', sessionId: 'shared-session' });
+  await assert.rejects(
+    gateway.invoke('session_message_send', { fromSessionId: 'sender-c', toSessionId: 'shared-session', text: 'ambiguous target' }),
+    /multiple session hosts/,
+    'an ambiguous target must fail closed instead of silently picking dsh-local',
+  );
+  assert.equal(total(), beforeAmbiguous, 'the ambiguous-host rejection leaves zero dirty records');
+  const explicitHost = await gateway.invoke('session_message_send', {
+    fromSessionId: 'sender-c', toSessionId: 'shared-session', toHost: 'dsh-alt', text: 'explicit host',
+  }) as any;
+  assert.equal(explicitHost.queuedOn, 'owner');
+  assert.equal(explicitHost.toHost, 'dsh-alt');
+  assert.equal(gateway.sessions.hasDelivery('shared-b', explicitHost.messageId), true);
+  assert.equal(totalOwned(), beforeAmbiguity + 1);
+
   const before = total();
   const rejections: Array<[string, Error | RegExp]> = [
     ['unknown host', /Unknown session host/],
@@ -236,6 +292,7 @@ test('session_message_send queues on the owner FIFO when bound, on its own targe
     ['reserved a2a notice namespace', /reserved/],
     ['reserved execution notice namespace', /reserved/],
     ['reserved process request namespace', /reserved/],
+    ['reserved subscriber notice namespace', /reserved/],
     ['blank text', /./],
     ['blank sender', /./],
   ];
@@ -245,6 +302,7 @@ test('session_message_send queues on the owner FIFO when bound, on its own targe
     { fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'a2a-notice:forged', text: 'x' },
     { fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'execution-notice:forged', text: 'x' },
     { fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'process-request:forged', text: 'x' },
+    { fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'sub-notice:forged', text: 'x' },
     { fromSessionId: 'sender-a', toSessionId: 'owner-session', text: '   ' },
     { fromSessionId: '   ', toSessionId: 'owner-session', text: 'x' },
   ];
@@ -361,9 +419,11 @@ test('acp-service session send delivers with an explicit or environment sender a
   assert.match(anonymous.stderr, /发件方/);
   assert.equal(requests.length, 2);
 
-  const reserved = await runSessionCli(['send', '--to', 'target-session', '--from', 'cli-sender', '--url', url,
-    '--message-id', 'a2a-notice:forged', 'x'], baseEnv);
-  assert.equal(reserved.code, 1);
-  assert.match(reserved.stderr, /保留前缀/);
+  for (const reservedId of ['a2a-notice:forged', 'sub-notice:forged']) {
+    const reserved = await runSessionCli(['send', '--to', 'target-session', '--from', 'cli-sender', '--url', url,
+      '--message-id', reservedId, 'x'], baseEnv);
+    assert.equal(reserved.code, 1);
+    assert.match(reserved.stderr, /保留前缀/);
+  }
   assert.equal(requests.length, 2);
 });

@@ -14,7 +14,14 @@ declare module '@deepseek-ai/cordis' {
 declare module '@deepseek-ai/dsh-llm' {
   export type ContentBlock = any;
   export type MessageId = string;
-  export interface UserMessage { id?: MessageId; role: string; source?: any; content?: any; [key: string]: any }
+  /**
+   * Host-owned messages are immutable: DSH declares `content`/`source` readonly and deep-freezes
+   * them at runtime. Queued notices must be swapped through `AgentInbox.replace`, never mutated.
+   */
+  export interface UserMessage {
+    readonly id?: MessageId; readonly role: string; readonly source?: unknown; readonly content?: readonly unknown[];
+    [key: string]: unknown;
+  }
   export type LlmAdapter = any;
   export interface GenerateOptions { messages: UserMessage[]; [key: string]: any }
   export type StreamChunk = any;
@@ -27,7 +34,21 @@ declare module '@deepseek-ai/dsh-session' {
   export type TurnEndReason = any;
 }
 declare module '@deepseek-ai/dsh-api-session-controller' { export type SessionRequestId = string; }
-declare module '@deepseek-ai/dsh-agent' { export type Agent = any; }
+declare module '@deepseek-ai/dsh-agent' {
+  import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
+  /** Pending-input queues. `replace` atomically swaps one not-yet-consumed message by ID. */
+  export interface AgentInbox {
+    readonly nextTurn?: readonly UserMessage[];
+    readonly nextStep?: readonly UserMessage[];
+    replace?(messageId: MessageId, next: UserMessage): boolean;
+  }
+  /** The host-owned part of an agent that queued notices touch. */
+  export interface AgentHost {
+    readonly id?: string;
+    readonly inbox?: AgentInbox;
+  }
+  export type Agent = any;
+}
 declare module '@deepseek-ai/dsh-tools' { export const defineTool: (...args: any[]) => any; }
 declare module '@deepseek-ai/dsh-storage' { const Storage: any; export default Storage; }
 declare module '@deepseek-ai/dsh-storage-json' { const value: any; export = value; }

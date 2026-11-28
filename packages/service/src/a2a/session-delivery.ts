@@ -8,10 +8,40 @@ import { deliverSessionMessage, SessionDeliveryError, sessionNoticeSchema, type 
 const id = z.string().trim().min(1).max(512);
 const deliveryModeSchema = z.enum(['queue', 'steer']);
 /** One host admission can carry several queued messages; stay well below the 256 KiB host body limit. */
-const MAX_BATCH_BYTES = 200 * 1024;
-/** Per-message attribution/framing overhead in a merged body. */
-const MERGE_SEGMENT_OVERHEAD_BYTES = 320;
+export const MAX_BATCH_BYTES = 200 * 1024;
 const MERGE_SUMMARY_MAX_CHARS = 240;
+/** Everything a merged segment shows about one queued message. */
+export interface MergeBatchEntry {
+  messageId: string;
+  fromSessionId?: string;
+  notice?: SessionNoticeMeta;
+  createdAt: string;
+  text: string;
+}
+/**
+ * Frame a queue batch as numbered Chinese segments. The real UTF-8 size of this output is the only
+ * merge budget check: attribution fields (`msg_from_session_id`, message IDs) can be hundreds of
+ * bytes each, so an estimate would let an over-limit body through.
+ */
+export function formatMergedBatchText(batch: readonly MergeBatchEntry[]): string {
+  const segments = batch.map((entry, index) => {
+    const source = entry.fromSessionId
+      ? `msg_from_session_id: ${entry.fromSessionId}${entry.notice ? `（系统通知: ${entry.messageId}）` : ''}`
+      : entry.notice ? `系统通知: ${entry.messageId}` : `系统消息: ${entry.messageId}`;
+    return [`[第 ${index + 1}/${batch.length} 条]`, `来源: ${source}`, `时间: ${entry.createdAt}`, '', entry.text].join('\n');
+  });
+  return [
+    `[队列合并 · 共 ${batch.length} 条消息]`,
+    '以下待发消息在同一会话队列中合并为一次投递，请按顺序逐条处理。',
+    '',
+    ...segments,
+  ].join('\n\n');
+}
+/** Message ID namespaces owned by durable task notifications; callers must never queue into them. */
+export const RESERVED_MESSAGE_ID_PREFIXES = ['a2a-notice:', 'execution-notice:', 'process-request:', 'sub-notice:'] as const;
+export function isReservedMessageId(messageId: string): boolean {
+  return RESERVED_MESSAGE_ID_PREFIXES.some(prefix => messageId.startsWith(prefix));
+}
 export const sessionOriginSchema = z.object({ originSessionId: id }).strict();
 export const sessionBindSchema = sessionOriginSchema.extend({ host: id, sessionId: id }).strict();
 export const sessionMessageSchema = sessionOriginSchema.extend({ messageId: id }).strict();
@@ -431,7 +461,6 @@ export class SessionDelivery {
     if (start < 0) return [head];
     const now = Date.now();
     const batch: (Delivery | TargetDelivery)[] = [];
-    let bytes = 0;
     for (let index = start; index < fifo.length; index++) {
       const entry = fifo[index]!;
       // Acknowledged before dispatch: it will never be delivered, so it cannot be a merge partner either.
@@ -439,27 +468,11 @@ export class SessionDelivery {
       if (entry.mode === 'steer') break;
       if (!this.due(entry, now)) break;
       if (entry.host !== head.host || entry.sessionId !== head.sessionId || entry.hostFingerprint !== head.hostFingerprint) break;
-      const size = Buffer.byteLength(entry.text, 'utf8') + MERGE_SEGMENT_OVERHEAD_BYTES;
-      if (batch.length && bytes + size > MAX_BATCH_BYTES) break;
-      batch.push(entry); bytes += size;
+      // The exact formatted UTF-8 size is the budget: framing includes sender and message IDs.
+      if (batch.length && Buffer.byteLength(formatMergedBatchText([...batch, entry]), 'utf8') > MAX_BATCH_BYTES) break;
+      batch.push(entry);
     }
     return batch.length ? batch : [head];
-  }
-  /** One message keeps its exact body; a batch is framed as numbered Chinese segments with its sender. */
-  private batchText(batch: readonly (Delivery | TargetDelivery)[]): string {
-    if (batch.length === 1) return batch[0]!.text;
-    const segments = batch.map((entry, index) => {
-      const source = entry.fromSessionId
-        ? `msg_from_session_id: ${entry.fromSessionId}${entry.notice ? `（系统通知: ${entry.messageId}）` : ''}`
-        : entry.notice ? `系统通知: ${entry.messageId}` : `系统消息: ${entry.messageId}`;
-      return [`[第 ${index + 1}/${batch.length} 条]`, `来源: ${source}`, `时间: ${entry.createdAt}`, '', entry.text].join('\n');
-    });
-    return [
-      `[队列合并 · 共 ${batch.length} 条消息]`,
-      '以下待发消息在同一会话队列中合并为一次投递，请按顺序逐条处理。',
-      '',
-      ...segments,
-    ].join('\n\n');
   }
   /** A batch that carries any notice collapses into one notice summary; a pure relay batch stays relay. */
   private batchNotice(batch: readonly (Delivery | TargetDelivery)[]): SessionNoticeMeta | undefined {
@@ -489,7 +502,7 @@ export class SessionDelivery {
       head.updatedAt = new Date().toISOString(); this.save(); return;
     }
     const batch = this.collectBatch(head, fifo);
-    const text = this.batchText(batch);
+    const text = batch.length === 1 ? batch[0]!.text : formatMergedBatchText(batch);
     const notice = this.batchNotice(batch);
     const mode = batch.length > 1 ? 'queue' : (batch[0]!.mode ?? 'queue');
     const startedAt = new Date().toISOString();

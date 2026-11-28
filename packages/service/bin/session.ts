@@ -1,3 +1,5 @@
+import { isReservedMessageId, RESERVED_MESSAGE_ID_PREFIXES } from '../src/a2a/session-delivery.js';
+
 /**
  * `acp-service session send`: one-shot cross-session message through a running a2a-gateway.
  * The sender identity is mandatory, so a message can never be queued anonymously; missing
@@ -76,8 +78,8 @@ export function parseSessionSendArgs(args: string[], env: NodeJS.ProcessEnv = pr
   if (summary && summary.length > 240) throw new Error('--summary 最多 240 个字符');
   const toHost = (flags.get('host') ?? '').trim() || undefined;
   const messageId = (flags.get('message-id') ?? '').trim() || undefined;
-  if (messageId && /^(?:a2a-notice:|execution-notice:|process-request:)/.test(messageId)) {
-    throw new Error('messageId 不能使用 a2a-notice: / execution-notice: / process-request: 保留前缀');
+  if (messageId && isReservedMessageId(messageId)) {
+    throw new Error(`messageId 不能使用 ${RESERVED_MESSAGE_ID_PREFIXES.join(' / ')} 保留前缀`);
   }
   const url = (flags.get('url') ?? '').trim() || DEFAULT_GATEWAY_URL;
   return {

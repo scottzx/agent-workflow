@@ -44,27 +44,46 @@ function sameDelivery(message: UserMessage | undefined, requestId: string): bool
 }
 
 function messageText(message: UserMessage): string {
-  if (typeof message.content === 'string') return message.content;
-  if (!Array.isArray(message.content)) return '';
-  return message.content
+  // `content` is a readonly host type; read it as unknown so one shape check covers both arrays and strings.
+  const content: unknown = message.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
     .map((block: unknown) => block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
       ? (block as { text: string }).text : '')
     .filter(Boolean).join('\n');
 }
 
 /**
- * Merge one queue delivery into the not-yet-consumed `1agents-acp` tail of `inbox.nextTurn`.
- * The host wakes the receiver once instead of once per queued message. `steer` never merges.
- * Returns the merged message, or undefined when the merge would exceed the host text limit.
+ * The host's immutable pending-input queue; mirrors `AgentInbox` in types/dsh-host.d.ts. Declared
+ * locally because the real `@deepseek-ai/dsh-agent` package does not export that helper type.
  */
-function mergeIntoPendingQueue(
-  queue: UserMessage[],
-  input: SessionNoticeInput,
-): UserMessage | undefined {
-  const index = queue.length - 1;
-  const tail = queue[index] as UserMessage | undefined;
+interface PendingInbox {
+  readonly nextTurn?: readonly UserMessage[];
+  readonly nextStep?: readonly UserMessage[];
+  replace?(messageId: MessageId, next: UserMessage): boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * Merge one queue delivery into the not-yet-consumed `1agents-acp` tail of `inbox.nextTurn`.
+ *
+ * The host owns that message: real DSH `UserMessage.content`/`source` are `readonly` and deep-frozen,
+ * so this never assigns into the tail. It builds a new immutable message and swaps it through the
+ * host's own `inbox.replace`. The host then persists it via its normal `agent/inbox/spliced` event.
+ * Returns true only when the host confirmed the swap; every other outcome (no replace API, unknown
+ * id, concurrent consumption, over-limit body) returns false so the caller falls back to
+ * `agent.followup` and no queued message is ever lost. `steer` never reaches this path.
+ */
+function replacePendingQueueTail(inbox: unknown, input: SessionNoticeInput): boolean {
+  if (!inbox || typeof inbox !== 'object') return false;
+  const host = inbox as PendingInbox;
+  const queue = host.nextTurn;
+  if (!Array.isArray(queue) || queue.length === 0) return false;
+  const tail = queue[queue.length - 1] as UserMessage | undefined;
   const source = tail?.source as { kind?: unknown; rpcId?: unknown; rpcIds?: unknown; form?: unknown; summary?: unknown; fromSessionId?: unknown } | undefined;
-  if (!tail || source?.kind !== NOTICE_SOURCE_KIND) return undefined;
+  if (!tail || source?.kind !== NOTICE_SOURCE_KIND) return false;
+  if (tail.id === undefined || typeof host.replace !== 'function') return false;
   const previousIds = Array.isArray(source.rpcIds)
     ? source.rpcIds.filter((value: unknown): value is string => typeof value === 'string')
     : [];
@@ -72,7 +91,7 @@ function mergeIntoPendingQueue(
   const ids = [...new Set([...previousIds, ...(originalId ? [originalId] : []), input.requestId])];
   const body = messageText(tail).replace(MERGE_HEADER, '');
   const mergedText = `[队列合并 · 共 ${ids.length} 条消息]\n\n${body}\n\n—— 第 ${ids.length} 条 ——\n${input.text}`;
-  if (Buffer.byteLength(mergedText, 'utf8') > MAX_TEXT_BYTES) return undefined;
+  if (Buffer.byteLength(mergedText, 'utf8') > MAX_TEXT_BYTES) return false;
   const form = source.form === 'notice' || input.form === 'notice' ? 'notice' : 'relay';
   const previousSummary = typeof source.summary === 'string' ? source.summary : undefined;
   const summary = form === 'notice'
@@ -85,10 +104,18 @@ function mergeIntoPendingQueue(
   if (summary) mergedSource.summary = summary;
   const fromSessionId = existingFrom ?? input.fromSessionId;
   if (fromSessionId) mergedSource.fromSessionId = fromSessionId;
-  tail.content = [{ type: 'text', text: mergedText }];
-  tail.source = mergedSource as unknown as UserMessage['source'];
-  queue[index] = tail;
-  return tail;
+  const nextMessage: UserMessage = {
+    id: tail.id,
+    role: tail.role,
+    content: [{ type: 'text', text: mergedText }],
+    source: mergedSource as unknown as UserMessage['source'],
+  };
+  try {
+    return host.replace(tail.id, nextMessage) === true;
+  } catch {
+    // A host that rejects the swap must still receive the new message as its own queued turn.
+    return false;
+  }
 }
 
 function parseInput(raw: unknown): { rpcId: string; request: SessionNoticeInput } {
@@ -158,12 +185,7 @@ export async function deliverSessionNotice(
     source: source as unknown as UserMessage['source'],
   };
   if (input.mode === 'steer') agent.steer(message);
-  else {
-    // One queued wakeup instead of one per message: merge into the pending `1agents-acp` tail.
-    const queue = agent.inbox?.nextTurn;
-    const merged = Array.isArray(queue) ? mergeIntoPendingQueue(queue as UserMessage[], input) : undefined;
-    if (!merged) agent.followup(message);
-  }
+  else if (!replacePendingQueueTail(agent.inbox, input)) agent.followup(message);
   await ctx.sessionPersistence?.flush?.();
   return { accepted: true };
 }

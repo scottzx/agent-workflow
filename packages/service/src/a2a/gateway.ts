@@ -14,7 +14,7 @@ import { FileA2AStore } from './store.js';
 import { A2ADispatchRejectedError } from './types.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
-import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
+import { isReservedMessageId, RESERVED_MESSAGE_ID_PREFIXES, SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
 import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary, type RemoteAgentNotice, type SubscriberNotice } from './notices.js';
 import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
@@ -1945,13 +1945,17 @@ export class RemoteAgentGateway {
   private sessionMessageSend(input: z.output<typeof sessionMessageSendSchema>) {
     const { fromSessionId, toSessionId } = input;
     const messageId = input.messageId ?? `session-msg:${randomUUID()}`;
-    if (/^(?:a2a-notice:|execution-notice:|process-request:)/.test(messageId)) {
-      throw new Error('The a2a-notice:, execution-notice:, and process-request: message ID namespaces are reserved for task notifications');
+    if (isReservedMessageId(messageId)) {
+      throw new Error(`The ${RESERVED_MESSAGE_ID_PREFIXES.join(', ')} message ID namespaces are reserved for task notifications`);
     }
     const hosts = this.sessions.hostNames();
     const boundHosts = this.sessions.hostsForSession(toSessionId);
+    // An ambiguous target must not silently pick one of its hosts: that would misroute the message.
+    if (!input.toHost && boundHosts.length > 1) {
+      throw new Error('toSessionId is bound to multiple session hosts; pass toHost explicitly');
+    }
     const toHost = input.toHost
-      ?? (boundHosts.length === 1 ? boundHosts[0] : undefined)
+      ?? boundHosts[0]
       ?? (hosts.includes('dsh-local') ? 'dsh-local' : hosts.length === 1 ? hosts[0] : undefined);
     if (!toHost) throw new Error('Cannot resolve a unique session host for toSessionId; pass toHost');
     // An explicit host must exist and a Codex target must be a thread UUID.
@@ -2154,8 +2158,8 @@ export class RemoteAgentGateway {
     if (method === 'session_bind') return this.sessions.bind(sessionBindSchema.parse(params));
     if (method === 'session_send') {
       const input = sessionSendSchema.parse(params);
-      if (input.messageId.startsWith('a2a-notice:') || input.messageId.startsWith('execution-notice:') || input.messageId.startsWith('process-request:')) {
-        throw new Error('The a2a-notice:, execution-notice:, and process-request: message ID namespaces are reserved for task notifications');
+      if (isReservedMessageId(input.messageId)) {
+        throw new Error(`The ${RESERVED_MESSAGE_ID_PREFIXES.join(', ')} message ID namespaces are reserved for task notifications`);
       }
       const result = this.sessions.enqueue(input);
       void this.reconcile().catch(() => {});
