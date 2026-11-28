@@ -21,7 +21,7 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { Ticket } from '../execution/ticket.js';
 import { normalizeRoleRouting } from '../roles/routing.js';
-import { assertSafeRoleWorkspaceId, computeChecksDigest, computeRoleDigest, loadCalibration } from './calibrate.js';
+import { assertSafeRoleWorkspaceId, computeChecksDigest, computeRoleDigest, crEvalReportPath, loadCalibration } from './calibrate.js';
 import { type LedgerEntry, ledgerPath, roleVersion, type RoleVersion, type StopReason } from './outline-run.js';
 import {
   coerceCrEvalResults,
@@ -118,10 +118,7 @@ export interface GateReport {
   };
 }
 
-export function crEvalReportPath(workspace: string, roleId: string): string {
-  assertSafeRoleWorkspaceId(roleId);
-  return path.join(path.resolve(workspace), roleId, 'eval-cr.json');
-}
+export { crEvalReportPath };
 
 function digestCrResults(results: readonly CrReviewResult[]): string {
   return createHash('sha256').update(JSON.stringify(results)).digest('hex');

@@ -104,7 +104,7 @@ export class A2ADispatchRejectedError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
-    readonly category: 'quota' | 'rate_limit' | 'http_429' | 'http_5xx' | 'timeout',
+    readonly category: 'quota' | 'rate_limit' | 'http_429' | 'http_5xx' | 'timeout' | 'auth',
     message: string,
   ) {
     super(message);
@@ -119,7 +119,7 @@ export interface A2ABackend {
   /** Standard preset routes on this host. Does not allocate a session or submit a prompt. */
   modelCatalog?(): Promise<A2AModelCatalog>;
   /** Optional dispatch-boundary route/quota admission check run before allocating a Task. Throw `A2ADispatchRejectedError` (e.g. 429/quota) to reject cleanly at admission. */
-  checkRouteAvailability?(input: { provider?: string; model?: string; agentPreset?: string; cwd?: string }): Promise<void> | void;
+  checkRouteAvailability?(input: { provider?: string; model?: string; agentPreset?: string; cwd?: string; signal?: AbortSignal }): Promise<void> | void;
   /** Optional read-only reconciliation; never resumes or repeats execution. */
   recover?(target: A2ATarget, options: { requestId: string }): Promise<SafeError | undefined>;
   /** Cancel pending admission and drain owned initialization before rejecting an aborted preparation. */

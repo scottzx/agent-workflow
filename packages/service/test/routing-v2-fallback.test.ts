@@ -34,9 +34,9 @@ class RouteAwareBackend implements A2ABackend {
     while (this.hangResolvers.length) this.hangResolvers.pop()!();
   }
 
-  async checkRouteAvailability(input: { provider?: string; model?: string }): Promise<void> {
+  async checkRouteAvailability(input: { provider?: string; model?: string; signal?: AbortSignal }): Promise<void> {
     this.checkedRoutes.push({ provider: input.provider, model: input.model });
-    if (input.model !== this.rejectModel || this.rejectMode === 'none') return;
+    if ((this.rejectModel !== '*' && input.model !== this.rejectModel) || this.rejectMode === 'none') return;
     if (this.rejectMode === 'quota_429') {
       throw new A2ADispatchRejectedError(429, 'ACCOUNT_QUOTA', 'quota', `HTTP 429 ACCOUNT_QUOTA exhausted on ${input.model}`);
     }
@@ -50,7 +50,7 @@ class RouteAwareBackend implements A2ABackend {
       return;
     }
     if (this.rejectMode === 'auth_401') {
-      throw new A2ADispatchRejectedError(401, 'HTTP_401', 'http_429', 'HTTP 401 Unauthorized');
+      throw new A2ADispatchRejectedError(401, 'HTTP_401', 'auth', 'HTTP 401 Unauthorized');
     }
   }
 
@@ -178,6 +178,11 @@ test('routing v2 schema, model family single-source assertion (M3), cross-family
     classifyFallbackTrigger(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
     'timeout',
     'real AbortSignal.timeout DOMException TimeoutError must trigger timeout fallback',
+  );
+  assert.equal(
+    classifyFallbackTrigger(new DOMException('This operation was aborted', 'AbortError')),
+    undefined,
+    'generic non-timeout AbortError (e.g. gateway close/cancel) must NOT trigger timeout fallback',
   );
   assert.equal(classifyFallbackTrigger({ status: 401, category: 'auth', message: 'Unauthorized' }), undefined);
   assert.equal(classifyFallbackTrigger({ status: 400, message: 'Bad Request' }), undefined);
@@ -369,7 +374,8 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   assert.ok(authFailed.error, '401 must fail dispatch');
   assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['grok/grok-4.7@500k'], '401 auth failure must NOT try fallback candidates');
 
-  // S1: Conflicting deliveryMode on read-only reviewer slot MUST fail closed before prepare!
+  // S1 + S2: Conflicting deliveryMode or resultContract.deliveryMode on read-only reviewer slot MUST fail closed before prepare (0 orphan jobs)!
+  const countBeforeReadOnly = (await gateway.invoke('execution_list', { originSessionId: 'origin-drill' }) as { jobs: unknown[] }).jobs.length;
   await assert.rejects(
     gateway.invoke('execution_submit', {
       originSessionId: 'origin-drill',
@@ -386,9 +392,64 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
     }),
     /Read-only routing slot requires deliveryMode "none"/,
   );
+  await assert.rejects(
+    gateway.invoke('execution_submit', {
+      originSessionId: 'origin-drill',
+      targetId: 'legacy:drill',
+      input: {
+        cwd: workDir,
+        routingRoleId: 'pr-delivery',
+        routingSlot: 'reviewer',
+        peerJobId: workerSubmitted.jobId,
+        resultContract: { jobId: 'job-ro-conflict', deliveryMode: 'workspace_git' },
+        prompt: 'Conflicting resultContract.deliveryMode must fail',
+        agentPreset: 'standard',
+      },
+    }),
+    /Read-only routing slot requires resultContract\.deliveryMode "none"/,
+  );
+  const countAfterReadOnly = (await gateway.invoke('execution_list', { originSessionId: 'origin-drill' }) as { jobs: unknown[] }).jobs.length;
+  assert.equal(countAfterReadOnly, countBeforeReadOnly, 'readOnly deliveryMode conflicts must leave 0 orphan jobs');
 
-  // M1: Real HTTP transport timeout (AbortSignal.timeout 10s DOMException TimeoutError) MUST switch to fallback within <60s!
+  // S1: When ALL candidates are rejected cleanly at pre-Task admission (HTTP 429/quota), job must be recorded as known_not_submitted/rejected (NOT unknown), so execution_continue remains usable once quota recovers!
   backend.checkedRoutes.length = 0;
+  backend.rejectMode = 'quota_429';
+  backend.rejectModel = '*';
+  const allRejected = await gateway.invoke('execution_submit', {
+    originSessionId: 'origin-drill',
+    targetId: 'legacy:drill',
+    input: {
+      cwd: workDir,
+      routingRoleId: 'pr-delivery',
+      routingSlot: 'worker',
+      prompt: 'All candidates exhausted at admission',
+      agentPreset: 'standard',
+    },
+  }) as { jobId: string; executionStatus: string; unresolvedAttemptIds?: string[]; error?: string };
+  assert.ok(allRejected.error);
+  assert.equal(allRejected.executionStatus, 'rejected', 'pre-Task admission exhaustion must not leave job in unknown status');
+  assert.equal(allRejected.unresolvedAttemptIds?.length ?? 0, 0, 'pre-Task admission exhaustion must leave 0 unresolved attempts');
+  // Once quota recovers, execution_continue on the SAME jobId must succeed without reconciliation!
+  backend.rejectMode = 'none';
+  const recovered = await gateway.invoke('execution_continue', {
+    originSessionId: 'origin-drill',
+    jobId: allRejected.jobId,
+    input: {
+      cwd: workDir,
+      routingRoleId: 'pr-delivery',
+      routingSlot: 'worker',
+      prompt: 'Retry same jobId after quota recovery',
+      agentPreset: 'standard',
+    },
+  }) as { jobId: string; executionStatus: string; routing?: { selected: { model: string } }; error?: string };
+  assert.equal(recovered.error, undefined);
+  assert.equal(recovered.jobId, allRejected.jobId);
+  assert.equal(recovered.routing?.selected.model, 'grok/grok-4.7@500k');
+
+  // M1: Real HTTP transport timeout (AbortSignal.timeout 10s DOMException TimeoutError) MUST switch to fallback within <60s
+  // AND the abandoned primary request MUST NOT spawn a duplicate concurrent model execution after releaseHangs()!
+  backend.checkedRoutes.length = 0;
+  backend.executedRoutes.length = 0;
   backend.rejectMode = 'hang_timeout';
   backend.rejectModel = 'grok/grok-4.7@500k';
   const timeoutStart = Date.now();
@@ -399,19 +460,32 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
       cwd: workDir,
       routingRoleId: 'pr-delivery',
       routingSlot: 'worker',
-      prompt: 'Real timeout hang must auto-switch to fallback',
+      prompt: 'Real timeout hang must auto-switch to fallback without duplicate execution',
       agentPreset: 'standard',
     },
   }) as {
     jobId: string;
     routing?: { selected: { model: string }; fallbacks: { trigger: string }[] };
   };
-  backend.releaseHangs();
   const timeoutElapsedMs = Date.now() - timeoutStart;
   assert.ok(timeoutElapsedMs < 60_000, `timeout fallback took ${timeoutElapsedMs}ms`);
   assert.equal(timeoutSwitched.routing?.selected.model, 'openai/gpt-5.2-codex');
   assert.equal(timeoutSwitched.routing?.fallbacks.length, 1);
   assert.equal(timeoutSwitched.routing?.fallbacks[0]?.trigger, 'timeout');
+
+  // Release the hanging primary admission promise and wait to verify the abandoned primary NEVER executes!
+  backend.releaseHangs();
+  for (let i = 0; i < 40; i += 1) {
+    const view = await gateway.invoke('execution_get', { originSessionId: 'origin-drill', jobId: timeoutSwitched.jobId }) as { executionStatus: string };
+    if (view.executionStatus === 'completed') break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  await new Promise(r => setTimeout(r, 250));
+  assert.deepEqual(
+    backend.executedRoutes.map(r => r.model),
+    ['openai/gpt-5.2-codex'],
+    'abandoned timed-out primary request must NEVER execute concurrently with the fallback route',
+  );
 });
 
 test('verifyRoutingCanaryGate & checkGate enforce routing.json v2 invariants and digest-bound golden eval', async t => {

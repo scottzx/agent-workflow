@@ -11,6 +11,7 @@ import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, type 
 import { reportAndHoldRegistration, reportToAgent } from '@1agents/dreammate-node/client';
 import { z } from 'zod';
 import { FileA2AStore } from './store.js';
+import { A2ADispatchRejectedError } from './types.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
 import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
@@ -731,8 +732,16 @@ export class RemoteAgentGateway {
       });
       const parsedMode = deliveryModeSchema.safeParse(initialPick.endpoint.deliveryMode);
       if (parsedMode.success) preRoutingDeliveryMode = parsedMode.data;
-      if (initialPick.endpoint.readOnly === true && preFields.deliveryMode !== undefined && preFields.deliveryMode !== 'none') {
-        throw new Error(`Read-only routing slot requires deliveryMode "none" (got "${String(preFields.deliveryMode)}")`);
+      const preContractDeliveryMode = preFields.resultContract && typeof preFields.resultContract === 'object'
+        ? (preFields.resultContract as { deliveryMode?: unknown }).deliveryMode
+        : undefined;
+      if (initialPick.endpoint.readOnly === true) {
+        if (preFields.deliveryMode !== undefined && preFields.deliveryMode !== 'none') {
+          throw new Error(`Read-only routing slot requires deliveryMode "none" (got "${String(preFields.deliveryMode)}")`);
+        }
+        if (preContractDeliveryMode !== undefined && preContractDeliveryMode !== 'none') {
+          throw new Error(`Read-only routing slot requires resultContract.deliveryMode "none" (got "${String(preContractDeliveryMode)}")`);
+        }
       }
     }
 
@@ -748,6 +757,7 @@ export class RemoteAgentGateway {
     this.attachSubscriptions(input.originSessionId, input.notifySessions, { scope: 'job', jobId: job.jobId, caseId: job.caseId ?? input.caseId });
     if (input.handoffId) this.noteHandoffTaken(input.originSessionId, input.handoffId, job.jobId);
     let sent = false;
+    let allRejectedPreTask = false;
     try {
       if (reportRequest !== undefined) {
         const { reportReview: _review, ...authorInput } = resolved.input;
@@ -876,6 +886,8 @@ export class RemoteAgentGateway {
         const allowedTriggers = routingPolicy.slot.fallbackOn ?? [...FALLBACK_TRIGGER_KINDS];
         let lastError: unknown;
         let acceptedTask: Task | undefined;
+        let sawPreTaskRejection = false;
+        let hadAmbiguousDispatch = false;
 
         for (;;) {
           const picked = selectDispatchCandidate({
@@ -895,6 +907,7 @@ export class RemoteAgentGateway {
               selectedRoute = candidate;
               break;
             }
+            hadAmbiguousDispatch = true;
             lastError = new Error(`Dispatch failed on ${candidate.provider}/${candidate.model} (${trigger}): ${dispatchFailure?.message ?? 'rejected'}`);
             const elapsedMs = this.now() - dispatchStartedAt;
             if (elapsedMs > maxDurationMs) throw lastError;
@@ -910,6 +923,12 @@ export class RemoteAgentGateway {
               elapsedMs,
             });
           } catch (dispatchError) {
+            if (dispatchError instanceof A2ADispatchRejectedError) {
+              sawPreTaskRejection = true;
+            } else {
+              hadAmbiguousDispatch = true;
+            }
+            allRejectedPreTask = sawPreTaskRejection && !hadAmbiguousDispatch;
             const trigger = classifyFallbackTrigger(dispatchError, allowedTriggers);
             if (!trigger) throw dispatchError;
             lastError = dispatchError;
@@ -931,7 +950,12 @@ export class RemoteAgentGateway {
         if (!acceptedTask) throw lastError ?? new Error('Routing fallback failed without accepted task');
         task = acceptedTask;
       } else {
-        task = await sendWithRoute(provider, model, attempt.attemptId);
+        try {
+          task = await sendWithRoute(provider, model, attempt.attemptId);
+        } catch (error) {
+          if (error instanceof A2ADispatchRejectedError) allRejectedPreTask = true;
+          throw error;
+        }
       }
 
       const routingRecord: AttemptRoutingRecord | undefined = selectedRoute
@@ -946,7 +970,7 @@ export class RemoteAgentGateway {
       return this.ledgerView(input.originSessionId, job.jobId);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
-      if (sent) this.ledger.markUnknown(attempt.attemptId, diagnostic);
+      if (sent && !allRejectedPreTask) this.ledger.markUnknown(attempt.attemptId, diagnostic);
       else if (this.ledger.getAttempt(attempt.attemptId).submissionStatus !== 'known_not_submitted')
         this.ledger.knownNotSubmitted(attempt.attemptId, { executionStatus: 'rejected', diagnostic });
       return { ...this.ledgerView(input.originSessionId, job.jobId), error: diagnostic };
@@ -1458,7 +1482,20 @@ export class RemoteAgentGateway {
         const controller = new AbortController();
         this.controllers.add(controller);
         const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000), ...(init?.signal ? [init.signal] : [])]);
-        try { return await fetch(input, { ...init, signal, redirect: 'error' }); }
+        try {
+          const response = await fetch(input, { ...init, signal, redirect: 'error' });
+          if (response.headers.get('x-1agents-dispatch-rejected') === '1') {
+            const payload = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; category?: unknown };
+            const validCategories = new Set(['quota', 'rate_limit', 'http_429', 'http_5xx', 'timeout', 'auth']);
+            const category = typeof payload.category === 'string' && validCategories.has(payload.category)
+              ? (payload.category as 'quota' | 'rate_limit' | 'http_429' | 'http_5xx' | 'timeout' | 'auth')
+              : (response.status === 429 ? 'http_429' : response.status >= 500 ? 'http_5xx' : 'auth');
+            const code = typeof payload.code === 'string' && payload.code ? payload.code : `HTTP_${response.status}`;
+            const message = typeof payload.error === 'string' && payload.error ? payload.error : `HTTP ${response.status} dispatch rejected`;
+            throw new A2ADispatchRejectedError(response.status, code, category, message);
+          }
+          return response;
+        }
         finally { this.controllers.delete(controller); }
       };
       pending = new ClientFactory({ transports: [new JsonRpcTransportFactory({ fetchImpl })],
@@ -1859,15 +1896,18 @@ export class RemoteAgentGateway {
           input: attempt.input as Record<string, unknown>, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy },
           { jobId: job.jobId, deliveryRecovery: delivery, deliveryRecoveryInput: recoveryInput, requestDigestInput: input.input });
       }
-      const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
-      if (!previous) throw new Error('Continue is unsupported for this provider');
+      const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId)
+        ?? [...job.attempts].reverse().map(a => this.state.jobs.find(item => item.attemptId === a.attemptId)).find(Boolean);
+      if (!previous && !(attempt.submissionStatus === 'known_not_submitted' && attempt.targetSnapshot.provider === 'a2a')) {
+        throw new Error('Continue is unsupported for this provider');
+      }
       // A round queued behind a running one could not surface the running round's approvals, and the two would wait on each other.
-      if (job.inFlightAttemptIds.length) await this.refresh(previous);
+      if (previous && job.inFlightAttemptIds.length) await this.refresh(previous);
       const current = this.ledger.get(input.originSessionId, job.jobId);
       if (current.attempts.some(item => current.inFlightAttemptIds.includes(item.attemptId) && item.executionStatus !== 'input_required'))
         throw new Error('Job still has a running round; wait for it to end or cancel it before continuing');
       const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
-        input: { ...(attempt.input as Record<string, unknown>), ...continueInput }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, previous, requestDigestInput: continueInput });
+        input: { ...(attempt.input as Record<string, unknown>), ...continueInput }, clientRequestId: input.clientRequestId, initiatedBy: input.initiatedBy }, { jobId: job.jobId, ...(previous ? { previous } : {}), requestDigestInput: continueInput });
       reopenForContinue(this.ledger, input.originSessionId, job.jobId);
       return submitted;
     }

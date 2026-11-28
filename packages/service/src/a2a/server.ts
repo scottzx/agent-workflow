@@ -389,19 +389,42 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
       }
       const context = new ServerCallContext({ requestedVersion: '1.0', user: { isAuthenticated: true, userName: 'dsh-a2a' } });
       if (stopped) { res.writeHead(503); res.end(); return; }
-      // Real dispatch-boundary route/quota admission check before allocating a Task.
-      if (options.backend.checkRouteAvailability && decoded && typeof decoded === 'object' && !Array.isArray(decoded)) {
-        const rpcMethod = typeof decoded.method === 'string' ? decoded.method : '';
-        if (rpcMethod === 'message/send' || rpcMethod === 'SendMessage' || rpcMethod === 'message/stream' || rpcMethod === 'SendStreamingMessage') {
-          const params = decoded.params as Record<string, unknown> | undefined;
-          const meta = (params?.metadata as Record<string, unknown> | undefined)?.['1agents'] as Record<string, unknown> | undefined;
-          await options.backend.checkRouteAvailability({
-            ...(typeof meta?.provider === 'string' ? { provider: meta.provider } : {}),
-            ...(typeof meta?.model === 'string' ? { model: meta.model } : {}),
-            ...(typeof meta?.agentPreset === 'string' ? { agentPreset: meta.agentPreset } : {}),
-            ...(typeof meta?.cwd === 'string' ? { cwd: meta.cwd } : {}),
-          });
+      // Track HTTP client disconnect before/during admission so a timed-out dispatch request
+      // NEVER proceeds into transport.handle() and spawns a duplicate concurrent Task.
+      const admissionAbort = new AbortController();
+      let clientAborted = false;
+      const isClientGone = () => stopped || clientAborted || res.destroyed || res.writableEnded || Boolean(req.socket?.destroyed);
+      const onDisconnect = () => {
+        if (!res.writableEnded) {
+          clientAborted = true;
+          admissionAbort.abort();
         }
+      };
+      res.once('close', onDisconnect);
+      req.socket?.once('close', onDisconnect);
+      try {
+        if (isClientGone()) return;
+        // Real dispatch-boundary route/quota admission check before allocating a Task.
+        if (options.backend.checkRouteAvailability && decoded && typeof decoded === 'object' && !Array.isArray(decoded)) {
+          const rpcMethod = typeof decoded.method === 'string' ? decoded.method : '';
+          if (rpcMethod === 'message/send' || rpcMethod === 'SendMessage' || rpcMethod === 'message/stream' || rpcMethod === 'SendStreamingMessage') {
+            const params = decoded.params as Record<string, unknown> | undefined;
+            const meta = (params?.metadata as Record<string, unknown> | undefined)?.['1agents'] as Record<string, unknown> | undefined;
+            await options.backend.checkRouteAvailability({
+              ...(typeof meta?.provider === 'string' ? { provider: meta.provider } : {}),
+              ...(typeof meta?.model === 'string' ? { model: meta.model } : {}),
+              ...(typeof meta?.agentPreset === 'string' ? { agentPreset: meta.agentPreset } : {}),
+              ...(typeof meta?.cwd === 'string' ? { cwd: meta.cwd } : {}),
+              signal: admissionAbort.signal,
+            });
+          }
+        }
+        if (isClientGone()) {
+          return;
+        }
+      } finally {
+        res.off('close', onDisconnect);
+        req.socket?.off('close', onDisconnect);
       }
       const result = await transport.handle(body, context);
       if (!(Symbol.asyncIterator in result)) {
@@ -428,9 +451,14 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
         if (!res.destroyed) res.end();
       }
     } catch (error) {
+      if (stopped || res.destroyed || res.writableEnded || Boolean(req.socket?.destroyed)) return;
       if (error instanceof A2ADispatchRejectedError && !res.headersSent) {
-        res.writeHead(error.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ error: error.message, code: error.code, category: error.category }));
+        res.writeHead(error.status, {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+          'X-1Agents-Dispatch-Rejected': '1',
+        });
+        res.end(JSON.stringify({ error: error.message, code: error.code, category: error.category, preTaskRejected: true }));
         return;
       }
       const envelope = { jsonrpc: '2.0', id, error: JsonRpcTransportHandler.mapToJSONRPCError(error) };

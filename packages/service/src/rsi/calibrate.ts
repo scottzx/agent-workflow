@@ -239,6 +239,11 @@ export function holdoutPath(workspace: string, roleId: string): string {
   return path.join(path.resolve(workspace), roleId, 'holdout.json');
 }
 
+export function crEvalReportPath(workspace: string, roleId: string): string {
+  assertSafeRoleWorkspaceId(roleId);
+  return path.join(path.resolve(workspace), roleId, 'eval-cr.json');
+}
+
 /** Stable SHA-256 over `checklist.json`, optional `rubric.json`, and every regular file in `checks/`. */
 export async function computeChecksDigest(roleDirectory: string): Promise<string> {
   const root = path.resolve(roleDirectory);

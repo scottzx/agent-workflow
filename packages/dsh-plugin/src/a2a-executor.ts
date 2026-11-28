@@ -256,11 +256,13 @@ export class DshA2ABackend implements A2ABackend {
    * Dispatch-boundary route availability check backed by DSH's live model catalog.
    * Rejects failing/rate-limited/quota-exhausted providers with sanitized HTTP 429/503 before allocating a Task.
    */
-  async checkRouteAvailability(input: { provider?: string; model?: string; agentPreset?: string }): Promise<void> {
+  async checkRouteAvailability(input: { provider?: string; model?: string; agentPreset?: string; signal?: AbortSignal }): Promise<void> {
+    if (input.signal?.aborted) return;
     if (!input.provider || !input.model || input.agentPreset?.startsWith('oneagents-acp-')) return;
     if (typeof this.ctx.sessionController?.modelCatalog !== 'function') return;
     let raw: unknown;
     try { raw = await this.ctx.sessionController.modelCatalog(); } catch { return; }
+    if (input.signal?.aborted) return;
     if (!raw || typeof raw !== 'object') return;
     const record = raw as { failures?: unknown; value?: { failures?: unknown } };
     const rawFailures = Array.isArray(record.failures)
