@@ -373,12 +373,22 @@ export class DshA2ABackend implements A2ABackend {
   private async enforceSandbox(input: A2APrepareInput, agent: Agent): Promise<void> {
     if (input.sandboxMode !== 'read-only') return;
     // Structural access: a host without permission presets stays loadable, but cannot run read-only work.
+    // `ctx.get()` is the service lookup and comes first: on a real Cordis proxy the plain property read
+    // of an unregistered service can throw, which would escape this method's error contract.
     const record = this.ctx as unknown as {
       permissionPresets?: PermissionPresetsHost;
       get?: (name: string) => unknown;
     };
-    const host = record.permissionPresets ?? (record.get?.('permissionPresets') as PermissionPresetsHost | undefined);
-    const set = host?.set;
+    let host: PermissionPresetsHost | undefined;
+    let set: PermissionPresetsHost['set'] | undefined;
+    try {
+      host = (record.get?.('permissionPresets') ?? record.permissionPresets) as PermissionPresetsHost | undefined;
+      set = host?.set;
+    } catch {
+      // A throwing lookup or property trap (including on `host.set`) means the host cannot prove the sandbox either.
+      host = undefined;
+      set = undefined;
+    }
     if (typeof set !== 'function') {
       throw sessionError('SANDBOX_UNAVAILABLE', 'The DSH host cannot enforce a read-only sandbox; refusing to start a read-only task');
     }

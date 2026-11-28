@@ -195,6 +195,73 @@ test('prepare enforces sandboxMode read-only through the host permission presets
   assert.deepEqual(untouchedCalls, [], 'a task without sandboxMode never changes permissions');
 });
 
+test('a Cordis proxy that throws on the permissionPresets property still fails closed through ctx.get', async t => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-sandbox-proxy-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  // 1. The service lookup finds nothing and the plain property read throws a Cordis trap error.
+  //    The prepared task must still report SANDBOX_UNAVAILABLE instead of leaking the trap error.
+  const missing = currentDsh(cwd);
+  Object.defineProperty(missing.ctx, 'permissionPresets', {
+    configurable: true,
+    get() { throw new Error('cordis: service "permissionPresets" is not registered'); },
+  });
+  await assert.rejects(
+    new DshA2ABackend(missing.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE' && /read-only sandbox/.test(error.message),
+    'a throwing property read must not escape the fail-closed error contract',
+  );
+
+  // 2. Both lookups throw for the preset service: the same stable code and message come back, never
+  //    the host error. Other services keep resolving, so the task reaches the sandbox step.
+  const broken = currentDsh(cwd);
+  const originalGet = broken.ctx.get;
+  broken.ctx.get = name => {
+    if (name === 'permissionPresets') throw new Error('cordis: lookup of permissionPresets failed');
+    return originalGet(name);
+  };
+  Object.defineProperty(broken.ctx, 'permissionPresets', {
+    configurable: true,
+    get() { throw new Error('cordis: property trap fired'); },
+  });
+  await assert.rejects(
+    new DshA2ABackend(broken.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE' && !/property trap/.test(error.message),
+    'neither a throwing lookup nor a throwing trap may surface its own error code',
+  );
+
+  // 3. ctx.get() resolves the service, so the property trap is never read and the preset is installed.
+  const viaGet = currentDsh(cwd);
+  const calls = [];
+  const resolveService = viaGet.ctx.get;
+  viaGet.ctx.get = name => name === 'permissionPresets'
+    ? { set: (session, preset) => { calls.push([session, preset]); } }
+    : resolveService(name);
+  Object.defineProperty(viaGet.ctx, 'permissionPresets', {
+    configurable: true,
+    get() { throw new Error('the proxy property must not be read when ctx.get() resolves the service'); },
+  });
+  const target = await new DshA2ABackend(viaGet.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' });
+  assert.equal(target.sessionId, 'stored');
+  assert.equal(calls.length, 1, 'exactly one permission preset call');
+  assert.equal(calls[0][1], 'read-only');
+
+  // 4. ctx.get() returns a host proxy whose `set` getter throws; still converges to SANDBOX_UNAVAILABLE.
+  const setTrap = currentDsh(cwd);
+  const resolveSetTrap = setTrap.ctx.get;
+  setTrap.ctx.get = name => name === 'permissionPresets'
+    ? Object.defineProperty({}, 'set', {
+        enumerable: true,
+        get() { throw new Error('cordis: trap on set property'); },
+      })
+    : resolveSetTrap(name);
+  await assert.rejects(
+    new DshA2ABackend(setTrap.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE',
+    'a throwing getter on host.set must also converge to SANDBOX_UNAVAILABLE',
+  );
+});
+
 test('a brand-new read-only session also gets the preset, and a refused preset prevents the session from running', async t => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-sandbox-new-')));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
