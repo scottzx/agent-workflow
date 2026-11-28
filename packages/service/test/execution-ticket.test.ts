@@ -149,7 +149,7 @@ test('ledger state written before tickets existed loads and takes tickets', () =
 });
 
 test('every ticket method is described for discovery', () => {
-  assert.deepEqual(Object.keys(TICKET_METHODS), ['ticket_get', 'ticket_open', 'ticket_checks', 'ticket_review', 'ticket_revise', 'ticket_show', 'ticket_mark', 'ticket_self_check', 'ticket_submit', 'ticket_proposal', 'ticket_close', 'ticket_reopen']);
+  assert.deepEqual(Object.keys(TICKET_METHODS), ['ticket_get', 'ticket_open', 'ticket_checks', 'ticket_review', 'ticket_revise', 'ticket_show', 'ticket_mark', 'ticket_self_check', 'ticket_submit', 'ticket_proposal_raise', 'ticket_proposal', 'ticket_close', 'ticket_reopen']);
   for (const method of Object.values(TICKET_METHODS)) assert.equal((method.parameters as { type?: string }).type, 'object');
 });
 

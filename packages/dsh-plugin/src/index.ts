@@ -27,8 +27,10 @@ import { runHandoffTool } from './handoff-executor.js';
 import { TICKET_PATH } from './ticket-spec.js';
 import { createSessionDeliverHandler, SESSION_DELIVER_PATH } from './session-notice.js';
 import { registerRowConfigRpc } from './row-config.js';
+import { registerPrCoachPreset } from './preset.js';
 import { loadDshTools } from './host-runtime.js';
 export type { DshA2AOptions } from './a2a.js';
+export { PR_COACH_PRESET_ID, PR_COACH_ROLE_ID, PR_COACH_SKILLS, prCoachPresetDefinition, registerPrCoachPreset } from './preset.js';
 
 /** Kept identical to packages/service/src/dsh.ts. Do not re-export them from the package root: that cycle breaks HMR. */
 export const name = 'oneagents-acp';
@@ -36,7 +38,7 @@ export const inject = ['llm', 'agents', 'approval', 'userQuestions', 'commands',
 
 type Stop = () => void | Promise<void>;
 
-export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
+export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string; prCoachPreset?: boolean } = {}): Promise<void> {
   registerRowConfigRpc(ctx);
   // One plugin install updates the global acp-service CLI. A failure must not stop DSH.
   try {
@@ -163,6 +165,9 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
           { id: 'acp-session', name: '@1agents/acp-service/dsh/preset', config: { agent } },
         ],
       }));
+    }
+    if (input.prCoachPreset === true) {
+      track(await registerPrCoachPreset(ctx));
     }
     // A preset chosen on a session that is already running is composed onto its
     // live agent instead of creating one, so the route the preset proposes is
