@@ -4,26 +4,26 @@
     "primary": {
       "provider": "magpie",
       "model": "group/deepseek-v4.1",
-      "deliveryMode": "workspace_git",
+      "deliveryMode": "workspace_files",
       "family": "deepseek"
     },
     "fallbacks": [
       {
         "provider": "deepseek-account",
         "model": "deepseek-flash",
-        "deliveryMode": "workspace_git",
+        "deliveryMode": "workspace_files",
         "family": "deepseek"
       },
       {
         "provider": "magpie-responses",
         "model": "grok/grok-4.7@500k",
-        "deliveryMode": "workspace_git",
+        "deliveryMode": "workspace_files",
         "family": "grok"
       },
       {
         "provider": "magpie",
         "model": "minimax-cn/MiniMax-M3.1-Flash",
-        "deliveryMode": "workspace_git",
+        "deliveryMode": "workspace_files",
         "family": "minimax"
       }
     ],

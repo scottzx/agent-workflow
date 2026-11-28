@@ -54,7 +54,8 @@ for (let index = 0; index < args.length; index += 1) {
   if (arg === '--worktree') worktree = args[++index];
   else if (arg === '--role-dir') {
     roleDir = args[++index];
-    if (roleDir === undefined || roleDir.startsWith('-')) {
+    // An empty or whitespace-only value must fail closed, not silently skip --role-dir validation.
+    if (roleDir === undefined || !roleDir.trim() || roleDir.startsWith('-')) {
       await finish({
         ok: false,
         worktree: worktree ?? null,

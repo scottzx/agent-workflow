@@ -17,10 +17,11 @@ DSH 目录只展示 `name` 和 `description`。可选路由字段的源码键是
 严格按 `workflow.json`：
 
 1. `implement`：在隔离 worktree 里开发。先确认 `<worktree>/.git` 存在。只改授权文件。不 push，不开 PR。
+   BL-004 之后 Worker 与本地提交解耦：`routing.json` 的 `worker.deliveryMode` 是 `workspace_files`，网关不再注入“提交一个干净的 commit”。`.git` 指向主仓 `.git/worktrees/<name>`，在 `workspace-write` 白名单之外，`git add` / `git commit` 必然触发 `danger-full-access`。所以 Worker 禁止 `git add`、`git commit`、`git push`、`gh pr`，也禁止申请提权；提交由总管核验 `git diff` 与 L1 之后代为执行。
 2. 把真源投影到该 worktree（`.agents/skills/`、`.claude/skills` 软链、`AGENTS.local.md`）。投影已被 `.gitignore` 挡住。没有 `.git` 的目录不要投影。
-3. `l1_gate`：`node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <worktree>`。退出码不是 0 就停，不要用口头说明代替 JSON 摘要。
-4. `draft_pr`：L1 通过之后才开 Draft PR。不要把投影文件、任务目录或凭据放进提交。
-5. `cross_model_cr`：审查模型按 `routing.json`（v2：`primary + fallbacks[]`，向后兼容 v1）选路，默认 `magpie` / `group/deepseek-v4.1`，只读。通过 `execution_submit` 传入 `input.routingRoleId: "pr-delivery"` 与 `input.routingSlot: "worker" | "reviewer"`（审查节点同时传 `input.peerJobId: <workerJobId>`），网关会自动加载 `routing.json`、注入对应 `deliveryMode`（worker=`workspace_git`，reviewer=`none` + `readOnly: true`）、在派单边界遇 `quota/rate_limit/429/5xx/timeout` 60 秒内自动切换备用模型并落账实际执行路由，同时硬校验 `family(reviewer) !== family(actualWorker)`。实现模型不得自评通过。
+3. `l1_gate`：`node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <worktree> --role-dir <roleDir> --allowed-paths <本轮授权路径>`。退出码不是 0 就停，不要用口头说明代替 JSON 摘要。`--role-dir` 缺值、空串或纯空白一律报 `usage` 退出码 1，与 `--base-ref`、`--allowed-paths` 一致 fail-closed。两道硬门禁不会被参数绕过：`evals_immutable` 默认拒绝 `.1agents/roles/*/evals/` 的任何改动（已提交、staged、unstaged、untracked 与 rename 源目标都算，仅人在批准 `eval_change` 后显式传 `--allow-eval-change` 放行），`aoci_block_immutable` 拒绝改写 `AGENTS.md` 的 AOCI 区块；两者与 `--allowed-paths` 共用同一条 `merge-base(HEAD, origin/main)` 基线，缺 `origin/main` 即 fail-closed。
+4. `draft_pr`：L1 通过之后才开 Draft PR。不要把投影文件、任务目录或凭据放进提交。开 PR 只由总管执行。
+5. `cross_model_cr`：审查模型按 `routing.json`（v2：`primary + fallbacks[]`，向后兼容 v1）选路，默认 `magpie` / `group/deepseek-v4.1`，只读。通过 `execution_submit` 传入 `input.routingRoleId: "pr-delivery"` 与 `input.routingSlot: "worker" | "reviewer"`（审查节点同时传 `input.peerJobId: <workerJobId>`），网关会自动加载 `routing.json`、注入对应 `deliveryMode`（worker=`workspace_files`，reviewer=`none` + `readOnly: true`）、在派单边界遇 `quota/rate_limit/429/5xx/timeout` 60 秒内自动切换备用模型并落账实际执行路由，同时硬校验 `family(reviewer) !== family(actualWorker)`。实现模型不得自评通过。
 6. 返工走 `workflow.json` 的 `qaRevise` / `programBounce`，回到 `implement` 后重新跑 L1。不要为了变绿删测试或放宽断言。
 7. `ready_for_human`：自检、L1、异模型 CR、CI 都绿之后，才请人做一次验收。
 
@@ -28,6 +29,7 @@ DSH 目录只展示 `name` 和 `description`。可选路由字段的源码键是
 
 ## 不要做的事
 
+- 不要在 Worker 节点运行 `git add`、`git commit`、`git push` 或 `gh pr`，也不要申请 `danger-full-access` 提权；提交与开 PR 只由总管在核验 L1、diff 与测试之后执行。
 - 不要把技能抄进 `~/.dsh/.agent-presets/`，也不要建 `.agents/hooks/`。
 - 不要改 `AGENTS.md` 的 `<!-- aoci:begin -->` 到 `<!-- aoci:end -->`。
 - 不要在提示、测试、日志或提交说明里写入 token、cookie、指纹或真实 `.env`。
