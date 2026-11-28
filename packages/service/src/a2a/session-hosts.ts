@@ -56,13 +56,15 @@ export const sessionNoticeSchema = z.discriminatedUnion('form', [
   z.object({ form: z.literal('relay') }).strict(),
 ]);
 export type SessionNoticeMeta = z.output<typeof sessionNoticeSchema>;
-type Message = { sessionId: string; messageId: string; text: string; mode?: SessionDeliveryMode; notice?: SessionNoticeMeta };
+type Message = { sessionId: string; messageId: string; text: string; mode?: SessionDeliveryMode; notice?: SessionNoticeMeta; fromSessionId?: string };
 const messageSchema = z.object({
   sessionId: value,
   messageId: value,
   text: z.string().min(1).refine(text => !text.includes('\0')),
   mode: z.enum(['queue', 'steer']).optional(),
   notice: sessionNoticeSchema.optional(),
+  /** Optional sender identity; older DSH hosts ignore it because the body already names the sender. */
+  fromSessionId: z.string().trim().min(1).max(512).optional(),
 });
 const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
 const uuidPattern = new RegExp(`^${uuid}$`, 'i');
@@ -220,6 +222,7 @@ async function deliverDsh(
           text: input.text,
           form: input.notice.form,
           ...(input.notice.form === 'notice' ? { summary: input.notice.summary } : {}),
+          ...(input.fromSessionId ? { fromSessionId: input.fromSessionId } : {}),
         } } },
       },
       input.messageId,

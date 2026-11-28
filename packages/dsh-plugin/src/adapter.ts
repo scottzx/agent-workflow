@@ -731,10 +731,17 @@ export class AcpAdapter implements LlmAdapter {
     if (this.agentName(agent) !== options.model) throw new Error('ACP is available only in its matching Agent preset; start a new ACP session');
     const importedIds = new Set(this.state.get(agent.id)?.imported?.messageIds ?? []);
     const isForwardableSource = (kind: unknown): boolean => kind === 'user' || kind === '1agents-acp';
-    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && isForwardableSource(m.source?.kind) && (m.id === undefined || !importedIds.has(m.id)));
-    const blocks = input.flatMap(m => m.content);
-    if (!blocks.length || blocks.some(b => b.type !== 'text')) throw new Error('This ACP plugin currently accepts text prompts only');
-    const text = blocks.map(b => (b as { text: string }).text).join('\n\n');
+    // `GenerateOptions.messages` is `RequestMessage[]` (durable messages plus forwarded `RequestUserInput`
+    // without identity), so this helper accepts any shape that carries an opaque `source`.
+    const sourceOf = (message: { readonly source?: unknown }): { kind?: unknown; rpcId?: unknown } | undefined =>
+      message.source as { kind?: unknown; rpcId?: unknown } | undefined;
+    const isTextBlock = (block: unknown): block is { type: 'text'; text: string } =>
+      Boolean(block && typeof block === 'object' && (block as { type?: unknown }).type === 'text'
+        && typeof (block as { text?: unknown }).text === 'string');
+    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && isForwardableSource(sourceOf(m)?.kind) && (m.id === undefined || !importedIds.has(m.id)));
+    const blocks = input.flatMap(m => m.content ?? []);
+    if (!blocks.length || !blocks.every(isTextBlock)) throw new Error('This ACP plugin currently accepts text prompts only');
+    const text = blocks.map(block => block.text).join('\n\n');
     const requestId = 'dsh-' + createHash('sha256').update(JSON.stringify([agent.id, input.map(m => m.id)])).digest('hex');
     const endpoint = new URL(`/agents/${encodeURIComponent(options.model)}`, this.config.serviceUrl); endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
     let binding = this.state.get(agent.id);
@@ -815,16 +822,21 @@ export class AcpAdapter implements LlmAdapter {
         diagnosticId = await this.diagnostics!.begin({ sessionId: agent.id, turn,
           turnStartSeq, stepStartSeq: boundary?.lastStepStartSeq ?? 0, nativeRequestId: requestId,
           messageIds: [...new Set(admitted.flatMap(m => m.id === undefined ? [] : [m.id]))],
-          requestIds: [...new Set(admitted.flatMap(m => m.role === 'user' && m.source && isForwardableSource(m.source.kind) && 'rpcId' in m.source
-            && typeof m.source.rpcId === 'string' ? [m.source.rpcId] : []))],
+          requestIds: [...new Set(admitted.flatMap(m => {
+            const source = sourceOf(m);
+            return m.role === 'user' && isForwardableSource(source?.kind) && typeof source?.rpcId === 'string' ? [source.rpcId] : [];
+          }))],
         });
       });
       for (let attempt = 0; ; attempt++) {
         signal.throwIfAborted();
         try {
           this.output.set(agent.id, update);
-          const capacityId = input.flatMap(message => message.role === 'user' && message.source?.kind === 'user' && 'rpcId' in message.source
-            && typeof message.source.rpcId === 'string' && message.source.rpcId.startsWith('a2a-') ? [message.source.rpcId] : [])[0];
+          const capacityId = input.flatMap(message => {
+            const source = sourceOf(message);
+            return message.role === 'user' && source?.kind === 'user' && typeof source.rpcId === 'string'
+              && source.rpcId.startsWith('a2a-') ? [source.rpcId] : [];
+          })[0];
           try {
             active = await this.connection(agent, capacityId, signal);
             noteProcessReady(agent.id);

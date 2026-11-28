@@ -68,6 +68,7 @@ function printUnifiedHelp(binName: string) {
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   rsi run --role <dir> --case <id> ...    Run a role case: executor, program checks, send failures back
   rsi eval-cr --role <dir> [--results <file>] [--json]   Score L3 golden CR evals; exit 1 unless promotion-ready
+  session send --to <sessionId> <text...>  Queue one cross-session message (msg_from_session_id) on the target session
   ticket show|events|proposal --job <id>  Read a job's task ticket and its events, or settle a proposal
   process list|answer --job <id>          Read a job's process requests, or answer one as the coach or a person
   mcp [--url <url>] [--agent <name>]      Start lightweight A2A approval & task-ticket MCP server (stdio)
@@ -201,6 +202,11 @@ async function main() {
   if (rawArgs[0] === 'a2a') {
     const { runA2ACli } = await import('./a2a.js');
     await runA2ACli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'session') {
+    const { runSessionCli } = await import('./session.js');
+    await runSessionCli(rawArgs.slice(1));
     return;
   }
   if (rawArgs[0] === 'ticket') {

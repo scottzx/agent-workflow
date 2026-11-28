@@ -14,7 +14,7 @@ import { FileA2AStore } from './store.js';
 import { A2ADispatchRejectedError } from './types.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
-import { SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
+import { isReservedMessageId, RESERVED_MESSAGE_ID_PREFIXES, SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
 import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary, type RemoteAgentNotice, type SubscriberNotice } from './notices.js';
 import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
@@ -151,6 +151,17 @@ const closeSchema = z.object({ ...originFields, remote: string, taskId: string.o
 const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
+/** Cross-session message: the sender must name itself, and the receiving session sees msg_from_session_id. */
+const sessionDeliveryModeSchema = z.enum(['queue', 'steer']);
+const sessionMessageSendSchema = z.object({
+  fromSessionId: string,
+  toSessionId: string,
+  toHost: string.optional(),
+  messageId: string.optional(),
+  text: z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'message text must contain text'),
+  mode: sessionDeliveryModeSchema.optional(),
+  summary: z.string().trim().min(1).max(240).optional(),
+}).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
   clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
   parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(), caseId: string.optional(),
@@ -218,6 +229,7 @@ export const REMOTE_AGENT_METHODS = {
   remote_agent_ack: { description: '确认主会话已处理指定通知。noticeId 稳定，重复确认安全。', parameters: z.toJSONSchema(ackSchema) },
   session_bind: { description: '将主会话绑定到配置的 Codex 或 DSH 宿主及其已有会话 ID。同一归属不可静默换目标；在派任务前绑定可自动接收其完成通知。', parameters: z.toJSONSchema(sessionBindSchema) },
   session_send: { description: '向已绑定的主会话可靠投递消息。messageId 是稳定幂等键；立即返回持久投递回执，通过 session_delivery_get 查询。accepted 仅表示宿主已接收入队。', parameters: z.toJSONSchema(sessionSendSchema) },
+  session_message_send: { description: '跨会话留言：fromSessionId 必填，正文自动带 msg_from_session_id 让接收方看见发件方。目标已绑定时入该归属队列，与 A2A 任务通知在同一 FIFO 内自动合并为一次宿主投递；未绑定时直接入目标队列，无需接收方先 bind。messageId 是稳定幂等键，a2a-notice:/execution-notice:/process-request: 前缀保留给任务通知。', parameters: z.toJSONSchema(sessionMessageSendSchema) },
   session_delivery_get: { description: '查询本主会话的消息投递状态。unknown 必须先核实宿主是否已接收，不能盲目重发。', parameters: z.toJSONSchema(sessionMessageSchema) },
   session_delivery_resolve: { description: '核实 unknown 或处理 rejected 投递并记录依据。accepted=true 表示已确认入队；false 仅用于已证实未入队且已处理阻碍后释放重试。note 必填，不等于任务业务处理确认。', parameters: z.toJSONSchema(sessionResolveSchema) },
   session_binding_get: { description: '只读查询主会话是否已绑定宿主，以及该归属的投递计数和是否阻塞。不返回宿主凭据、hostFingerprint 或消息正文。unknown 或 rejected 大于 0 时 blocked 为 true。', parameters: z.toJSONSchema(sessionOriginSchema) },
@@ -1925,6 +1937,50 @@ export class RemoteAgentGateway {
     } catch { /* Durable outbox retries on the next tick, with the same ID. */ }
     finally { this.controllers.delete(controller); this.delivering.delete(id); }
   }
+  /**
+   * Send one cross-session message. Every parameter is validated before anything is persisted, so a
+   * rejected call leaves no dirty delivery. A bound target joins its owner FIFO and therefore merges
+   * with that session's A2A notices; an unbound target gets its own queue.
+   */
+  private sessionMessageSend(input: z.output<typeof sessionMessageSendSchema>) {
+    const { fromSessionId, toSessionId } = input;
+    const messageId = input.messageId ?? `session-msg:${randomUUID()}`;
+    if (isReservedMessageId(messageId)) {
+      throw new Error(`The ${RESERVED_MESSAGE_ID_PREFIXES.join(', ')} message ID namespaces are reserved for task notifications`);
+    }
+    const hosts = this.sessions.hostNames();
+    const boundHosts = this.sessions.hostsForSession(toSessionId);
+    // An ambiguous target must not silently pick one of its hosts: that would misroute the message.
+    if (!input.toHost && boundHosts.length > 1) {
+      throw new Error('toSessionId is bound to multiple session hosts; pass toHost explicitly');
+    }
+    const toHost = input.toHost
+      ?? boundHosts[0]
+      ?? (hosts.includes('dsh-local') ? 'dsh-local' : hosts.length === 1 ? hosts[0] : undefined);
+    if (!toHost) throw new Error('Cannot resolve a unique session host for toSessionId; pass toHost');
+    // An explicit host must exist and a Codex target must be a thread UUID.
+    this.sessions.resolveTarget({ host: toHost, sessionId: toSessionId });
+    const mode = input.mode ?? 'queue';
+    const text = `[跨会话留言]\nmsg_from_session_id: ${fromSessionId}\n---\n${input.text}`;
+    // The wrapper is part of the delivered body; refuse before enqueue when it no longer fits the host limit.
+    if (Buffer.byteLength(text, 'utf8') > 256 * 1024) {
+      throw new Error('Cross-session message exceeds the 256 KiB host delivery limit after adding msg_from_session_id');
+    }
+    const rawSummary = input.summary ?? `来自 ${fromSessionId} 的留言`;
+    const summary = rawSummary.length <= 240 ? rawSummary : `${rawSummary.slice(0, 239)}…`;
+    const notice = { form: 'notice' as const, summary };
+    const owner = this.sessions.originForTarget(toHost, toSessionId);
+    if (owner) {
+      const receipt = this.sessions.enqueue({ originSessionId: owner, messageId, text, mode, fromSessionId, notice });
+      void this.reconcile().catch(() => {});
+      return { messageId, fromSessionId, toHost, toSessionId, mode, status: receipt.status, queuedOn: 'owner' as const, receipt };
+    }
+    const receipt = this.sessions.enqueueTarget({
+      targetKey: `session-msg:${toHost}:${toSessionId}`, host: toHost, sessionId: toSessionId, messageId, text, mode, fromSessionId, notice,
+    });
+    void this.reconcile().catch(() => {});
+    return { messageId, fromSessionId, toHost, toSessionId, mode, status: receipt.status, queuedOn: 'target' as const, receipt };
+  }
   async invoke(method: string, params: unknown): Promise<unknown> {
     if (this.closed) throw new Error('Gateway is closed');
     const operation = this.invokeMethod(method, params);
@@ -2102,13 +2158,14 @@ export class RemoteAgentGateway {
     if (method === 'session_bind') return this.sessions.bind(sessionBindSchema.parse(params));
     if (method === 'session_send') {
       const input = sessionSendSchema.parse(params);
-      if (input.messageId.startsWith('a2a-notice:') || input.messageId.startsWith('execution-notice:') || input.messageId.startsWith('process-request:')) {
-        throw new Error('The a2a-notice:, execution-notice:, and process-request: message ID namespaces are reserved for task notifications');
+      if (isReservedMessageId(input.messageId)) {
+        throw new Error(`The ${RESERVED_MESSAGE_ID_PREFIXES.join(', ')} message ID namespaces are reserved for task notifications`);
       }
       const result = this.sessions.enqueue(input);
       void this.reconcile().catch(() => {});
       return result;
     }
+    if (method === 'session_message_send') return this.sessionMessageSend(sessionMessageSendSchema.parse(params));
     if (method === 'session_delivery_get') return this.sessions.get(sessionMessageSchema.parse(params));
     if (method === 'session_delivery_resolve') {
       const result = this.sessions.resolve(sessionResolveSchema.parse(params));

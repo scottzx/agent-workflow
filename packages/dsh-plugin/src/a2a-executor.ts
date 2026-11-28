@@ -439,8 +439,11 @@ export class DshA2ABackend implements A2ABackend {
     let settled = false;
     /** The failure facts of this turn's own error event, when the host published one. */
     let turnFailure: unknown;
-    const owns = (message: UserMessage): boolean => message.source.kind === 'user'
-      && 'rpcId' in message.source && message.source.rpcId === options.requestId;
+    const owns = (message: UserMessage): boolean => {
+      // `source` is host-owned and untyped from the plugin's perspective.
+      const source = message.source as { kind?: unknown; rpcId?: unknown } | undefined;
+      return source?.kind === 'user' && source.rpcId === options.requestId;
+    };
     const settle = (result: A2ARunResult): void => {
       if (settled) return;
       settled = true;
