@@ -6,6 +6,7 @@ import { join, resolve, sep } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { roleSkillProfileSchema } from '../src/roles/skills.js';
+import { deliveryInstructions } from '../src/a2a/job-directory.js';
 import { AGENTS_LOCAL_GENERATED_HEADER, projectRoleToWorktree, readRoleRules, validateSkillFrontmatter } from '../src/roles/index.js';
 import { loadChecklist } from '../src/rsi/checklist.js';
 import { loadWorkflow, runRoundDag } from '../src/rsi/engine.js';
@@ -104,10 +105,13 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
   for (const id of [
     'self_check', 'l1_deterministic', 'cross_model_cr', 'ci_status',
     'proj_git_anchor', 'proj_skill_frontmatter', 'proj_claude_symlink', 'proj_agents_local_header', 'proj_no_hooks',
-    'learnings_lookup', 'aoci_block_immutable',
+    'learnings_lookup', 'aoci_block_immutable', 'evals_immutable',
   ]) {
     assert.ok(ids.includes(id), id);
   }
+  assert.deepEqual(checklist.items.find(item => item.id === 'evals_immutable')?.dependsOn, ['l1_deterministic'],
+    'evals_immutable is a program check anchored on the L1 gate, like aoci_block_immutable');
+  assert.equal(checklist.items.find(item => item.id === 'evals_immutable')?.kind, 'program');
   assert.equal(checklist.items.find(item => item.id === 'learnings_lookup')?.modePolicy?.trial, 'observe');
   assert.deepEqual(checklist.items.find(item => item.id === 'aoci_block_immutable')?.dependsOn, ['l1_deterministic']);
   assert.equal(checklist.items.find(item => item.id === 'self_check')?.kind, 'self');
@@ -119,7 +123,7 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
   assert.equal(routing.schemaVersion, 2);
   assert.equal(routing.worker.primary.provider, 'magpie');
   assert.equal(routing.worker.primary.model, 'group/deepseek-v4.1');
-  assert.equal(routing.worker.primary.deliveryMode, 'workspace_git');
+  assert.equal(routing.worker.primary.deliveryMode, 'workspace_files');
   assert.ok(Array.isArray(routing.worker.fallbacks) && routing.worker.fallbacks.length >= 1);
   assert.equal(routing.reviewer.primary.provider, 'magpie');
   assert.equal(routing.reviewer.primary.model, 'minimax-cn/MiniMax-M3.1-Flash');
@@ -142,6 +146,47 @@ test('the tracked pr-delivery role matches the schema, workflow, checklist and s
   assert.equal(template.split(/\r?\n/, 1)[0], AGENTS_LOCAL_GENERATED_HEADER);
   const gitignore = await readFile(join(repoRoot, '.gitignore'), 'utf8');
   for (const rule of ignoreRules) assert.ok(gitignore.includes(rule), rule);
+});
+
+test('BL-004: every worker route delivers workspace_files and no prompt or rule asks for a commit', async () => {
+  const routing = JSON.parse(await readFile(join(roleDir, 'routing.json'), 'utf8')) as {
+    worker: { primary: { deliveryMode?: string }; fallbacks: { deliveryMode?: string }[] };
+    reviewer: { primary: { deliveryMode?: string }; fallbacks: { deliveryMode?: string }[] };
+  };
+  const workerEndpoints = [routing.worker.primary, ...routing.worker.fallbacks];
+  assert.ok(workerEndpoints.length >= 4, 'the primary route plus every fallback is a real worker endpoint');
+  for (const endpoint of workerEndpoints) {
+    // workspace_git injected "<提交一个干净的 commit>" into the worker prompt. In a worktree `.git`
+    // is a file under the main checkout, outside workspace-write, so that sentence forced a
+    // danger-full-access escalation (and widened the git push surface). The contract is now decoupled.
+    assert.equal(endpoint.deliveryMode, 'workspace_files', `worker route ${JSON.stringify(endpoint)} must not need a local commit`);
+    const prompt = deliveryInstructions(endpoint.deliveryMode as 'workspace_files');
+    assert.doesNotMatch(prompt, /commit/i, 'the injected delivery prompt must not ask the worker to commit');
+    assert.match(prompt, /原地写入或修改文件/);
+  }
+  assert.equal(routing.reviewer.primary.deliveryMode, 'none');
+  assert.equal(routing.reviewer.fallbacks.every(endpoint => endpoint.deliveryMode === 'none'), true);
+
+  // Both workspace_files prompt shapes (no manifest, with manifest) stay commit-free.
+  assert.doesNotMatch(deliveryInstructions('workspace_files'), /commit/i);
+  assert.doesNotMatch(deliveryInstructions('workspace_files', '/j/.1agents/jobs/job-1', '/j/manifest-a1.json'), /commit/i);
+
+  const role = await readFile(join(roleDir, 'ROLE.md'), 'utf8');
+  const template = await readFile(join(roleDir, 'AGENTS.local.template.md'), 'utf8');
+  for (const [label, text] of [['ROLE.md', role], ['AGENTS.local.template.md', template]] as const) {
+    assert.match(text, /git add/, `${label} must forbid git add`);
+    assert.match(text, /git commit/, `${label} must forbid git commit`);
+    assert.match(text, /git push/, `${label} must forbid git push`);
+    assert.match(text, /danger-full-access/, `${label} must forbid the privilege escalation that a local commit needs`);
+  }
+
+  // The self-check and the machine checklist must both state the decoupling, not just the prose.
+  const checklist = await loadChecklist(roleDir);
+  const selfCheck = checklist.items.find(item => item.id === 'self_check');
+  assert.match(selfCheck?.rule ?? '', /未运行 git add\/commit\/push/);
+  assert.match(selfCheck?.rule ?? '', /danger-full-access/);
+  const evals = checklist.items.find(item => item.id === 'evals_immutable');
+  assert.match(evals?.rule ?? '', /--allow-eval-change/);
 });
 
 test('projectRoleToWorktree fills a real git worktree and leaves status clean', async t => {

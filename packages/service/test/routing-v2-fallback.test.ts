@@ -142,14 +142,14 @@ test('routing v2 schema, model family single-source assertion (M3), cross-family
   assert.equal(normalized.schemaVersion, 2);
   // The tracked role must route onto this host's real online catalog, not retired model ids.
   assert.deepEqual(normalized.worker.primary, {
-    provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'workspace_git', family: 'deepseek',
+    provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'workspace_files', family: 'deepseek',
   });
   assert.deepEqual(normalized.worker.fallbacks.map(f => [f.provider, f.model, f.family]), [
     ['deepseek-account', 'deepseek-flash', 'deepseek'],
     ['magpie-responses', 'grok/grok-4.7@500k', 'grok'],
     ['magpie', 'minimax-cn/MiniMax-M3.1-Flash', 'minimax'],
   ]);
-  assert.deepEqual(normalized.worker.fallbacks.map(f => f.deliveryMode), ['workspace_git', 'workspace_git', 'workspace_git']);
+  assert.deepEqual(normalized.worker.fallbacks.map(f => f.deliveryMode), ['workspace_files', 'workspace_files', 'workspace_files']);
   assert.deepEqual(normalized.reviewer.primary, {
     provider: 'magpie', model: 'minimax-cn/MiniMax-M3.1-Flash', deliveryMode: 'none', readOnly: true, family: 'minimax',
   });
@@ -381,7 +381,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   assert.ok(elapsedMs < 60_000, `429 fallback took ${elapsedMs}ms, must be < 60000ms`);
   assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['group/deepseek-v4.1', 'deepseek-flash']);
   assert.equal(workerSubmitted.routing?.selected.model, 'deepseek-flash');
-  assert.equal(workerSubmitted.routing?.selected.deliveryMode, 'workspace_git');
+  assert.equal(workerSubmitted.routing?.selected.deliveryMode, 'workspace_files');
   assert.equal(workerSubmitted.routing?.fallbacks.length, 1);
   assert.equal(workerSubmitted.routing?.fallbacks[0]?.trigger, 'http_429');
 

@@ -268,4 +268,10 @@ test('--allowed-paths fails closed on a missing, empty, absolute or escaping spe
   assert.match(check(await usage(['--allowed-paths', '--allow-eval-change']), 'usage').detail ?? '', /looks like a flag/);
   assert.match(check(await usage(['--role-dir']), 'usage').detail ?? '', /missing value for --role-dir/);
   assert.match(check(await usage(['--role-dir', '--allow-eval-change']), 'usage').detail ?? '', /missing value for --role-dir/);
+  // SHOULD-1 (PR #41 Round 2): an empty or whitespace-only value used to skip role-source validation silently.
+  assert.match(check(await usage(['--role-dir', '']), 'usage').detail ?? '', /missing value for --role-dir/);
+  assert.match(check(await usage(['--role-dir', '   ']), 'usage').detail ?? '', /missing value for --role-dir/);
+  const blankRoleDir = await runGate(repo.root, ['--role-dir', '  ']);
+  assert.equal(blankRoleDir.body.checks.some(item => item.id === 'role-source'), false,
+    'a blank --role-dir must never be treated as "validate nothing"');
 });

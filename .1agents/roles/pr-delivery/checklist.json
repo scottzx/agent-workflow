@@ -9,7 +9,7 @@
       "severity": "must",
       "locked": true,
       "selfCheck": true,
-      "rule": "实现者按 ROLE.md 自检：隔离 worktree、只改授权文件、未 push、未开 PR、投影未进入 git status，并写了能打回退的回归测试"
+      "rule": "实现者按 ROLE.md 自检：隔离 worktree、只改授权文件、未运行 git add/commit/push 也未开 PR、未申请 danger-full-access 提权、投影未进入 git status，并写了能打回退的回归测试"
     },
     {
       "id": "l1_deterministic",
@@ -88,6 +88,14 @@
       "severity": "must",
       "locked": true,
       "rule": "AGENTS.md 中 <!-- aoci:begin --> 至 <!-- aoci:end --> 区块字节相对 merge-base(HEAD, origin/main) 基线不可改写（基线或 origin/main 缺失时 fail-closed 返回非 0）"
+    },
+    {
+      "id": "evals_immutable",
+      "kind": "program",
+      "dependsOn": ["l1_deterministic"],
+      "severity": "must",
+      "locked": true,
+      "rule": ".1agents/roles/<role>/evals/ 下任何禁改考卷变更（已提交 baseSha..HEAD、staged、unstaged、untracked 与 rename/copy 源目标）都使 l1-gate.mjs 退出码非 0；仅人在批准 eval_change 后显式传 --allow-eval-change 才放行并标记 overridden，基线或 origin/main 缺失时 fail-closed"
     }
   ]
 }

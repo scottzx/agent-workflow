@@ -40,7 +40,7 @@ test('readRoleRules loads the tracked pr-delivery role and isolates phases', asy
   assert.equal(all.routing?.schemaVersion, 2);
   if (all.routing?.schemaVersion === 2) {
     assert.equal(all.routing.reviewer.primary.model, 'minimax-cn/MiniMax-M3.1-Flash');
-    assert.equal(all.routing.worker.primary.deliveryMode, 'workspace_git');
+    assert.equal(all.routing.worker.primary.deliveryMode, 'workspace_files');
     assert.ok(all.routing.worker.fallbacks.length >= 1);
     assert.ok(all.routing.reviewer.fallbacks.length >= 1);
   }
