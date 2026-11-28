@@ -12,6 +12,7 @@ import {
   assertCrossModelFamily,
   classifyFallbackTrigger,
   extractModelFamily,
+  inferModelFamilyFromModel,
   normalizeRoleRouting,
   RoutingInvariantError,
   selectDispatchCandidate,
@@ -19,6 +20,8 @@ import {
 } from '../src/roles/routing.js';
 import { checkGate, writeCrEvalReport } from '../src/rsi/gate.js';
 import { loadCrEvalManifest, scoreCrEvalSuite, type CrEvalCase, type CrReviewResult } from '../src/rsi/pr-cr-eval.js';
+import { loadRubric, scoreRubricEvaluation } from '../src/rsi/rubric.js';
+import { lookupLearnings } from '../src/rsi/learnings-lookup.js';
 
 const repoRoot = resolve(import.meta.dirname, '../../..');
 const prDeliveryRoleDir = join(repoRoot, '.1agents/roles/pr-delivery');
@@ -27,7 +30,7 @@ class RouteAwareBackend implements A2ABackend {
   readonly checkedRoutes: { provider?: string; model?: string }[] = [];
   readonly executedRoutes: { provider?: string; model?: string; prompt: string }[] = [];
   rejectMode: 'quota_429' | 'http_503' | 'hang_timeout' | 'auth_401' | 'none' = 'none';
-  rejectModel = 'grok/grok-4.7@500k';
+  rejectModel = 'group/deepseek-v4.1';
   /** Throws after Task allocation, from prepare or run, to prove the rejection label cannot leak past admission. */
   allocationFailure: 'none' | 'prepare' | 'run' = 'none';
   private readonly hangResolvers: (() => void)[] = [];
@@ -137,18 +140,51 @@ test('routing v2 schema, model family single-source assertion (M3), cross-family
   const raw = JSON.parse(await readFile(join(prDeliveryRoleDir, 'routing.json'), 'utf8')) as unknown;
   const normalized = normalizeRoleRouting(raw);
   assert.equal(normalized.schemaVersion, 2);
-  assert.equal(normalized.worker.primary.model, 'grok/grok-4.7@500k');
-  assert.equal(normalized.reviewer.primary.model, 'group/deepseek-v4.1');
-  assert.ok(normalized.worker.fallbacks.length >= 2);
-  assert.ok(normalized.reviewer.fallbacks.length >= 2);
+  // The tracked role must route onto this host's real online catalog, not retired model ids.
+  assert.deepEqual(normalized.worker.primary, {
+    provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'workspace_git', family: 'deepseek',
+  });
+  assert.deepEqual(normalized.worker.fallbacks.map(f => [f.provider, f.model, f.family]), [
+    ['deepseek-account', 'deepseek-flash', 'deepseek'],
+    ['magpie-responses', 'grok/grok-4.7@500k', 'grok'],
+    ['magpie', 'minimax-cn/MiniMax-M3.1-Flash', 'minimax'],
+  ]);
+  assert.deepEqual(normalized.worker.fallbacks.map(f => f.deliveryMode), ['workspace_git', 'workspace_git', 'workspace_git']);
+  assert.deepEqual(normalized.reviewer.primary, {
+    provider: 'magpie', model: 'minimax-cn/MiniMax-M3.1-Flash', deliveryMode: 'none', readOnly: true, family: 'minimax',
+  });
+  assert.deepEqual(normalized.reviewer.fallbacks.map(f => [f.provider, f.model, f.family]), [
+    ['spark', 'qwen3.8-flash-next-nvfp4-nvfp4-qad', 'qwen'],
+    ['magpie', 'group/deepseek-v4.1', 'deepseek'],
+  ]);
+  assert.equal(normalized.reviewer.fallbacks.every(f => f.deliveryMode === 'none' && f.readOnly === true), true);
+  for (const slot of [normalized.worker, normalized.reviewer]) {
+    assert.deepEqual(slot.fallbackOn, ['quota', 'rate_limit', 'http_429', 'http_5xx', 'timeout']);
+    assert.equal(slot.maxFallbackDurationMs, 60_000);
+  }
+  assert.equal(normalized.canary?.required, true);
+
+  // minimax is a first-class family: vendor-prefixed AND router-prefixed ids must normalize identically.
+  assert.equal(inferModelFamilyFromModel('minimax-cn/MiniMax-M3.1-Flash'), 'minimax');
+  assert.equal(inferModelFamilyFromModel('openrouter/minimax-m2'), 'minimax');
+  assert.equal(extractModelFamily({ provider: 'magpie', model: 'minimax-cn/MiniMax-M3.1-Flash' }), 'minimax');
+  assert.equal(extractModelFamily({ provider: 'spark', model: 'qwen3.8-flash-next-nvfp4-nvfp4-qad' }), 'qwen');
+  assert.throws(
+    () => assertCrossModelFamily(
+      { provider: 'magpie', model: 'minimax-cn/MiniMax-M3.1-Flash' },
+      { provider: 'minimax', model: 'openrouter/minimax-m2' },
+    ),
+    (err: unknown) => err instanceof RoutingInvariantError && err.code === 'SAME_MODEL_FAMILY',
+    'two minimax aliases must be recognised as the same family',
+  );
 
   // V1 backward compatibility.
   const v1 = normalizeRoleRouting({
     schemaVersion: 1,
-    worker: { provider: 'magpie-responses', model: 'grok/grok-4.7@500k', deliveryMode: 'workspace_git' },
-    reviewer: { provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'none', readOnly: true },
+    worker: { provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'workspace_git' },
+    reviewer: { provider: 'magpie', model: 'minimax-cn/MiniMax-M3.1-Flash', deliveryMode: 'none', readOnly: true },
   });
-  assert.equal(v1.worker.primary.model, 'grok/grok-4.7@500k');
+  assert.equal(v1.worker.primary.model, 'group/deepseek-v4.1');
   assert.deepEqual(v1.worker.fallbacks, []);
 
   // M3: Forged `family` field contradicting `model` MUST fail closed with INVALID_MODEL_FAMILY!
@@ -321,9 +357,9 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   assert.equal(afterInvalid.jobs.length, 0, 'invalid routingFallback must NOT leave an orphan/unknown attempt in the ledger');
 
   // M1 + M5: Production dispatch via `routingRoleId: 'pr-delivery'` + `routingSlot: 'worker'` (NO manual routingFallback!)
-  // Real createA2AServer rejects grok with HTTP 429 ACCOUNT_QUOTA -> auto-switches to openai/gpt-5.2-codex in <60s!
+  // Real createA2AServer rejects the primary deepseek route with HTTP 429 ACCOUNT_QUOTA -> auto-switches to deepseek-flash in <60s!
   backend.rejectMode = 'quota_429';
-  backend.rejectModel = 'grok/grok-4.7@500k';
+  backend.rejectModel = 'group/deepseek-v4.1';
   const startedAt = Date.now();
   const workerSubmitted = await gateway.invoke('execution_submit', {
     originSessionId: 'origin-drill',
@@ -343,8 +379,8 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   const elapsedMs = Date.now() - startedAt;
   assert.ok(workerSubmitted.jobId);
   assert.ok(elapsedMs < 60_000, `429 fallback took ${elapsedMs}ms, must be < 60000ms`);
-  assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['grok/grok-4.7@500k', 'openai/gpt-5.2-codex']);
-  assert.equal(workerSubmitted.routing?.selected.model, 'openai/gpt-5.2-codex');
+  assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['group/deepseek-v4.1', 'deepseek-flash']);
+  assert.equal(workerSubmitted.routing?.selected.model, 'deepseek-flash');
   assert.equal(workerSubmitted.routing?.selected.deliveryMode, 'workspace_git');
   assert.equal(workerSubmitted.routing?.fallbacks.length, 1);
   assert.equal(workerSubmitted.routing?.fallbacks[0]?.trigger, 'http_429');
@@ -359,7 +395,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
     if (workerView.executionStatus === 'completed') break;
     await new Promise(r => setTimeout(r, 50));
   }
-  assert.equal(workerView?.routing?.selected.model, 'openai/gpt-5.2-codex', 'ledger execution_get must persist actual executed model');
+  assert.equal(workerView?.routing?.selected.model, 'deepseek-flash', 'ledger execution_get must persist actual executed model');
 
   // Continuation preserves exact same jobId!
   const continued = await gateway.invoke('execution_continue', {
@@ -371,7 +407,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   assert.notEqual(continued.attemptId, workerSubmitted.attemptId);
 
   // M2: Dispatch reviewer via `routingSlot: 'reviewer'` + `peerJobId: workerSubmitted.jobId`
-  // Gateway reads Worker's actual route (`openai/gpt-5.2-codex`) from ledger; reviewer picks deepseek with deliveryMode='none' + readOnly=true!
+  // Gateway reads Worker's actual route (`deepseek-flash`) from ledger; reviewer picks minimax with deliveryMode='none' + readOnly=true!
   backend.checkedRoutes.length = 0;
   backend.rejectMode = 'none';
   const reviewerSubmitted = await gateway.invoke('execution_submit', {
@@ -389,7 +425,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
     jobId: string;
     routing?: { selected: { model: string; deliveryMode?: string; readOnly?: boolean } };
   };
-  assert.equal(reviewerSubmitted.routing?.selected.model, 'group/deepseek-v4.1');
+  assert.equal(reviewerSubmitted.routing?.selected.model, 'minimax-cn/MiniMax-M3.1-Flash');
   assert.equal(reviewerSubmitted.routing?.selected.deliveryMode, 'none');
   assert.equal(reviewerSubmitted.routing?.selected.readOnly, true);
 
@@ -406,10 +442,10 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
         agentPreset: 'standard',
         routingFallback: {
           slot: {
-            primary: { provider: 'magpie', model: 'openai/gpt-5.2', deliveryMode: 'none', readOnly: true },
+            primary: { provider: 'magpie', model: 'group/deepseek-v4.1', deliveryMode: 'none', readOnly: true },
             fallbacks: [],
           },
-          peerJobId: workerSubmitted.jobId, // actual worker ran openai/gpt-5.2-codex!
+          peerJobId: workerSubmitted.jobId, // actual worker ran deepseek-flash (same deepseek family)!
         },
       },
     }),
@@ -421,7 +457,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   // Non-fallback HTTP 401 auth error must NOT switch to fallback!
   backend.checkedRoutes.length = 0;
   backend.rejectMode = 'auth_401';
-  backend.rejectModel = 'grok/grok-4.7@500k';
+  backend.rejectModel = 'group/deepseek-v4.1';
   const authFailed = await gateway.invoke('execution_submit', {
     originSessionId: 'origin-drill',
     targetId: 'legacy:drill',
@@ -434,7 +470,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
     },
   }) as { error?: string };
   assert.ok(authFailed.error, '401 must fail dispatch');
-  assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['grok/grok-4.7@500k'], '401 auth failure must NOT try fallback candidates');
+  assert.deepEqual(backend.checkedRoutes.map(r => r.model), ['group/deepseek-v4.1'], '401 auth failure must NOT try fallback candidates');
 
   // S1 + S2: Conflicting deliveryMode or resultContract.deliveryMode on read-only reviewer slot MUST fail closed before prepare (0 orphan jobs)!
   const countBeforeReadOnly = (await gateway.invoke('execution_list', { originSessionId: 'origin-drill' }) as { jobs: unknown[] }).jobs.length;
@@ -506,14 +542,14 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   }) as { jobId: string; executionStatus: string; routing?: { selected: { model: string } }; error?: string };
   assert.equal(recovered.error, undefined);
   assert.equal(recovered.jobId, allRejected.jobId);
-  assert.equal(recovered.routing?.selected.model, 'grok/grok-4.7@500k');
+  assert.equal(recovered.routing?.selected.model, 'group/deepseek-v4.1');
 
   // M1: Real HTTP transport timeout (AbortSignal.timeout 10s DOMException TimeoutError) MUST switch to fallback within <60s
   // AND the abandoned primary request MUST NOT spawn a duplicate concurrent model execution after releaseHangs()!
   backend.checkedRoutes.length = 0;
   backend.executedRoutes.length = 0;
   backend.rejectMode = 'hang_timeout';
-  backend.rejectModel = 'grok/grok-4.7@500k';
+  backend.rejectModel = 'group/deepseek-v4.1';
   const timeoutStart = Date.now();
   const timeoutSwitched = await gateway.invoke('execution_submit', {
     originSessionId: 'origin-drill',
@@ -531,7 +567,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   };
   const timeoutElapsedMs = Date.now() - timeoutStart;
   assert.ok(timeoutElapsedMs < 60_000, `timeout fallback took ${timeoutElapsedMs}ms`);
-  assert.equal(timeoutSwitched.routing?.selected.model, 'openai/gpt-5.2-codex');
+  assert.equal(timeoutSwitched.routing?.selected.model, 'deepseek-flash');
   assert.equal(timeoutSwitched.routing?.fallbacks.length, 1);
   assert.equal(timeoutSwitched.routing?.fallbacks[0]?.trigger, 'timeout');
 
@@ -545,7 +581,7 @@ test('real createA2AServer 429/quota admission rejection + production routingSlo
   await new Promise(r => setTimeout(r, 250));
   assert.deepEqual(
     backend.executedRoutes.map(r => r.model),
-    ['openai/gpt-5.2-codex'],
+    ['deepseek-flash'],
     'abandoned timed-out primary request must NEVER execute concurrently with the fallback route',
   );
 });
@@ -863,4 +899,77 @@ test('verifyRoutingCanaryGate & checkGate enforce routing.json v2 invariants and
   const gateMinCases = await checkGate({ roleDirectory: roleCopy, workspace, repoRoot });
   assert.equal(gateMinCases.crEval?.status, 'failed');
   assert.ok(gateMinCases.reasons.some(r => r.includes('canary 要求至少 999 条黄金样本')));
+});
+
+test('pr-delivery rubric.json loads as an observe-only C1-C6 rubric and its gates really bite', async () => {
+  const rubric = await loadRubric(prDeliveryRoleDir);
+  assert.equal(rubric.roleId, 'pr-delivery');
+  assert.deepEqual(rubric.artifacts, ['commit']);
+  assert.equal(rubric.purpose, 'summative');
+  assert.deepEqual(rubric.criteria.map(c => c.id), ['C1', 'C2', 'C3', 'C4', 'C5', 'C6']);
+  assert.deepEqual(
+    rubric.criteria.map(c => c.gate?.mode),
+    ['observe', 'observe', 'observe', 'observe', 'observe', 'observe'],
+    'trial/observe rubric条目不得自动阻断，红线仍由 QA.md 与 L1 机检负责',
+  );
+  assert.deepEqual(rubric.criteria.map(c => [c.id, c.weight, c.severity]), [
+    ['C1', 3, 'must'], ['C2', 3, 'must'], ['C3', 2, 'must'],
+    ['C4', 2, 'should'], ['C5', 2, 'should'], ['C6', -4, 'must'],
+  ]);
+  assert.equal(rubric.criteria[3]?.scale.type, 'ordinal');
+  assert.equal(rubric.criteria[5]?.polarity, 'negative');
+  assert.equal(rubric.aggregation?.passScore, 0.8);
+  assert.deepEqual(rubric.aggregation?.mustAllPass, ['C1', 'C2', 'C3']);
+  assert.deepEqual(rubric.aggregation?.mustNotTrigger, ['C6']);
+  assert.equal(rubric.calibration?.minSamples, 40);
+  assert.deepEqual(rubric.calibration?.bands, { auto: 0.8, advise: 0.67, split: 0.67 });
+
+  const clean = ['C1', 'C2', 'C3', 'C4', 'C5'].map(id => ({ id, met: true }));
+  const passing = scoreRubricEvaluation(rubric, clean);
+  assert.equal(passing.positiveWeightSum, 12);
+  assert.equal(passing.normalizedScore, 1);
+  assert.equal(passing.passed, true);
+
+  // Dropping one must criterion still clears passScore numerically (10/12 = 0.833) but mustAllPass blocks it.
+  const missingMust = scoreRubricEvaluation(rubric, clean.filter(item => item.id !== 'C3'));
+  assert.ok(missingMust.normalizedScore > 0.8);
+  assert.deepEqual(missingMust.mustAllPassFailed, ['C3']);
+  assert.equal(missingMust.passed, false, 'mustAllPass 必须独立于 passScore 阻断');
+
+  // C6 (-4) must drag the score below passScore AND fire mustNotTrigger: (12 - 4) / 12 = 0.667 < 0.8.
+  const leak = scoreRubricEvaluation(rubric, [...clean, { id: 'C6', met: true }]);
+  assert.equal(leak.negativeDeduction, 4);
+  assert.equal(leak.rawNormalizedScore, 0.667);
+  assert.ok(leak.normalizedScore < leak.passScore);
+  assert.deepEqual(leak.mustNotTriggerFired, ['C6']);
+  assert.equal(leak.passed, false);
+
+  // A clean review must NOT be dragged down by the negative criterion staying quiet.
+  assert.equal(scoreRubricEvaluation(rubric, [...clean, { id: 'C6', met: false }]).passed, true);
+});
+
+test('lookupLearnings recalls the active docs/solutions/a2a cards for the delivery boundary files', async () => {
+  const targets = ['packages/service/src/a2a/session-delivery.ts', 'packages/service/src/a2a/gateway.ts'];
+  const report = await lookupLearnings({ repoRoot, paths: targets });
+  assert.equal(report.ok, true);
+  assert.equal(report.activeCount >= 3, true, 'the a2a cards must be indexed as active entries');
+  assert.equal(report.matches.length <= 3, true, `pre-implementation recall is capped at 3, got ${report.matches.length}`);
+  const ids = report.matches.map(match => match.id);
+  assert.ok(ids.includes('solution:a2a/session-delivery-queue-and-pretask-boundaries'), `missing session-delivery card in ${ids.join(', ')}`);
+  assert.ok(ids.includes('solution:a2a/pre-prepare-fail-closed-and-zero-orphans'), `missing pre-prepare card in ${ids.join(', ')}`);
+  assert.equal(
+    report.matches[0]?.id,
+    'solution:a2a/session-delivery-queue-and-pretask-boundaries',
+    'the card that names both target files must rank first',
+  );
+  assert.deepEqual(
+    report.matches[0]?.matchedBy.filter(m => m.startsWith('path:')),
+    ['path:packages/service/src/a2a/gateway.ts', 'path:packages/service/src/a2a/session-delivery.ts'],
+  );
+  assert.equal(report.matches.every(match => match.kind === 'solution' && match.problem_type.length > 0), true);
+
+  // A server.ts-only query still recalls the disconnect card instead of returning nothing.
+  const single = await lookupLearnings({ repoRoot, paths: ['packages/service/src/a2a/server.ts'] });
+  assert.ok(single.matches.length > 0 && single.matches.length <= 3);
+  assert.equal(single.matches[0]?.id, 'solution:a2a/server-disconnect-not-req-destroyed');
 });

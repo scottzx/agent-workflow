@@ -9,6 +9,7 @@ docs/solutions/
 ├── README.md                  # 本约定说明（不作为知识条目索引）
 ├── <module>/<slug>.md         # 经验卡片（YAML frontmatter + 正文）
 ├── rejected-edits.jsonl       # 正文只追加不回滚的失败教训 / 退化记录
+├── backlog.jsonl              # 持久化演进优化清单（待排期改造项，不进入 learnings_lookup 约束召回）
 └── index-meta.json            # 可选：索引元数据（如将历史条目标记为 stale）
 ```
 
@@ -44,6 +45,12 @@ paths:
 - `rejected-edits.jsonl` 按行存储被拒绝、打回或回滚的改动教训（每行一条独立 JSON，包含 `id`、`module`、`tags`、`problem_type`、`rule`、`source`、`createdAt` 以及可选 `paths`）。
 - **正文只追加，不回滚、不原地删除**：哪怕某次角色改动因回归被不对称回滚，`rejected-edits.jsonl` 里的历史正文也必须完整保留。
 - **标记过时仅改索引元数据**：当一条历史约束不再适用时，通过 `markKnowledgeStale` 写入 `docs/solutions/index-meta.json`（记录 `status: "stale"`、`reason`、`updatedAt`），绝不改写或截断 `rejected-edits.jsonl` 原文。
+
+## `backlog.jsonl` 演进优化清单约定
+
+- `backlog.jsonl` 按行持久化跨会话待排期的系统改造与程序化硬锁优化项（每行一条独立 JSON，包含 `id`、`title`、`kind`、`layer`、`priority`、`status`、`source`、`createdAt`、`acceptance` 以及可选 `linkedPr`）。
+- 与经验卡片（活跃避坑约束）严格分离：`compileKnowledgeIndex` / `learnings_lookup` **不索引** `backlog.jsonl`，避免把尚未实现的待办需求误召回为开工约束。
+- 对应 PR 合入 `main` 后将条目标记为 `status: "done"` 并记录 `linkedPr`，同时把新固化的约束沉淀为经验卡片或 L1 检查。
 
 ## 开工前检索
 

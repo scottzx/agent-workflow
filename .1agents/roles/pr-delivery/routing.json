@@ -2,23 +2,29 @@
   "schemaVersion": 2,
   "worker": {
     "primary": {
-      "provider": "magpie-responses",
-      "model": "grok/grok-4.7@500k",
+      "provider": "magpie",
+      "model": "group/deepseek-v4.1",
       "deliveryMode": "workspace_git",
-      "family": "grok"
+      "family": "deepseek"
     },
     "fallbacks": [
       {
-        "provider": "magpie-responses",
-        "model": "openai/gpt-5.2-codex",
+        "provider": "deepseek-account",
+        "model": "deepseek-flash",
         "deliveryMode": "workspace_git",
-        "family": "openai"
+        "family": "deepseek"
+      },
+      {
+        "provider": "magpie-responses",
+        "model": "grok/grok-4.7@500k",
+        "deliveryMode": "workspace_git",
+        "family": "grok"
       },
       {
         "provider": "magpie",
-        "model": "anthropic/claude-sonnet-4.5",
+        "model": "minimax-cn/MiniMax-M3.1-Flash",
         "deliveryMode": "workspace_git",
-        "family": "claude"
+        "family": "minimax"
       }
     ],
     "fallbackOn": ["quota", "rate_limit", "http_429", "http_5xx", "timeout"],
@@ -27,25 +33,25 @@
   "reviewer": {
     "primary": {
       "provider": "magpie",
-      "model": "group/deepseek-v4.1",
+      "model": "minimax-cn/MiniMax-M3.1-Flash",
       "deliveryMode": "none",
       "readOnly": true,
-      "family": "deepseek"
+      "family": "minimax"
     },
     "fallbacks": [
       {
-        "provider": "magpie",
-        "model": "google/gemini-2.5-pro",
+        "provider": "spark",
+        "model": "qwen3.8-flash-next-nvfp4-nvfp4-qad",
         "deliveryMode": "none",
         "readOnly": true,
-        "family": "gemini"
+        "family": "qwen"
       },
       {
         "provider": "magpie",
-        "model": "anthropic/claude-opus-4.5",
+        "model": "group/deepseek-v4.1",
         "deliveryMode": "none",
         "readOnly": true,
-        "family": "claude"
+        "family": "deepseek"
       }
     ],
     "fallbackOn": ["quota", "rate_limit", "http_429", "http_5xx", "timeout"],

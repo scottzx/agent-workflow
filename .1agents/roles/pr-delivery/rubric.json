@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "roleId": "pr-delivery",
+  "artifacts": ["commit"],
+  "purpose": "summative",
+  "layers": ["program", "text"],
+  "criteria": [
+    {
+      "id": "C1",
+      "title": "需求契约与边界完整无旁路",
+      "question": "本次提交实现的功能、输入边界与拒绝路径，是否与任务单声明的契约逐条对应，并且没有用旁路（跳过前置校验、放宽断言、绕开授权文件范围）凑出结果？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": {
+        "required": true,
+        "kind": "path",
+        "hint": "按 path:line 给出实现契约与边界检查的确切位置，并指出任务单里对应哪一条要求",
+        "minChars": 8
+      },
+      "gate": { "mode": "observe" },
+      "antiGaming": {
+        "shortcuts": [
+          "只引用文件路径不给行号，无法核对契约落点",
+          "把任务单没要求的行为写成已实现，用来掩盖缺失的拒绝路径"
+        ]
+      }
+    },
+    {
+      "id": "C2",
+      "title": "前置校验、零孤儿与并发/故障边界",
+      "question": "所有准入与路由校验是否前移到落盘/派单副作用之前，失败时不留孤儿状态，并且没有把超时或断连后的废弃请求继续执行成第二份并发工作？",
+      "layer": "program",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 3,
+      "severity": "must",
+      "evidence": {
+        "required": true,
+        "kind": "path",
+        "hint": "引用前置校验与副作用起点的 path:line（如 ledger.prepare 之前、transport.handle 之前），并指出 0 孤儿/0 unknown 的观察点",
+        "minChars": 8
+      },
+      "gate": { "mode": "observe" },
+      "antiGaming": {
+        "shortcuts": [
+          "先落盘再逐个校验，失败时把已写入的记录留在账本里",
+          "只在 happy path 校验，靠调用方自律保证边界"
+        ]
+      }
+    },
+    {
+      "id": "C3",
+      "title": "回归测试真打回退",
+      "question": "新增或更新的回归测试，在把实现退回缺陷版本时会不会失败——它断言的是退出码、JSON、文件字节或 git 状态这类可观察事实，而不是“某个函数被调用过”？",
+      "layer": "program",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "must",
+      "evidence": {
+        "required": true,
+        "kind": "path",
+        "hint": "引用测试文件的 path:line，并说明退回缺陷实现时是哪一条断言变红",
+        "minChars": 8
+      },
+      "gate": { "mode": "observe" },
+      "antiGaming": {
+        "shortcuts": [
+          "只断言函数被调用、捕获并吞掉错误",
+          "为了让测试变绿而放宽或删除既有断言"
+        ]
+      }
+    },
+    {
+      "id": "C4",
+      "title": "模块解耦与向后兼容",
+      "question": "改动是否停留在授权模块内、没有引入新的循环依赖，并且老状态（旧账本/旧配置/旧 routing v1）仍能按既有语义读取？",
+      "layer": "program",
+      "modality": "text",
+      "scale": {
+        "type": "ordinal",
+        "levels": [
+          {
+            "value": 0,
+            "label": "破坏兼容",
+            "anchor": "引入了新的循环依赖，或旧状态/旧配置在读入时直接报错或被静默改写",
+            "counterExample": "旧 routing v1 文件在 normalize 时抛错，已有账本无法继续读取"
+          },
+          {
+            "value": 1,
+            "label": "兼容但有耦合",
+            "anchor": "老状态能读，但新增了一条不必要的跨模块依赖，或兼容路径缺少测试覆盖",
+            "counterExample": "为复用校验把渲染层 import 进路由层，仅靠约定避免循环"
+          },
+          {
+            "value": 2,
+            "label": "解耦且兼容",
+            "anchor": "依赖方向单向且无新增循环，旧状态与旧配置有显式兼容路径和对应回归断言",
+            "counterExample": "新枚举复用既有 schema，v1/v2 都有独立回归用例"
+          }
+        ]
+      },
+      "weight": 2,
+      "severity": "should",
+      "evidence": {
+        "required": true,
+        "kind": "path",
+        "hint": "引用兼容分支与新依赖方向的 path:line；没有兼容负担时说明为什么不适用",
+        "minChars": 8
+      },
+      "gate": { "mode": "observe" }
+    },
+    {
+      "id": "C5",
+      "title": "变更日志与文档事实一致",
+      "question": "变更日志和角色文档是否只把真正完成并验证过的事项写成已完成，未执行、未验证的部分被明确标注，也没有把并行任务的未提交内容算进本次提交？",
+      "layer": "content",
+      "modality": "text",
+      "scale": { "type": "binary" },
+      "weight": 2,
+      "severity": "should",
+      "evidence": {
+        "required": true,
+        "kind": "quote",
+        "hint": "引用变更日志里对应的那条原文（≤120 字），并给出它所依据的验证命令或测试结论",
+        "minChars": 8
+      },
+      "gate": { "mode": "observe" }
+    },
+    {
+      "id": "C6",
+      "title": "凭据泄露、AOCI 块改写、投影入提交或越权改文件（负向）",
+      "question": "提交里是否出现真实凭据/指纹、AGENTS.md 的 AOCI 区块被改写、投影文件（.agents/、.claude/、AGENTS.local.md）或考卷文件被纳入，或修改了授权范围之外的文件？",
+      "layer": "program",
+      "modality": "text",
+      "polarity": "negative",
+      "scale": { "type": "binary" },
+      "weight": -4,
+      "severity": "must",
+      "evidence": {
+        "required": true,
+        "kind": "path",
+        "hint": "命中时给出具体文件与行；未命中时说明核验了哪些范围（diff、git status、aoci 区块字节）",
+        "minChars": 8
+      },
+      "gate": { "mode": "observe" },
+      "antiGaming": {
+        "shortcuts": [
+          "把示例值写成看似真实的 token 来“复现问题”",
+          "用重新生成 AOCI 区块的方式解释 AGENTS.md 的改动"
+        ]
+      }
+    }
+  ],
+  "aggregation": {
+    "method": "normalized_positive_sum",
+    "formula": "normalized_positive_sum",
+    "passScore": 0.8,
+    "mustAllPass": ["C1", "C2", "C3"],
+    "mustNotTrigger": ["C6"],
+    "note": "分母只算正权重之和（C1-C5 共 12 分）；C6 为负向条目，命中直接扣 4 分并触发 mustNotTrigger 判失败。trial/observe 期所有条目 gate.mode 均为 observe：只并行观察打分，绝不替代 QA.md 的二元红线闸门与 L1 机检。"
+  },
+  "calibration": {
+    "goldSet": "evals/human-calibration.json",
+    "minSamples": 40,
+    "metrics": ["krippendorff_alpha", "cohen_kappa", "spearman_rho"],
+    "bands": { "auto": 0.8, "advise": 0.67, "split": 0.67 },
+    "note": "auto 需要有效 alpha >= 0.8 且可用配对样本 n >= 40；未达 40 条人工金标前一律落在 advise/split，不允许自动阻断。"
+  }
+}
