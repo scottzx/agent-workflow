@@ -113,9 +113,14 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
   const metadata: unknown = request.metadata?.['1agents'];
   if (metadata !== undefined && (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))) throw new RequestMalformedError('metadata.1agents must be an object');
   const value = (metadata ?? {}) as Record<string, unknown>;
-  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'agentFile', 'provider', 'model', 'execution'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
+  for (const key of Object.keys(value)) if (!['cwd', 'agentPreset', 'workspace', 'preflight', 'resultContract', 'roleId', 'agentFile', 'provider', 'model', 'execution', 'sandboxMode'].includes(key)) throw new RequestMalformedError(`Unknown metadata.1agents field: ${key}`);
   for (const key of ['cwd', 'agentPreset', 'workspace', 'roleId', 'agentFile', 'provider', 'model']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !(value[key] as string).trim())) throw new RequestMalformedError(`${key} must be a nonempty string`);
+  }
+  // A remote caller may only ever narrow its own writes. Any other value — including a widening
+  // sandbox name — is rejected before a session is prepared, so it cannot escalate permissions.
+  if (value.sandboxMode !== undefined && value.sandboxMode !== 'read-only') {
+    throw new RequestMalformedError('metadata.1agents.sandboxMode may only be "read-only"');
   }
   if ((value.provider === undefined) !== (value.model === undefined)) throw new RequestMalformedError('provider and model must be passed together');
   if (value.roleId !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value.roleId as string)
@@ -137,7 +142,8 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
     ...(preflight?.success ? { preflight: preflight.data } : {}),
     ...(value.roleId ? { roleId: value.roleId as string } : {}),
     ...(value.agentFile ? { agentFile: value.agentFile as string } : {}),
-    ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}) },
+    ...(value.provider ? { provider: value.provider as string, model: value.model as string } : {}),
+    ...(value.sandboxMode === 'read-only' ? { sandboxMode: 'read-only' as const } : {}) },
     ...(resultContract?.success ? { resultContract: resultContract.data } : {}),
     ...(execution ? { execution } : {}) };
 }
@@ -307,7 +313,9 @@ export class A2ASessionExecutor implements AgentExecutor {
           cwd: input.cwd ?? saved?.cwd ?? this.options.defaultCwd,
           agentPreset,
           ...(input.preflight ? { preflight: input.preflight } : {}),
-          ...(input.provider ? { provider: input.provider, model: input.model } : {}) }, { signal: controller.signal });
+          ...(input.provider ? { provider: input.provider, model: input.model } : {}),
+          // A read-only routing hop must reach the host, which is where the sandbox is enforced.
+          ...(input.sandboxMode ? { sandboxMode: input.sandboxMode } : {}) }, { signal: controller.signal });
         if (input.provider && !target.provider) throw Object.assign(new Error('The host did not apply the requested model'), { code: 'MODEL_UNAVAILABLE' });
         // The DSH session keeps its earlier selection; report it until a new value is passed.
         if (!target.provider && saved?.provider) { target.provider = saved.provider; target.model = saved.model; }

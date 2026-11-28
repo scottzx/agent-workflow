@@ -4,6 +4,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
+import type { MessageCorrelation } from '@1agents/acp-service/a2a';
 import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 
@@ -23,6 +24,34 @@ export interface SessionNoticeInput {
   summary?: string;
   /** Sender of a cross-session message; older gateways omit it because the body already names the sender. */
   fromSessionId?: string;
+  /** Which context the message belongs to (L0 `MessageCorrelation`); absent keeps the old source shape. */
+  correlation?: MessageCorrelation;
+}
+
+const CORRELATION_KEYS = ['ticket_id', 'team_id', 'job_id', 'a2a_task_id', 'pending_approval_id'] as const;
+const MAX_CORRELATION_VALUE = 512;
+const controlCharRun = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Strictly validate the optional L0 `MessageCorrelation` tags. Unknown keys, non-strings, empty values,
+ * control characters and over-long values are rejected before the delivery reaches the agent, so a
+ * malformed request is a 400 instead of a half-tagged message in the host queue. An empty object
+ * carries no context and is treated as absent, which keeps the un-correlated source shape byte-identical.
+ */
+function parseCorrelation(raw: unknown): MessageCorrelation | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid correlation');
+  const record = raw as Record<string, unknown>;
+  const parsed: Record<string, string> = {};
+  for (const key of Object.keys(record)) {
+    if (!(CORRELATION_KEYS as readonly string[]).includes(key)) throw new Error(`Unknown correlation field: ${key}`);
+    const value = record[key];
+    if (typeof value !== 'string') throw new Error(`Invalid correlation.${key}`);
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_CORRELATION_VALUE || controlCharRun.test(trimmed)) throw new Error(`Invalid correlation.${key}`);
+    parsed[key] = trimmed;
+  }
+  return Object.keys(parsed).length ? parsed as MessageCorrelation : undefined;
 }
 
 const MERGE_HEADER = /^\[队列合并 · 共 \d+ 条消息\]\n\n/;
@@ -83,7 +112,8 @@ function replacePendingQueueTail(inbox: unknown, input: SessionNoticeInput): boo
   const queue = host.nextTurn;
   if (!Array.isArray(queue) || queue.length === 0) return false;
   const tail = queue[queue.length - 1] as UserMessage | undefined;
-  const source = tail?.source as { kind?: unknown; rpcId?: unknown; rpcIds?: unknown; form?: unknown; summary?: unknown; fromSessionId?: unknown } | undefined;
+  const source = tail?.source as { kind?: unknown; rpcId?: unknown; rpcIds?: unknown; form?: unknown; summary?: unknown;
+    fromSessionId?: unknown; correlation?: unknown } | undefined;
   if (!tail || source?.kind !== NOTICE_SOURCE_KIND) return false;
   if (tail.id === undefined || typeof host.replace !== 'function') return false;
   const previousIds = Array.isArray(source.rpcIds)
@@ -106,6 +136,10 @@ function replacePendingQueueTail(inbox: unknown, input: SessionNoticeInput): boo
   if (summary) mergedSource.summary = summary;
   const fromSessionId = existingFrom ?? input.fromSessionId;
   if (fromSessionId) mergedSource.fromSessionId = fromSessionId;
+  // A merged tail already belongs to one context; keep it rather than letting a later message retag it.
+  const existingCorrelation = source.correlation && typeof source.correlation === 'object' ? source.correlation as MessageCorrelation : undefined;
+  const correlation = existingCorrelation ?? input.correlation;
+  if (correlation) mergedSource.correlation = correlation;
   const nextMessage: UserMessage = {
     id: tail.id,
     role: tail.role,
@@ -141,6 +175,7 @@ function parseInput(raw: unknown): { rpcId: string; request: SessionNoticeInput 
   const form = req.form === 'notice' ? 'notice' : req.form === 'relay' ? 'relay' : undefined;
   const summary = typeof req.summary === 'string' ? boundNoticeSummary(req.summary) : undefined;
   const fromSessionId = typeof req.fromSessionId === 'string' ? req.fromSessionId.trim() : undefined;
+  const correlation = parseCorrelation(req.correlation);
   if (!requestId || requestId.length > 512 || requestId !== rpcId) throw new Error('Invalid requestId');
   if (!sessionId || sessionId.length > 256) throw new Error('Invalid sessionId');
   if (!text.trim() || text.includes('\0') || Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES) throw new Error('Invalid text');
@@ -151,6 +186,7 @@ function parseInput(raw: unknown): { rpcId: string; request: SessionNoticeInput 
     requestId, sessionId, mode, text, form,
     ...(summary ? { summary } : {}),
     ...(fromSessionId ? { fromSessionId } : {}),
+    ...(correlation ? { correlation } : {}),
   } };
 }
 
@@ -179,6 +215,7 @@ export async function deliverSessionNotice(
     rpcId: input.requestId,
     ...(input.form === 'notice' ? { summary: boundNoticeSummary(input.summary ?? '') } : {}),
     ...(input.fromSessionId ? { fromSessionId: input.fromSessionId } : {}),
+    ...(input.correlation ? { correlation: input.correlation } : {}),
   };
   const message: UserMessage = {
     id: input.requestId as MessageId,

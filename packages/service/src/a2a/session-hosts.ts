@@ -56,7 +56,30 @@ export const sessionNoticeSchema = z.discriminatedUnion('form', [
   z.object({ form: z.literal('relay') }).strict(),
 ]);
 export type SessionNoticeMeta = z.output<typeof sessionNoticeSchema>;
-type Message = { sessionId: string; messageId: string; text: string; mode?: SessionDeliveryMode; notice?: SessionNoticeMeta; fromSessionId?: string };
+/**
+ * Which context a message belongs to. The vocabulary is the DreamMate Network L0
+ * `MessageCorrelation` (0.6.0, protocol §13): a session can carry a group chat, a private
+ * thread and an approval at the same time, and this is what keeps them apart.
+ *
+ * Every field is an optional short, printable, non-empty string; unknown keys are rejected so a
+ * caller cannot smuggle an untyped payload into the host envelope. `a2a_task_id` is the remote's
+ * opaque task id — never the local Task id.
+ */
+const correlationValue = z.string().trim().min(1).max(512)
+  .refine(text => !/[\u0000-\u001f\u007f]/.test(text), 'Correlation values must be printable');
+export const messageCorrelationSchema = z.object({
+  ticket_id: correlationValue.optional(),
+  team_id: correlationValue.optional(),
+  job_id: correlationValue.optional(),
+  a2a_task_id: correlationValue.optional(),
+  pending_approval_id: correlationValue.optional(),
+}).strict();
+export type MessageCorrelation = z.output<typeof messageCorrelationSchema>;
+/** Compile-time proof this stays a value-compatible subset of the L0 vocabulary. */
+const correlationFitsL0: (value: MessageCorrelation) => import('@1agents/dreammate-network').MessageCorrelation = value => value;
+void correlationFitsL0;
+type Message = { sessionId: string; messageId: string; text: string; mode?: SessionDeliveryMode; notice?: SessionNoticeMeta;
+  fromSessionId?: string; correlation?: MessageCorrelation };
 const messageSchema = z.object({
   sessionId: value,
   messageId: value,
@@ -65,6 +88,8 @@ const messageSchema = z.object({
   notice: sessionNoticeSchema.optional(),
   /** Optional sender identity; older DSH hosts ignore it because the body already names the sender. */
   fromSessionId: z.string().trim().min(1).max(512).optional(),
+  /** Optional context tags; older DSH hosts ignore the key because it is absent from their schema. */
+  correlation: messageCorrelationSchema.optional(),
 });
 const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
 const uuidPattern = new RegExp(`^${uuid}$`, 'i');
@@ -223,6 +248,7 @@ async function deliverDsh(
           form: input.notice.form,
           ...(input.notice.form === 'notice' ? { summary: input.notice.summary } : {}),
           ...(input.fromSessionId ? { fromSessionId: input.fromSessionId } : {}),
+          ...(input.correlation ? { correlation: input.correlation } : {}),
         } } },
       },
       input.messageId,

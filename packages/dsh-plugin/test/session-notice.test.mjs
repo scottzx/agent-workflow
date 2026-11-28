@@ -330,3 +330,91 @@ test('a merge that would exceed MAX_TEXT_BYTES is refused: the tail stays intact
   assert.equal(agent.inbox.nextTurn[1].id, 'big-req-2');
   assert.equal(textOf(agent.inbox.nextTurn[1]).length, big.length);
 });
+
+test('a correlated delivery writes the L0 MessageCorrelation into message.source.correlation and keeps the old shape without it', async t => {
+  const { agent, steered, state, ctx } = noticeContext(t);
+  const base = await startServer(t, ctx);
+  const post = body => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  const correlation = { job_id: 'job-1', a2a_task_id: 'a2a-task-1', pending_approval_id: 'prc-1' };
+  assert.equal((await post(deliveryEnvelope('corr-steer-1', {
+    mode: 'steer', form: 'notice', text: '过程审批', summary: '过程审批', correlation,
+  }))).status, 200);
+  assert.equal(steered.length, 1);
+  assert.deepEqual(steered[0].source.correlation, correlation, 'the context tags reach the DSH host message source');
+  assert.equal(steered[0].source.rpcId, 'corr-steer-1');
+
+  // A queued correlated notice merges into the pending tail and keeps the tail's own context.
+  assert.equal((await post(deliveryEnvelope('corr-queue-1', {
+    mode: 'queue', form: 'notice', text: '第一条', summary: '任务一', correlation: { job_id: 'job-queue-1' },
+  }))).status, 200);
+  assert.equal(agent.inbox.nextTurn.length, 1);
+  assert.deepEqual(agent.inbox.nextTurn[0].source.correlation, { job_id: 'job-queue-1' });
+  const replacedBefore = state.replaced.length;
+  assert.equal((await post(deliveryEnvelope('corr-queue-2', {
+    mode: 'queue', form: 'notice', text: '第二条', summary: '任务二', correlation: { job_id: 'job-queue-2' },
+  }))).status, 200);
+  assert.equal(state.replaced.length, replacedBefore + 1, 'the merge still goes through the host inbox.replace');
+  assert.equal(agent.inbox.nextTurn.length, 1);
+  const merged = agent.inbox.nextTurn[0];
+  assert.equal(merged.id, 'corr-queue-1');
+  assert.deepEqual(merged.source.correlation, { job_id: 'job-queue-1' },
+    'a merged tail keeps its own context instead of being retagged by the later message');
+  assert.deepEqual(merged.source.rpcIds, ['corr-queue-1', 'corr-queue-2']);
+  assert.match(textOf(merged), /第一条/);
+  assert.match(textOf(merged), /第二条/);
+  // Retrying either original id stays idempotent and leaves the merged message alone.
+  assert.equal((await post(deliveryEnvelope('corr-queue-2', {
+    mode: 'queue', form: 'notice', text: '第二条', summary: '任务二', correlation: { job_id: 'job-queue-2' },
+  }))).status, 200);
+  assert.equal(agent.inbox.nextTurn.length, 1, 'the correlated queue tail is not duplicated');
+  assert.equal(state.replaced.length, replacedBefore + 1);
+
+  // Without correlation the source object keeps exactly its previous shape.
+  const plain = noticeContext(t);
+  const plainBase = await startServer(t, plain.ctx);
+  const plainPost = body => fetch(`${plainBase}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  assert.equal((await plainPost(deliveryEnvelope('plain-relay-1', { mode: 'queue', form: 'relay', text: '无线索正文' }))).status, 200);
+  assert.equal(plain.followed.length, 1);
+  assert.equal(Object.hasOwn(plain.followed[0].source, 'correlation'), false, 'an uncorrelated message is byte-identical to before');
+  assert.deepEqual(plain.followed[0].source, { kind: NOTICE_SOURCE_KIND, form: 'relay', rpcId: 'plain-relay-1' });
+});
+
+test('an invalid correlation is rejected with 400 before the delivery reaches the agent', async t => {
+  const { agent, followed, steered, ctx } = noticeContext(t);
+  const base = await startServer(t, ctx);
+  const post = correlation => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(deliveryEnvelope('bad-corr-1', { mode: 'steer', form: 'notice', text: '正文', summary: '摘要', correlation })),
+  });
+  const rejected = [
+    'job-1',
+    ['job-1'],
+    { bogus: 'x' },
+    { job_id: '   ' },
+    { job_id: 7 },
+    { job_id: 'a\u0000b' },
+    { a2a_task_id: 'a'.repeat(513) },
+    { pending_approval_id: null },
+  ];
+  for (const correlation of rejected) {
+    const response = await post(correlation);
+    assert.equal(response.status, 400, `${JSON.stringify(correlation)} must be a 400`);
+    const body = await response.json();
+    assert.equal(body.result.ok, false);
+  }
+  assert.equal(steered.length, 0, 'no rejected request ever reaches agent.steer');
+  assert.equal(followed.length, 0, 'no rejected request ever reaches agent.followup');
+  assert.equal(agent.inbox.nextTurn.length, 0);
+  assert.equal(agent.inbox.nextStep.length, 0);
+
+  // An empty object carries no context: it is accepted and leaves the source shape unchanged.
+  const empty = await post({});
+  assert.equal(empty.status, 200);
+  assert.equal(steered.length, 1);
+  assert.equal(Object.hasOwn(steered[0].source, 'correlation'), false);
+});

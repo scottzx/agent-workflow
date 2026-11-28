@@ -221,8 +221,8 @@ importers:
         specifier: npm:@agentclientprotocol/sdk@^1.9.0
         version: '@agentclientprotocol/sdk@1.9.0(zod@4.6.7)'
       '@1agents/dreammate-network':
-        specifier: ^0.5.0
-        version: 0.5.0
+        specifier: ^0.6.0
+        version: 0.6.0
       '@1agents/dreammate-node':
         specifier: ^0.15.0
         version: 0.15.0(supports-color@7.2.0)(zod@4.6.7)
@@ -283,6 +283,10 @@ packages:
 
   '@1agents/dreammate-network@0.5.0':
     resolution: {integrity: sha512-2zbsna1jZt4bogNRpfJpvrK0xzu8jE1xf9P83LYKLN1E3AUqxk9SOmfzID7Y3c5w59FNQv0FFQBsYPp/R3M5IA==}
+    engines: {node: '>=22.5'}
+
+  '@1agents/dreammate-network@0.6.0':
+    resolution: {integrity: sha512-8tzlWD11LnO8TXhMfORIVVcH+GejU2tjnmLrdKoPk4nLP0BkwVmSqzbQBdn5usSSFCPSFpdZddAI6ODCJoQfMw==}
     engines: {node: '>=22.5'}
 
   '@1agents/dreammate-node@0.15.0':
@@ -3775,6 +3779,8 @@ packages:
 snapshots:
 
   '@1agents/dreammate-network@0.5.0': {}
+
+  '@1agents/dreammate-network@0.6.0': {}
 
   '@1agents/dreammate-node@0.15.0(supports-color@7.2.0)(zod@4.6.7)':
     dependencies:

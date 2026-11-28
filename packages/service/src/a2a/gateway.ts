@@ -15,6 +15,7 @@ import { A2ADispatchRejectedError } from './types.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
 import { isReservedMessageId, RESERVED_MESSAGE_ID_PREFIXES, SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
+import { messageCorrelationSchema, type MessageCorrelation } from './session-hosts.js';
 import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary, type RemoteAgentNotice, type SubscriberNotice } from './notices.js';
 import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
@@ -32,7 +33,8 @@ import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '.
 import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type AttemptRoutingRecord, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
-import { invokeTicket, reopenForContinue, TicketError, TICKET_METHODS } from '../execution/ticket.js';
+import { invokeTicket, reopenForContinue, TicketError, TICKET_METHODS, type Ticket } from '../execution/ticket.js';
+import { projectDelegationMirror } from '../execution/delegation-mirror.js';
 import { continueByConvention, decideHandoff, HANDOFF_METHODS, invokeHandoff, offerConvention, proposeByFact, type Handoff, type HandoffSnapshot } from '../execution/handoff.js';
 import { rolePublicationDirectory } from '../execution/spaces.js';
 import { caseOpenSchema, CaseError, openCase, projectCase, requireCase } from '../execution/cases.js';
@@ -161,6 +163,8 @@ const sessionMessageSendSchema = z.object({
   text: z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim()), 'message text must contain text'),
   mode: sessionDeliveryModeSchema.optional(),
   summary: z.string().trim().min(1).max(240).optional(),
+  /** Optional L0 `MessageCorrelation` tags carried to the DSH host envelope; unknown keys are rejected. */
+  correlation: messageCorrelationSchema.optional(),
 }).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
   clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
@@ -169,6 +173,8 @@ const executionSubmitSchema = z.object({ ...originFields, targetId: string, inpu
   replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(), initiatedBy: actorSchema.optional(),
   notifySessions: notifySessionsSchema }).strict();
 const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
+/** `execution_get` may also project the read-only L0 delegation mirror; it stays opt-in so the default view is unchanged. */
+const executionGetSchema = executionJobSchema.extend({ includeDelegationMirror: z.boolean().optional() }).strict();
 const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
 const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
   limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0) }).strict();
@@ -197,7 +203,7 @@ const EXECUTION_METHODS = {
   execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。支持 input.routingSlot("worker"|"reviewer") 与 input.routingRoleId（或 roleId）自动读取 .1agents/roles/<roleId>/routing.json v2（或显式 input.routingFallback），并在派单边界自动回退及按 input.peerJobId 校验异模型族硬约束。可选 notifySessions 登记该任务或所属 case 的只读订阅。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
-  execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
+  execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。includeDelegationMirror=true 时额外返回只读的 L0 DelegationMirror 投影（delegationMirror），不写入执行账本。', parameters: z.toJSONSchema(executionGetSchema) },
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
   execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
   execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；decidedBy 必填，写明是人还是教练；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
@@ -465,7 +471,7 @@ export class RemoteAgentGateway {
       roleId: resolved.target.binding.roleId, binding: resolved.target.binding, remote: resolved.remote, endpoint: resolved.endpoint, cwd: resolved.cwd,
       agentPreset: resolved.agentPreset, capabilities: resolved.target.capabilities };
   }
-  private ledgerView(originSessionId: string, jobId: string) {
+  private ledgerView(originSessionId: string, jobId: string, options?: { delegationMirror?: boolean }) {
     const view = this.ledger.get(originSessionId, jobId);
     const attempt = view.attempts.find(item => item.attemptId === view.currentAttemptId)!;
     const raw = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
@@ -479,9 +485,33 @@ export class RemoteAgentGateway {
       ...(attempt.routing ? { routing: structuredClone(attempt.routing) } : {}),
       resultSummary: view.result?.resultSummary, artifactLinks: view.result?.artifactLinks ?? [],
       resultDigest: view.result?.resultDigest, resultRevision: view.result?.resultRevision ?? view.resultRevision,
+      ...(options?.delegationMirror ? { delegationMirror: this.delegationMirrorOf(view, attempt, raw?.taskId) } : {}),
       ...(raw ? { remote: raw.remote, taskId: raw.taskId, contextId: raw.contextId,
         sessionId: Task.fromJSON(raw.task).metadata?.['1agents']?.sessionId,
         resultMetadata: Task.fromJSON(raw.task).metadata?.['1agents']?.result } : {}) };
+  }
+  /**
+   * The read-only L0 `DelegationMirror` of one job. Purely derived: it reads the ledger, the job's ticket
+   * and its pending process request, and never writes an execution fact back.
+   */
+  private delegationMirrorOf(view: ReturnType<JobLedger['get']>, attempt: ReturnType<JobLedger['get']>['attempts'][number], a2aTaskId: string | undefined) {
+    let ticket: Ticket | undefined;
+    try { ticket = this.ledger.ticket(view.originSessionId, view.jobId); }
+    catch (error) { if (!(error instanceof TicketError)) throw error; }
+    const development = (attempt.targetSnapshot as { development?: { channel?: unknown } } | undefined)?.development;
+    const lifecycleMode = development?.channel === 'trial' || development?.channel === 'formal' ? development.channel : undefined;
+    const pendingApprovalId = this.state.processRequests?.find(item => item.jobId === view.jobId && item.status === 'pending')?.requestId;
+    return projectDelegationMirror({
+      job: view,
+      attempt,
+      ...(view.businessAcceptance ? { acceptance: view.businessAcceptance } : {}),
+      ...(ticket ? { ticket } : {}),
+      ...(pendingApprovalId ? { pendingApprovalId } : {}),
+      ...(lifecycleMode ? { lifecycleMode } : {}),
+      // The remote's own A2A task id travels as `a2a_task_id`; it is never the local Task id.
+      ...(a2aTaskId ? { a2aTaskId } : {}),
+      updatedAt: view.updatedAt,
+    });
   }
   /**
    * Freeze the bytes a handoff talks about. The files are copied into the gateway's snapshot store and addressed
@@ -968,6 +998,9 @@ export class RemoteAgentGateway {
             ...(explicitRole ? { roleId: explicitRole } : !options.previous && boundRole ? { roleId: boundRole } : {}),
             ...(hop.requirements ? { preflight: hop.requirements } : {}), ...(hop.resultContract ? { resultContract: hop.resultContract } : {}),
             ...(routeProvider && routeModel ? { provider: routeProvider, model: routeModel } : {}),
+            // A read-only routing candidate (e.g. routing.json's `readOnly: true` reviewer slot) must not
+            // rely on the prompt asking nicely: the host is told to enforce an OS-level read-only sandbox.
+            ...(readOnly === true ? { sandboxMode: 'read-only' } : {}),
             execution: { jobId: job.jobId, attemptId: attempt.attemptId } } },
           configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
             authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
@@ -1970,16 +2003,21 @@ export class RemoteAgentGateway {
     const summary = rawSummary.length <= 240 ? rawSummary : `${rawSummary.slice(0, 239)}…`;
     const notice = { form: 'notice' as const, summary };
     const owner = this.sessions.originForTarget(toHost, toSessionId);
+    const correlation = input.correlation;
     if (owner) {
-      const receipt = this.sessions.enqueue({ originSessionId: owner, messageId, text, mode, fromSessionId, notice });
+      const receipt = this.sessions.enqueue({ originSessionId: owner, messageId, text, mode, fromSessionId, notice,
+        ...(correlation ? { correlation } : {}) });
       void this.reconcile().catch(() => {});
-      return { messageId, fromSessionId, toHost, toSessionId, mode, status: receipt.status, queuedOn: 'owner' as const, receipt };
+      return { messageId, fromSessionId, toHost, toSessionId, mode, status: receipt.status, queuedOn: 'owner' as const,
+        ...(correlation ? { correlation } : {}), receipt };
     }
     const receipt = this.sessions.enqueueTarget({
       targetKey: `session-msg:${toHost}:${toSessionId}`, host: toHost, sessionId: toSessionId, messageId, text, mode, fromSessionId, notice,
+      ...(correlation ? { correlation } : {}),
     });
     void this.reconcile().catch(() => {});
-    return { messageId, fromSessionId, toHost, toSessionId, mode, status: receipt.status, queuedOn: 'target' as const, receipt };
+    return { messageId, fromSessionId, toHost, toSessionId, mode, status: receipt.status, queuedOn: 'target' as const,
+      ...(correlation ? { correlation } : {}), receipt };
   }
   async invoke(method: string, params: unknown): Promise<unknown> {
     if (this.closed) throw new Error('Gateway is closed');
@@ -2064,10 +2102,10 @@ export class RemoteAgentGateway {
       return submitted;
     }
     if (method === 'execution_get') {
-      const input = executionJobSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
+      const input = executionGetSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
       const raw = this.state.jobs.find(item => item.attemptId === job.currentAttemptId);
       if (raw) await this.refresh(raw);
-      return this.ledgerView(input.originSessionId, input.jobId);
+      return this.ledgerView(input.originSessionId, input.jobId, input.includeDelegationMirror ? { delegationMirror: true } : undefined);
     }
     if (method === 'execution_cancel') {
       const input = executionCancelSchema.parse(params);
@@ -2650,12 +2688,21 @@ export class RemoteAgentGateway {
             ...(created.questions ? { questions: created.questions } : {}),
             deadlineAt: created.deadlineAt,
           };
+          const rawJob = this.state.jobs.find(item => item.attemptId === created.attemptId);
+          // The wakeup names its context: which job, which remote A2A task, and which approval is waiting,
+          // so the receiving session can tell this `steer` apart from an unrelated chat turn.
+          const correlation: MessageCorrelation = {
+            job_id: created.jobId,
+            ...(rawJob?.taskId ? { a2a_task_id: rawJob.taskId } : {}),
+            pending_approval_id: created.requestId,
+          };
           this.sessions.enqueue({
             originSessionId: scope.originSessionId,
             messageId: `process-request:${created.requestId}`,
             mode: 'steer',
             notice: { form: 'notice', summary: formatProcessRequestSummary(noticePayload) },
             text: formatProcessRequestNotice(noticePayload),
+            correlation,
           });
           void this.sessions.reconcile().catch(() => {});
         } catch { /* Best-effort origin wakeup must not hide the durable workbench request. */ }

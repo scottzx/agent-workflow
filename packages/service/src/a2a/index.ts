@@ -19,6 +19,10 @@ export { RemoteAgentGateway, serveA2AGateway, REMOTE_AGENT_METHODS } from './gat
 export type { A2AGatewayConfig, RemoteAgentNotice } from './gateway.js';
 export { runExecutorTicket } from '../execution/ticket-executor.js';
 export type { ExecutorTicketArgs, ExecutorTicketChannel, ExecutorTicketScope, ExecutorTicketTool } from '../execution/ticket-executor.js';
+export { countPendingGovernanceProposals, projectDelegationMirror, toL0ExecutionStatus } from '../execution/delegation-mirror.js';
+export type {
+  DelegationMirror, L0ExecutionStatus, L0LifecycleMode, L0ReviewStatus, ProjectDelegationMirrorParams,
+} from '../execution/delegation-mirror.js';
 export { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 export { A2AAutomation } from './automation.js';
 export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';
@@ -28,8 +32,8 @@ export { CapacityQueue } from '../capacity-queue.js';
 export type { CapacityOptions, CapacityLease, CapacitySnapshot } from '../capacity.js';
 export { SessionDelivery } from './session-delivery.js';
 export type { SessionBinding, SessionDeliveryReceipt, SessionDeliveryStatus } from './session-delivery.js';
-export { sessionHostSchema, deliverSessionMessage, SessionDeliveryError } from './session-hosts.js';
-export type { SessionDeliveryMode, SessionHost, SessionNoticeMeta } from './session-hosts.js';
+export { sessionHostSchema, deliverSessionMessage, messageCorrelationSchema, SessionDeliveryError } from './session-hosts.js';
+export type { MessageCorrelation, SessionDeliveryMode, SessionHost, SessionNoticeMeta } from './session-hosts.js';
 export { formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary } from './notices.js';
 export type { ProcessRequestNotice } from './notices.js';
 export {
