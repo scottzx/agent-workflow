@@ -55,11 +55,15 @@ export class SessionDeliveryError extends Error {
  * The L0 `SessionDeliveryMode` vocabulary (0.6.0, protocol §15) is the only delivery mode this
  * service understands: `queue` waits behind the current work, `steer` interrupts and is never merged.
  *
- * The runtime tuple is pinned against the L0 type, so a local edit that drifts from the published
- * vocabulary stops compiling, and the type itself is never re-declared here.
+ * The runtime tuple is pinned bi-directionally against the L0 type (both `satisfies` and `AssertSame`),
+ * so widening or narrowing relative to the published vocabulary stops compiling, and the type itself is
+ * never re-declared here.
  */
+type AssertSame<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
 export const SESSION_DELIVERY_MODES = ['queue', 'steer'] as const satisfies readonly L0SessionDeliveryMode[];
 export type SessionDeliveryMode = L0SessionDeliveryMode;
+const _assertDeliveryModesMatchL0: AssertSame<(typeof SESSION_DELIVERY_MODES)[number], L0SessionDeliveryMode> = true;
+void _assertDeliveryModesMatchL0;
 export const sessionNoticeSchema = z.discriminatedUnion('form', [
   z.object({ form: z.literal('notice'), summary: z.string().trim().min(1).max(240).refine(text => !text.includes('\0'), 'NUL is not allowed') }).strict(),
   z.object({ form: z.literal('relay') }).strict(),

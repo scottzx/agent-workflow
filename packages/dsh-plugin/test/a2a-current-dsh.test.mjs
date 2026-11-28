@@ -245,6 +245,21 @@ test('a Cordis proxy that throws on the permissionPresets property still fails c
   assert.equal(target.sessionId, 'stored');
   assert.equal(calls.length, 1, 'exactly one permission preset call');
   assert.equal(calls[0][1], 'read-only');
+
+  // 4. ctx.get() returns a host proxy whose `set` getter throws; still converges to SANDBOX_UNAVAILABLE.
+  const setTrap = currentDsh(cwd);
+  const resolveSetTrap = setTrap.ctx.get;
+  setTrap.ctx.get = name => name === 'permissionPresets'
+    ? Object.defineProperty({}, 'set', {
+        enumerable: true,
+        get() { throw new Error('cordis: trap on set property'); },
+      })
+    : resolveSetTrap(name);
+  await assert.rejects(
+    new DshA2ABackend(setTrap.ctx).prepare({ sessionId: 'stored', sandboxMode: 'read-only' }),
+    error => error.code === 'SANDBOX_UNAVAILABLE',
+    'a throwing getter on host.set must also converge to SANDBOX_UNAVAILABLE',
+  );
 });
 
 test('a brand-new read-only session also gets the preset, and a refused preset prevents the session from running', async t => {

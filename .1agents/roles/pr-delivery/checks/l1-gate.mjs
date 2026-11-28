@@ -52,7 +52,16 @@ let missingAllowedPathsValue = false;
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
   if (arg === '--worktree') worktree = args[++index];
-  else if (arg === '--role-dir') roleDir = args[++index];
+  else if (arg === '--role-dir') {
+    roleDir = args[++index];
+    if (roleDir === undefined || roleDir.startsWith('-')) {
+      await finish({
+        ok: false,
+        worktree: worktree ?? null,
+        checks: [{ id: 'usage', ok: false, detail: 'missing value for --role-dir <dir>' }],
+      });
+    }
+  }
   else if (arg === '--base-ref') {
     hasBaseRef = true;
     baseRef = args[++index];

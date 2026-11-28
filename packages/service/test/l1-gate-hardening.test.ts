@@ -266,4 +266,6 @@ test('--allowed-paths fails closed on a missing, empty, absolute or escaping spe
   assert.match(check(await usage(['--allowed-paths', '../outside']), 'usage').detail ?? '', /escapes the worktree/);
   assert.match(check(await usage(['--allowed-paths', 'docs/../../outside']), 'usage').detail ?? '', /escapes the worktree/);
   assert.match(check(await usage(['--allowed-paths', '--allow-eval-change']), 'usage').detail ?? '', /looks like a flag/);
+  assert.match(check(await usage(['--role-dir']), 'usage').detail ?? '', /missing value for --role-dir/);
+  assert.match(check(await usage(['--role-dir', '--allow-eval-change']), 'usage').detail ?? '', /missing value for --role-dir/);
 });

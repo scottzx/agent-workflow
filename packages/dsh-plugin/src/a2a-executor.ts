@@ -380,13 +380,15 @@ export class DshA2ABackend implements A2ABackend {
       get?: (name: string) => unknown;
     };
     let host: PermissionPresetsHost | undefined;
+    let set: PermissionPresetsHost['set'] | undefined;
     try {
       host = (record.get?.('permissionPresets') ?? record.permissionPresets) as PermissionPresetsHost | undefined;
+      set = host?.set;
     } catch {
-      // A throwing lookup or property trap means the host cannot prove the sandbox either.
+      // A throwing lookup or property trap (including on `host.set`) means the host cannot prove the sandbox either.
       host = undefined;
+      set = undefined;
     }
-    const set = host?.set;
     if (typeof set !== 'function') {
       throw sessionError('SANDBOX_UNAVAILABLE', 'The DSH host cannot enforce a read-only sandbox; refusing to start a read-only task');
     }
