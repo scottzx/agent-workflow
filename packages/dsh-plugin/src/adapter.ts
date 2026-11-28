@@ -5,7 +5,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId, LlmError, UserMessage } from '@deepseek-ai/dsh-llm';
+import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId, LlmError } from '@deepseek-ai/dsh-llm';
 import { loadDshLlm } from './host-runtime.js';
 import type { DiagnosticLog } from './diagnostics.js';
 import type {} from '@deepseek-ai/dsh-user-approval';
@@ -731,8 +731,9 @@ export class AcpAdapter implements LlmAdapter {
     if (this.agentName(agent) !== options.model) throw new Error('ACP is available only in its matching Agent preset; start a new ACP session');
     const importedIds = new Set(this.state.get(agent.id)?.imported?.messageIds ?? []);
     const isForwardableSource = (kind: unknown): boolean => kind === 'user' || kind === '1agents-acp';
-    // Host messages are readonly with an opaque source/content; narrow them locally instead of assuming a shape.
-    const sourceOf = (message: UserMessage): { kind?: unknown; rpcId?: unknown } | undefined =>
+    // `GenerateOptions.messages` is `RequestMessage[]` (durable messages plus forwarded `RequestUserInput`
+    // without identity), so this helper accepts any shape that carries an opaque `source`.
+    const sourceOf = (message: { readonly source?: unknown }): { kind?: unknown; rpcId?: unknown } | undefined =>
       message.source as { kind?: unknown; rpcId?: unknown } | undefined;
     const isTextBlock = (block: unknown): block is { type: 'text'; text: string } =>
       Boolean(block && typeof block === 'object' && (block as { type?: unknown }).type === 'text'

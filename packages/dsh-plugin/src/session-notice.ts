@@ -55,8 +55,10 @@ function messageText(message: UserMessage): string {
 }
 
 /**
- * The host's immutable pending-input queue; mirrors `AgentInbox` in types/dsh-host.d.ts. Declared
- * locally because the real `@deepseek-ai/dsh-agent` package does not export that helper type.
+ * The host's immutable pending-input queue. Declared locally because the real `@deepseek-ai/dsh-agent`
+ * package does not export that helper type; the single source of truth is the DSH host contract
+ * `packages/core/agent/src/runtime-types.ts` (`Inbox.replace(messageId, newMessage): boolean`).
+ * `types/dsh-host.d.ts` (`AgentInbox`) documents the same shape for unlinked typechecks.
  */
 interface PendingInbox {
   readonly nextTurn?: readonly UserMessage[];
