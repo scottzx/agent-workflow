@@ -5,7 +5,7 @@
 import type { Handoff } from './handoff.js';
 import type { HumanReviewRequest } from './human-review.js';
 import { projectProcessRequest, type ProcessRequest } from './process-request.js';
-import type { Ticket, TicketProposal } from './ticket.js';
+import { isGovernanceProposalKind, type Ticket, type TicketProposal } from './ticket.js';
 import { describeTaskDevelopment } from './agent-registry.js';
 import type { WorkbenchSource } from './workbench.js';
 
@@ -49,6 +49,7 @@ export interface ApprovalItem {
   proposalId?: string;
   proposalKind?: TicketProposal['kind'];
   text?: string;
+  evidence?: string;
   /** The pending process request, so the page can answer it in place. */
   processRequest?: ProcessRequest & { canAnswer: boolean };
   handoff?: ApprovalHandoff;
@@ -124,16 +125,26 @@ function handoffItem(source: WorkbenchSource, handoff: Handoff): ApprovalItem | 
       artifactRevision: handoff.artifactRevision, artifactDigest: handoff.artifactDigest, ...(handoff.snapshots ? { snapshots: handoff.snapshots } : {}) } };
 }
 
+const PROPOSAL_TITLES: Partial<Record<TicketProposal['kind'], string>> = {
+  locked: '规范红线',
+  check: '检查项提议',
+  eval_change: '考卷变更提议',
+  permission_escalation: '越权申请提议',
+  promote_formal: '晋升 formal 提议',
+};
+
 function proposalItem(source: WorkbenchSource, jobId: string, ticket: Ticket, proposal: TicketProposal, scope?: ApprovalsScope): ApprovalItem | undefined {
-  if (proposal.state !== 'open' || (proposal.kind !== 'locked' && proposal.kind !== 'check')) return;
+  if (proposal.state !== 'open') return;
+  if (proposal.kind !== 'locked' && proposal.kind !== 'check' && !isGovernanceProposalKind(proposal.kind)) return;
   if (scope?.caseId && ticket.caseId !== scope.caseId) return;
   const job = source.ledger.jobs[jobId];
   if (!job) return;
   return { kind: 'proposal', id: `${jobId}:${proposal.id}`, jobId, originSessionId: job.originSessionId,
     caseId: ticket.caseId || job.caseId, channel: channelOf(source, jobId),
-    title: proposal.kind === 'locked' ? '规范红线' : '检查项提议', summary: proposal.text,
+    title: PROPOSAL_TITLES[proposal.kind] ?? '规范提议', summary: proposal.text,
     createdAt: job.updatedAt, updatedAt: job.updatedAt, canDecide: true, roleId: ticket.roleId,
-    proposalId: proposal.id, proposalKind: proposal.kind, text: proposal.text };
+    proposalId: proposal.id, proposalKind: proposal.kind, text: proposal.text,
+    ...(proposal.evidence ? { evidence: proposal.evidence } : {}) };
 }
 
 /** Pending process requests, reviews this person may decide, proposed handoffs, and open locked/check proposals. */

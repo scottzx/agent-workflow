@@ -1,0 +1,11 @@
+{
+  "id": "pr-coach",
+  "version": "1.0.0",
+  "instructionsPath": "ROLE.md",
+  "skills": [
+    { "key": "orchestrate", "name": "pr-orchestrate" },
+    { "key": "deploy", "name": "local-deploy-verify" },
+    { "key": "distill", "name": "rsi-distill" }
+  ],
+  "entrySkill": "orchestrate"
+}

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 2,
+  "roleId": "pr-coach",
+  "artifacts": ["pr-delivery-report"],
+  "items": [
+    {
+      "id": "worktree_isolated",
+      "kind": "self",
+      "severity": "must",
+      "locked": true,
+      "selfCheck": true,
+      "rule": "开发任务在隔离 worktree 中完成，已投影 pr-delivery 角色真源，且投影未进入 git status"
+    },
+    {
+      "id": "three_green_verified",
+      "kind": "self_and_qa",
+      "severity": "must",
+      "locked": true,
+      "rule": "合并前已核实 L1 机检 ok=true、全部必需 CI 绿灯、异模型只读 CR 返回 VERDICT: PASS 且 MUST 为无"
+    },
+    {
+      "id": "formal_and_evals_locked",
+      "kind": "self_and_qa",
+      "severity": "must",
+      "locked": true,
+      "rule": "总管未直接改写 formal 快照或 evals/ 考卷；涉及考卷、越权或 trial->formal 晋升均通过带 evidence 的单条 proposal 交由人裁决"
+    }
+  ]
+}
