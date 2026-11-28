@@ -16,6 +16,7 @@ import {
   computeCrEvalDigest,
   findRepoRoot,
   loadCrEvalManifest,
+  loadRoleHumanCalibration,
   scoreCrEvalSuite,
   verifyCrEvalCommits,
   type CrEvalScore,
@@ -338,9 +339,18 @@ export async function verifyRoutingCanaryGate(options: {
     }
   }
 
-  const score = scoreCrEvalSuite(manifest, resultsToScore);
+  const minCases = normalized.canary?.minCases;
+  if (normalized.canary?.required !== false && minCases !== undefined && manifest.cases.length < minCases) {
+    reasons.push(`Canary 要求至少 ${minCases} 条黄金样本，当前 manifest 仅有 ${manifest.cases.length} 条`);
+  }
+
+  const humanCalibration = await loadRoleHumanCalibration(roleDirectory);
+  const score = scoreCrEvalSuite(manifest, resultsToScore, {
+    ...(humanCalibration ? { humanCalibration } : {}),
+    requireHumanCalibration: true,
+  });
   if (!score.promotionReady) {
-    reasons.push(`Canary 黄金回放未达标（negativeRecall=${score.negativeRecall}，falsePositives=${score.falsePositives}，missing=${score.missingCases.length}）`);
+    reasons.push(`Canary 黄金回放未达标（negativeRecall=${score.negativeRecall}，falsePositives=${score.falsePositives}，missing=${score.missingCases.length}，kappa=${score.judgeCalibration?.kappa ?? 'null'}）`);
   }
 
   const ok = reasons.length === 0 && commitCheck.ok && score.promotionReady;

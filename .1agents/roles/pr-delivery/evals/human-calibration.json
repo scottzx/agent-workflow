@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "roleId": "pr-delivery",
+  "minKappa": 0.8,
+  "samples": [
+    {
+      "caseId": "pr11-neg-non-atomic-notify",
+      "humanVerdict": "CHANGES_REQUESTED",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #11 确认半持久化阻塞缺陷"
+    },
+    {
+      "caseId": "pr11-pos-atomic-notify",
+      "humanVerdict": "PASS",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #11 原子校验修复后签字放行"
+    },
+    {
+      "caseId": "pr12-neg-sandbox-and-inherit",
+      "humanVerdict": "CHANGES_REQUESTED",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #12 越出沙箱与未继承 deliveryMode 双缺陷"
+    },
+    {
+      "caseId": "pr14-pos-verified-worktree-fix",
+      "humanVerdict": "PASS",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #14 拒绝伪造 gitdir 修复通过"
+    },
+    {
+      "caseId": "pr18-neg-lease-leak-on-teardown",
+      "humanVerdict": "CHANGES_REQUESTED",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #18 卸载竞态与路由抛错泄漏 DirectoryLease"
+    },
+    {
+      "caseId": "pr18-pos-typed-teardown-fix",
+      "humanVerdict": "PASS",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #18 统一 teardown 与严格类型修复后放行"
+    },
+    {
+      "caseId": "pr19-neg-failure-trust-boundary",
+      "humanVerdict": "CHANGES_REQUESTED",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #19 失败分类信任边界过宽"
+    },
+    {
+      "caseId": "pr22-neg-log-rotation-and-profile-degrade",
+      "humanVerdict": "CHANGES_REQUESTED",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #22 日志轮转同步刷盘与配置降级缺陷"
+    },
+    {
+      "caseId": "pr23-neg-empty-list-collapse",
+      "humanVerdict": "CHANGES_REQUESTED",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #23 空列表隐藏导致右栏塌缩"
+    },
+    {
+      "caseId": "pr23-pos-grid-column-pin",
+      "humanVerdict": "PASS",
+      "reviewer": "human-maintainer-1",
+      "reviewedAt": "2026-11-28T00:00:00Z",
+      "note": "PR #23 grid-column: 2 固定修复通过"
+    }
+  ]
+}

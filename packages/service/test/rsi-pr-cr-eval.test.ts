@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile, cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import {
-  coerceCrEvalResults, computeCrEvalDigest, computeManifestSnapshotDigest, crEvalCaseSchema, crEvalManifestSchema, findRepoRoot,
-  lintCrEvalManifest, loadCrEvalManifest, parseMarkdownCrReport, scoreCrEvalSuite, verifyCrEvalCommits,
-  type CrEvalCase, type CrEvalManifest, type CrReviewResult,
+  classifyCrMiss, coerceCrEvalResults, computeCrEvalDigest, computeManifestSnapshotDigest, crEvalCaseSchema, crEvalManifestSchema, findRepoRoot,
+  generateProposalsFromCrMisses, lintCrEvalManifest, loadCrEvalManifest, loadRoleHumanCalibration, parseMarkdownCrReport,
+  scoreCrEvalSuite, scoreCrJudgeAgreement, verifyCrEvalCommits,
+  type CrEvalCase, type CrEvalManifest, type CrHumanCalibrationSample, type CrReviewResult,
 } from '../src/rsi/pr-cr-eval.js';
 
 const exec = promisify(execFile);
@@ -575,4 +576,128 @@ test('lintCrEvalManifest enforces minCases, class balance, dedup, defect discrim
   const conflict = await spawn(['--import', 'tsx', cli, 'rsi', 'eval-cr', '--role', roleDir, '--lint', '--results', 'dummy.json']);
   assert.equal(conflict.status, 1);
   assert.match(`${conflict.stderr}\n${conflict.stdout}`, /cannot be combined/);
+});
+
+test('judge agreement calibration (Cohen kappa < 0.8 forces promotionReady=false) and 3-way miss failure taxonomy -> proposals', async t => {
+  const manifest = await loadCrEvalManifest(roleDir);
+  const roleHumanCal = await loadRoleHumanCalibration(roleDir, 'pr-delivery');
+  assert.ok(roleHumanCal && roleHumanCal.samples.length >= 10);
+
+  // 1. Clean results agree 100% with repo human-calibration.json -> kappa = 1.0 >= 0.8 -> promotionReady = true.
+  const allClean = manifest.cases.map(structured);
+  const cleanScored = scoreCrEvalSuite(manifest, allClean, { humanCalibration: roleHumanCal });
+  assert.equal(cleanScored.passed, true);
+  assert.equal(cleanScored.judgeCalibration?.kappa, 1);
+  assert.equal(cleanScored.judgeCalibration?.passed, true);
+  assert.equal(cleanScored.promotionReady, true);
+  assert.deepEqual(cleanScored.missClassifications, []);
+  assert.deepEqual(cleanScored.generatedProposals, []);
+
+  // 2. Human calibration disagreements drop Cohen's kappa below 0.8 -> forces promotionReady = false EVEN WHEN suite passed === true!
+  const disagreedSamples: CrHumanCalibrationSample[] = roleHumanCal.samples.map((sample, idx) => ({
+    ...sample,
+    humanVerdict: idx < 3
+      ? (sample.humanVerdict === 'PASS' ? 'CHANGES_REQUESTED' : 'PASS')
+      : sample.humanVerdict,
+  }));
+  const lowKappa = scoreCrEvalSuite(manifest, allClean, { humanCalibration: disagreedSamples });
+  assert.equal(lowKappa.passed, true, 'suite metrics themselves passed');
+  assert.ok(lowKappa.judgeCalibration && lowKappa.judgeCalibration.kappa !== null && lowKappa.judgeCalibration.kappa < 0.8);
+  assert.equal(lowKappa.judgeCalibration?.passed, false);
+  assert.equal(lowKappa.promotionReady, false, 'kappa < 0.8 MUST force promotionReady = false');
+
+  // Policy floor rejects minKappa < 0.8; insufficient overlap fails closed.
+  assert.throws(() => scoreCrJudgeAgreement(allClean, disagreedSamples, { minKappa: 0.5 }), /below policy floor/);
+  const noOverlap = scoreCrJudgeAgreement(allClean, [{ caseId: 'unrelated-case', humanVerdict: 'PASS', reviewer: 'h1', reviewedAt: '2026-11-28T00:00:00Z' }]);
+  assert.equal(noOverlap.passed, false);
+  assert.equal(noOverlap.kappa, null);
+
+  // 3. Failure taxonomy covers all 3 classes (system_design, agent_misalignment, task_verification) and generates structured proposals.
+  const mixedReviews = allClean.map(review => {
+    // system_design: PR #12 multi-defect case catches 1 defect, misses 1 defect
+    if (review.caseId === 'pr12-neg-sandbox-and-inherit') {
+      return { ...review, must: [review.must[0]!] };
+    }
+    // agent_misalignment: PR #18 negative case returns PASS (missed completely)
+    if (review.caseId === 'pr18-neg-lease-leak-on-teardown') {
+      return { caseId: review.caseId, verdict: 'PASS' as const, must: [] };
+    }
+    // task_verification: PR #23 positive case gets false-positive CHANGES_REQUESTED
+    if (review.caseId === 'pr23-pos-grid-column-pin') {
+      return { caseId: review.caseId, verdict: 'CHANGES_REQUESTED' as const, must: [{ file: 'packages/service/workbench-ui/app.css', summary: 'false positive' }] };
+    }
+    return review;
+  });
+  const missedScore = scoreCrEvalSuite(manifest, mixedReviews);
+  assert.equal(missedScore.promotionReady, false);
+  const byCase = new Map(missedScore.missClassifications.map(item => [item.caseId, item]));
+  assert.equal(byCase.get('pr12-neg-sandbox-and-inherit')?.taxonomy, 'system_design');
+  assert.equal(byCase.get('pr18-neg-lease-leak-on-teardown')?.taxonomy, 'agent_misalignment');
+  assert.equal(byCase.get('pr23-pos-grid-column-pin')?.taxonomy, 'task_verification');
+  assert.equal(missedScore.generatedProposals.length, 3);
+  assert.equal(missedScore.generatedProposals.find(p => p.caseId === 'pr12-neg-sandbox-and-inherit')?.kind, 'check');
+  assert.equal(missedScore.generatedProposals.find(p => p.caseId === 'pr18-neg-lease-leak-on-teardown')?.kind, 'qa');
+  assert.equal(missedScore.generatedProposals.find(p => p.caseId === 'pr23-pos-grid-column-pin')?.kind, 'eval_change');
+
+  // Direct helper check: negative case that touched right file without catching mechanism -> task_verification.
+  const pr14Case = manifest.cases.find(c => c.id === 'pr14-neg-forged-git-and-config')!;
+  const partialTouch = classifyCrMiss(
+    {
+      caseId: pr14Case.id, kind: 'negative', expectedVerdict: 'CHANGES_REQUESTED', actualVerdict: 'CHANGES_REQUESTED',
+      passed: false, matchedDefects: [], missedDefects: ['forged-git-containment', 'l1-config-example-prefix'], falsePositive: false,
+    },
+    pr14Case,
+    { caseId: pr14Case.id, verdict: 'CHANGES_REQUESTED', must: [{ file: 'packages/service/src/roles/role-rules.ts', summary: 'touched file without matching mechanism' }] },
+  );
+  assert.equal(partialTouch?.taxonomy, 'task_verification');
+  assert.equal(generateProposalsFromCrMisses([partialTouch!])[0]?.kind, 'check');
+
+  // 4. CLI with --human-calibration fails with exit 1 when kappa < 0.8 (using temp workspace).
+  const dir = await mkdtemp(join(tmpdir(), 'cr-eval-kappa-cli-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const passFile = join(dir, 'pass.json');
+  const badCalFile = join(dir, 'bad-cal.json');
+  await writeFile(passFile, JSON.stringify({ results: allClean }));
+  await writeFile(badCalFile, JSON.stringify({
+    schemaVersion: 1,
+    roleId: 'pr-delivery',
+    minKappa: 0.8,
+    samples: disagreedSamples,
+  }));
+  const res = await spawn([
+    '--import', 'tsx', cli, 'rsi', 'eval-cr',
+    '--role', roleDir, '--repo', repoRoot,
+    '--results', passFile,
+    '--human-calibration', badCalFile,
+    '--workspace', dir,
+    '--json',
+  ]);
+  assert.equal(res.status, 1, 'CLI must exit 1 when kappa < 0.8');
+  const body = JSON.parse(res.stdout) as { promotionReady: boolean; judgeCalibration?: { kappa: number; passed: boolean } };
+  assert.equal(body.promotionReady, false);
+  assert.equal(body.judgeCalibration?.passed, false);
+
+  // 5. M1 regression: deleting evals/human-calibration.json MUST fail closed (cannot bypass kappa gate by deleting asset).
+  const roleCopy = join(dir, 'role-no-cal');
+  const wsNoCal = join(dir, 'ws-no-cal');
+  await cp(roleDir, roleCopy, { recursive: true });
+  await rm(join(roleCopy, 'evals', 'human-calibration.json'));
+  const noCalCli = await spawn([
+    '--import', 'tsx', cli, 'rsi', 'eval-cr',
+    '--role', roleCopy, '--repo', repoRoot,
+    '--results', passFile,
+    '--workspace', wsNoCal,
+    '--json',
+  ]);
+  assert.equal(noCalCli.status, 1, 'missing human-calibration.json must exit 1');
+  const noCalBody = JSON.parse(noCalCli.stdout) as { promotionReady: boolean; judgeCalibration?: { passed: boolean; kappa: number | null } };
+  assert.equal(noCalBody.promotionReady, false);
+  assert.equal(noCalBody.judgeCalibration?.passed, false);
+  assert.equal(noCalBody.judgeCalibration?.kappa, null);
+
+  const { checkGate } = await import('../src/rsi/gate.js');
+  const noCalGate = await checkGate({ roleDirectory: roleCopy, workspace: wsNoCal, repoRoot });
+  assert.equal(noCalGate.crEval?.status, 'failed');
+  assert.equal(noCalGate.crEval?.promotionReady, false);
+  assert.ok(noCalGate.reasons.some(r => r.includes('人工校准')));
 });
