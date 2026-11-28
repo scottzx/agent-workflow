@@ -365,8 +365,9 @@ export interface AcpInboxItem {
     canDecide: boolean;
     channel?: 'trial' | 'formal' | 'standalone';
     proposalId?: string;
-    proposalKind?: 'locked' | 'check' | 'role' | 'qa';
+    proposalKind?: 'locked' | 'check' | 'role' | 'qa' | 'eval_change' | 'permission_escalation' | 'promote_formal';
     text?: string;
+    evidence?: string;
     roleId?: string;
 }
 
@@ -472,8 +473,9 @@ export interface AcpTicketItem {
 
 export interface AcpTicketProposal {
     id: string;
-    kind: 'check' | 'role' | 'qa' | 'locked';
+    kind: 'check' | 'role' | 'qa' | 'locked' | 'eval_change' | 'permission_escalation' | 'promote_formal';
     text: string;
+    evidence?: string;
     raisedInRound: number;
     state: 'open' | 'accepted' | 'rejected' | 'done';
     note?: string;
@@ -536,6 +538,7 @@ export interface AcpApprovalItem {
     proposalId?: string;
     proposalKind?: AcpTicketProposal['kind'];
     text?: string;
+    evidence?: string;
     processRequest?: AcpProcessRequest;
     handoff?: {
         handoffId: string;

@@ -15,6 +15,17 @@ const kindLabel = (kind: AcpApprovalKind | 'all') =>
         proposal: text('规范提议', 'Proposal'),
     })[kind];
 
+const proposalKindLabel = (kind: NonNullable<AcpApprovalItem['proposalKind']>) =>
+    ({
+        locked: text('红线', 'Locked'),
+        check: text('检查', 'Check'),
+        role: text('角色', 'Role'),
+        qa: text('质检', 'QA'),
+        eval_change: text('考卷变更', 'Eval Change'),
+        permission_escalation: text('越权申请', 'Escalation'),
+        promote_formal: text('晋升 Formal', 'Promote Formal'),
+    })[kind];
+
 function urgent(item: AcpApprovalItem, now: number): boolean {
     if (!item.deadlineAt) return false;
     const deadline = Date.parse(item.deadlineAt);
@@ -170,7 +181,7 @@ export function ApprovalsModule({
                                             <strong class="acp-approval-title">{item.title}</strong>
                                             <span class="acp-approval-meta">
                                                 {item.proposalKind && (
-                                                    <span class="acp-kind-tag">{item.proposalKind === 'locked' ? text('红线', 'Locked') : text('检查', 'Check')}</span>
+                                                    <span class="acp-kind-tag">{proposalKindLabel(item.proposalKind)}</span>
                                                 )}
                                                 <span>{kindLabel(item.kind)}</span>
                                                 <span aria-hidden="true">·</span>
@@ -204,7 +215,7 @@ export function ApprovalsModule({
                                     <p class="acp-approval-meta">
                                         <span class="acp-kind-tag">{kindLabel(selected.kind)}</span>
                                         {selected.proposalKind && (
-                                            <span class="acp-kind-tag">{selected.proposalKind === 'locked' ? text('红线', 'Locked') : text('检查', 'Check')}</span>
+                                            <span class="acp-kind-tag">{proposalKindLabel(selected.proposalKind)}</span>
                                         )}
                                         {selected.roleId && <span>{selected.roleId}</span>}
                                         <span>{channelLabel(selected.channel)}</span>
@@ -268,6 +279,9 @@ export function ApprovalsModule({
                             {selected.kind === 'proposal' && (
                                 <div class="acp-review-form">
                                     {!!bodyText && <p class="acp-approval-body">{selected.text}</p>}
+                                    {!!selected.evidence?.trim() && (
+                                        <pre class="acp-approval-preview">{selected.evidence}</pre>
+                                    )}
                                     <div class="acp-decision-box">
                                         <textarea value={note} maxLength={2000} placeholder={text('理由（必填）', 'Reason (required)')} onInput={event => setNote(event.currentTarget.value)} />
                                         <div class="acp-review-buttons acp-sticky-actions">

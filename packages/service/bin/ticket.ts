@@ -9,6 +9,7 @@ import { gatewayInvoke } from './rsi.js';
 
 const USAGE = `Usage: acp-service ticket show --job ID [--origin ID] [--url URL]
        acp-service ticket events --job ID [--origin ID] [--url URL]
+       acp-service ticket propose --job ID --kind eval_change|permission_escalation|promote_formal --text TEXT --evidence TEXT [--origin ID] [--url URL]
        acp-service ticket proposal --job ID --id R1-2 accept|reject|done [--note TEXT] [--origin ID] [--url URL]
 
 The executor, from its own shell while its round is running:
@@ -30,11 +31,14 @@ const states = { accept: 'accepted', reject: 'rejected', done: 'done' } as const
 
 /**
  * Who settles a proposal, read from the environment the command runs in rather than from a flag: a coach agent's
- * harness marks its own shell with the session it runs in (Claude Code sets CLAUDECODE and CLAUDE_CODE_SESSION_ID);
- * anyone else is a person. Like the executor's tools, this does not defend against a caller faking that environment.
+ * harness marks its own shell with the session it runs in (Claude Code sets CLAUDECODE + CLAUDE_CODE_SESSION_ID;
+ * DSH / OneAgents / Codex set DSH_SESSION_ID / ONEAGENTS_SESSION_ID / CODEX_THREAD_ID); anyone else is a person.
  */
 export function settler(env: NodeJS.ProcessEnv = process.env): { kind: 'person' | 'coach'; agent?: string; sessionId?: string } {
   if (env.CLAUDECODE === '1' && env.CLAUDE_CODE_SESSION_ID) return { kind: 'coach', agent: 'claude-code', sessionId: env.CLAUDE_CODE_SESSION_ID };
+  if (env.DSH_SESSION_ID) return { kind: 'coach', agent: 'dsh', sessionId: env.DSH_SESSION_ID };
+  if (env.ONEAGENTS_SESSION_ID) return { kind: 'coach', agent: 'oneagents', sessionId: env.ONEAGENTS_SESSION_ID };
+  if (env.CODEX_THREAD_ID) return { kind: 'coach', agent: 'codex', sessionId: env.CODEX_THREAD_ID };
   return { kind: 'person' };
 }
 
@@ -47,9 +51,10 @@ export function stampActor(method: string, params: Record<string, unknown>, env:
 
 export async function runTicketCli(argv: string[]): Promise<void> {
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) { console.log(USAGE); return; }
-  if (!['show', 'events', 'proposal', 'pending', 'mark', 'submit', 'self-check'].includes(argv[0]!)) throw new Error('Unknown ticket command; use ticket --help');
+  if (!['show', 'events', 'propose', 'proposal', 'pending', 'mark', 'submit', 'self-check'].includes(argv[0]!)) throw new Error('Unknown ticket command; use ticket --help');
   const { values, positionals } = parseArgs({ args: argv.slice(1), strict: true, allowPositionals: true, options: {
     job: { type: 'string' }, id: { type: 'string' }, note: { type: 'string' }, state: { type: 'string' }, status: { type: 'string' },
+    kind: { type: 'string' }, text: { type: 'string' }, evidence: { type: 'string' },
     origin: { type: 'string', default: 'rsi-cli' }, url: { type: 'string', default: 'http://127.0.0.1:36814' },
   } });
   if (!values.job) throw new Error('--job is required');
@@ -65,6 +70,14 @@ export async function runTicketCli(argv: string[]): Promise<void> {
     return;
   }
   if (argv[0] === 'show') return print(await invoke('ticket_get', scope) as unknown as Ticket);
+  if (argv[0] === 'propose') {
+    if (!values.kind || !values.text || !values.evidence) {
+      throw new Error('Use: ticket propose --job ID --kind eval_change|permission_escalation|promote_formal --text TEXT --evidence TEXT');
+    }
+    const actor = settler().kind === 'coach' ? 'coach' : 'person';
+    print(await invoke('ticket_proposal_raise', { ...scope, kind: values.kind, text: values.text, evidence: values.evidence, actor }) as unknown as Ticket);
+    return;
+  }
   if (argv[0] === 'events') {
     for (let after = 0; ;) {
       const page = await invoke('execution_events', { ...scope, afterSequence: after, limit: 500 }) as { events: { sequence: number; type: string; observedAt: string; data?: Record<string, unknown> }[]; hasMore: boolean };
@@ -99,5 +112,6 @@ function print(ticket: Ticket): void {
   for (const proposal of ticket.proposals) {
     const by = proposal.by ? `（${proposal.by.kind === 'coach' ? `教练 ${proposal.by.agent ?? ''} ${proposal.by.sessionId ?? ''}`.trim() : '人'}）` : '';
     console.log(`  ${proposal.id} 提议（${proposal.kind}）${proposal.state}${by}：${proposal.text}${proposal.note ? `  ——${proposal.note}` : ''}`);
+    if (proposal.evidence) console.log(`      依据：${proposal.evidence}`);
   }
 }

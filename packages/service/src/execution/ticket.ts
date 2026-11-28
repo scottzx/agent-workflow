@@ -306,9 +306,9 @@ export function raiseGovernanceProposal(
   return [{ type: 'ticket.proposal_raised', data: { actor, round: ticket.round, proposalId: id, kind: input.kind, text, evidence } }];
 }
 
-/** Person or coach: what became of a single proposal. Batch settlement is rejected; governance proposals require a person settler and non-empty evidence. */
+/** Person or coach: what became of a single proposal. Batch settlement is rejected; governance proposals require an explicit person settler and non-empty evidence. */
 export function setProposal(ticket: Ticket, proposalId: string, state: 'accepted' | 'rejected' | 'done', note?: string,
-  by: ProposalSettler = { kind: 'person' }): TicketChange[] {
+  by?: ProposalSettler): TicketChange[] {
   if (typeof proposalId !== 'string') fail('禁止批量结算提议：proposalId 必须是单条字符串编号');
   const trimmedId = proposalId.trim();
   if (!trimmedId || /[,;|\s*]/.test(trimmedId) || trimmedId.toLowerCase() === 'all') {
@@ -316,16 +316,17 @@ export function setProposal(ticket: Ticket, proposalId: string, state: 'accepted
   }
   const proposal = ticket.proposals.find(entry => entry.id === trimmedId) ?? fail(`任务单上没有提议 ${trimmedId}`);
   if (isGovernanceProposalKind(proposal.kind)) {
-    if (by.kind !== 'person') {
-      fail(`治理提议 ${trimmedId}（${proposal.kind}）必须由人（person）双钥匙裁决，教练不可自批`);
+    if (!by || by.kind !== 'person') {
+      fail(`治理提议 ${trimmedId}（${proposal.kind}）必须显式由人（person）双钥匙裁决，教练或未声明身份者不可自批`);
     }
     if ((state === 'accepted' || state === 'done') && !proposal.evidence?.trim()) {
       fail(`治理提议 ${trimmedId}（${proposal.kind}）缺少可核验 evidence，不能标为 ${state}`);
     }
   }
-  proposal.state = state; proposal.by = by;
+  const settler: ProposalSettler = by ?? { kind: 'person' };
+  proposal.state = state; proposal.by = settler;
   if (note) proposal.note = note;
-  const { kind, ...who } = by;
+  const { kind, ...who } = settler;
   return [{ type: 'ticket.proposal_marked', data: { actor: kind, round: ticket.round, proposalId: trimmedId, state, ...(note ? { note } : {}), ...who } }];
 }
 
@@ -373,6 +374,12 @@ const checksSchema = jobSchema.extend({ results: z.array(checkResultSchema).max(
 const reviewSchema = jobSchema.extend({ review: qualityReviewSchema, qaJobId: id.optional() }).strict();
 const reviseSchema = jobSchema.extend({ note: z.string().trim().max(2000).optional() }).strict();
 const reopenSchema = reviseSchema;
+const proposalRaiseSchema = jobSchema.extend({
+  kind: z.enum(GOVERNANCE_PROPOSAL_KINDS),
+  text: z.string().trim().min(1).max(2000),
+  evidence: z.string().trim().min(1).max(4000),
+  actor: z.enum(['coach', 'host', 'person']).optional(),
+}).strict();
 const proposalSchema = jobSchema.extend({ proposalId: id, state: z.enum(['accepted', 'rejected', 'done']), note: z.string().trim().max(2000).optional(),
   by: settlerSchema.optional() }).strict();
 const closeSchema = jobSchema.extend({ status: z.enum(['closed', 'stopped']), stopReason: id.optional() }).strict();
@@ -399,7 +406,8 @@ export const TICKET_METHODS = {
   ticket_mark: { description: '执行者：修改中把本轮 open 或 reopened 的意见标为 done 或 disputed，必须写说明；只能由正在执行当前轮次的会话调用。', parameters: z.toJSONSchema(markSchema) },
   ticket_self_check: { description: '执行者：在 drafting 或 in_revision 把一条预置自检标为 pass 或 na，必须写依据。只能由正在执行当前轮次的会话调用。', parameters: z.toJSONSchema(selfCheckSchema) },
   ticket_submit: { description: '执行者：待处理意见和必填自检都完成后提交任务单，等待宿主检查。drafting 与 in_revision 都可提交。', parameters: z.toJSONSchema(executorSchema) },
-  ticket_proposal: { description: '人或教练：把一条提议标为 accepted、rejected 或 done，可写说明；运行结束后也可以。by 说明是人还是教练（教练写明所在的智能体会话），缺省为人。', parameters: z.toJSONSchema(proposalSchema) },
+  ticket_proposal_raise: { description: '教练或宿主：发起一条治理提议（eval_change / permission_escalation / promote_formal），必须填写可核验 evidence，交由人在工作台或 CLI 逐条双钥匙裁决。', parameters: z.toJSONSchema(proposalRaiseSchema) },
+  ticket_proposal: { description: '人或教练：把一条提议标为 accepted、rejected 或 done，可写说明；运行结束后也可以。普通提议缺省为人；治理提议必须显式声明 by={kind:"person"}，禁止教练或未声明身份者自批。', parameters: z.toJSONSchema(proposalSchema) },
   ticket_close: { description: '宿主：运行结束时关单，通过为 closed，否则为 stopped 并写停止原因。', parameters: z.toJSONSchema(closeSchema) },
   ticket_reopen: { description: '宿主：停下的运行接着跑时，把 stopped 的任务单放回停止前的状态。', parameters: z.toJSONSchema(reopenSchema) },
 };
@@ -440,6 +448,7 @@ export function invokeTicket(ledger: JobLedger, method: string, params: unknown)
     case 'ticket_checks': { const input = checksSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyChecks(ticket, input.results, input.observeItemIds ? { observeItemIds: input.observeItemIds } : undefined)); }
     case 'ticket_review': { const input = reviewSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => applyReview(ticket, input.review, input.qaJobId)); }
     case 'ticket_revise': { const input = reviseSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => startRevision(ticket, input.note)); }
+    case 'ticket_proposal_raise': { const input = proposalRaiseSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => raiseGovernanceProposal(ticket, { kind: input.kind, text: input.text, evidence: input.evidence, ...(input.actor ? { actor: input.actor } : {}) })); }
     case 'ticket_proposal': { const input = proposalSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => setProposal(ticket, input.proposalId, input.state, input.note, input.by)); }
     case 'ticket_close': { const input = closeSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => closeTicket(ticket, input.status, input.stopReason)); }
     case 'ticket_reopen': { const input = reopenSchema.parse(params); return change(input.originSessionId, input.jobId, ticket => reopenTicket(ticket, input.note)); }

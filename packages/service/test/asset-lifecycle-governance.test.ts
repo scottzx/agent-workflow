@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { runRolesCli } from '../bin/roles.js';
+import { settler } from '../bin/ticket.js';
+import { projectApprovals } from '../src/execution/approvals-view.js';
+import { workbenchCases } from '../src/execution/case-view.js';
 import { JobLedger } from '../src/execution/ledger.js';
 import {
   GOVERNANCE_PROPOSAL_KINDS,
@@ -13,6 +17,7 @@ import {
   setProposal,
   TicketError,
 } from '../src/execution/ticket.js';
+import { workbenchSnapshot } from '../src/execution/workbench.js';
 import {
   ASSET_KINDS,
   AssetLifecycleError,
@@ -20,7 +25,7 @@ import {
   assertAssetWriteAllowed,
   computeAssetDigest,
   validateFormalDependencyClosure,
-} from '../src/roles/asset-lifecycle.js';
+} from '../src/roles/index.js';
 import { readRoleRules } from '../src/roles/role-rules.js';
 import { validateSkillFrontmatter } from '../src/roles/worktree-projection.js';
 
@@ -199,7 +204,7 @@ test('two-key ticket proposals scope to eval_change / permission_escalation / pr
   // Coach cannot self-settle a governance proposal.
   assert.throws(
     () => setProposal(ticket, 'G1-1', 'accepted', 'self approve', { kind: 'coach', agent: 'antigravity', sessionId: 's1' }),
-    /必须由人（person）双钥匙裁决/,
+    /必须显式由人（person）双钥匙裁决/,
   );
 
   // Batch settlement forms (comma list, wildcard, 'all') are strictly rejected!
@@ -226,4 +231,176 @@ test('two-key ticket proposals scope to eval_change / permission_escalation / pr
   setProposal(ticket, 'G1-2', 'rejected', 'not needed', { kind: 'person', via: 'page' });
   assert.equal(ticket.proposals[0]!.state, 'accepted');
   assert.equal(ticket.proposals[1]!.state, 'rejected');
+
+  // M1: omitting `by` on governance proposal MUST fail closed (no silent default to person), and DSH/Codex/OneAgents envs resolve to coach!
+  assert.deepEqual(settler({ DSH_SESSION_ID: 'dsh-42' }), { kind: 'coach', agent: 'dsh', sessionId: 'dsh-42' });
+  assert.deepEqual(settler({ ONEAGENTS_SESSION_ID: 'oa-9' }), { kind: 'coach', agent: 'oneagents', sessionId: 'oa-9' });
+  assert.deepEqual(settler({ CODEX_THREAD_ID: 'codex-7' }), { kind: 'coach', agent: 'codex', sessionId: 'codex-7' });
+
+  // M2 + M3: gateway RPC `ticket_proposal_raise` creates governance proposal, surfaces in Workbench Approvals + Case Inbox with evidence,
+  // and `ticket_proposal` without explicit `by: { kind: 'person' }` fails closed!
+  const raisedTicket = invokeTicket(ledger, 'ticket_proposal_raise', {
+    originSessionId: 'root',
+    jobId: prepared.job.jobId,
+    kind: 'promote_formal',
+    text: 'promote pr-delivery v2 to formal',
+    evidence: 'calibration passed=true, eval-cr kappa=0.92, pairwise winRate=0.80',
+    actor: 'coach',
+  });
+  assert.equal(raisedTicket.proposals.length, 1);
+  const raisedId = raisedTicket.proposals[0]!.id;
+  assert.equal(raisedTicket.proposals[0]!.evidence, 'calibration passed=true, eval-cr kappa=0.92, pairwise winRate=0.80');
+
+  assert.throws(
+    () => invokeTicket(ledger, 'ticket_proposal', {
+      originSessionId: 'root',
+      jobId: prepared.job.jobId,
+      proposalId: raisedId,
+      state: 'accepted',
+      note: 'bypass attempt without by',
+    }),
+    /必须显式由人（person）双钥匙裁决/,
+  );
+
+  // Workbench approvals & case inbox surface governance proposal with evidence!
+  const snapState = ledger.snapshot();
+  snapState.jobs[prepared.job.jobId]!.caseId = 'c1';
+  const source = { ledger: snapState, runs: [], reviews: [], actorId: 'person-1' };
+  const approvals = projectApprovals(source);
+  const govApproval = approvals.items.find(item => item.proposalId === raisedId);
+  assert.ok(govApproval, 'promote_formal proposal must appear in workbench approvals queue');
+  assert.equal(govApproval.proposalKind, 'promote_formal');
+  assert.equal(govApproval.title, '晋升 formal 提议');
+  assert.equal(govApproval.evidence, 'calibration passed=true, eval-cr kappa=0.92, pairwise winRate=0.80');
+
+  const wb = workbenchSnapshot(source);
+  const cases = workbenchCases(source, wb);
+  const caseDetail = Object.values(cases.details)[0]!;
+  const inboxGov = caseDetail.inbox.find(item => item.proposalId === raisedId);
+  assert.ok(inboxGov, 'promote_formal proposal must appear in case inbox');
+  assert.equal(inboxGov.evidence, 'calibration passed=true, eval-cr kappa=0.92, pairwise winRate=0.80');
+
+  // Explicit person settler succeeds via gateway RPC!
+  const settledTicket = invokeTicket(ledger, 'ticket_proposal', {
+    originSessionId: 'root',
+    jobId: prepared.job.jobId,
+    proposalId: raisedId,
+    state: 'accepted',
+    note: 'verified evidence',
+    by: { kind: 'person', via: 'page' },
+  });
+  assert.equal(settledTicket.proposals[0]!.state, 'accepted');
+  assert.equal(settledTicket.proposals[0]!.by?.kind, 'person');
+});
+
+test('AssetLifecycleStore binds digest/rollback to real disk files, enforces OS 0o444 immutability, detects corrupt snapshots, and integrates with roles lifecycle CLI', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'asset-lifecycle-disk-'));
+  const roleDir = join(dir, 'role');
+  const storeDir = join(dir, 'store');
+  t.after(async () => {
+    // Restore permissions on snapshots so rm succeeds cleanly.
+    const store = new AssetLifecycleStore(storeDir);
+    const st = await store.inspect().catch(() => null);
+    if (st) {
+      for (const rec of Object.values(st.formalHistory).flat()) {
+        await chmod(store.formalSnapshotPath(rec.kind, rec.id, rec.digest), 0o644).catch(() => {});
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const checkFile = join(roleDir, 'checks', 'l1-gate.mjs');
+  await writeFile(join(dir, 'dummy'), ''); // ensure dir exists
+  const store = new AssetLifecycleStore(storeDir);
+
+  // Create real check file v1 on disk, save trial bound to sourceRoot (reads actual file bytes).
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(join(roleDir, 'checks'), { recursive: true });
+  await writeFile(checkFile, 'export const version = 1;\n', 'utf8');
+
+  const trialV1 = await store.saveTrialAsset({
+    kind: 'check',
+    id: 'l1-gate',
+    sourceRoot: roleDir,
+    relativePath: 'checks/l1-gate.mjs',
+    version: '1.0.0',
+    actor: 'coach',
+  });
+  assert.equal(trialV1.record.digest, computeAssetDigest('export const version = 1;\n'));
+
+  const formalV1 = await store.promoteTrialToFormal({
+    kind: 'check',
+    id: 'l1-gate',
+    actor: 'person',
+    evidence: 'v1 calibrated',
+  });
+
+  // S4: Real OS write to 0o444 formal snapshot MUST fail with EACCES/EPERM (unless running as root).
+  if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+    await assert.rejects(
+      writeFile(formalV1.snapshotPath, 'tampered', 'utf8'),
+      (err: unknown) => {
+        const code = (err as NodeJS.ErrnoException).code;
+        return code === 'EACCES' || code === 'EPERM';
+      },
+    );
+  }
+
+  // Update real file to v2, save trial, promote v2 via roles CLI, then rollback to v1 via roles CLI!
+  await writeFile(checkFile, 'export const version = 2;\n', 'utf8');
+  await runRolesCli([
+    'lifecycle', 'save-trial',
+    '--store', storeDir,
+    '--role-dir', roleDir,
+    '--kind', 'check',
+    '--id', 'l1-gate',
+    '--path', 'checks/l1-gate.mjs',
+    '--version', '2.0.0',
+  ]);
+
+  // Simulate DSH coach trying to promote via CLI -> rejected with APPROVAL_REQUIRED!
+  const prevDsh = process.env.DSH_SESSION_ID;
+  process.env.DSH_SESSION_ID = 'dsh-coach-99';
+  try {
+    await assert.rejects(
+      runRolesCli([
+        'lifecycle', 'promote',
+        '--store', storeDir,
+        '--kind', 'check',
+        '--id', 'l1-gate',
+        '--evidence', 'coach self promote',
+      ]),
+      (err: unknown) => err instanceof AssetLifecycleError && err.code === 'APPROVAL_REQUIRED',
+    );
+  } finally {
+    if (prevDsh === undefined) delete process.env.DSH_SESSION_ID;
+    else process.env.DSH_SESSION_ID = prevDsh;
+  }
+
+  // Person promotes v2 via CLI, then rolls back to v1 restoring the real disk file!
+  await runRolesCli([
+    'lifecycle', 'promote',
+    '--store', storeDir,
+    '--kind', 'check',
+    '--id', 'l1-gate',
+    '--evidence', 'v2 approved by person',
+  ]);
+  await runRolesCli([
+    'lifecycle', 'rollback',
+    '--store', storeDir,
+    '--role-dir', roleDir,
+    '--kind', 'check',
+    '--id', 'l1-gate',
+    '--reason', 'prod regression',
+  ]);
+  assert.equal(await readFile(checkFile, 'utf8'), 'export const version = 1;\n', 'rollback must restore real file bytes on disk');
+
+  // S4: Tampering a formal snapshot on disk MUST be detected as SNAPSHOT_CORRUPT on fork!
+  await chmod(formalV1.snapshotPath, 0o644);
+  await writeFile(formalV1.snapshotPath, 'CORRUPTED BYTES', 'utf8');
+  await chmod(formalV1.snapshotPath, 0o444);
+  await assert.rejects(
+    store.forkTrialFromFormal({ kind: 'check', id: 'l1-gate', newVersion: '1.0.1-trial', actor: 'coach' }),
+    (err: unknown) => err instanceof AssetLifecycleError && err.code === 'SNAPSHOT_CORRUPT',
+  );
 });

@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "roleId": "pr-delivery",
+  "snapshotDigest": "822f6871dab8599d9649f27dd1e5cf2514d3cb3923c3784e4382cdac9cdb1012",
   "cases": [
     {
       "id": "pr11-neg-non-atomic-notify",
@@ -215,6 +216,322 @@
       "headCommit": "9bda36fe",
       "expectedVerdict": "PASS",
       "summary": "9bda36fe 拒绝伪造 .git 符号链接和手写 gitdir:，只有 gitdir 回指匹配的已注册 worktree 才算同一仓库。l1-gate 放行 .1agents/config 下的 *.example.json 与 *.example.yml。"
+    },
+    {
+      "id": "pr15-neg-empty-must-and-sweep",
+      "pr": 15,
+      "kind": "negative",
+      "baseCommit": "88804afa",
+      "headCommit": "e7439801",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "e7439801 的 L3 打分器把 **无。** / - 无阻塞项 等空 MUST 当成有效缺陷，且允许单条宽泛 MUST 同时核销多条 requiredDefects。",
+      "requiredDefects": [
+        {
+          "id": "empty-must-phantom",
+          "description": "加粗或列表形式的空 MUST（如 **无。**、- 无阻塞项）及代码块里的伪标题被误解析为 MUST 缺陷。",
+          "anyFilePatterns": [
+            "packages/service/src/rsi/pr-cr-eval.ts"
+          ],
+          "anyTextPatterns": [
+            "空 MUST",
+            "无阻塞项",
+            "幻影",
+            "isEmptyMust"
+          ]
+        },
+        {
+          "id": "single-finding-defect-sweep",
+          "description": "一条宽泛的 MUST 可以重复匹配并核销同一案例中的多条 requiredDefects。",
+          "anyFilePatterns": [
+            "packages/service/src/rsi/pr-cr-eval.ts"
+          ],
+          "anyTextPatterns": [
+            "核销",
+            "one-finding",
+            "多条",
+            "assignDefects"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr15-pos-kuhn-and-empty-must",
+      "pr": 15,
+      "kind": "positive",
+      "baseCommit": "e7439801",
+      "headCommit": "43070c75",
+      "expectedVerdict": "PASS",
+      "summary": "43070c75 归一化空 MUST 短语、剥离围栏代码块，并用二分图匹配保证一条 MUST 最多核销一条缺陷。"
+    },
+    {
+      "id": "pr18-neg-lease-leak-on-teardown",
+      "pr": 18,
+      "kind": "negative",
+      "baseCommit": "668a0ab4",
+      "headCommit": "c4a18af9",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "c4a18af9 在插件启动失败回滚或卸载竞态抛错时未执行 closeA2A/dispose 与宿主引用复位，且单条路由注销抛错会跳过 server.close()，导致 A2A 8 条路由与 DirectoryLease 永久泄漏。",
+      "requiredDefects": [
+        {
+          "id": "failed-start-lease-leak",
+          "description": "插件启动失败回滚遗漏 closeA2A、nativeSessions/adapter 释放与宿主引用复位，留下残留路由与 DirectoryLease。",
+          "anyFilePatterns": [
+            "packages/dsh-plugin/src/index.ts",
+            "packages/dsh-plugin/src/diagnostics.ts"
+          ],
+          "anyTextPatterns": [
+            "DirectoryLease",
+            "closeA2A",
+            "泄漏",
+            "teardown"
+          ]
+        },
+        {
+          "id": "route-unregister-skips-close",
+          "description": "a2a.ts 卸载时某条路由注销抛错会中断后续注销并跳过 server.close()，造成存储租约泄漏。",
+          "anyFilePatterns": [
+            "packages/dsh-plugin/src/a2a.ts"
+          ],
+          "anyTextPatterns": [
+            "server.close",
+            "路由注销",
+            "DirectoryLease",
+            "try/catch"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr18-neg-untyped-tool-callbacks",
+      "pr": 18,
+      "kind": "negative",
+      "baseCommit": "c4a18af9",
+      "headCommit": "08b5b84f",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "08b5b84f 在严格 DSH 联编下暴露 defineTool 回调隐式 any（TS7006）以及将 adapter/nativeSessions 提升为可空 let 后引发的闭包 TS18048。",
+      "requiredDefects": [
+        {
+          "id": "strict-dsh-ts7006-ts18048",
+          "description": "packages/dsh-plugin/src/index.ts 的 defineTool 回调缺少显式参数类型且可空变量在闭包中触发严格类型报错。",
+          "anyFilePatterns": [
+            "packages/dsh-plugin/src/index.ts"
+          ],
+          "anyTextPatterns": [
+            "TS7006",
+            "TS18048",
+            "defineTool",
+            "隐式 any"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr18-pos-typed-teardown-fix",
+      "pr": 18,
+      "kind": "positive",
+      "baseCommit": "08b5b84f",
+      "headCommit": "7e190dfb",
+      "expectedVerdict": "PASS",
+      "summary": "7e190dfb 补全 defineTool 显式参数类型并将 adapter/nativeSessions 保持为 const 配合 dispose 句柄，通过真实 DSH 严格类型联编。"
+    },
+    {
+      "id": "pr19-neg-failure-trust-boundary",
+      "pr": 19,
+      "kind": "negative",
+      "baseCommit": "668a0ab4",
+      "headCommit": "2bb7ba55",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "2bb7ba55 在 native-failure.ts 中信任了 provider 形态码与散文/嵌套 cause；safe-error-summary 与 notices 未收紧标识符长度/换行与重试建议文案。",
+      "requiredDefects": [
+        {
+          "id": "native-failure-overbroad-trust",
+          "description": "native-failure.ts 采信了非宿主稳定码、散文或嵌套 data/cause 信封，突破失败事实信任边界。",
+          "anyFilePatterns": [
+            "packages/dsh-plugin/src/native-failure.ts"
+          ],
+          "anyTextPatterns": [
+            "信任边界",
+            "trust boundary",
+            "provider",
+            "嵌套"
+          ]
+        },
+        {
+          "id": "error-id-unbounded-retry-advice",
+          "description": "safe-error-summary/notices 未限制错误标识字符集与长度，且把未声明可重试的失败误写成请勿原地重试。",
+          "anyFilePatterns": [
+            "packages/service/src/safe-error-summary.ts",
+            "packages/service/src/a2a/notices.ts"
+          ],
+          "anyTextPatterns": [
+            "重试",
+            "retryable",
+            "标识符",
+            "注入"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr19-neg-conflict-error-and-nel",
+      "pr": 19,
+      "kind": "negative",
+      "baseCommit": "2bb7ba55",
+      "headCommit": "0cba7f1e",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "0cba7f1e 在终态失败遇到冲突观测时可能抹除 attempt.error，且 safe-error-summary 未剥离 U+0085/U+2028/U+2029 等换行控制字符。",
+      "requiredDefects": [
+        {
+          "id": "conflict-overwrites-attempt-error",
+          "description": "账本对终态失败的冲突观测覆盖或抹除原 attempt.error，丢失真实失败原因。",
+          "anyFilePatterns": [
+            "packages/service/src/execution/ledger.ts",
+            "packages/service/src/a2a/gateway.ts"
+          ],
+          "anyTextPatterns": [
+            "attempt.error",
+            "冲突观测",
+            "抹除",
+            "overwrite"
+          ]
+        },
+        {
+          "id": "nel-control-chars-not-stripped",
+          "description": "safe-error-summary 未清洗 Unicode NEL/LS/PS 控制字符（U+0085/U+2028/U+2029），允许通知文本换行注入。",
+          "anyFilePatterns": [
+            "packages/service/src/safe-error-summary.ts",
+            "packages/service/src/a2a/notices.ts"
+          ],
+          "anyTextPatterns": [
+            "U+0085",
+            "NEL",
+            "控制字符",
+            "U+2028"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr19-pos-failure-observability-fix",
+      "pr": 19,
+      "kind": "positive",
+      "baseCommit": "0cba7f1e",
+      "headCommit": "102c34ad",
+      "expectedVerdict": "PASS",
+      "summary": "102c34ad 在冲突观测时保留失败态 attempt.error，订阅通知仅在终态失败附带原因，并清洗 NEL/LS/PS 控制字符。"
+    },
+    {
+      "id": "pr20-neg-ci-filter-and-dsh-links",
+      "pr": 20,
+      "kind": "negative",
+      "baseCommit": "668a0ab4",
+      "headCommit": "a28b12b5",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "a28b12b5 的 CI 路径过滤漏掉 docs/ 与 examples/flows/ 变更覆盖，且未保证 ci-status 与 changes 输出交叉防静默跳过。",
+      "requiredDefects": [
+        {
+          "id": "ci-misses-docs-and-flows-filter",
+          "description": ".github/workflows/ci.yml 路径过滤遗漏 docs/ 或 examples/flows/ 导致相关改动被静默跳过。",
+          "anyFilePatterns": [
+            ".github/workflows/ci.yml"
+          ],
+          "anyTextPatterns": [
+            "examples/flows",
+            "docs-check",
+            "静默跳过",
+            "ci-status"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr20-pos-ci-hardened",
+      "pr": 20,
+      "kind": "positive",
+      "baseCommit": "a28b12b5",
+      "headCommit": "be9703ee",
+      "expectedVerdict": "PASS",
+      "summary": "be9703ee 补齐 docs/ 与 examples/flows/ 过滤、加固 ci-status 交叉校验并修复 DSH 工作区包软链。"
+    },
+    {
+      "id": "pr22-neg-log-rotation-and-profile-degrade",
+      "pr": 22,
+      "kind": "negative",
+      "baseCommit": "03f9d4cb",
+      "headCommit": "09e32e1f",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "09e32e1f 的每日日志轮转在退出前异步写入会丢行且缺少 stdio 降级，agent-profiles 在 profiles.json 格式损坏时破坏内置 profile 安全降级。",
+      "requiredDefects": [
+        {
+          "id": "async-log-rotation-loss",
+          "description": "log-rotation.ts 缺少退出同步刷盘与 stdio 异常降级，进程退出或目录不可写时会丢失日志或崩溃。",
+          "anyFilePatterns": [
+            "packages/service/src/log-rotation.ts"
+          ],
+          "anyTextPatterns": [
+            "同步",
+            "flush",
+            "stdio",
+            "降级",
+            "丢行"
+          ]
+        },
+        {
+          "id": "malformed-profiles-breaks-builtins",
+          "description": "agent-profiles.ts 未统一校验配置字段，在 profiles.json 损坏或非法时影响内置 profile 的安全降级。",
+          "anyFilePatterns": [
+            "packages/service/src/agent-profiles.ts"
+          ],
+          "anyTextPatterns": [
+            "profiles.json",
+            "降级",
+            "校验",
+            "expandHome"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr22-pos-log-flush-and-profile-fallback",
+      "pr": 22,
+      "kind": "positive",
+      "baseCommit": "09e32e1f",
+      "headCommit": "e4d91bb7",
+      "expectedVerdict": "PASS",
+      "summary": "e4d91bb7 加固了 log-rotation 同步刷盘与 stdio 降级，并统一了 agent-profiles 校验与损坏配置安全降级。"
+    },
+    {
+      "id": "pr23-neg-empty-list-collapse",
+      "pr": 23,
+      "kind": "negative",
+      "baseCommit": "f8ecd799",
+      "headCommit": "6a10f605",
+      "expectedVerdict": "CHANGES_REQUESTED",
+      "summary": "6a10f605 隐藏空的 .acp-agent-list:empty 后未固定 .acp-agent-detail 到桌面端第 2 列，导致右栏塌缩到左侧窄轨。",
+      "requiredDefects": [
+        {
+          "id": "empty-agent-list-column-collapse",
+          "description": "app.css 隐藏空 .acp-agent-list:empty 时未将 .acp-agent-detail 固定在 grid-column: 2，右栏塌缩进左列。",
+          "anyFilePatterns": [
+            "packages/service/workbench-ui/app.css"
+          ],
+          "anyTextPatterns": [
+            "grid-column",
+            ".acp-agent-detail",
+            ".acp-agent-list:empty",
+            "塌缩"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pr23-pos-grid-column-pin",
+      "pr": 23,
+      "kind": "positive",
+      "baseCommit": "6a10f605",
+      "headCommit": "a2734d75",
+      "expectedVerdict": "PASS",
+      "summary": "a2734d75 在桌面端将 .acp-agent-detail 固定在 grid-column: 2 并在移动端复位为 grid-column: auto，消除空列表塌缩。"
     }
   ]
 }

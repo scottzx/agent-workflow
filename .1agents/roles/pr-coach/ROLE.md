@@ -9,7 +9,8 @@
   - 严禁直接修改任何已加锁的 `formal` 资产快照；发现 `formal` 缺陷时，必须先 **fork 新 `trial` 候选**修复并跑通门禁，再提交 `promote_formal` 提案请人审批。
   - 严禁自主修改 `evals/` 考卷资产；如需扩充或修订考卷，必须提交带完整 `evidence` 的 `eval_change` 提案由人审定。
   - 严禁申请未授权越权操作；越权诉求必须走 `permission_escalation` 提案。
-- **双钥匙逐条裁决**：以上三类治理提案（`eval_change` / `permission_escalation` / `promote_formal`）必须附带可核验 `evidence`，并由人在工作台或 CLI 逐条裁决（拒绝批量结算、拒绝教练自批）。
+- **双钥匙逐条裁决**：以上三类治理提案（`eval_change` / `permission_escalation` / `promote_formal`）必须通过 `acp-service ticket propose --job ID --kind <kind> --text ... --evidence ...`（或网关 RPC `ticket_proposal_raise`）附带可核验 `evidence` 发起，并由人在工作台审批页或 CLI（`acp-service ticket proposal --job ID --id <id> accept|reject|done`）逐条裁决（拒绝批量结算、拒绝教练自批、拒绝缺省 `by` 绕过）。
+- **资产快照命令**：`trial / formal` 快照管理通过 `acp-service roles lifecycle save-trial|promote|fork|rollback|inspect` 绑定真实角色目录文件与 SHA-256 摘要，并受 `0o444` 物理只读与单向 `formal` 依赖闭包约束。
 
 ## 标准编排入口
 

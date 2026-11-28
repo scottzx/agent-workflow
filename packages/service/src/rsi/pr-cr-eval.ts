@@ -61,6 +61,7 @@ export type CrEvalCase = z.infer<typeof crEvalCaseSchema>;
 export const crEvalManifestSchema = z.object({
   schemaVersion: z.literal(1),
   roleId: z.string().min(1),
+  snapshotDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   cases: z.array(crEvalCaseSchema).min(1),
 }).strict().superRefine((manifest, ctx) => {
   const seen = new Set<string>();
@@ -153,6 +154,284 @@ export async function findRepoRoot(start: string): Promise<string> {
   }
 }
 
+export interface CrEvalLintIssue {
+  code:
+    | 'min_cases'
+    | 'class_balance'
+    | 'empty_commit_range'
+    | 'duplicate_commit_pair'
+    | 'duplicate_defect_id'
+    | 'duplicate_pattern'
+    | 'weak_text_pattern'
+    | 'weak_file_pattern'
+    | 'indistinguishable_defects'
+    | 'commit_verification'
+    | 'unmatched_diff_file_pattern'
+    | 'snapshot_digest_missing'
+    | 'snapshot_digest_mismatch';
+  caseId?: string;
+  defectId?: string;
+  message: string;
+}
+
+export interface CrEvalLintReport {
+  ok: boolean;
+  roleId: string;
+  totalCases: number;
+  negativeCases: number;
+  positiveCases: number;
+  negativeRatio: number;
+  totalDefects: number;
+  declaredSnapshotDigest?: string;
+  expectedSnapshotDigest: string;
+  snapshotFrozen: boolean;
+  checkedCommits?: number;
+  issues: CrEvalLintIssue[];
+}
+
+const GENERIC_TEXT_PATTERNS = new Set([
+  'bug', 'fix', 'error', 'fail', 'failed', 'pass', 'must', 'should', 'todo', 'issue', 'change', 'code', 'file', 'test', 'check', 'ok', 'warn',
+]);
+const GENERIC_FILE_PATTERNS = new Set([
+  '.', '/', '*', '**', 'src', 'packages', 'test', 'tests', 'ts', 'tsx', 'js', 'mjs', 'json', 'md', 'yml', 'yaml',
+]);
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).filter(key => record[key] !== undefined).sort();
+  return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+}
+
+/** Deterministic frozen SHA-256 over the manifest payload excluding `snapshotDigest` itself. */
+export function computeManifestSnapshotDigest(manifest: Pick<CrEvalManifest, 'schemaVersion' | 'roleId' | 'cases'>): string {
+  const payload = {
+    schemaVersion: manifest.schemaVersion,
+    roleId: manifest.roleId,
+    cases: manifest.cases,
+  };
+  return createHash('sha256').update(canonicalJson(payload)).digest('hex');
+}
+
+export async function lintCrEvalManifest(
+  manifest: CrEvalManifest,
+  options?: {
+    repoRoot?: string;
+    minCases?: number;
+    minNegativeRatio?: number;
+    maxNegativeRatio?: number;
+    requireSnapshotDigest?: boolean;
+  },
+): Promise<CrEvalLintReport> {
+  const parsed = crEvalManifestSchema.parse(manifest);
+  const minCases = options?.minCases ?? 20;
+  const minNegativeRatio = options?.minNegativeRatio ?? 0.45;
+  const maxNegativeRatio = options?.maxNegativeRatio ?? 0.75;
+  const requireSnapshotDigest = options?.requireSnapshotDigest ?? true;
+
+  const issues: CrEvalLintIssue[] = [];
+  const totalCases = parsed.cases.length;
+  const negativeCases = parsed.cases.filter(item => item.kind === 'negative').length;
+  const positiveCases = parsed.cases.filter(item => item.kind === 'positive').length;
+  const negativeRatio = totalCases === 0 ? 0 : Math.round((negativeCases / totalCases) * 1000) / 1000;
+  const totalDefects = parsed.cases.reduce((sum, item) => sum + (item.requiredDefects?.length ?? 0), 0);
+
+  if (totalCases < minCases) {
+    issues.push({
+      code: 'min_cases',
+      message: `Manifest has ${totalCases} cases, requiring at least ${minCases}`,
+    });
+  }
+  if (negativeCases === 0 || positiveCases === 0 || negativeRatio < minNegativeRatio || negativeRatio > maxNegativeRatio) {
+    issues.push({
+      code: 'class_balance',
+      message: `Class balance out of range: negative=${negativeCases}, positive=${positiveCases} (negativeRatio=${negativeRatio}, expected ${minNegativeRatio}..${maxNegativeRatio})`,
+    });
+  }
+
+  const seenCommitPairs = new Map<string, string>();
+  const seenDefectIds = new Map<string, string>();
+
+  for (const item of parsed.cases) {
+    if (item.baseCommit === item.headCommit) {
+      issues.push({
+        code: 'empty_commit_range',
+        caseId: item.id,
+        message: `${item.id}: baseCommit equals headCommit (${item.baseCommit})`,
+      });
+    }
+    const pairKey = `${item.baseCommit}..${item.headCommit}`;
+    const priorCase = seenCommitPairs.get(pairKey);
+    if (priorCase) {
+      issues.push({
+        code: 'duplicate_commit_pair',
+        caseId: item.id,
+        message: `${item.id}: commit range ${pairKey} duplicates ${priorCase}`,
+      });
+    } else {
+      seenCommitPairs.set(pairKey, item.id);
+    }
+
+    const defectSignatures = new Set<string>();
+    for (const defect of item.requiredDefects ?? []) {
+      const priorOwner = seenDefectIds.get(defect.id);
+      if (priorOwner) {
+        issues.push({
+          code: 'duplicate_defect_id',
+          caseId: item.id,
+          defectId: defect.id,
+          message: `${item.id}/${defect.id}: defect id duplicates ${priorOwner}`,
+        });
+      } else {
+        seenDefectIds.set(defect.id, item.id);
+      }
+
+      const normFiles = new Set<string>();
+      for (const fp of defect.anyFilePatterns) {
+        const trimmed = fp.trim().toLowerCase();
+        if (normFiles.has(trimmed)) {
+          issues.push({
+            code: 'duplicate_pattern',
+            caseId: item.id,
+            defectId: defect.id,
+            message: `${item.id}/${defect.id}: duplicate file pattern "${fp}"`,
+          });
+        }
+        normFiles.add(trimmed);
+        if (trimmed.length < 3 || GENERIC_FILE_PATTERNS.has(trimmed)) {
+          issues.push({
+            code: 'weak_file_pattern',
+            caseId: item.id,
+            defectId: defect.id,
+            message: `${item.id}/${defect.id}: overly generic file pattern "${fp}"`,
+          });
+        }
+      }
+
+      const normTexts = new Set<string>();
+      for (const tp of defect.anyTextPatterns) {
+        const trimmed = tp.trim().toLowerCase();
+        if (normTexts.has(trimmed)) {
+          issues.push({
+            code: 'duplicate_pattern',
+            caseId: item.id,
+            defectId: defect.id,
+            message: `${item.id}/${defect.id}: duplicate text pattern "${tp}"`,
+          });
+        }
+        normTexts.add(trimmed);
+        if (trimmed.length < 2 || GENERIC_TEXT_PATTERNS.has(trimmed)) {
+          issues.push({
+            code: 'weak_text_pattern',
+            caseId: item.id,
+            defectId: defect.id,
+            message: `${item.id}/${defect.id}: overly generic text pattern "${tp}"`,
+          });
+        }
+      }
+
+      const signature = `${[...normFiles].sort().join('|')}::${[...normTexts].sort().join('|')}`;
+      if (defectSignatures.has(signature)) {
+        issues.push({
+          code: 'indistinguishable_defects',
+          caseId: item.id,
+          defectId: defect.id,
+          message: `${item.id}/${defect.id}: shares identical file+text pattern signature with another defect in the same case`,
+        });
+      }
+      defectSignatures.add(signature);
+    }
+  }
+
+  let checkedCommits: number | undefined;
+  if (options?.repoRoot) {
+    const verification = await verifyCrEvalCommits(parsed, options.repoRoot);
+    checkedCommits = verification.checkedCommits;
+    for (const err of verification.errors) {
+      issues.push({ code: 'commit_verification', message: err });
+    }
+    if (verification.ok) {
+      for (const item of parsed.cases) {
+        if (item.kind !== 'negative' || !item.requiredDefects?.length) continue;
+        const diff = await git(options.repoRoot, ['diff', '--name-only', item.baseCommit, item.headCommit]);
+        if (diff.code !== 0) {
+          issues.push({
+            code: 'commit_verification',
+            caseId: item.id,
+            message: `${item.id}: git diff ${item.baseCommit}..${item.headCommit} failed`,
+          });
+          continue;
+        }
+        const changedFiles = diff.stdout.split(/\r?\n/).map(line => line.trim().toLowerCase()).filter(Boolean);
+        for (const defect of item.requiredDefects) {
+          const matchesDiff = defect.anyFilePatterns.some(pattern => {
+            const needle = pattern.trim().toLowerCase();
+            return changedFiles.some(file => file.includes(needle));
+          });
+          if (!matchesDiff) {
+            issues.push({
+              code: 'unmatched_diff_file_pattern',
+              caseId: item.id,
+              defectId: defect.id,
+              message: `${item.id}/${defect.id}: none of anyFilePatterns [${defect.anyFilePatterns.join(', ')}] appear in git diff ${item.baseCommit}..${item.headCommit}`,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const expectedSnapshotDigest = computeManifestSnapshotDigest(parsed);
+  const declaredSnapshotDigest = parsed.snapshotDigest;
+  let snapshotFrozen = false;
+  if (!declaredSnapshotDigest) {
+    if (requireSnapshotDigest) {
+      issues.push({
+        code: 'snapshot_digest_missing',
+        message: `Missing snapshotDigest freeze field (expected ${expectedSnapshotDigest})`,
+      });
+    }
+  } else if (declaredSnapshotDigest !== expectedSnapshotDigest) {
+    issues.push({
+      code: 'snapshot_digest_mismatch',
+      message: `snapshotDigest mismatch: declared ${declaredSnapshotDigest} !== computed ${expectedSnapshotDigest}`,
+    });
+  } else {
+    snapshotFrozen = true;
+  }
+
+  return {
+    ok: issues.length === 0,
+    roleId: parsed.roleId,
+    totalCases,
+    negativeCases,
+    positiveCases,
+    negativeRatio,
+    totalDefects,
+    ...(declaredSnapshotDigest ? { declaredSnapshotDigest } : {}),
+    expectedSnapshotDigest,
+    snapshotFrozen,
+    ...(checkedCommits !== undefined ? { checkedCommits } : {}),
+    issues,
+  };
+}
+
+export function formatCrEvalLintText(report: CrEvalLintReport): string {
+  const lines = [
+    `CR 考卷清单一键 Lint：角色 ${report.roleId}，样本 ${report.totalCases}（负 ${report.negativeCases} / 正 ${report.positiveCases}，负样本占比 ${(report.negativeRatio * 100).toFixed(1)}%），缺陷 ${report.totalDefects}`,
+    `快照冻结：${report.snapshotFrozen ? '已冻结' : '未冻结/不匹配'}（expected ${report.expectedSnapshotDigest.slice(0, 12)}）`,
+  ];
+  if (report.checkedCommits !== undefined) lines.push(`提交核验端点数：${report.checkedCommits}`);
+  if (report.issues.length) {
+    lines.push(`发现 ${report.issues.length} 个问题：`);
+    for (const issue of report.issues) lines.push(`  [${issue.code}] ${issue.message}`);
+  } else {
+    lines.push('Lint 全部通过。');
+  }
+  return lines.join('\n');
+}
+
 export async function loadCrEvalManifest(roleDirectory: string): Promise<CrEvalManifest> {
   const manifestFile = await readContained(roleDirectory, 'evals/manifest.json');
   const profileFile = await readContained(roleDirectory, 'profile.json');
@@ -166,6 +445,12 @@ export async function loadCrEvalManifest(roleDirectory: string): Promise<CrEvalM
   const profileId = profileJson && typeof profileJson === 'object' ? (profileJson as { id?: unknown }).id : undefined;
   if (typeof profileId !== 'string' || profileId !== manifest.roleId) {
     throw new Error(`evals/manifest.json roleId ${manifest.roleId} does not match profile.json id ${typeof profileId === 'string' ? profileId : '(missing)'}`);
+  }
+  if (manifest.snapshotDigest) {
+    const expected = computeManifestSnapshotDigest(manifest);
+    if (manifest.snapshotDigest !== expected) {
+      throw new Error(`evals/manifest.json snapshotDigest mismatch: declared ${manifest.snapshotDigest} !== computed ${expected}`);
+    }
   }
   return manifest;
 }

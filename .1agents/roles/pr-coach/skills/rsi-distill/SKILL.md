@@ -16,5 +16,5 @@ user-invocable: true
 
 ## 双钥匙约束
 
-- 绝不直接修改 `formal` 快照或 `evals/` 考卷；对 `formal` 缺陷先 fork `trial` 候选。
-- 涉及 `eval_change`、`permission_escalation` 或 `promote_formal` 时，必须附带可机检 `evidence` 发起单条 `proposal`，等待人逐条裁决。
+- 绝不直接修改 `formal` 快照或 `evals/` 考卷；对 `formal` 缺陷先通过 `acp-service roles lifecycle fork` 派生 `trial` 候选并用 `save-trial` 绑定真实文件摘要。
+- 涉及 `eval_change`、`permission_escalation` 或 `promote_formal` 时，必须通过 `acp-service ticket propose --job <id> --kind <kind> --text <summary> --evidence <proof>`（或网关 RPC `ticket_proposal_raise`）附带可机检 `evidence` 发起单条提案，等待人在工作台或 CLI 逐条裁决。

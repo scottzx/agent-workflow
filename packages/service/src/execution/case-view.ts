@@ -86,6 +86,7 @@ export interface WorkbenchInboxItem {
   proposalId?: string;
   proposalKind?: ProposalKind;
   text?: string;
+  evidence?: string;
   roleId?: string;
 }
 
@@ -190,7 +191,7 @@ function inboxItem(item: ApprovalItem): WorkbenchInboxItem {
     title: item.title, summary: item.summary, createdAt: item.createdAt, canDecide: item.canDecide, channel: item.channel,
     ...(item.revision ? { revision: item.revision } : {}), ...(item.digest ? { digest: item.digest } : {}),
     ...(item.proposalId ? { proposalId: item.proposalId } : {}), ...(item.proposalKind ? { proposalKind: item.proposalKind } : {}),
-    ...(item.text ? { text: item.text } : {}), ...(item.roleId ? { roleId: item.roleId } : {}) };
+    ...(item.text ? { text: item.text } : {}), ...(item.evidence ? { evidence: item.evidence } : {}), ...(item.roleId ? { roleId: item.roleId } : {}) };
 }
 
 /** The same four gates as the approvals tab, limited to this case, newest first. */

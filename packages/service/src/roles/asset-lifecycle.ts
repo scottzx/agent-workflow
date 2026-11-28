@@ -13,8 +13,8 @@
  * - `formal` snapshots are persisted read-only (`0o444`) on disk with SHA-256 verification on
  *   fork (`forkTrialFromFormal`) and instant rollback (`rollbackFormalSnapshot`).
  */
-import { createHash } from 'node:crypto';
-import { chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -99,6 +99,25 @@ function assertSafeRelativePath(relativePath: string): string {
     throw new AssetLifecycleError('UNSAFE_PATH', `Unsafe asset path: ${relativePath}`);
   }
   return segments.join('/');
+}
+
+function resolveContainedPath(rootDir: string, relativePath: string): { cleanPath: string; fullPath: string } {
+  const cleanPath = assertSafeRelativePath(relativePath);
+  const resolvedRoot = path.resolve(rootDir);
+  const fullPath = path.resolve(resolvedRoot, cleanPath);
+  const rel = path.relative(resolvedRoot, fullPath);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new AssetLifecycleError('UNSAFE_PATH', `Asset path escapes root directory: ${relativePath}`);
+  }
+  return { cleanPath, fullPath };
+}
+
+async function atomicWriteFile(filePath: string, data: string | Buffer, mode?: number): Promise<void> {
+  const dir = path.dirname(filePath);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  await writeFile(tmpPath, data, mode !== undefined ? { mode } : undefined);
+  await rename(tmpPath, filePath);
 }
 
 /** True when a path points to or inside an `evals/` exam-paper directory. */
@@ -266,8 +285,7 @@ export class AssetLifecycleStore {
   }
 
   private async saveState(state: StoredLifecycleState): Promise<void> {
-    await mkdir(path.dirname(this.stateFile), { recursive: true });
-    await writeFile(this.stateFile, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    await atomicWriteFile(this.stateFile, `${JSON.stringify(state, null, 2)}\n`, 0o644);
   }
 
   formalSnapshotPath(kind: AssetKind, id: string, digest: string): string {
@@ -278,23 +296,44 @@ export class AssetLifecycleStore {
     return path.join(this.trialDir, kind, id, 'candidate.asset');
   }
 
-  /** Autonomous coach/person write to a `trial` asset. Rejects `formal` or `evals/` targets. */
+  /**
+   * Autonomous coach/person write to a `trial` asset. Rejects `formal` or `evals/` targets.
+   * When `sourceRoot` is supplied without `content`, bytes are read directly from
+   * `path.join(sourceRoot, relativePath)` so `digest` is bound to the real file on disk.
+   */
   async saveTrialAsset(input: {
     kind: AssetKind;
     id: string;
-    content: string | Buffer;
+    content?: string | Buffer;
+    sourceRoot?: string;
     relativePath: string;
     version: string;
     dependencies?: AssetDependency[];
     forkedFromDigest?: string;
     actor: LifecycleActor;
     now?: () => Date;
-  }): Promise<{ record: AssetRecord; filePath: string }> {
+  }): Promise<{ record: AssetRecord; filePath: string; sourcePath?: string }> {
     assetKindSchema.parse(input.kind);
     z.string().regex(SAFE_ID).parse(input.id);
     assertAssetWriteAllowed({ actor: input.actor, lifecycle: 'trial', relativePath: input.relativePath, operation: 'write' });
 
-    const bytes = Buffer.isBuffer(input.content) ? input.content : Buffer.from(input.content, 'utf8');
+    let bytes: Buffer;
+    let sourcePath: string | undefined;
+    if (input.sourceRoot) {
+      const resolved = resolveContainedPath(input.sourceRoot, input.relativePath);
+      sourcePath = resolved.fullPath;
+      if (input.content !== undefined) {
+        bytes = Buffer.isBuffer(input.content) ? input.content : Buffer.from(input.content, 'utf8');
+        await atomicWriteFile(sourcePath, bytes, 0o644);
+      } else {
+        bytes = await readFile(sourcePath);
+      }
+    } else if (input.content !== undefined) {
+      bytes = Buffer.isBuffer(input.content) ? input.content : Buffer.from(input.content, 'utf8');
+    } else {
+      throw new AssetLifecycleError('ASSET_NOT_FOUND', `Either content or sourceRoot must be provided for ${input.kind}:${input.id}`);
+    }
+
     const digest = computeAssetDigest(bytes);
     const record: AssetRecord = assetRecordSchema.parse({
       kind: input.kind,
@@ -310,13 +349,12 @@ export class AssetLifecycleStore {
     });
 
     const filePath = this.trialCandidatePath(input.kind, input.id);
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, bytes, { mode: 0o644 });
+    await atomicWriteFile(filePath, bytes, 0o644);
 
     const state = await this.loadState();
     state.trial[assetKey(input.kind, input.id)] = record;
     await this.saveState(state);
-    return { record, filePath };
+    return { record, filePath, ...(sourcePath ? { sourcePath } : {}) };
   }
 
   /**
@@ -401,14 +439,17 @@ export class AssetLifecycleStore {
   /**
    * One-click fork of an active `formal` snapshot into a writable `trial` candidate
    * so a coach can autonomously fix a formal defect without mutating `formal`.
+   * When `targetRoot` is provided, the forked bytes are also materialized at
+   * `path.join(targetRoot, activeFormal.relativePath)`.
    */
   async forkTrialFromFormal(input: {
     kind: AssetKind;
     id: string;
     newVersion: string;
     actor: LifecycleActor;
+    targetRoot?: string;
     now?: () => Date;
-  }): Promise<{ record: AssetRecord; filePath: string }> {
+  }): Promise<{ record: AssetRecord; filePath: string; sourcePath?: string }> {
     const key = assetKey(input.kind, input.id);
     const state = await this.loadState();
     const activeFormal = state.formal[key];
@@ -432,6 +473,7 @@ export class AssetLifecycleStore {
       kind: input.kind,
       id: input.id,
       content: bytes,
+      ...(input.targetRoot ? { sourceRoot: input.targetRoot } : {}),
       relativePath: activeFormal.relativePath,
       version: input.newVersion,
       dependencies: activeFormal.dependencies,
@@ -444,15 +486,18 @@ export class AssetLifecycleStore {
   /**
    * One-click instant rollback of a `formal` asset to a previous immutable `formal` snapshot
    * (defaults to the immediately preceding distinct snapshot in `formalHistory`).
+   * When `targetRoot` is supplied, atomically writes the verified snapshot bytes back to
+   * `path.join(targetRoot, restored.relativePath)` on disk.
    */
   async rollbackFormalSnapshot(input: {
     kind: AssetKind;
     id: string;
     targetDigest?: string;
+    targetRoot?: string;
     actor: LifecycleActor;
     reason: string;
     now?: () => Date;
-  }): Promise<{ record: AssetRecord; snapshotPath: string; rolledBackFromDigest: string }> {
+  }): Promise<{ record: AssetRecord; snapshotPath: string; rolledBackFromDigest: string; restoredPath?: string }> {
     const key = assetKey(input.kind, input.id);
     const state = await this.loadState();
     const current = state.formal[key];
@@ -495,6 +540,13 @@ export class AssetLifecycleStore {
       );
     }
 
+    let restoredPath: string | undefined;
+    if (input.targetRoot) {
+      const resolved = resolveContainedPath(input.targetRoot, target.relativePath);
+      await atomicWriteFile(resolved.fullPath, bytes, 0o644);
+      restoredPath = resolved.fullPath;
+    }
+
     const restored: AssetRecord = assetRecordSchema.parse({
       ...target,
       evidence: `rollback from ${current.digest.slice(0, 12)}: ${input.reason.trim()}`,
@@ -504,7 +556,7 @@ export class AssetLifecycleStore {
     state.formal[key] = restored;
     state.formalHistory[key] = [...history, restored];
     await this.saveState(state);
-    return { record: restored, snapshotPath, rolledBackFromDigest: current.digest };
+    return { record: restored, snapshotPath, rolledBackFromDigest: current.digest, ...(restoredPath ? { restoredPath } : {}) };
   }
 
   /** Read active state snapshot (read-only). */

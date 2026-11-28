@@ -22,6 +22,17 @@ test('bundle registers ACP-only presets and releases them with its lifetime', as
  assert.equal(presets.size,0);
 });
 
+test('bundle registers oneagents-pr-coach preset when prCoachPreset is enabled and disposes it cleanly', async () => {
+ const dir=mkdtempSync(join(tmpdir(),'dsh-pr-coach-preset-')); const effects=[]; const presets=new Map();
+ const ctx={provide:(key,value)=>{ctx[key]=value; effects.push(()=>delete ctx[key]);}, get:key=>key==='dshHomePath'?(...p)=>join(dir,...p):undefined, llm:{registerAdapter:()=>()=>{}}, effect:async setup=>{effects.push(await setup());}, webServer:{register:()=>()=>{}}, on:()=>()=>{}, agentPresets:{register:async definition=>{presets.set(definition.id,definition); return ()=>presets.delete(definition.id);}}};
+ try {
+  await apply(ctx, { agents: ['codex'], serviceMode: 'external', prCoachPreset: true });
+  assert.deepEqual([...presets.keys()], ['oneagents-acp-codex', 'oneagents-pr-coach']);
+  assert.match(presets.get('oneagents-pr-coach').plugins[0].config.prefix, /\.1agents\/roles\/pr-coach\/ROLE\.md/);
+ } finally { for(const dispose of effects) await dispose?.(); rmSync(dir,{recursive:true,force:true}); }
+ assert.equal(presets.size, 0);
+});
+
 import { createServer } from 'node:http';
 import { discoverPresets } from '../dist/discovery.js';
 

@@ -7,8 +7,18 @@ import { calibrateRole, calibrationPath } from '../src/rsi/calibrate.js';
 import { checkGate, writeCrEvalReport } from '../src/rsi/gate.js';
 import { formatLearningsLookupText, lookupLearnings } from '../src/rsi/learnings-lookup.js';
 import { runOutlineCase } from '../src/rsi/outline-run.js';
-import { coerceCrEvalResults, computeCrEvalDigest, findRepoRoot, loadCrEvalManifest, scoreCrEvalSuite, verifyCrEvalCommits } from '../src/rsi/pr-cr-eval.js';
+import {
+  coerceCrEvalResults,
+  computeCrEvalDigest,
+  findRepoRoot,
+  formatCrEvalLintText,
+  lintCrEvalManifest,
+  loadCrEvalManifest,
+  scoreCrEvalSuite,
+  verifyCrEvalCommits,
+} from '../src/rsi/pr-cr-eval.js';
 import { calibrateRubric, formatRubricCalibrationText, rubricCalibrationPath } from '../src/rsi/rubric.js';
+import { formatPairwiseRegressionText, pairwiseRegressionPath, runPairwiseRegression } from '../src/rsi/pairwise.js';
 import { computeRoleScorecard, formatScorecardText } from '../src/rsi/scorecard.js';
 import { stampActor } from './ticket.js';
 
@@ -16,9 +26,10 @@ const USAGE = `Usage: acp-service rsi run --role DIR --case ID --project REPO [o
        acp-service rsi gate --role DIR [--workspace DIR] [--required N] [--url URL]
        acp-service rsi calibrate --role DIR [--workspace DIR] [--python PATH] [--only P15,P14]
        acp-service rsi calibrate --rubric --role DIR --judgments FILE [--workspace DIR] [--json]
+       acp-service rsi pairwise --role DIR --votes FILE [--workspace DIR] [--candidate VER] [--baseline VER] [--json]
        acp-service rsi scorecard --role DIR [--workspace DIR] [--since VER] [--json]
        acp-service rsi lookup --paths FILE1,FILE2 [--repo DIR] [--limit N] [--json]
-       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--workspace DIR] [--json]
+       acp-service rsi eval-cr --role DIR [--repo DIR] [--results FILE] [--workspace DIR] [--lint] [--json]
 
 Runs one case of a product-intro outline role: exports the pinned commit, dispatches the
 executor, runs the role's program checks and sends failures back to the same session.
@@ -90,6 +101,7 @@ export async function runRsiCli(argv: string[]): Promise<void> {
   if (argv[0] === 'scorecard') return runScorecard(argv.slice(1));
   if (argv[0] === 'lookup') return runLookup(argv.slice(1));
   if (argv[0] === 'eval-cr') return runEvalCr(argv.slice(1));
+  if (argv[0] === 'pairwise') return runPairwise(argv.slice(1));
   if (argv[0] !== 'run') throw new Error('Unknown rsi command; use rsi --help');
   const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
     role: { type: 'string' }, case: { type: 'string' }, project: { type: 'string' },
@@ -143,6 +155,10 @@ async function runGate(argv: string[]): Promise<void> {
   if (gate.rubricCalibration?.present) {
     const rubricLabel = { passed: '已通过', failed: '未通过', stale: '已过期', not_required: '未校准（observe）' }[gate.rubricCalibration.status];
     console.log(`Rubric 校准：${rubricLabel}${gate.rubricCalibration.blockedBy?.length ? `（未达标：${gate.rubricCalibration.blockedBy.join('、')}）` : ''}`);
+  }
+  if (gate.pairwiseRegression?.present) {
+    const pwLabel = { passed: '已通过', failed: '未通过', stale: '已过期', missing: '缺少', not_required: '未运行（可选）' }[gate.pairwiseRegression.status];
+    console.log(`Pairwise 回归：${pwLabel}${gate.pairwiseRegression.winRate !== undefined ? `（winRate=${gate.pairwiseRegression.winRate}）` : ''}`);
   }
   for (const kase of gate.testCases) console.log(`  测试 ${kase.caseId}（${kase.kind === 'original' ? '原题' : '变体题'}）：${{ passed: '通过', failed: '未通过', not_run: '未跑' }[kase.result]}`);
   if (!gate.ready) process.exitCode = 1;
@@ -240,13 +256,23 @@ async function runEvalCr(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, strict: true, options: {
     role: { type: 'string' }, repo: { type: 'string' }, results: { type: 'string' },
     workspace: { type: 'string' },
+    lint: { type: 'boolean', default: false },
     json: { type: 'boolean', default: false },
   } });
   if (!values.role) throw new Error('--role is required');
+  if (values.lint && values.results) throw new Error('--lint cannot be combined with --results');
   const roleDirectory = resolve(values.role);
   const manifest = await loadCrEvalManifest(roleDirectory);
   const evalDigest = await computeCrEvalDigest(roleDirectory);
   const repoRoot = values.repo ? resolve(values.repo) : await findRepoRoot(roleDirectory);
+  if (values.lint) {
+    const lint = await lintCrEvalManifest(manifest, { repoRoot });
+    const report = { mode: 'lint' as const, evalDigest, repoRoot, ...lint };
+    if (values.json) console.log(JSON.stringify(report));
+    else console.log(formatCrEvalLintText(lint));
+    if (!lint.ok) process.exitCode = 1;
+    return;
+  }
   const verification = await verifyCrEvalCommits(manifest, repoRoot);
   const negativeCases = manifest.cases.filter(item => item.kind === 'negative').length;
   const positiveCases = manifest.cases.filter(item => item.kind === 'positive').length;
@@ -310,4 +336,32 @@ async function runEvalCr(argv: string[]): Promise<void> {
     console.log(ready ? '达到 trial → formal 晋升门槛。' : '未达到 trial → formal 晋升门槛。');
   }
   if (!ready) process.exitCode = 1;
+}
+
+async function runPairwise(argv: string[]): Promise<void> {
+  const { values } = parseArgs({ args: argv, strict: true, options: {
+    role: { type: 'string' },
+    votes: { type: 'string' },
+    workspace: { type: 'string', default: '.1agents/runtime/rsi' },
+    candidate: { type: 'string' },
+    baseline: { type: 'string' },
+    json: { type: 'boolean', default: false },
+  } });
+  if (!values.role) throw new Error('--role is required');
+  if (!values.votes) throw new Error('--votes <jsonl|json> is required');
+  const workspace = resolve(values.workspace!);
+  const report = await runPairwiseRegression({
+    roleDirectory: resolve(values.role),
+    votesPath: resolve(values.votes),
+    workspace,
+    ...(values.candidate ? { candidateVersion: values.candidate } : {}),
+    ...(values.baseline ? { baselineVersion: values.baseline } : {}),
+  });
+  if (values.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(formatPairwiseRegressionText(report));
+    console.log(`回归报告：${pairwiseRegressionPath(workspace, report.roleId)}`);
+  }
+  if (!report.passed) process.exitCode = 1;
 }
