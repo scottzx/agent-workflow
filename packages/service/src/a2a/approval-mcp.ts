@@ -42,6 +42,17 @@ const sessionBindingGetArgsSchema = z.object({
   originSessionId: id.optional(),
 }).strict();
 
+/** Sender identity is never a caller argument: the MCP process's bound session owns it. */
+const sessionDeliveryModeSchema = z.enum(['queue', 'steer']);
+const sessionMessageSendArgsSchema = z.object({
+  toSessionId: id,
+  text: promptText,
+  toHost: id.optional(),
+  mode: sessionDeliveryModeSchema.optional(),
+  summary: z.string().trim().min(1).max(240).optional(),
+  messageId: id.optional(),
+}).strict();
+
 const taskDispatchArgsSchema = z.object({
   originSessionId: id.optional(),
   targetId: id.optional(),
@@ -205,6 +216,11 @@ export const A2A_APPROVAL_MCP_TOOLS: readonly McpToolDefinition[] = [
     name: 'a2a_session_binding_get',
     description: '只读查询主会话绑定与投递计数。省略 originSessionId 时使用默认总会话。不返回宿主凭据、hostFingerprint 或消息正文。',
     inputSchema: z.toJSONSchema(sessionBindingGetArgsSchema) as Record<string, unknown>,
+  },
+  {
+    name: 'a2a_session_message_send',
+    description: '跨会话留言：发件方身份由本 MCP 进程已绑定的当前会话自动决定（A2A_DEFAULT_HOST_SESSION_ID，回退 A2A_DEFAULT_ORIGIN_SESSION_ID），不接受调用方传 fromSessionId，未配置默认会话身份时直接失败。转发网关 session_message_send；接收方正文可见 msg_from_session_id，且该留言会与目标会话的 A2A 通知在同一队列内自动合并。messageId 可省略，网关生成 session-msg:<uuid>。',
+    inputSchema: z.toJSONSchema(sessionMessageSendArgsSchema) as Record<string, unknown>,
   },
   {
     name: 'a2a_task_dispatch',
@@ -458,6 +474,15 @@ export function createA2AApprovalMcpHandler(options: A2AApprovalMcpOptions = {})
             throw new Error('session bind requires originSessionId, host, and sessionId: pass them or configure A2A_DEFAULT_ORIGIN_SESSION_ID, A2A_DEFAULT_SESSION_HOST, and A2A_DEFAULT_HOST_SESSION_ID');
           }
           data = await invokeGateway('session_bind', { originSessionId, host, sessionId });
+          break;
+        }
+        case 'a2a_session_message_send': {
+          const input = sessionMessageSendArgsSchema.parse(args);
+          const fromSessionId = defaultHostSessionId;
+          if (!fromSessionId) {
+            throw new Error('a2a_session_message_send requires a bound session identity: set A2A_DEFAULT_HOST_SESSION_ID (or A2A_DEFAULT_ORIGIN_SESSION_ID)');
+          }
+          data = await invokeGateway('session_message_send', { fromSessionId, ...input });
           break;
         }
         case 'a2a_task_dispatch': {

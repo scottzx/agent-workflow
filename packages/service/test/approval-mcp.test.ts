@@ -119,7 +119,7 @@ test('MCP handler lists approval tools, dispatches/queries tasks, aggregates pen
   assert.deepEqual(ping?.result, {});
   const list = await mcp.handleJsonRpc({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
   const tools = (list?.result as { tools: typeof A2A_APPROVAL_MCP_TOOLS }).tools;
-  assert.equal(tools.length, 20);
+  assert.equal(tools.length, 21);
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object');
     assert.ok(tool.description.trim().length > 0);
@@ -280,7 +280,7 @@ test('acp-service mcp stdio subprocess speaks clean newline-delimited JSON-RPC o
   assert.equal((init.result as { serverInfo: { name: string } }).serverInfo.name, A2A_APPROVAL_MCP_SERVER_NAME);
 
   const list = await rpc(2, 'tools/list');
-  assert.equal((list.result as { tools: unknown[] }).tools.length, 20);
+  assert.equal((list.result as { tools: unknown[] }).tools.length, 21);
 
   const pending = await rpc(3, 'tools/call', { name: 'a2a_pending_approvals', arguments: {} });
   const result = pending.result as { isError?: boolean; structuredContent: { counts: { pendingProcessRequests: number } } };

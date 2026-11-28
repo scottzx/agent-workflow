@@ -7,10 +7,17 @@ import { deliverSessionMessage, SessionDeliveryError, sessionNoticeSchema, type 
 
 const id = z.string().trim().min(1).max(512);
 const deliveryModeSchema = z.enum(['queue', 'steer']);
+/** One host admission can carry several queued messages; stay well below the 256 KiB host body limit. */
+const MAX_BATCH_BYTES = 200 * 1024;
+/** Per-message attribution/framing overhead in a merged body. */
+const MERGE_SEGMENT_OVERHEAD_BYTES = 320;
+const MERGE_SUMMARY_MAX_CHARS = 240;
 export const sessionOriginSchema = z.object({ originSessionId: id }).strict();
 export const sessionBindSchema = sessionOriginSchema.extend({ host: id, sessionId: id }).strict();
 export const sessionMessageSchema = sessionOriginSchema.extend({ messageId: id }).strict();
 export const sessionSendSchema = sessionMessageSchema.extend({
+  /** Sender identity shown to the receiving session; older gateways omit it. */
+  fromSessionId: id.optional(),
   text: z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim())),
   mode: deliveryModeSchema.optional(),
   notice: sessionNoticeSchema.optional(),
@@ -51,6 +58,7 @@ export interface SessionDeliverySummary {
 }
 export interface SessionDeliveryReceipt extends SessionBinding {
   messageId: string;
+  fromSessionId?: string;
   mode?: SessionDeliveryMode;
   notice?: SessionNoticeMeta;
   status: SessionDeliveryStatus;
@@ -66,7 +74,7 @@ interface Delivery extends SessionDeliveryReceipt { text: string; hostFingerprin
 const deliveryStatusSchema = z.enum(['pending', 'dispatching', 'retrying', 'accepted', 'unknown', 'rejected']);
 const bindingSchema = sessionBindSchema.extend({ createdAt: id, hostFingerprint: id }).strict();
 const deliverySchema = bindingSchema.extend({
-  messageId: id, text: sessionSendSchema.shape.text, mode: deliveryModeSchema.optional(), notice: sessionNoticeSchema.optional(),
+  messageId: id, fromSessionId: id.optional(), text: sessionSendSchema.shape.text, mode: deliveryModeSchema.optional(), notice: sessionNoticeSchema.optional(),
   status: deliveryStatusSchema,
   attempts: z.number().int().nonnegative(), updatedAt: id,
   nextAttemptAt: id.optional(), hostReceiptId: id.optional(), error: id.optional(),
@@ -79,6 +87,7 @@ const targetDeliverySchema = z.object({
   sessionId: id,
   hostFingerprint: id,
   messageId: id,
+  fromSessionId: id.optional(),
   text: sessionSendSchema.shape.text,
   mode: deliveryModeSchema.optional(),
   notice: sessionNoticeSchema.optional(),
@@ -105,6 +114,7 @@ export interface TargetDeliveryReceipt {
   host: string;
   sessionId: string;
   messageId: string;
+  fromSessionId?: string;
   mode?: SessionDeliveryMode;
   notice?: SessionNoticeMeta;
   status: SessionDeliveryStatus;
@@ -122,6 +132,7 @@ export interface TargetEnqueueInput {
   host: string;
   sessionId: string;
   messageId: string;
+  fromSessionId?: string;
   text: string;
   mode?: SessionDeliveryMode;
   notice?: SessionNoticeMeta;
@@ -217,6 +228,19 @@ export class SessionDelivery {
   hasDelivery(originSessionId: string, messageId: string): boolean {
     return this.state.deliveries.some(value => value.originSessionId === originSessionId && value.messageId === messageId);
   }
+  /** Configured host aliases, used to resolve an implicit cross-session message target. */
+  hostNames(): string[] { return Object.keys(this.hosts); }
+  /** Hosts already bound to one host session, without duplicates. */
+  hostsForSession(sessionId: string): string[] {
+    return [...new Set(this.state.bindings.filter(value => value.sessionId === sessionId).map(value => value.host))];
+  }
+  /** The single owner origin of one (host, session) target. Ambiguous targets have no owner FIFO. */
+  originForTarget(host: string, sessionId: string): string | undefined {
+    const origins = [...new Set(this.state.bindings
+      .filter(value => value.host === host && value.sessionId === sessionId)
+      .map(value => value.originSessionId))];
+    return origins.length === 1 ? origins[0] : undefined;
+  }
   bind(input: z.output<typeof sessionBindSchema>): SessionBinding {
     this.requireWritable();
     const host = this.hosts[input.host];
@@ -237,7 +261,8 @@ export class SessionDelivery {
     const previous = this.state.deliveries.find(value => value.originSessionId === input.originSessionId && value.messageId === input.messageId);
     if (previous) {
       const sameNotice = JSON.stringify(previous.notice ?? null) === JSON.stringify(input.notice ?? null);
-      if (previous.text !== input.text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice) {
+      if (previous.text !== input.text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice
+        || previous.fromSessionId !== input.fromSessionId) {
         throw new Error('Message ID was already used for different content');
       }
       return receipt(previous);
@@ -248,6 +273,7 @@ export class SessionDelivery {
     const delivery: Delivery = {
       ...binding,
       messageId: input.messageId,
+      ...(input.fromSessionId ? { fromSessionId: input.fromSessionId } : {}),
       text: input.text,
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.notice ? { notice: input.notice } : {}),
@@ -293,7 +319,8 @@ export class SessionDelivery {
     if (previous) {
       const sameNotice = JSON.stringify(previous.notice ?? null) === JSON.stringify(input.notice ?? null);
       if (previous.text !== text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice
-        || previous.host !== input.host || previous.sessionId !== input.sessionId) {
+        || previous.host !== input.host || previous.sessionId !== input.sessionId
+        || previous.fromSessionId !== input.fromSessionId) {
         throw new Error('Message ID was already used for different content');
       }
       return targetReceipt(previous);
@@ -305,6 +332,7 @@ export class SessionDelivery {
       sessionId: input.sessionId,
       hostFingerprint: fingerprint(host),
       messageId: input.messageId,
+      ...(input.fromSessionId ? { fromSessionId: input.fromSessionId } : {}),
       text,
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.notice ? { notice: input.notice } : {}),
@@ -387,37 +415,126 @@ export class SessionDelivery {
       delivery.processedAt = new Date().toISOString(); delivery.updatedAt = delivery.processedAt; this.save();
     }
   }
-  /** The head of one FIFO. `scopeId` is the owner origin or the subscriber target key, never mixed. */
-  private async pumpQueue(delivery: Delivery | TargetDelivery | undefined, scopeId: string): Promise<void> {
-    if (!delivery || this.closed || this.storageFailed) return;
+  /** One FIFO entry: an owner delivery or a subscriber/direct target delivery. */
+  private due(entry: Delivery | TargetDelivery, now: number): boolean {
+    if (entry.nextAttemptAt && Date.parse(entry.nextAttemptAt) > now) return false;
+    return entry.status === 'pending' || entry.status === 'retrying';
+  }
+  /**
+   * The contiguous run of due queue messages behind one FIFO head. A steer message is always alone and
+   * ends the run; unknown, rejected, dispatching, not-yet-due retrying and different host/session
+   * entries are hard boundaries, so a failed or uncertain admission is never merged with later work.
+   */
+  private collectBatch(head: Delivery | TargetDelivery, fifo: readonly (Delivery | TargetDelivery)[]): (Delivery | TargetDelivery)[] {
+    if (head.mode === 'steer') return [head];
+    const start = fifo.indexOf(head);
+    if (start < 0) return [head];
+    const now = Date.now();
+    const batch: (Delivery | TargetDelivery)[] = [];
+    let bytes = 0;
+    for (let index = start; index < fifo.length; index++) {
+      const entry = fifo[index]!;
+      // Acknowledged before dispatch: it will never be delivered, so it cannot be a merge partner either.
+      if (entry.processedAt) continue;
+      if (entry.mode === 'steer') break;
+      if (!this.due(entry, now)) break;
+      if (entry.host !== head.host || entry.sessionId !== head.sessionId || entry.hostFingerprint !== head.hostFingerprint) break;
+      const size = Buffer.byteLength(entry.text, 'utf8') + MERGE_SEGMENT_OVERHEAD_BYTES;
+      if (batch.length && bytes + size > MAX_BATCH_BYTES) break;
+      batch.push(entry); bytes += size;
+    }
+    return batch.length ? batch : [head];
+  }
+  /** One message keeps its exact body; a batch is framed as numbered Chinese segments with its sender. */
+  private batchText(batch: readonly (Delivery | TargetDelivery)[]): string {
+    if (batch.length === 1) return batch[0]!.text;
+    const segments = batch.map((entry, index) => {
+      const source = entry.fromSessionId
+        ? `msg_from_session_id: ${entry.fromSessionId}${entry.notice ? `（系统通知: ${entry.messageId}）` : ''}`
+        : entry.notice ? `系统通知: ${entry.messageId}` : `系统消息: ${entry.messageId}`;
+      return [`[第 ${index + 1}/${batch.length} 条]`, `来源: ${source}`, `时间: ${entry.createdAt}`, '', entry.text].join('\n');
+    });
+    return [
+      `[队列合并 · 共 ${batch.length} 条消息]`,
+      '以下待发消息在同一会话队列中合并为一次投递，请按顺序逐条处理。',
+      '',
+      ...segments,
+    ].join('\n\n');
+  }
+  /** A batch that carries any notice collapses into one notice summary; a pure relay batch stays relay. */
+  private batchNotice(batch: readonly (Delivery | TargetDelivery)[]): SessionNoticeMeta | undefined {
+    if (batch.length === 1) return batch[0]!.notice;
+    if (!batch.some(entry => entry.notice)) return undefined;
+    if (batch.some(entry => entry.notice?.form === 'notice')) {
+      const first = batch.find(entry => entry.notice?.form === 'notice')!;
+      const detail = first.notice?.form === 'notice' ? first.notice.summary : '';
+      const raw = `队列合并 · 共 ${batch.length} 条消息${detail ? `：${detail}` : ''}`;
+      const summary = raw.length <= MERGE_SUMMARY_MAX_CHARS ? raw : `${raw.slice(0, MERGE_SUMMARY_MAX_CHARS - 1)}…`;
+      return { form: 'notice', summary };
+    }
+    return batch.every(entry => entry.notice?.form === 'relay') ? { form: 'relay' } : undefined;
+  }
+  /**
+   * Deliver the head of one FIFO plus its mergeable queue tail. `scopeId` is the owner origin or the
+   * subscriber target key, never mixed. A single message keeps its historical host message ID.
+   */
+  private async pumpQueue(head: Delivery | TargetDelivery | undefined, scopeId: string, fifo: readonly (Delivery | TargetDelivery)[]): Promise<void> {
+    if (!head || this.closed || this.storageFailed) return;
     // The first unresolved admission holds later messages in this FIFO only.
-    if (['unknown', 'rejected', 'dispatching'].includes(delivery.status)) return;
-    if (delivery.nextAttemptAt && Date.parse(delivery.nextAttemptAt) > Date.now()) return;
-    const host = this.hosts[delivery.host];
-    if (!host || fingerprint(host) !== delivery.hostFingerprint) {
-      delivery.status = 'unknown'; delivery.error = 'Saved host configuration is missing or its destination changed';
-      delivery.updatedAt = new Date().toISOString(); this.save(); return;
+    if (['unknown', 'rejected', 'dispatching'].includes(head.status)) return;
+    if (head.nextAttemptAt && Date.parse(head.nextAttemptAt) > Date.now()) return;
+    const host = this.hosts[head.host];
+    if (!host || fingerprint(host) !== head.hostFingerprint) {
+      head.status = 'unknown'; head.error = 'Saved host configuration is missing or its destination changed';
+      head.updatedAt = new Date().toISOString(); this.save(); return;
     }
-    delivery.status = 'dispatching'; delivery.attempts++; delivery.updatedAt = new Date().toISOString();
-    delete delivery.nextAttemptAt; this.save();
+    const batch = this.collectBatch(head, fifo);
+    const text = this.batchText(batch);
+    const notice = this.batchNotice(batch);
+    const mode = batch.length > 1 ? 'queue' : (batch[0]!.mode ?? 'queue');
+    const startedAt = new Date().toISOString();
+    // Mark the whole batch in flight atomically before the host call, so a restart never re-sends part of it.
+    for (const entry of batch) {
+      entry.status = 'dispatching'; entry.attempts++; entry.updatedAt = startedAt;
+      delete entry.nextAttemptAt; delete entry.error;
+    }
+    this.save();
+    let failure: { status: SessionDeliveryStatus; error: string; retryable: boolean } | undefined;
     try {
-      // Host deduplication must preserve the ledger's origin/message scope, or the subscriber target scope.
-      const hostMessageId = `1agents-session:${createHash('sha256').update(JSON.stringify([scopeId, delivery.messageId])).digest('hex')}`;
+      // Host deduplication keeps the ledger scope; a merged batch hashes every message ID in order.
+      const hostMessageId = `1agents-session:${createHash('sha256').update(JSON.stringify([scopeId, ...batch.map(entry => entry.messageId)])).digest('hex')}`;
       const result = await deliverSessionMessage(host, {
-        sessionId: delivery.sessionId, messageId: hostMessageId, text: delivery.text,
-        ...(delivery.mode ? { mode: delivery.mode } : {}),
-        ...(delivery.notice ? { notice: delivery.notice } : {}),
+        sessionId: head.sessionId, messageId: hostMessageId, text,
+        ...(mode === 'steer' ? { mode } : {}),
+        ...(notice ? { notice } : {}),
+        ...(batch.length === 1 && batch[0]!.fromSessionId ? { fromSessionId: batch[0]!.fromSessionId } : {}),
       }, this.controller.signal);
-      delivery.status = 'accepted'; delivery.hostReceiptId = result.hostReceiptId;
-      delete delivery.error;
+      const updatedAt = new Date().toISOString();
+      for (const entry of batch) {
+        entry.status = 'accepted'; entry.hostReceiptId = result.hostReceiptId; entry.updatedAt = updatedAt;
+        delete entry.error;
+      }
     } catch (error) {
-      if (error instanceof SessionDeliveryError && error.retryable && !error.outcomeUnknown) {
-        delivery.status = 'retrying';
-        delivery.nextAttemptAt = new Date(Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(delivery.attempts - 1, 6))).toISOString();
-      } else delivery.status = error instanceof SessionDeliveryError && !error.outcomeUnknown ? 'rejected' : 'unknown';
-      delivery.error = error instanceof SessionDeliveryError ? error.message : 'Host admission failed; verify delivery before retrying';
+      failure = error instanceof SessionDeliveryError && error.retryable && !error.outcomeUnknown
+        ? { status: 'retrying', retryable: true, error: error.message }
+        : {
+          status: error instanceof SessionDeliveryError && !error.outcomeUnknown ? 'rejected' : 'unknown',
+          retryable: false,
+          error: error instanceof SessionDeliveryError ? error.message : 'Host admission failed; verify delivery before retrying',
+        };
     }
-    delivery.updatedAt = new Date().toISOString(); this.save();
+    if (failure) {
+      const updatedAt = new Date().toISOString();
+      for (const entry of batch) {
+        entry.status = failure.status;
+        if (failure.retryable) {
+          entry.nextAttemptAt = new Date(Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(entry.attempts - 1, 6))).toISOString();
+        }
+        entry.error = failure.error;
+        entry.updatedAt = updatedAt;
+      }
+    }
+    this.save();
   }
   async reconcile(): Promise<void> {
     if (this.closed || this.storageFailed) return;
@@ -425,12 +542,20 @@ export class SessionDelivery {
     const run = async (): Promise<void> => {
       do {
         this.repump = false;
-        const origins = [...new Set(this.state.deliveries.map(value => value.originSessionId))];
-        const targetKeys = [...new Set(this.state.targetDeliveries.map(value => value.targetKey))];
+        const ownerFifos = new Map<string, Delivery[]>();
+        for (const value of this.state.deliveries) {
+          const fifo = ownerFifos.get(value.originSessionId);
+          if (fifo) fifo.push(value); else ownerFifos.set(value.originSessionId, [value]);
+        }
+        const targetFifos = new Map<string, TargetDelivery[]>();
+        for (const value of this.state.targetDeliveries) {
+          const fifo = targetFifos.get(value.targetKey);
+          if (fifo) fifo.push(value); else targetFifos.set(value.targetKey, [value]);
+        }
         // Owner origins and subscriber targets are separate FIFOs and run side by side.
         await Promise.allSettled([
-          ...origins.map(origin => this.pumpQueue(this.state.deliveries.find(value => value.originSessionId === origin && value.status !== 'accepted' && !value.processedAt), origin)),
-          ...targetKeys.map(targetKey => this.pumpQueue(this.state.targetDeliveries.find(value => value.targetKey === targetKey && value.status !== 'accepted' && !value.processedAt), targetKey)),
+          ...[...ownerFifos].map(([origin, fifo]) => this.pumpQueue(fifo.find(value => value.status !== 'accepted' && !value.processedAt), origin, fifo)),
+          ...[...targetFifos].map(([targetKey, fifo]) => this.pumpQueue(fifo.find(value => value.status !== 'accepted' && !value.processedAt), targetKey, fifo)),
         ]);
       } while (this.repump && !this.closed && !this.storageFailed);
     };

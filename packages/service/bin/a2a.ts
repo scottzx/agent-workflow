@@ -18,7 +18,7 @@ invoke reads a JSON parameters object from stdin. Credentials stay in the
 gateway config file (chmod 600), outside tool arguments. Remote cwd is absolute.
 Methods: remote_agent_preflight, remote_agent_model_catalog, remote_agent_spawn, remote_agent_get, remote_agent_message,
          remote_agent_cancel, remote_agent_close, remote_agent_sessions, remote_agent_list, remote_agent_inbox, remote_agent_ack,
-         session_bind, session_send, session_delivery_get, session_delivery_resolve,
+         session_bind, session_send, session_message_send, session_delivery_get, session_delivery_resolve,
          execution_project_scan, execution_project_list,
          execution_discovery_config_get, execution_discovery_config_update,
          handoff_propose, handoff_decide, handoff_offer, handoff_space, handoff_get,

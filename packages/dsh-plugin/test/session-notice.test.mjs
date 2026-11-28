@@ -130,3 +130,119 @@ test('deliver endpoint steers ContextFormed notice, deduplicates retries, suppor
   const resCrossOrigin = await post(noticeReq, { Origin: 'https://evil.example' });
   assert.equal(resCrossOrigin.status, 403);
 });
+
+function noticeContext(t) {
+  const steered = [];
+  const followed = [];
+  const events = [];
+  const state = { flushed: 0 };
+  const agent = {
+    id: 'session-origin',
+    inbox: { nextTurn: [], nextStep: [] },
+    session: { snapshotEvents: () => events },
+    steer(msg) { steered.push(msg); agent.inbox.nextStep.push(msg); },
+    followup(msg) { followed.push(msg); agent.inbox.nextTurn.push(msg); },
+  };
+  const ctx = {
+    sessionController: { async resolveAgent(id) { return id === 'session-origin' ? { agent } : { error: { code: 'session/not-found', message: 'missing' } }; } },
+    sessionPersistence: { async flush() { state.flushed += 1; } },
+  };
+  return { agent, steered, followed, events, state, ctx };
+}
+
+function deliveryEnvelope(requestId, request) {
+  return {
+    type: 'client-request',
+    rpcId: requestId,
+    method: '1agents-acp/session/deliver',
+    payload: { args: { request: { requestId, sessionId: 'session-origin', ...request } } },
+  };
+}
+
+const textOf = message => (Array.isArray(message.content) ? message.content : [])
+  .map(block => (block && typeof block.text === 'string' ? block.text : '')).filter(Boolean).join('\n');
+
+test('queue deliveries merge into the pending 1agents-acp inbox tail instead of waking the session twice', async t => {
+  const { agent, steered, followed, state, ctx } = noticeContext(t);
+  const base = await startServer(t, ctx);
+  const post = body => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  const first = deliveryEnvelope('queue-req-1', {
+    mode: 'queue', form: 'notice', text: '第一条队列通知', summary: '任务一完成', fromSessionId: 'sender-a',
+  });
+  assert.equal((await post(first)).status, 200);
+  assert.equal(followed.length, 1, 'the first queue message still uses agent.followup');
+  assert.equal(state.flushed, 1);
+  assert.equal(agent.inbox.nextTurn.length, 1);
+
+  const second = deliveryEnvelope('queue-req-2', {
+    mode: 'queue', form: 'notice', text: '第二条队列通知', summary: '任务二完成', fromSessionId: 'sender-b',
+  });
+  assert.equal((await post(second)).status, 200);
+  assert.equal(followed.length, 1, 'the second queue message must not schedule another wakeup');
+  assert.equal(state.flushed, 2, 'the merged message is persisted');
+  assert.equal(agent.inbox.nextTurn.length, 1);
+
+  const merged = agent.inbox.nextTurn[0];
+  assert.equal(merged.id, 'queue-req-1');
+  const mergedText = textOf(merged);
+  assert.match(mergedText, /^\[队列合并 · 共 2 条消息\]/);
+  assert.match(mergedText, /第一条队列通知/);
+  assert.match(mergedText, /第二条队列通知/);
+  assert.match(mergedText, /—— 第 2 条 ——/);
+  assert.equal(merged.source.kind, NOTICE_SOURCE_KIND);
+  assert.equal(merged.source.form, 'notice');
+  assert.equal(merged.source.rpcId, 'queue-req-1');
+  assert.deepEqual(merged.source.rpcIds, ['queue-req-1', 'queue-req-2']);
+  assert.match(merged.source.summary, /任务一完成/);
+  assert.match(merged.source.summary, /任务二完成/);
+
+  // Every original request id keeps its own idempotency, including the one that only lives in rpcIds.
+  for (const envelope of [second, first]) {
+    assert.equal((await post(envelope)).status, 200);
+    assert.equal(followed.length, 1);
+    assert.equal(steered.length, 0);
+    assert.equal(agent.inbox.nextTurn.length, 1);
+    assert.deepEqual(agent.inbox.nextTurn[0].source.rpcIds, ['queue-req-1', 'queue-req-2']);
+  }
+
+  // steer never merges: it goes straight to agent.steer and leaves the queued tail untouched.
+  const steer = deliveryEnvelope('steer-req-1', { mode: 'steer', form: 'notice', text: 'steer 通知', summary: '过程审批' });
+  assert.equal((await post(steer)).status, 200);
+  assert.equal(steered.length, 1);
+  assert.equal(steered[0].id, 'steer-req-1');
+  assert.equal(textOf(steered[0]), 'steer 通知');
+  assert.equal(followed.length, 1);
+  assert.equal(agent.inbox.nextTurn.length, 1);
+  assert.equal(agent.inbox.nextStep.length, 1);
+});
+
+test('a queue delivery does not merge when the inbox tail is not an a2a notice', async t => {
+  const { agent, followed, ctx } = noticeContext(t);
+  agent.inbox.nextTurn.push({ id: 'human-1', role: 'user', content: [{ type: 'text', text: '人类消息' }], source: { kind: 'user' } });
+  const base = await startServer(t, ctx);
+  const post = body => fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  assert.equal((await post(deliveryEnvelope('relay-req-1', { mode: 'queue', form: 'relay', text: 'relay 正文' }))).status, 200);
+  assert.equal(followed.length, 1);
+  assert.equal(agent.inbox.nextTurn.length, 2);
+  assert.equal(agent.inbox.nextTurn[1].id, 'relay-req-1');
+  assert.equal(agent.inbox.nextTurn[1].source.rpcId, 'relay-req-1');
+  assert.equal(agent.inbox.nextTurn[1].source.rpcIds, undefined, 'an unmerged source keeps the old shape');
+});
+
+test('an invalid fromSessionId is rejected before the delivery reaches the agent', async t => {
+  const { agent, followed, steered, ctx } = noticeContext(t);
+  const base = await startServer(t, ctx);
+  const response = await fetch(`${base}${SESSION_DELIVER_PATH}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(deliveryEnvelope('bad-sender-1', { mode: 'queue', form: 'relay', text: '正文', fromSessionId: '   ' })),
+  });
+  assert.equal(response.status, 400);
+  assert.equal(followed.length, 0);
+  assert.equal(steered.length, 0);
+  assert.equal(agent.inbox.nextTurn.length, 0);
+});
