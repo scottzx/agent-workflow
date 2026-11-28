@@ -23,6 +23,7 @@ import { toSafeError } from '@1agents/acp-service/runtime';
 import { capacityPendingOf, noteProcessCapacity, noteProcessReady, noteSessionRestore, requestWhenAdmitted } from './process-admission.js';
 import type { ProcessQuestionInput, ProcessRequestClient, ProcessRequestView } from './process-requests.js';
 import { AgentSessionSettings, pinnedModeError, pinnedOptionError, replayPinnedOptions } from './session-settings.js';
+import { isForwardableSource, selectPromptInput, sourceOf } from './prompt-input.js';
 
 // Owned by dsh-sandbox-policy, which this plugin does not link: the last logged sandbox/mode switch, or null.
 declare module '@deepseek-ai/dsh-session-projection/types' {
@@ -724,24 +725,20 @@ export class AcpAdapter implements LlmAdapter {
   private async run(agent: Agent, options: GenerateOptions, signal: AbortSignal, queue: Queue<StreamChunk>): Promise<void> {
     const cwd = agent.session.header.cwd;
     if (!cwd) throw new Error('Create the ACP session in a workspace first');
+    if (this.agentName(agent) !== options.model) throw new Error('ACP is available only in its matching Agent preset; start a new ACP session');
     // Only newly admitted input goes to the stateful remote Agent. Its native
     // conversation already owns prior turns and tool results.
-    let start = options.messages.length - 1;
-    while (start >= 0 && options.messages[start].role !== 'assistant') start--;
-    if (this.agentName(agent) !== options.model) throw new Error('ACP is available only in its matching Agent preset; start a new ACP session');
     const importedIds = new Set(this.state.get(agent.id)?.imported?.messageIds ?? []);
-    const isForwardableSource = (kind: unknown): boolean => kind === 'user' || kind === '1agents-acp';
-    // `GenerateOptions.messages` is `RequestMessage[]` (durable messages plus forwarded `RequestUserInput`
-    // without identity), so this helper accepts any shape that carries an opaque `source`.
-    const sourceOf = (message: { readonly source?: unknown }): { kind?: unknown; rpcId?: unknown } | undefined =>
-      message.source as { kind?: unknown; rpcId?: unknown } | undefined;
-    const isTextBlock = (block: unknown): block is { type: 'text'; text: string } =>
-      Boolean(block && typeof block === 'object' && (block as { type?: unknown }).type === 'text'
-        && typeof (block as { text?: unknown }).text === 'string');
-    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && isForwardableSource(sourceOf(m)?.kind) && (m.id === undefined || !importedIds.has(m.id)));
-    const blocks = input.flatMap(m => m.content ?? []);
-    if (!blocks.length || !blocks.every(isTextBlock)) throw new Error('This ACP plugin currently accepts text prompts only');
-    const text = blocks.map(block => block.text).join('\n\n');
+    const selection = selectPromptInput(options.messages, importedIds);
+    if (selection.kind === 'noop') {
+      // This step carries only a DSH-injected user message, such as the `user-approval` notice that follows a
+      // mid-turn policy change. Nothing is forwarded and nothing failed: finishing the step lets DSH complete
+      // the turn and consume the next queued message instead of aborting it with a misleading prompt error.
+      queue.push({ type: 'finish', reason: { kind: 'stop' } });
+      return;
+    }
+    const input = selection.input;
+    const text = selection.text;
     const requestId = 'dsh-' + createHash('sha256').update(JSON.stringify([agent.id, input.map(m => m.id)])).digest('hex');
     const endpoint = new URL(`/agents/${encodeURIComponent(options.model)}`, this.config.serviceUrl); endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
     let binding = this.state.get(agent.id);

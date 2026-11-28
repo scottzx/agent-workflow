@@ -895,6 +895,50 @@ test('only user-authored messages reach ACP, excluding DSH instructions and runt
   assert.deepEqual(f.prompts, [[{ type: 'text', text: 'hello' }]]);
 });
 
+test('a step whose only new message is the user-approval notice finishes without connecting or prompting', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  const approval = { id: 'approval-notice', role: 'user', source: { kind: 'user-approval' }, content: [{ type: 'text', text: 'The user changed the approval policy to danger-full-access.' }] };
+  const turn = [
+    { id: 'turn-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] },
+    { id: 'assistant-1', role: 'assistant', content: [{ type: 'text', text: 'Native reply' }] },
+    approval,
+  ];
+  const first = await collect(f.adapter, { ...f.options('turn-1'), messages: turn });
+  // The step ends normally so DSH completes the turn instead of failing it with a prompt error.
+  assert.deepEqual(first, [{ type: 'finish', reason: { kind: 'stop' } }]);
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
+  assert.equal(f.prompts.length, 0);
+
+  // The next step carries the queued cross-session message and connects normally.
+  const second = await collect(f.adapter, { ...f.options('turn-2'), messages: [...turn,
+    { id: 'assistant-2', role: 'assistant', content: [{ type: 'text', text: '' }] },
+    { id: 'queued-message', role: 'user', source: { kind: '1agents-acp', rpcId: 'a2a-queued' }, content: [{ type: 'text', text: 'Queued cross-session message' }] },
+  ] });
+  assert.equal(second.at(-1).reason.kind, 'stop');
+  assert.equal(f.counts().creations, 1);
+  assert.equal(f.counts().executions, 1);
+  assert.deepEqual(f.prompts, [[{ type: 'text', text: 'Queued cross-session message' }]]);
+});
+
+test('a step with no forwardable new message reports the missing prompt, not the text-only error', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await assert.rejects(collect(f.adapter, { ...f.options('unused'), messages: [
+    { id: 'assistant-1', role: 'assistant', content: [{ type: 'text', text: 'Native reply' }] },
+  ] }), { message: 'No forwardable text prompt was supplied to the ACP plugin' });
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
+  assert.equal(f.prompts.length, 0);
+});
+
+test('a real user message with non-text content still fails as text-only', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await assert.rejects(collect(f.adapter, { ...f.options('unused'), messages: [
+    { id: 'assistant-1', role: 'assistant', content: [{ type: 'text', text: 'Native reply' }] },
+    { id: 'image-message', role: 'user', source: { kind: 'user' }, content: [{ type: 'image', data: 'AA==' }] },
+  ] }), { message: 'This ACP plugin currently accepts text prompts only' });
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
+  assert.equal(f.prompts.length, 0);
+});
+
 test('native commands, models and modes are discovered before prompting and stay session-local', async t => {
   const f = await fixture(t);
   const info = await f.adapter.describe(f.local);
