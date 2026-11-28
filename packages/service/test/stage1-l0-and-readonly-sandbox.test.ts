@@ -14,12 +14,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { SendMessageRequest } from '@a2a-js/sdk';
-import { PROTOCOL_VERSION } from '@1agents/dreammate-network';
+import { PROTOCOL_VERSION, type SessionDeliveryMode as L0SessionDeliveryMode } from '@1agents/dreammate-network';
 import { parseA2AInput } from '../src/a2a/executor.js';
 import { RemoteAgentGateway, type A2AGatewayConfig } from '../src/a2a/gateway.js';
 import { createA2AServer } from '../src/a2a/server.js';
 import { SessionDelivery, sessionSendSchema } from '../src/a2a/session-delivery.js';
-import { messageCorrelationSchema, sessionHostSchema } from '../src/a2a/session-hosts.js';
+import {
+  messageCorrelationSchema, SESSION_DELIVERY_MODES, sessionHostSchema,
+  type SessionDeliveryMode as ServiceSessionDeliveryMode,
+} from '../src/a2a/session-hosts.js';
 import { countPendingGovernanceProposals, projectDelegationMirror, toL0ExecutionStatus } from '../src/execution/delegation-mirror.js';
 import type { Ticket } from '../src/execution/ticket.js';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
@@ -221,6 +224,96 @@ test('messageCorrelationSchema rejects unknown keys, blanks, non-strings, contro
   // Old saved deliveries never carried the field; it stays optional in the wire schema.
   const parsed = sessionSendSchema.parse({ originSessionId: 'o', messageId: 'm', text: 'x' });
   assert.equal('correlation' in parsed, false);
+});
+
+test('the delivery mode tuple is the L0 vocabulary and the runtime schema is pinned to it', () => {
+  // Compile-time proof: the service tuple and its alias both stay inside the published L0 type.
+  const fitsL0: readonly L0SessionDeliveryMode[] = SESSION_DELIVERY_MODES;
+  const sameAlias: (mode: ServiceSessionDeliveryMode) => L0SessionDeliveryMode = mode => mode;
+  assert.equal(fitsL0.length, 2);
+  assert.equal(sameAlias('steer'), 'steer');
+  assert.deepEqual([...SESSION_DELIVERY_MODES], ['queue', 'steer']);
+
+  // Runtime proof: the zod enum is built from that tuple, so a mode the L0 vocabulary does not have
+  // is rejected before anything reaches a host queue.
+  for (const mode of SESSION_DELIVERY_MODES) {
+    assert.equal(sessionSendSchema.parse({ originSessionId: 'o', messageId: 'm', text: 'x', mode }).mode, mode);
+  }
+  for (const widening of ['steer-then-queue', 'interrupt', 'QUEUE', '', 'steer ']) {
+    assert.throws(
+      () => sessionSendSchema.parse({ originSessionId: 'o', messageId: 'm', text: 'x', mode: widening }),
+      `mode ${JSON.stringify(widening)} is outside the L0 vocabulary`,
+    );
+  }
+});
+
+test('an empty correlation object is normalised to absent instead of being persisted or forwarded', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'stage1-empty-correlation-'));
+  const host = await recordingSessionHost(t);
+  const gateway = new RemoteAgentGateway({
+    stateDirectory: root, port: 0, remotes: {}, pollIntervalMs: 60_000,
+    sessionHosts: { dsh: sessionHostSchema.parse({ kind: 'dsh', url: host.url, timeoutMs: 2_000 }) },
+  });
+  t.after(() => gateway.close());
+  await gateway.invoke('session_bind', { originSessionId: 'owner-origin', host: 'dsh', sessionId: 'owner-session' });
+
+  const sent = await gateway.invoke('session_message_send', {
+    fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'session-msg:empty-corr', text: '没有上下文的留言',
+    correlation: {},
+  }) as { correlation?: unknown; receipt: Record<string, unknown> };
+  assert.equal('correlation' in sent, false, 'the top-level session_message_send reply must not echo an empty correlation');
+  assert.equal('correlation' in sent.receipt, false, 'the delivery receipt must not carry an empty correlation');
+
+  const receipt = gateway.sessions.get({ originSessionId: 'owner-origin', messageId: 'session-msg:empty-corr' });
+  assert.equal(Object.hasOwn(receipt, 'correlation'), false);
+  const persisted = JSON.parse(await readFile(join(root, 'session-delivery.json'), 'utf8')) as {
+    deliveries: Array<Record<string, unknown>>;
+  };
+  const stored = persisted.deliveries.find(item => item.messageId === 'session-msg:empty-corr')!;
+  assert.equal(Object.hasOwn(stored, 'correlation'), false, 'session-delivery.json must not store an empty correlation');
+
+  await gateway.sessions.reconcile();
+  const admission = await until(async () => host.calls.length, count => count >= 1, 'the uncorrelated host admission');
+  assert.ok(admission >= 1);
+  assert.equal(host.calls[0]!.correlation, undefined, 'the host envelope carries no correlation key at all');
+
+  // An empty context is the same context: replaying the message stays idempotent.
+  const before = gateway.sessions.summary().deliveries.total;
+  await gateway.invoke('session_message_send', {
+    fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'session-msg:empty-corr', text: '没有上下文的留言',
+    correlation: {},
+  });
+  assert.equal(gateway.sessions.summary().deliveries.total, before);
+  // ... and it is not the same message as one that names a context.
+  await assert.rejects(
+    gateway.invoke('session_message_send', {
+      fromSessionId: 'sender-a', toSessionId: 'owner-session', messageId: 'session-msg:empty-corr', text: '没有上下文的留言',
+      correlation: { job_id: 'job-1' },
+    }),
+    /different content/,
+  );
+  // A state file written by an older version may already contain `correlation: {}`; loading it drops
+  // the empty object from memory, from the receipt and from the bytes on disk.
+  const legacyRoot = join(root, 'legacy-empty-correlation');
+  const legacyHost = sessionHostSchema.parse({ kind: 'dsh', url: host.url, timeoutMs: 2_000 });
+  const legacy = new SessionDelivery(legacyRoot, { dsh: legacyHost });
+  legacy.bind({ originSessionId: 'legacy-origin', host: 'dsh', sessionId: 'legacy-session' });
+  legacy.enqueue({ originSessionId: 'legacy-origin', messageId: 'legacy-empty-corr', text: '旧的空上下文' });
+  await legacy.close();
+  const legacyFile = join(legacyRoot, 'session-delivery.json');
+  const legacyState = JSON.parse(await readFile(legacyFile, 'utf8')) as { deliveries: Array<Record<string, unknown>> };
+  legacyState.deliveries[0]!.correlation = {};
+  await writeFile(legacyFile, JSON.stringify(legacyState));
+  const reopened = new SessionDelivery(legacyRoot, { dsh: legacyHost });
+  t.after(() => reopened.close());
+  assert.equal(Object.hasOwn(reopened.get({ originSessionId: 'legacy-origin', messageId: 'legacy-empty-corr' }), 'correlation'), false);
+  const rewritten = JSON.parse(await readFile(legacyFile, 'utf8')) as { deliveries: Array<Record<string, unknown>> };
+  assert.equal(Object.hasOwn(rewritten.deliveries[0]!, 'correlation'), false, 'loading rewrites the empty object away');
+  // ... and the same content stays idempotent instead of looking like a different context.
+  assert.equal(reopened.enqueue({ originSessionId: 'legacy-origin', messageId: 'legacy-empty-corr', text: '旧的空上下文' }).messageId, 'legacy-empty-corr');
+
+  // Cleanup runs after the gateway and host close hooks registered above.
+  t.after(() => rm(root, { recursive: true, force: true }));
 });
 
 test('session_message_send carries correlation to the DSH envelope, keeps it on the receipt, and fails closed on a malformed one', async t => {

@@ -5,6 +5,21 @@
  * DSH 0.2.2-rc.5 drops a skill whose frontmatter uses disableModelInvocation, modelInvocable, or userInvocable.
  *
  *   node .1agents/roles/pr-delivery/checks/l1-gate.mjs --worktree <dir> [--role-dir <dir>] [--base-ref <ref>]
+ *        [--allow-eval-change] [--allowed-paths <p1,p2,...>]...
+ *
+ *   --worktree <dir>          Worktree to judge. Required.
+ *   --role-dir <dir>          Also validate that role source package (profile.json + skills/).
+ *   --base-ref <ref>          Optional alias for the baseline ref. It cannot move the anchor: it must
+ *                             resolve to merge-base(HEAD, origin/main) or the gate fails closed.
+ *   --allow-eval-change       Approve a change under .1agents/roles/<role>/evals/. Only a person
+ *                             accepting an `eval_change` proposal may pass it.
+ *   --allowed-paths <spec>    Authorization whitelist, repeatable and comma separated. Every changed
+ *                             path must match one entry: an exact file, a directory prefix (`dir/` or
+ *                             `dir`) or a glob (`*` inside one segment, `**` across segments).
+ *
+ * Git-derived checks share resolveBaseline(): merge-base(HEAD, refs/remotes/origin/main). The gate
+ * never fetches, so a missing or stale origin/main fails closed, and the changed-path window covers
+ * committed (baseSha..HEAD), staged, unstaged and untracked paths including rename/copy source+target.
  */
 import { execFile } from 'node:child_process';
 import { lstat, readFile, readdir, readlink, realpath, stat } from 'node:fs/promises';
@@ -17,6 +32,9 @@ const AOCI_BEGIN = '<!-- aoci:begin -->';
 const AOCI_END = '<!-- aoci:end -->';
 const CONFIG_EXAMPLE = /^\.1agents\/config\/[^/]+\.example\.(?:json|yml)$/;
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const EVALS_PATH = /^\.1agents\/roles\/[^/]+\/evals(?:\/|$)/;
+const PROJECTION_PATHS = ['AGENTS.local.md', 'CLAUDE.local.md'];
+
 const LEGACY = {
   disableModelInvocation: 'disable-model-invocation',
   modelInvocable: 'disable-model-invocation',
@@ -28,6 +46,9 @@ let worktree;
 let roleDir;
 let baseRef;
 let hasBaseRef = false;
+let allowEvalChange = false;
+const allowedPathArgs = [];
+let missingAllowedPathsValue = false;
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
   if (arg === '--worktree') worktree = args[++index];
@@ -42,6 +63,12 @@ for (let index = 0; index < args.length; index += 1) {
         checks: [{ id: 'usage', ok: false, detail: 'missing value for --base-ref <ref>' }],
       });
     }
+  }
+  else if (arg === '--allow-eval-change') allowEvalChange = true;
+  else if (arg === '--allowed-paths') {
+    const spec = args[++index];
+    if (spec === undefined) missingAllowedPathsValue = true;
+    else allowedPathArgs.push(spec);
   }
   else {
     await finish({
@@ -60,15 +87,36 @@ if (!worktree) {
 }
 
 const root = resolve(worktree);
+if (missingAllowedPathsValue) {
+  await finish({
+    ok: false,
+    worktree: root,
+    checks: [{ id: 'usage', ok: false, detail: 'missing value for --allowed-paths <spec>' }],
+  });
+}
+// A whitelist that names nothing is a configuration error, never "allow everything".
+const whitelist = allowedPathArgs.length ? parseAllowedPaths(allowedPathArgs) : undefined;
+if (whitelist && !whitelist.ok) {
+  await finish({
+    ok: false,
+    worktree: root,
+    checks: [{ id: 'usage', ok: false, detail: whitelist.detail }],
+  });
+}
+
 const checks = [];
 const anchor = await checkGitAnchor(root);
+// One baseline for every git-derived check: a forged --base-ref can never widen their window.
+const baseline = await resolveBaseline(root, hasBaseRef ? baseRef : undefined, anchor.ok);
 checks.push(anchor);
 checks.push(await checkSkillFrontmatter(root));
 checks.push(await checkAgentsLocal(root));
 checks.push(await checkClaudeLink(root));
 checks.push(await checkNoHooks(root));
 checks.push(anchor.ok ? await checkGitStatus(root) : { id: 'git-status', ok: true, skipped: true, detail: 'skipped because .git anchor is missing' });
-checks.push(await checkAociBlockImmutable(root, hasBaseRef ? baseRef : undefined, anchor.ok));
+checks.push(await checkAociBlockImmutable(root, baseline));
+checks.push(await checkEvalsImmutable(root, baseline, allowEvalChange));
+if (whitelist) checks.push(await checkAllowedPaths(root, baseline, whitelist.patterns));
 if (roleDir) checks.push(await checkRoleSource(resolve(roleDir)));
 
 await finish({ ok: checks.every(item => item.ok), worktree: root, checks });
@@ -242,20 +290,28 @@ function extractAociBlock(text, label) {
   return { ok: true, block: text.slice(beginIndex, endIndex + AOCI_END.length) };
 }
 
-async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
+/**
+ * The single fail-closed baseline for every git-derived check.
+ *
+ * The anchor is always merge-base(HEAD, refs/remotes/origin/main). The gate never fetches, so a
+ * missing or stale origin/main fails closed instead of silently comparing against nothing. An
+ * explicit `--base-ref` cannot move the anchor: it must resolve to that exact same merge-base, so
+ * passing HEAD or a branch that also changed a protected path cannot widen the changed-path window.
+ * @returns `{ ok: true, baseRef, baseSha }` or `{ ok: false, baseRef, baseSha, detail }`.
+ */
+async function resolveBaseline(dir, explicitBaseRef, anchorOk) {
   const reportedRef = explicitBaseRef ?? 'origin/main';
   if (!anchorOk) {
-    return { id: 'aoci_block_immutable', ok: false, baseRef: reportedRef, baseSha: null, detail: 'missing .git anchor (fail-closed)' };
+    return { ok: false, baseRef: reportedRef, baseSha: null, detail: 'missing .git anchor (fail-closed)' };
   }
   if (explicitBaseRef !== undefined && (!explicitBaseRef.trim() || explicitBaseRef.startsWith('-'))) {
-    return { id: 'aoci_block_immutable', ok: false, baseRef: explicitBaseRef, baseSha: null, detail: 'invalid --base-ref (fail-closed)' };
+    return { ok: false, baseRef: explicitBaseRef, baseSha: null, detail: 'invalid --base-ref (fail-closed)' };
   }
   let originMainSha;
   try {
     originMainSha = (await gitOutput(dir, ['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'])).trim();
   } catch {
     return {
-      id: 'aoci_block_immutable',
       ok: false,
       baseRef: reportedRef,
       baseSha: null,
@@ -267,7 +323,6 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
     originMergeBase = (await gitOutput(dir, ['merge-base', 'HEAD', originMainSha])).trim();
   } catch (error) {
     return {
-      id: 'aoci_block_immutable',
       ok: false,
       baseRef: reportedRef,
       baseSha: null,
@@ -282,7 +337,6 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
       resolvedRefSha = (await gitOutput(dir, ['rev-parse', '--verify', `${explicitBaseRef}^{commit}`])).trim();
     } catch {
       return {
-        id: 'aoci_block_immutable',
         ok: false,
         baseRef: reportedRef,
         baseSha: null,
@@ -293,7 +347,6 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
       baseSha = (await gitOutput(dir, ['merge-base', 'HEAD', resolvedRefSha])).trim();
     } catch (error) {
       return {
-        id: 'aoci_block_immutable',
         ok: false,
         baseRef: reportedRef,
         baseSha: null,
@@ -304,7 +357,6 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
       await gitOutput(dir, ['merge-base', '--is-ancestor', baseSha, originMainSha]);
     } catch {
       return {
-        id: 'aoci_block_immutable',
         ok: false,
         baseRef: reportedRef,
         baseSha,
@@ -313,7 +365,6 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
     }
     if (baseSha !== originMergeBase) {
       return {
-        id: 'aoci_block_immutable',
         ok: false,
         baseRef: reportedRef,
         baseSha,
@@ -321,6 +372,13 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
       };
     }
   }
+
+  return { ok: true, baseRef: reportedRef, baseSha };
+}
+
+async function checkAociBlockImmutable(dir, baseline) {
+  if (!baseline.ok) return { id: 'aoci_block_immutable', ...baseline };
+  const { baseRef: reportedRef, baseSha } = baseline;
 
   let baseAgents;
   try {
@@ -406,6 +464,177 @@ async function checkAociBlockImmutable(dir, explicitBaseRef, anchorOk) {
   return { id: 'aoci_block_immutable', ok: true, baseRef: reportedRef, baseSha };
 }
 
+/** The untracked projection artifacts are gitignored by contract; they never count as a change. */
+function isProjectionPath(file) {
+  const normalized = file.replaceAll('\\', '/').replace(/^\.\//, '');
+  return PROJECTION_PATHS.includes(normalized)
+    || normalized === '.agents' || normalized.startsWith('.agents/')
+    || normalized === '.claude' || normalized.startsWith('.claude/');
+}
+
+/**
+ * Every path this worktree changed relative to the baseline: the committed range, the index, the
+ * working tree and untracked files. Rename and copy source+target both count, so moving a file out
+ * of a protected directory is still a change to it.
+ */
+async function collectChangedPaths(dir, baseSha) {
+  const paths = new Set();
+  const failures = [];
+  const add = value => {
+    if (!value) return;
+    const normalized = value.replaceAll('\\', '/').replace(/^\.\//, '');
+    if (normalized) paths.add(normalized);
+  };
+  const diffs = [
+    ['diff', '--name-status', '-z', '--find-renames', '--find-copies', `${baseSha}..HEAD`],
+    ['diff', '--cached', '--name-status', '-z', '--find-renames', '--find-copies'],
+    ['diff', '--name-status', '-z', '--find-renames', '--find-copies'],
+  ];
+  for (const gitArgs of diffs) {
+    try {
+      for (const path of diffNameStatusPaths(await gitOutput(dir, gitArgs))) add(path);
+    } catch (error) {
+      failures.push(`${gitArgs.slice(0, gitArgs.includes('--cached') ? 2 : 1).join(' ')}: ${errorMessage(error)}`);
+    }
+  }
+  if (failures.length) return { paths: [...paths], failures };
+  try {
+    // Same global-excludes hardening as checkGitStatus: a private excludes file cannot hide an
+    // untracked change from the gate. A repository's own .gitignore still decides what is untracked.
+    const stdout = await gitOutput(dir, ['-c', 'core.excludesFile=/dev/null', 'status', '--porcelain=v1', '-z', '-uall']);
+    for (const entry of porcelainEntries(stdout)) {
+      if (entry.xy === '??' && !isProjectionPath(entry.path)) add(entry.path);
+    }
+  } catch (error) {
+    failures.push(`status: ${errorMessage(error)}`);
+  }
+  return { paths: [...paths].sort(), failures };
+}
+
+/** `git diff --name-status -z` emits `status\0path\0`, or `R<n>\0from\0to\0` for a rename/copy. */
+function diffNameStatusPaths(stdout) {
+  const paths = [];
+  const fields = stdout.split('\0');
+  for (let index = 0; index < fields.length; index += 1) {
+    const status = fields[index];
+    if (!status) continue;
+    const first = fields[++index];
+    if (first === undefined) break;
+    paths.push(first);
+    if (status.startsWith('R') || status.startsWith('C')) {
+      const second = fields[++index];
+      if (second !== undefined) paths.push(second);
+    }
+  }
+  return paths;
+}
+
+/**
+ * The role exams under `.1agents/roles/<role>/evals/` are the grader, not the code under test.
+ * Any change to them — committed, staged, unstaged or untracked — fails the gate unless a person
+ * approved an `eval_change` proposal and passed `--allow-eval-change`.
+ */
+async function checkEvalsImmutable(dir, baseline, overridden) {
+  const id = 'evals_immutable';
+  if (!baseline.ok) return { id, ...baseline };
+  const collected = await collectChangedPaths(dir, baseline.baseSha);
+  if (collected.failures.length) {
+    return {
+      id,
+      ok: false,
+      baseRef: baseline.baseRef,
+      baseSha: baseline.baseSha,
+      violations: [],
+      detail: `cannot enumerate changed paths: ${collected.failures.join('; ')}`,
+    };
+  }
+  const violations = collected.paths.filter(path => EVALS_PATH.test(path));
+  if (overridden) return { id, ok: true, overridden: true, baseRef: baseline.baseRef, baseSha: baseline.baseSha };
+  return violations.length
+    ? { id, ok: false, baseRef: baseline.baseRef, baseSha: baseline.baseSha, violations }
+    : { id, ok: true, baseRef: baseline.baseRef, baseSha: baseline.baseSha };
+}
+
+/** Opt-in authorization whitelist: every changed path must match one `--allowed-paths` entry. */
+async function checkAllowedPaths(dir, baseline, patterns) {
+  const id = 'allowed_paths';
+  if (!baseline.ok) return { id, ...baseline, patterns };
+  const collected = await collectChangedPaths(dir, baseline.baseSha);
+  if (collected.failures.length) {
+    return {
+      id,
+      ok: false,
+      baseRef: baseline.baseRef,
+      baseSha: baseline.baseSha,
+      patterns,
+      violations: [],
+      detail: `cannot enumerate changed paths: ${collected.failures.join('; ')}`,
+    };
+  }
+  const violations = collected.paths.filter(path => !patterns.some(pattern => allowedPathMatches(path, pattern)));
+  return violations.length
+    ? { id, ok: false, baseRef: baseline.baseRef, baseSha: baseline.baseSha, patterns, violations }
+    : { id, ok: true, baseRef: baseline.baseRef, baseSha: baseline.baseSha, patterns };
+}
+
+/** Reject a whitelist that could never be satisfied honestly: absolute, escaping or empty entries. */
+function parseAllowedPaths(values) {
+  const patterns = [];
+  for (const value of values) {
+    for (const raw of value.split(',')) {
+      const candidate = raw.trim().replaceAll('\\', '/').replace(/^\.\//, '');
+      if (!candidate) continue;
+      if (candidate.startsWith('-')) {
+        return { ok: false, detail: `invalid --allowed-paths entry "${candidate}" (looks like a flag, not a path)` };
+      }
+      if (candidate.startsWith('/') || /^[A-Za-z]:\//.test(candidate)) {
+        return { ok: false, detail: `--allowed-paths entry "${candidate}" must be relative to the worktree` };
+      }
+      if (candidate.split('/').includes('..')) {
+        return { ok: false, detail: `--allowed-paths entry "${candidate}" escapes the worktree` };
+      }
+      patterns.push(candidate.replace(/\/{2,}/g, '/'));
+    }
+  }
+  if (!patterns.length) return { ok: false, detail: '--allowed-paths requires at least one non-empty path' };
+  return { ok: true, patterns };
+}
+
+/** Exact file, directory prefix (`dir/` or `dir`) or glob (`*` one segment, `**` across segments). */
+function allowedPathMatches(file, pattern) {
+  const normalized = file.replaceAll('\\', '/');
+  if (normalized === pattern) return true;
+  if (!pattern.includes('*')) {
+    const directory = pattern.replace(/\/+$/, '');
+    return directory !== '' && normalized.startsWith(`${directory}/`);
+  }
+  return globToRegExp(pattern.endsWith('/') ? `${pattern}**` : pattern).test(normalized);
+}
+
+function globToRegExp(pattern) {
+  let source = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index];
+    if (character === '*') {
+      if (pattern[index + 1] === '*') {
+        // `**/` also matches zero directories, so `**/*.ts` covers the repository root.
+        if (pattern[index + 2] === '/') {
+          source += '(?:[^/]+/)*';
+          index += 2;
+        } else {
+          source += '.*';
+          index += 1;
+        }
+      } else {
+        source += '[^/]*';
+      }
+      continue;
+    }
+    source += character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`${source}$`);
+}
+
 async function checkRoleSource(dir) {
   const profilePath = join(dir, 'profile.json');
   let profile;
@@ -433,25 +662,33 @@ async function checkRoleSource(dir) {
     : { id: 'role-source', ok: true, checked: skills.length };
 }
 
-function porcelainLeaks(stdout) {
-  const leaks = [];
+/** `git status --porcelain=v1 -z` records, including the source path of a rename or copy. */
+function porcelainEntries(stdout) {
+  const entries = [];
   let offset = 0;
   while (offset < stdout.length) {
     const end = stdout.indexOf('\0', offset);
     if (end < 0 || end < offset + 3) break;
     const xy = stdout.slice(offset, offset + 2);
-    const first = stdout.slice(offset + 3, end);
+    const path = stdout.slice(offset + 3, end);
     offset = end + 1;
-    const renamed = xy.includes('R') || xy.includes('C');
-    let second;
-    if (renamed) {
+    const entry = { xy, path, from: undefined };
+    if (xy.includes('R') || xy.includes('C')) {
       const end2 = stdout.indexOf('\0', offset);
       if (end2 < 0) break;
-      second = stdout.slice(offset, end2);
+      entry.from = stdout.slice(offset, end2);
       offset = end2 + 1;
     }
-    for (const path of [first, second]) {
-      if (path && isStatusLeak(xy, path)) leaks.push(path);
+    entries.push(entry);
+  }
+  return entries;
+}
+
+function porcelainLeaks(stdout) {
+  const leaks = [];
+  for (const entry of porcelainEntries(stdout)) {
+    for (const path of [entry.path, entry.from]) {
+      if (path && isStatusLeak(entry.xy, path)) leaks.push(path);
     }
   }
   return leaks;

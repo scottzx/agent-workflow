@@ -3,10 +3,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
-import { deliverSessionMessage, messageCorrelationSchema, SessionDeliveryError, sessionNoticeSchema, type MessageCorrelation, type SessionDeliveryMode, type SessionHost, type SessionNoticeMeta } from './session-hosts.js';
+import { deliverSessionMessage, messageCorrelationSchema, normalizeCorrelation, SESSION_DELIVERY_MODES, SessionDeliveryError, sessionNoticeSchema, type MessageCorrelation, type SessionDeliveryMode, type SessionHost, type SessionNoticeMeta } from './session-hosts.js';
 
 const id = z.string().trim().min(1).max(512);
-const deliveryModeSchema = z.enum(['queue', 'steer']);
+/** Pinned to the L0 vocabulary; the tuple is exported by session-hosts so it cannot drift. */
+const deliveryModeSchema = z.enum(SESSION_DELIVERY_MODES);
 /** One host admission can carry several queued messages; stay well below the 256 KiB host body limit. */
 export const MAX_BATCH_BYTES = 200 * 1024;
 const MERGE_SUMMARY_MAX_CHARS = 240;
@@ -211,6 +212,9 @@ export class SessionDelivery {
         origins.add(binding.originSessionId);
       }
       for (const delivery of this.state.deliveries) {
+        // An older version could persist a meaningless `correlation: {}`. Load it as absent so the
+        // receipt, the stored bytes and the idempotency check all agree with the current rule.
+        if (delivery.correlation && !normalizeCorrelation(delivery.correlation)) delete delivery.correlation;
         const key = JSON.stringify([delivery.originSessionId, delivery.messageId]);
         if (messages.has(key)) throw new Error('Duplicate session delivery');
         messages.add(key);
@@ -223,6 +227,7 @@ export class SessionDelivery {
         }
       }
       for (const delivery of this.state.targetDeliveries) {
+        if (delivery.correlation && !normalizeCorrelation(delivery.correlation)) delete delivery.correlation;
         const key = JSON.stringify([delivery.targetKey, delivery.messageId]);
         if (targets.has(key)) throw new Error('Duplicate session delivery');
         targets.add(key);
@@ -295,11 +300,13 @@ export class SessionDelivery {
   }
   enqueue(input: z.output<typeof sessionSendSchema>): SessionDeliveryReceipt {
     this.requireWritable();
+    // An empty `correlation: {}` names no context; store it as absent so the file and the receipt agree.
+    const correlation = normalizeCorrelation(input.correlation);
     const previous = this.state.deliveries.find(value => value.originSessionId === input.originSessionId && value.messageId === input.messageId);
     if (previous) {
       const sameNotice = JSON.stringify(previous.notice ?? null) === JSON.stringify(input.notice ?? null);
       // The context tags are part of the payload: reusing an id for another context is a different message.
-      const sameCorrelation = JSON.stringify(previous.correlation ?? null) === JSON.stringify(input.correlation ?? null);
+      const sameCorrelation = JSON.stringify(previous.correlation ?? null) === JSON.stringify(correlation ?? null);
       if (previous.text !== input.text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice || !sameCorrelation
         || previous.fromSessionId !== input.fromSessionId) {
         throw new Error('Message ID was already used for different content');
@@ -316,7 +323,7 @@ export class SessionDelivery {
       text: input.text,
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.notice ? { notice: input.notice } : {}),
-      ...(input.correlation ? { correlation: input.correlation } : {}),
+      ...(correlation ? { correlation } : {}),
       createdAt: now,
       updatedAt: now,
       attempts: 0,
@@ -355,10 +362,12 @@ export class SessionDelivery {
     if (!host) throw new Error('Unknown session host');
     if (host.kind === 'codex' && !z.uuid().safeParse(input.sessionId).success) throw new Error('Codex session ID must be a thread UUID');
     const text = sessionSendSchema.shape.text.parse(input.text);
+    // Same rule as enqueue(): an empty correlation object is no context, so it is stored as absent.
+    const correlation = normalizeCorrelation(input.correlation);
     const previous = this.state.targetDeliveries.find(value => value.targetKey === targetKey && value.messageId === input.messageId);
     if (previous) {
       const sameNotice = JSON.stringify(previous.notice ?? null) === JSON.stringify(input.notice ?? null);
-      const sameCorrelation = JSON.stringify(previous.correlation ?? null) === JSON.stringify(input.correlation ?? null);
+      const sameCorrelation = JSON.stringify(previous.correlation ?? null) === JSON.stringify(correlation ?? null);
       if (previous.text !== text || (previous.mode ?? 'queue') !== (input.mode ?? 'queue') || !sameNotice || !sameCorrelation
         || previous.host !== input.host || previous.sessionId !== input.sessionId
         || previous.fromSessionId !== input.fromSessionId) {
@@ -377,7 +386,7 @@ export class SessionDelivery {
       text,
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.notice ? { notice: input.notice } : {}),
-      ...(input.correlation ? { correlation: input.correlation } : {}),
+      ...(correlation ? { correlation } : {}),
       createdAt: now,
       updatedAt: now,
       attempts: 0,

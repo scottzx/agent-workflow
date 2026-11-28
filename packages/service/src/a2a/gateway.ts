@@ -15,7 +15,7 @@ import { A2ADispatchRejectedError } from './types.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 import { sessionHostSchema } from './session-hosts.js';
 import { isReservedMessageId, RESERVED_MESSAGE_ID_PREFIXES, SessionDelivery, sessionBindSchema, sessionOriginSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
-import { messageCorrelationSchema, type MessageCorrelation } from './session-hosts.js';
+import { messageCorrelationSchema, normalizeCorrelation, SESSION_DELIVERY_MODES, type MessageCorrelation } from './session-hosts.js';
 import { artifactLinks, formatNotice, formatNoticeSummary, formatProcessRequestNotice, formatProcessRequestSummary, formatSubscriberNotice, formatSubscriberNoticeSummary, type RemoteAgentNotice, type SubscriberNotice } from './notices.js';
 import { materializeSubscription, notificationListSchema, notificationSubscribeSchema, notificationSubscriptionSchema, notificationUnsubscribeSchema, notifySubscriptionInputSchema, subscriberMessageId, subscriberTargetKey, type NotificationSubscription, type NotifySubscriptionInput } from './notifications.js';
 import { a2aModelCatalogSchema } from './model-catalog.js';
@@ -154,7 +154,7 @@ const sessionsSchema = z.object({}).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
 /** Cross-session message: the sender must name itself, and the receiving session sees msg_from_session_id. */
-const sessionDeliveryModeSchema = z.enum(['queue', 'steer']);
+const sessionDeliveryModeSchema = z.enum(SESSION_DELIVERY_MODES);
 const sessionMessageSendSchema = z.object({
   fromSessionId: string,
   toSessionId: string,
@@ -2003,7 +2003,7 @@ export class RemoteAgentGateway {
     const summary = rawSummary.length <= 240 ? rawSummary : `${rawSummary.slice(0, 239)}…`;
     const notice = { form: 'notice' as const, summary };
     const owner = this.sessions.originForTarget(toHost, toSessionId);
-    const correlation = input.correlation;
+    const correlation = normalizeCorrelation(input.correlation);
     if (owner) {
       const receipt = this.sessions.enqueue({ originSessionId: owner, messageId, text, mode, fromSessionId, notice,
         ...(correlation ? { correlation } : {}) });

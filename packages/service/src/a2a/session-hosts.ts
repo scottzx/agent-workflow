@@ -2,6 +2,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { z } from 'zod';
+import type { SessionDeliveryMode as L0SessionDeliveryMode } from '@1agents/dreammate-network';
 
 const value = z.string().min(1).max(4096).refine(text => !text.includes('\0'), 'NUL is not allowed');
 const timeoutMs = z.number().int().min(1).max(300_000).default(15_000);
@@ -50,7 +51,15 @@ export class SessionDeliveryError extends Error {
   }
 }
 
-export type SessionDeliveryMode = 'queue' | 'steer';
+/**
+ * The L0 `SessionDeliveryMode` vocabulary (0.6.0, protocol §15) is the only delivery mode this
+ * service understands: `queue` waits behind the current work, `steer` interrupts and is never merged.
+ *
+ * The runtime tuple is pinned against the L0 type, so a local edit that drifts from the published
+ * vocabulary stops compiling, and the type itself is never re-declared here.
+ */
+export const SESSION_DELIVERY_MODES = ['queue', 'steer'] as const satisfies readonly L0SessionDeliveryMode[];
+export type SessionDeliveryMode = L0SessionDeliveryMode;
 export const sessionNoticeSchema = z.discriminatedUnion('form', [
   z.object({ form: z.literal('notice'), summary: z.string().trim().min(1).max(240).refine(text => !text.includes('\0'), 'NUL is not allowed') }).strict(),
   z.object({ form: z.literal('relay') }).strict(),
@@ -78,13 +87,21 @@ export type MessageCorrelation = z.output<typeof messageCorrelationSchema>;
 /** Compile-time proof this stays a value-compatible subset of the L0 vocabulary. */
 const correlationFitsL0: (value: MessageCorrelation) => import('@1agents/dreammate-network').MessageCorrelation = value => value;
 void correlationFitsL0;
+/**
+ * `correlation: {}` names no context at all. DSH `session-notice.ts` and L0 `protocol.md` §13 both
+ * treat "no context" as an absent key, so an empty object is normalised to `undefined` instead of
+ * being persisted into `session-delivery.json` or forwarded inside the host envelope.
+ */
+export function normalizeCorrelation(correlation: MessageCorrelation | undefined): MessageCorrelation | undefined {
+  return correlation && Object.values(correlation).some(value => value !== undefined) ? correlation : undefined;
+}
 type Message = { sessionId: string; messageId: string; text: string; mode?: SessionDeliveryMode; notice?: SessionNoticeMeta;
   fromSessionId?: string; correlation?: MessageCorrelation };
 const messageSchema = z.object({
   sessionId: value,
   messageId: value,
   text: z.string().min(1).refine(text => !text.includes('\0')),
-  mode: z.enum(['queue', 'steer']).optional(),
+  mode: z.enum(SESSION_DELIVERY_MODES).optional(),
   notice: sessionNoticeSchema.optional(),
   /** Optional sender identity; older DSH hosts ignore it because the body already names the sender. */
   fromSessionId: z.string().trim().min(1).max(512).optional(),
@@ -233,6 +250,8 @@ async function deliverDsh(
   host: Extract<SessionHost, { kind: 'dsh' }>, input: Message, signal?: AbortSignal,
 ): Promise<{ hostReceiptId: string }> {
   if (input.notice) {
+    // An empty `correlation: {}` carries no context; the envelope omits the key entirely.
+    const correlation = normalizeCorrelation(input.correlation);
     const structured = await deliverDshRpc(
       host,
       '/api/1agents-acp/session/deliver',
@@ -248,7 +267,7 @@ async function deliverDsh(
           form: input.notice.form,
           ...(input.notice.form === 'notice' ? { summary: input.notice.summary } : {}),
           ...(input.fromSessionId ? { fromSessionId: input.fromSessionId } : {}),
-          ...(input.correlation ? { correlation: input.correlation } : {}),
+          ...(correlation ? { correlation } : {}),
         } } },
       },
       input.messageId,
